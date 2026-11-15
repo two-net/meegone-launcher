@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use arch_check::{Role, check, listed_crates, load};
+use arch_check::{Role, check, listed_crates, load, os_access_violations};
 
 #[test]
 fn the_workspace_follows_the_architecture_rules() {
@@ -20,6 +20,23 @@ fn the_workspace_follows_the_architecture_rules() {
     assert!(
         violations.is_empty(),
         "architecture rules broken (see ARCHITECTURE.md):\n{}",
+        violations
+            .iter()
+            .map(|violation| format!("  - {violation}\n"))
+            .collect::<String>()
+    );
+}
+
+#[test]
+fn only_platform_adapters_reach_the_operating_system() {
+    // ARCH-04
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+
+    let violations = os_access_violations(&root).expect("the sources can be read");
+
+    assert!(
+        violations.is_empty(),
+        "the operating system is reached outside a platform adapter (see ARCHITECTURE.md):\n{}",
         violations
             .iter()
             .map(|violation| format!("  - {violation}\n"))

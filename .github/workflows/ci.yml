@@ -20,14 +20,15 @@ jobs:
 
       - name: Install Rust
         run: |
-          rustup toolchain install stable --profile minimal --component rustfmt,clippy --target aarch64-linux-android
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy,llvm-tools-preview --target aarch64-linux-android
           rustup default stable
 
       - name: Format
         run: cargo fmt --all --check
 
       # Fails on any feature-to-feature, upward (data → UI) or layer-skipping dependency,
-      # and on any third-party crate missing from DEPENDENCIES.md. See ARCHITECTURE.md.
+      # on any third-party crate missing from DEPENDENCIES.md, on OS access outside a platform
+      # adapter, and on fakes turned on outside tests. See ARCHITECTURE.md.
       - name: Architecture rules
         run: cargo test -p arch-check
 
@@ -36,6 +37,25 @@ jobs:
 
       - name: Tests
         run: cargo test --workspace
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      # Line coverage of the data and state crates (MAINT-02). Fails below 80 %; the table is
+      # shown on the run's summary page. The alias is in .cargo/config.toml.
+      - name: Core-logic coverage
+        shell: bash
+        run: |
+          {
+            echo '### Core-logic line coverage (MAINT-02)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          status=0
+          cargo coverage | tee -a "$GITHUB_STEP_SUMMARY" || status=$?
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"
 
       - name: Android target
         run: cargo check --workspace --exclude arch-check --target aarch64-linux-android

@@ -20,6 +20,17 @@ pub enum GridItem {
     },
 }
 
+impl GridItem {
+    /// The single-line label under the cell: the app's label or the folder's name (APPS-16,
+    /// FOLD-02).
+    pub fn label(&self) -> &str {
+        match self {
+            GridItem::App(app) => &app.label,
+            GridItem::Folder { name, .. } => name,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AppsState {
     pub items: Vec<GridItem>,

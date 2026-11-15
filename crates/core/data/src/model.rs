@@ -6,6 +6,16 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct ProfileId(pub u32);
 
+/// A profile that holds apps (SRS 8.1, "App catalogue").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Profile {
+    pub id: ProfileId,
+    /// Its apps carry the system's work badge (APPS-20).
+    pub work: bool,
+    /// Its apps are shown dimmed while it is paused (APPS-09).
+    pub paused: bool,
+}
+
 /// Identifies one launchable app: its profile, package and launcher activity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AppId {
@@ -44,7 +54,17 @@ pub struct App {
     /// False while the profile is paused, the app is suspended or its storage is missing
     /// (APPS-09).
     pub available: bool,
+    /// False for apps the user can't uninstall, which show no ✕ in edit mode (APPS-13).
+    pub can_uninstall: bool,
     pub installed_at_ms: u64,
+}
+
+/// One of an app's shortcuts, offered in its long-press menu (APPS-11).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Shortcut {
+    pub app: AppId,
+    pub id: String,
+    pub label: String,
 }
 
 /// Whether the user has granted a special access (C4).
@@ -90,6 +110,40 @@ pub struct RecentUse {
     pub last_used_ms: u64,
 }
 
+/// The kind of network the device is on (WALL-04, WALL-11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NetworkState {
+    #[default]
+    Offline,
+    /// Mobile data or another network that may cost the user.
+    Metered,
+    Unmetered,
+}
+
+/// The network a scheduled image job waits for (WALL-04).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobNetwork {
+    Unmetered,
+    /// Any connection, when "Use mobile data" is on.
+    Any,
+}
+
+/// A request to run the one scheduled background job, the daily image (ARCH-07).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageJob {
+    /// The job runs no earlier than this, in milliseconds since the Unix epoch. 0 means as soon
+    /// as its conditions allow.
+    pub not_before_ms: u64,
+    pub network: JobNetwork,
+}
+
+/// A size in physical pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Size {
+    pub width: u32,
+    pub height: u32,
+}
+
 /// An error from a platform adapter or a store. Each feature turns it into its own error state
 /// (ARCH-09).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,6 +152,11 @@ pub enum DataError {
     AccessDenied,
     /// The device or its policy doesn't allow it; the text says why (WALL-13).
     Unsupported(String),
+    /// There is no network connection (WALL-16).
+    Offline,
+    /// Data from outside was rejected: not HTTPS, too large, malformed, or in a format that
+    /// changed (SEC-02). The text says why.
+    Invalid(String),
     /// Anything else, in plain words for a status line.
     Failed(String),
 }
@@ -106,7 +165,10 @@ impl fmt::Display for DataError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::AccessDenied => f.write_str("Access not granted"),
-            Self::Unsupported(reason) | Self::Failed(reason) => f.write_str(reason),
+            Self::Offline => f.write_str("No connection"),
+            Self::Unsupported(reason) | Self::Invalid(reason) | Self::Failed(reason) => {
+                f.write_str(reason)
+            }
         }
     }
 }
@@ -134,6 +196,21 @@ mod tests {
         assert!(printed.contains("com.example.chat"));
         assert!(!printed.contains("Anna"));
         assert!(!printed.contains("See you at eight"));
+    }
+
+    #[test]
+    fn errors_read_as_plain_words_for_a_status_line() {
+        // WALL-16
+        assert_eq!(DataError::AccessDenied.to_string(), "Access not granted");
+        assert_eq!(DataError::Offline.to_string(), "No connection");
+        assert_eq!(
+            DataError::Invalid("Too large".into()).to_string(),
+            "Too large"
+        );
+        assert_eq!(
+            DataError::Unsupported("Blocked by device policy".into()).to_string(),
+            "Blocked by device policy"
+        );
     }
 
     #[test]

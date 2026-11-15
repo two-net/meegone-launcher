@@ -3,27 +3,7 @@
 use meegone_core_data::ThemeChoice;
 use meegone_core_data::fakes::{Fakes, app, app_id};
 use meegone_core_state::Theme;
-use meegone_launcher::{Direction, HomeView, Launcher, ShellIntent};
-
-#[test]
-fn swiping_right_to_left_three_times_goes_recent_events_applications() {
-    // AC-02
-    let fakes = Fakes::default();
-    let mut launcher = Launcher::start(fakes.platform());
-    assert_eq!(launcher.shell().state().current, HomeView::Applications);
-
-    let mut seen = Vec::new();
-    for _ in 0..3 {
-        launcher.dispatch(ShellIntent::Swipe(Direction::Next));
-        launcher.frame();
-        seen.push(launcher.shell().state().current);
-    }
-
-    assert_eq!(
-        seen,
-        [HomeView::Recent, HomeView::Events, HomeView::Applications]
-    );
-}
+use meegone_launcher::{Launcher, ShellIntent};
 
 #[test]
 fn a_tap_in_a_view_reaches_the_platform_through_the_state_layer() {

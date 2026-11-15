@@ -6,7 +6,10 @@
 
 use std::sync::Arc;
 
-use meegone_core_data::{DataError, SchedulerAdapter, SettingsStore, WallpaperAdapter};
+use meegone_core_data::{
+    DataError, ImageJob, ImageOptions, JobNetwork, SchedulerAdapter, SettingsStore,
+    WallpaperAdapter,
+};
 use meegone_core_state::StateHolder;
 use meegone_lockimage_data::ImageCache;
 
@@ -80,17 +83,25 @@ impl LockImageHolder {
         let result = self
             .settings
             .update(&mut |settings| settings.image.enabled = on)
-            .and_then(|_| self.apply(on));
+            .and_then(|settings| self.apply(&settings.image));
         self.state.problem = result.err().map(|error| error.to_string());
         self.refresh();
     }
 
-    fn apply(&self, on: bool) -> Result<(), DataError> {
-        if on {
-            self.scheduler.ensure_daily_job()
+    fn apply(&self, options: &ImageOptions) -> Result<(), DataError> {
+        if options.enabled {
+            // When the job runs again after this is decided by the updater (WALL-03, #28).
+            self.scheduler.schedule_image_job(ImageJob {
+                not_before_ms: 0,
+                network: if options.use_mobile_data {
+                    JobNetwork::Any
+                } else {
+                    JobNetwork::Unmetered
+                },
+            })
         } else {
             // The current lock-screen wallpaper stays as it is (WALL-12).
-            self.scheduler.cancel_daily_job()?;
+            self.scheduler.cancel_image_job()?;
             self.cache.clear()
         }
     }
@@ -120,43 +131,106 @@ mod tests {
 
     use super::*;
 
-    fn setup() -> (Fakes, Arc<MemoryImageCache>, LockImageHolder) {
+    struct Setup {
+        fakes: Fakes,
+        settings: Arc<MemorySettingsStore>,
+        cache: Arc<MemoryImageCache>,
+        holder: LockImageHolder,
+    }
+
+    fn setup() -> Setup {
         let fakes = Fakes::default();
+        let settings = Arc::new(MemorySettingsStore::default());
         let cache = Arc::new(MemoryImageCache::default());
         let mut holder = LockImageHolder::new(
-            Arc::new(MemorySettingsStore::default()),
+            settings.clone(),
             cache.clone(),
             fakes.wallpaper.clone(),
             fakes.scheduler.clone(),
         );
         holder.handle(LockImageIntent::Refresh);
-        (fakes, cache, holder)
+        Setup {
+            fakes,
+            settings,
+            cache,
+            holder,
+        }
     }
 
     #[test]
     fn the_daily_image_starts_off() {
         // WALL-02
-        let (fakes, _, holder) = setup();
+        let Setup { fakes, holder, .. } = setup();
 
         assert_eq!(holder.state().status, ImageStatus::Off);
-        assert!(!*fakes.scheduler.daily_job_scheduled.lock().unwrap());
+        assert_eq!(*fakes.scheduler.job.lock().unwrap(), None);
     }
 
     #[test]
-    fn turning_it_on_schedules_the_daily_job() {
-        // WALL-03, ARCH-07
-        let (fakes, _, mut holder) = setup();
+    fn turning_it_on_schedules_the_daily_job_on_unmetered_networks() {
+        // WALL-03, WALL-04, ARCH-07
+        let Setup {
+            fakes, mut holder, ..
+        } = setup();
 
         holder.handle(LockImageIntent::SetEnabled(true));
 
         assert_eq!(holder.state().status, ImageStatus::On);
-        assert!(*fakes.scheduler.daily_job_scheduled.lock().unwrap());
+        assert_eq!(
+            fakes.scheduler.job.lock().unwrap().map(|job| job.network),
+            Some(JobNetwork::Unmetered)
+        );
+    }
+
+    #[test]
+    fn with_mobile_data_allowed_the_job_runs_on_any_network() {
+        // WALL-04
+        let Setup {
+            fakes,
+            settings,
+            mut holder,
+            ..
+        } = setup();
+        settings
+            .update(&mut |s| s.image.use_mobile_data = true)
+            .unwrap();
+
+        holder.handle(LockImageIntent::SetEnabled(true));
+
+        assert_eq!(
+            fakes.scheduler.job.lock().unwrap().map(|job| job.network),
+            Some(JobNetwork::Any)
+        );
+    }
+
+    #[test]
+    fn without_background_scheduling_the_feature_stays_on_and_says_why() {
+        // SRS 8.1: without background scheduling, the image is checked at the next start.
+        let Setup {
+            fakes, mut holder, ..
+        } = setup();
+        *fakes.scheduler.error.lock().unwrap() = Some(DataError::Unsupported(
+            "Background work is restricted".into(),
+        ));
+
+        holder.handle(LockImageIntent::SetEnabled(true));
+
+        assert_eq!(holder.state().status, ImageStatus::On);
+        assert_eq!(
+            holder.state().problem.as_deref(),
+            Some("Background work is restricted")
+        );
     }
 
     #[test]
     fn turning_it_off_cancels_the_job_and_deletes_the_cache() {
         // WALL-12
-        let (fakes, cache, mut holder) = setup();
+        let Setup {
+            fakes,
+            cache,
+            mut holder,
+            ..
+        } = setup();
         holder.handle(LockImageIntent::SetEnabled(true));
         cache
             .put(ImageRecord {
@@ -172,14 +246,16 @@ mod tests {
         holder.handle(LockImageIntent::SetEnabled(false));
 
         assert_eq!(holder.state().status, ImageStatus::Off);
-        assert!(!*fakes.scheduler.daily_job_scheduled.lock().unwrap());
+        assert_eq!(*fakes.scheduler.job.lock().unwrap(), None);
         assert_eq!(cache.current(), None);
     }
 
     #[test]
     fn an_unsupported_device_shows_the_reason_and_stays_off() {
         // WALL-13
-        let (fakes, _, mut holder) = setup();
+        let Setup {
+            fakes, mut holder, ..
+        } = setup();
         *fakes.wallpaper.unsupported.lock().unwrap() = Some("Blocked by device policy".into());
         holder.handle(LockImageIntent::Refresh);
 
@@ -189,6 +265,6 @@ mod tests {
             holder.state().status,
             ImageStatus::Unavailable("Blocked by device policy".into())
         );
-        assert!(!*fakes.scheduler.daily_job_scheduled.lock().unwrap());
+        assert_eq!(*fakes.scheduler.job.lock().unwrap(), None);
     }
 }

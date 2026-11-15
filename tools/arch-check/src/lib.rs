@@ -1,15 +1,18 @@
-//! Checks the workspace's dependency graph against the architecture rules in ARCHITECTURE.md:
+//! Checks the workspace against the architecture rules in ARCHITECTURE.md:
 //!
 //! - one-way layers, UI → state → data (ARCH-02);
 //! - features depend only on core, and only the shell puts features together (ARCH-03);
-//! - every third-party crate is listed with a reason in DEPENDENCIES.md (ARCH-08).
+//! - only platform adapters reach the operating system (ARCH-04);
+//! - every third-party crate is listed with a reason in DEPENDENCIES.md (ARCH-08);
+//! - test fakes are enabled only in dev-dependencies (SEC-06).
 //!
-//! The rules are pure functions over a [`Graph`]; [`load`] reads the graph with
-//! `cargo metadata`. `tests/workspace.rs` runs them on this workspace, so CI fails on any
-//! violation.
+//! The rules are pure functions over a [`Graph`] and over source text; [`load`] reads the graph
+//! with `cargo metadata`, and [`os_access_violations`] reads the app's sources.
+//! `tests/workspace.rs` runs them on this workspace, so CI fails on any violation.
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -27,6 +30,19 @@ pub const AREAS: [&str; 7] = [
 ];
 /// The package name of the app, the root package (ARCH-01).
 pub const APP: &str = "meegone-launcher";
+
+/// The feature that turns on a crate's test fakes (SEC-06).
+pub const FAKES: &str = "fakes";
+
+/// The modules of `std` that reach the operating system. Only platform adapters may use them
+/// (ARCH-04).
+pub const OS_MODULES: [&str; 5] = ["env", "fs", "net", "os", "process"];
+/// The types that read the clock. Only `SystemConfigAdapter` may (ARCH-04).
+pub const CLOCKS: [&str; 2] = ["Instant", "SystemTime"];
+/// Source files, relative to the workspace root, that may reach the operating system directly.
+/// The Android adapter implementations (HOME-01) and the persistent stores (REL-03) add theirs
+/// here.
+pub const OS_ACCESS_ALLOWED: [&str; 0] = [];
 
 const CORE: &str = "core";
 const SHELL: &str = "shell";
@@ -57,12 +73,16 @@ pub struct Member {
     pub role: Option<Role>,
 }
 
-/// `from` depends on `to`, as a normal, dev or build dependency. The rules are the same for
-/// every kind.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `from` depends on `to`, as a normal, dev or build dependency. The layer and feature rules
+/// are the same for every kind.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Dependency {
     pub from: String,
     pub to: String,
+    /// A dev-dependency, used only by tests, examples and benchmarks.
+    pub dev: bool,
+    /// The features of `to` that this dependency turns on.
+    pub features: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -134,6 +154,16 @@ pub fn check(graph: &Graph, listed: &BTreeSet<String>) -> Vec<Violation> {
         }
     }
 
+    for dependency in &graph.internal {
+        if !dependency.dev && dependency.features.iter().any(|f| f == FAKES) {
+            violations.insert(Violation(format!(
+                "`{}` turns on the `{FAKES}` feature of `{}` outside [dev-dependencies]; fakes \
+                 are for tests only (SEC-06)",
+                dependency.from, dependency.to
+            )));
+        }
+    }
+
     for dependency in &graph.external {
         if !listed.contains(&dependency.to) {
             violations.insert(Violation(format!(
@@ -187,6 +217,234 @@ fn broken_rule(from: &Role, to: &Role) -> Option<&'static str> {
             }
         }
     }
+}
+
+/// Every place the app's sources reach the operating system other than through a platform
+/// adapter (ARCH-04): every `.rs` file in `crates/` and in the root package's `src/`, except
+/// those in [`OS_ACCESS_ALLOWED`].
+///
+/// This is a source scan, so it guards against accidents rather than determined workarounds.
+/// Cargo already keeps out third-party crates that aren't listed in DEPENDENCIES.md.
+pub fn os_access_violations(root: &Path) -> Result<Vec<Violation>, String> {
+    let mut files = Vec::new();
+    for dir in ["crates", "src"] {
+        rust_files(&root.join(dir), &mut files)?;
+    }
+    files.sort();
+
+    let mut violations = Vec::new();
+    for file in files {
+        let relative = file
+            .strip_prefix(root)
+            .unwrap_or(&file)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if OS_ACCESS_ALLOWED.contains(&relative.as_str()) {
+            continue;
+        }
+        let source = fs::read_to_string(&file)
+            .map_err(|error| format!("couldn't read {}: {error}", file.display()))?;
+        for path in os_access(&source) {
+            violations.push(Violation(format!(
+                "`{relative}` uses `{path}`; only platform adapters may reach the operating \
+                 system (ARCH-04)"
+            )));
+        }
+    }
+    Ok(violations)
+}
+
+fn rust_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    let entries =
+        fs::read_dir(dir).map_err(|error| format!("couldn't list {}: {error}", dir.display()))?;
+    for entry in entries {
+        let path = entry
+            .map_err(|error| format!("couldn't list {}: {error}", dir.display()))?
+            .path();
+        if path.is_dir() {
+            rust_files(&path, files)?;
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+/// The paths in `source` that reach the operating system: any path into one of
+/// [`OS_MODULES`], including inside `use std::{…}` groups, and any use of the [`CLOCKS`].
+/// Comments and string literals are ignored.
+pub fn os_access(source: &str) -> BTreeSet<String> {
+    let code = code_only(source);
+    let tokens = tokens(&code);
+    let mut found = BTreeSet::new();
+    for (i, token) in tokens.iter().enumerate() {
+        if *token == "std" && tokens.get(i + 1) == Some(&"::") {
+            let mut paths = Vec::new();
+            use_tree(&tokens, i + 2, "std", &mut paths);
+            found.extend(paths.into_iter().filter(|path| reaches_os(path)));
+        } else if CLOCKS.contains(token) && tokens.get(i + 1) == Some(&"::") {
+            found.insert(format!("{token}::{}", tokens.get(i + 2).unwrap_or(&"")));
+        }
+    }
+    found
+}
+
+fn reaches_os(path: &str) -> bool {
+    let mut segments = path.split("::").skip(1);
+    segments
+        .next()
+        .is_some_and(|module| OS_MODULES.contains(&module))
+        || segments.any(|segment| CLOCKS.contains(&segment))
+}
+
+/// Expands the path or `use` tree starting at `tokens[i]` under `prefix` into full paths, and
+/// returns the index after it.
+fn use_tree(tokens: &[&str], i: usize, prefix: &str, paths: &mut Vec<String>) -> usize {
+    match tokens.get(i) {
+        Some(&"{") => {
+            let mut i = i + 1;
+            loop {
+                match tokens.get(i) {
+                    None => return i,
+                    Some(&"}") => return i + 1,
+                    Some(&",") => i += 1,
+                    Some(_) => i = use_tree(tokens, i, prefix, paths).max(i + 1),
+                }
+            }
+        }
+        Some(segment) if is_word(segment) || *segment == "*" => {
+            let path = format!("{prefix}::{segment}");
+            if tokens.get(i + 1) == Some(&"::") {
+                use_tree(tokens, i + 2, &path, paths)
+            } else {
+                paths.push(path);
+                i + 1
+            }
+        }
+        _ => {
+            paths.push(prefix.to_owned());
+            i
+        }
+    }
+}
+
+fn is_word(token: &str) -> bool {
+    token.chars().all(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// Words, `::`, and single punctuation characters.
+fn tokens(code: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    let mut rest = code.trim_start();
+    while let Some(c) = rest.chars().next() {
+        let len = if c.is_alphanumeric() || c == '_' {
+            rest.find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len())
+        } else if rest.starts_with("::") {
+            2
+        } else {
+            c.len_utf8()
+        };
+        tokens.push(&rest[..len]);
+        rest = rest[len..].trim_start();
+    }
+    tokens
+}
+
+/// `source` without comments, and with every string and character literal emptied.
+fn code_only(source: &str) -> String {
+    let chars: Vec<char> = source.chars().collect();
+    let at = |i: usize, text: &str| {
+        text.chars()
+            .enumerate()
+            .all(|(k, c)| chars.get(i + k) == Some(&c))
+    };
+    let word = |i: usize| {
+        chars
+            .get(i)
+            .is_some_and(|c| c.is_alphanumeric() || *c == '_')
+    };
+    let mut code = String::with_capacity(source.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if at(i, "//") {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+        } else if at(i, "/*") {
+            // Block comments nest.
+            let mut depth = 0;
+            while i < chars.len() {
+                if at(i, "/*") {
+                    depth += 1;
+                    i += 2;
+                } else if at(i, "*/") {
+                    depth -= 1;
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        } else if chars[i] == 'r'
+            && (i == 0 || !word(i - 1) || (chars[i - 1] == 'b' && (i < 2 || !word(i - 2))))
+            && (at(i + 1, "\"") || at(i + 1, "#"))
+            && raw_string_end(&chars, i + 1).is_some()
+        {
+            i = raw_string_end(&chars, i + 1).unwrap_or(chars.len());
+            code.push_str("\"\"");
+        } else if chars[i] == '"' {
+            i += 1;
+            while i < chars.len() && chars[i] != '"' {
+                i += if chars[i] == '\\' { 2 } else { 1 };
+            }
+            i += 1;
+            code.push_str("\"\"");
+        } else if at(i, "'\\") {
+            i += 3;
+            while i < chars.len() && chars[i] != '\'' {
+                i += 1;
+            }
+            i += 1;
+            code.push_str("' '");
+        } else if chars[i] == '\'' && chars.get(i + 2) == Some(&'\'') {
+            i += 3;
+            code.push_str("' '");
+        } else {
+            code.push(chars[i]);
+            i += 1;
+        }
+    }
+    code
+}
+
+/// Where the raw string whose `#`s or opening quote start at `start` ends, if it is one.
+fn raw_string_end(chars: &[char], start: usize) -> Option<usize> {
+    let hashes = chars[start..].iter().take_while(|c| **c == '#').count();
+    let open = start + hashes;
+    if chars.get(open) != Some(&'"') {
+        return None;
+    }
+    let mut i = open + 1;
+    while i < chars.len() {
+        if chars[i] == '"'
+            && chars[i + 1..]
+                .iter()
+                .take(hashes)
+                .filter(|c| **c == '#')
+                .count()
+                == hashes
+        {
+            return Some(i + 1 + hashes);
+        }
+        i += 1;
+    }
+    Some(chars.len())
 }
 
 /// The crate names in the first column of DEPENDENCIES.md's tables, written as `` `name` ``.
@@ -249,6 +507,13 @@ fn graph_from_metadata(metadata: &Value) -> Result<Graph, String> {
             dependencies.push(Dependency {
                 from: name.clone(),
                 to: text(dependency, "name")?,
+                dev: dependency["kind"].as_str() == Some("dev"),
+                features: dependency["features"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|feature| feature.as_str().map(str::to_owned))
+                    .collect(),
             });
         }
     }
@@ -277,6 +542,7 @@ mod tests {
         let dependency = |(from, to): &(&str, &str)| Dependency {
             from: (*from).to_owned(),
             to: (*to).to_owned(),
+            ..Dependency::default()
         };
         Graph {
             members: names
@@ -416,6 +682,69 @@ mod tests {
 
         assert_eq!(found.len(), 1);
         assert!(found[0].0.contains("no crate uses"));
+    }
+
+    #[test]
+    fn fakes_may_be_turned_on_only_in_dev_dependencies() {
+        // SEC-06
+        let with_fakes = |dev| {
+            let mut graph = graph(&[("meegone-apps-state", "meegone-core-data")], &[]);
+            graph.internal[0].dev = dev;
+            graph.internal[0].features = vec![FAKES.to_owned()];
+            check(&graph, &BTreeSet::new())
+        };
+
+        let normal = with_fakes(false);
+        assert_eq!(normal.len(), 1, "{normal:?}");
+        assert!(normal[0].0.contains("fakes are for tests only"));
+        assert!(with_fakes(true).is_empty());
+    }
+
+    fn os(source: &str) -> Vec<String> {
+        os_access(source).into_iter().collect()
+    }
+
+    #[test]
+    fn os_modules_are_found_in_paths_and_use_groups() {
+        assert_eq!(os("use std::fs;"), ["std::fs"]);
+        assert_eq!(
+            os("let out = std::process::Command::new(\"ls\");"),
+            ["std::process::Command::new"]
+        );
+        assert_eq!(
+            os("use std::{collections::HashMap, env::{self, var}, net::TcpStream as Tcp};"),
+            ["std::env::self", "std::env::var", "std::net::TcpStream"]
+        );
+        assert_eq!(os("use ::std::os::unix;"), ["std::os::unix"]);
+    }
+
+    #[test]
+    fn reading_the_clock_is_found() {
+        assert_eq!(
+            os("use std::time::{Duration, Instant};"),
+            ["std::time::Instant"]
+        );
+        assert_eq!(
+            os("use std::time;\nlet now = time::SystemTime::now();"),
+            ["SystemTime::now"]
+        );
+    }
+
+    #[test]
+    fn safe_std_paths_comments_and_strings_are_ignored() {
+        let source = r##"
+            //! Only adapters may use std::fs.
+            use std::sync::{Arc, Mutex};
+            use std::time::Duration;
+            /* std::net /* nested std::env */ std::process */
+            const URL: &str = "https://example.com/std::fs";
+            const RAW: &str = r#"std::env "quoted" std::os"#;
+            const QUOTE: char = '"';
+            const ESCAPED: char = '\'';
+            fn f<'a>(x: &'a str) -> &'a str { x } // std::process
+        "##;
+
+        assert_eq!(os(source), Vec::<String>::new());
     }
 
     #[test]

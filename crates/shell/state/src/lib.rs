@@ -69,6 +69,11 @@ pub enum ShellIntent {
     OpenSettings,
     /// The device's dark-theme setting changed (THEME-02).
     SystemThemeChanged,
+    /// An app was installed, updated or removed, or a profile was paused or resumed
+    /// (APPS-06, APPS-08, APPS-09).
+    AppsChanged,
+    /// A notification was posted or removed, or notification access changed (EVT-10).
+    NotificationsChanged,
     Apps(AppsIntent),
     Events(EventsIntent),
     Recent(RecentIntent),
@@ -183,6 +188,11 @@ impl HomeShell {
                 self.state.settings_open = true;
             }
             ShellIntent::SystemThemeChanged => self.theme.dispatch(ThemeIntent::Refresh),
+            ShellIntent::AppsChanged => {
+                self.apps.dispatch(AppsIntent::Refresh);
+                self.recent.dispatch(RecentIntent::Refresh);
+            }
+            ShellIntent::NotificationsChanged => self.events.dispatch(EventsIntent::Refresh),
             ShellIntent::Apps(intent) => self.apps.dispatch(intent),
             ShellIntent::Events(intent) => self.events.dispatch(intent),
             ShellIntent::Recent(intent) => self.recent.dispatch(intent),
@@ -249,9 +259,10 @@ impl HomeShell {
 
 #[cfg(test)]
 mod tests {
-    use meegone_core_data::fakes::{Fakes, app, app_id};
-    use meegone_core_data::{App, AppId, AppsAdapter, DataError};
-    use meegone_core_state::{Health, Theme, ThemeChoice};
+    use meegone_apps_state::GridItem;
+    use meegone_core_data::fakes::{FakeApps, Fakes, app, app_id};
+    use meegone_core_data::{App, AppId, AppsAdapter, DataError, Profile, Shortcut};
+    use meegone_core_state::{Access, Health, Theme, ThemeChoice};
 
     use super::*;
 
@@ -368,16 +379,64 @@ mod tests {
         assert_eq!(shell.theme().state().theme, Theme::Dark);
     }
 
-    /// Lists one app, then panics when asked to launch it.
-    struct BrokenLauncher;
+    #[test]
+    fn an_installed_app_reaches_applications_and_a_removed_one_leaves() {
+        // APPS-06, APPS-08: the system reports the change and the shell refreshes.
+        let fakes = Fakes::default();
+        fakes.apps.apps.lock().unwrap().push(app("mail", "Mail"));
+        let mut shell = HomeShell::compose(fakes.platform());
+
+        *fakes.apps.apps.lock().unwrap() = vec![app("maps", "Maps")];
+        shell.dispatch(ShellIntent::AppsChanged);
+
+        assert!(matches!(
+            &shell.apps().state().items[..],
+            [GridItem::App(app)] if app.label == "Maps"
+        ));
+    }
+
+    #[test]
+    fn notification_changes_refresh_events() {
+        // EVT-10
+        let fakes = Fakes::default();
+        let mut shell = HomeShell::compose(fakes.platform());
+        *fakes.notifications.access.lock().unwrap() = Access::Granted;
+
+        shell.dispatch(ShellIntent::NotificationsChanged);
+
+        assert_eq!(shell.events().state().access, Access::Granted);
+    }
+
+    /// Works like [`FakeApps`], except that it panics when asked to launch an app.
+    struct BrokenLauncher(FakeApps);
 
     impl AppsAdapter for BrokenLauncher {
         fn launchable_apps(&self) -> Result<Vec<App>, DataError> {
-            Ok(vec![app("mail", "Mail")])
+            self.0.launchable_apps()
+        }
+
+        fn profiles(&self) -> Result<Vec<Profile>, DataError> {
+            self.0.profiles()
         }
 
         fn launch(&self, _app: &AppId) -> Result<(), DataError> {
             panic!("launcher bug");
+        }
+
+        fn shortcuts(&self, app: &AppId) -> Result<Vec<Shortcut>, DataError> {
+            self.0.shortcuts(app)
+        }
+
+        fn launch_shortcut(&self, shortcut: &Shortcut) -> Result<(), DataError> {
+            self.0.launch_shortcut(shortcut)
+        }
+
+        fn request_uninstall(&self, app: &AppId) -> Result<(), DataError> {
+            self.0.request_uninstall(app)
+        }
+
+        fn open_app_info(&self, app: &AppId) -> Result<(), DataError> {
+            self.0.open_app_info(app)
         }
     }
 
@@ -386,7 +445,9 @@ mod tests {
         // ARCH-09, REL-01
         let fakes = Fakes::default();
         let mut platform = fakes.platform();
-        platform.apps = Arc::new(BrokenLauncher);
+        let broken = FakeApps::default();
+        broken.apps.lock().unwrap().push(app("mail", "Mail"));
+        platform.apps = Arc::new(BrokenLauncher(broken));
         let mut shell = HomeShell::compose(platform);
 
         shell.dispatch(ShellIntent::Apps(AppsIntent::Launch(app_id("mail"))));

@@ -1,6 +1,6 @@
 [package]
 name = "meegone-lockimage-data"
-description = "Lock-screen image data layer: the image cache."
+description = "Lock-screen image data layer: the image cache and the image-feed interface."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,3 +8,8 @@ publish.workspace = true
 
 [dependencies]
 meegone-core-data.workspace = true
+
+[features]
+# A configurable fake of the image feed. Enabled only as a dev-dependency, for tests; the app
+# never enables it (SEC-06).
+fakes = []

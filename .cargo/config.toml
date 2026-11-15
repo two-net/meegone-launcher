@@ -1,0 +1,15 @@
+[alias]
+# Core-logic line coverage (MAINT-02): every test in the workspace, measured over the data and
+# state crates, where the core logic lives (MAINT-01). UI crates, tests and fakes don't count.
+# Fails below 80 %. CI runs it; for local runs, see ARCHITECTURE.md, "Checks".
+coverage = [
+    "llvm-cov",
+    "--workspace",
+    "--exclude",
+    "arch-check",
+    "--summary-only",
+    "--fail-under-lines",
+    "80",
+    "--ignore-filename-regex",
+    "(crates/[^/]+/ui/|/tests/|fakes\\.rs$)",
+]

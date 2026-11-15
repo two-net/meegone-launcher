@@ -17,7 +17,10 @@ pub use adapters::{
     AppsAdapter, NetworkAdapter, NotificationsAdapter, Platform, SchedulerAdapter,
     SystemConfigAdapter, UsageAdapter, WallpaperAdapter,
 };
-pub use model::{Access, App, AppId, DataError, Notification, ProfileId, RecentUse, Rgb};
+pub use model::{
+    Access, App, AppId, DataError, ImageJob, JobNetwork, NetworkState, Notification, Profile,
+    ProfileId, RecentUse, Rgb, Shortcut, Size,
+};
 pub use settings::{
     HomeTarget, ImageOptions, MemorySettingsStore, RecentDensity, SETTINGS_VERSION, Settings,
     SettingsStore, ThemeChoice,

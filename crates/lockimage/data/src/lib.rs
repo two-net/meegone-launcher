@@ -1,10 +1,21 @@
-//! Lock-screen image data layer: the image cache, the one store this feature owns (SRS 7.3).
+//! Lock-screen image data layer (SRS 7.3):
 //!
-//! The feed adapter and the daily updater (SRS 7.5) arrive with the WALL requirements.
+//! - the image cache, the one store this feature owns;
+//! - [`ImageFeed`], the interface to the image-of-the-day feed. Only its implementation knows
+//!   the feed's format (ARCH-04).
+//!
+//! The Bing implementation of the feed (#26) and the daily updater (SRS 7.5) arrive with the
+//! WALL requirements.
+
+#[cfg(feature = "fakes")]
+pub mod fakes;
+mod feed;
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 use meegone_core_data::DataError;
+
+pub use feed::{FeedImage, ImageFeed, ImageVersion};
 
 /// The details of one image of the day (SRS 7.4).
 #[derive(Debug, Clone, PartialEq, Eq)]
