@@ -6,10 +6,13 @@
 //! - [`storage`]: MeeGone's own files and the versioned format its stores save in (REL-03,
 //!   MAINT-04).
 //! - [`settings`]: the settings store, which several features share (ADR 0002).
+//! - `android` (Android builds only): the adapters' Android implementations (ADR 0005).
 //!
 //! Nothing here knows about state holders or the UI (ARCH-02).
 
 pub mod adapters;
+#[cfg(target_os = "android")]
+pub mod android;
 #[cfg(any(test, feature = "fakes"))]
 pub mod fakes;
 pub mod model;

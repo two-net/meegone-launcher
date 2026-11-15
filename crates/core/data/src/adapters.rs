@@ -2,9 +2,9 @@
 //!
 //! There are seven narrow traits, one per group of capabilities in SRS 8.1, plus
 //! [`StorageAdapter`] for MeeGone's own files (ADR 0004). Tests replace each one with a fake
-//! (MAINT-01). The table in ARCHITECTURE.md maps every capability to its adapter. Android
-//! implementations arrive with the platform work (HOME-01 onwards); storage already has
-//! `FileStorage`.
+//! (MAINT-01). The table in ARCHITECTURE.md maps every capability to its adapter. The Android
+//! implementations are in the `android` module (ADR 0005); those not built yet answer with
+//! their "if unavailable" value. Storage has `FileStorage`.
 //!
 //! Adapters only answer questions and carry out requests; they never call back. Changes the
 //! system reports, such as an app being installed, reach MeeGone as a `ShellIntent` that the

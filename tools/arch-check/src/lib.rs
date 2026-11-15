@@ -39,10 +39,21 @@ pub const FAKES: &str = "fakes";
 pub const OS_MODULES: [&str; 5] = ["env", "fs", "net", "os", "process"];
 /// The types that read the clock. Only `SystemConfigAdapter` may (ARCH-04).
 pub const CLOCKS: [&str; 2] = ["Instant", "SystemTime"];
-/// Source files, relative to the workspace root, that may reach the operating system directly:
-/// `FileStorage`, which keeps the three persistent stores' files (REL-03, ADR 0004). The Android
-/// adapter implementations (HOME-01) add theirs here.
-pub const OS_ACCESS_ALLOWED: [&str; 1] = ["crates/core/data/src/storage/files.rs"];
+/// The keyword that foreign code, such as Android's JNI, needs. Only platform adapters may use
+/// it (ARCH-04, ADR 0005).
+pub const UNSAFE: &str = "unsafe";
+/// Source files, relative to the workspace root, that may reach the operating system directly
+/// (ADR 0004, ADR 0005):
+///
+/// - `FileStorage`, which keeps the three persistent stores' files (REL-03);
+/// - the JNI binding and the Android `SystemConfigAdapter`, which reads the clock;
+/// - the app's Android entry points, which JNI calls.
+pub const OS_ACCESS_ALLOWED: [&str; 4] = [
+    "crates/core/data/src/storage/files.rs",
+    "crates/core/data/src/android/jni.rs",
+    "crates/core/data/src/android/system.rs",
+    "src/android.rs",
+];
 
 const CORE: &str = "core";
 const SHELL: &str = "shell";
@@ -274,14 +285,16 @@ fn rust_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
 }
 
 /// The paths in `source` that reach the operating system: any path into one of
-/// [`OS_MODULES`], including inside `use std::{…}` groups, and any use of the [`CLOCKS`].
-/// Comments and string literals are ignored.
+/// [`OS_MODULES`], including inside `use std::{…}` groups, any use of the [`CLOCKS`], and the
+/// [`UNSAFE`] keyword. Comments and string literals are ignored.
 pub fn os_access(source: &str) -> BTreeSet<String> {
     let code = code_only(source);
     let tokens = tokens(&code);
     let mut found = BTreeSet::new();
     for (i, token) in tokens.iter().enumerate() {
-        if *token == "std" && tokens.get(i + 1) == Some(&"::") {
+        if *token == UNSAFE {
+            found.insert(UNSAFE.to_owned());
+        } else if *token == "std" && tokens.get(i + 1) == Some(&"::") {
             let mut paths = Vec::new();
             use_tree(&tokens, i + 2, "std", &mut paths);
             found.extend(paths.into_iter().filter(|path| reaches_os(path)));
@@ -731,9 +744,20 @@ mod tests {
     }
 
     #[test]
+    fn unsafe_code_is_found() {
+        // Foreign code, such as JNI, needs `unsafe` (ADR 0005).
+        assert_eq!(os("let n = unsafe { strlen(text) };"), ["unsafe"]);
+        assert_eq!(
+            os("#[unsafe(no_mangle)]\npub extern \"system\" fn Java_f() {}"),
+            ["unsafe"]
+        );
+        assert_eq!(os("unsafe impl Send for Handle {}"), ["unsafe"]);
+    }
+
+    #[test]
     fn safe_std_paths_comments_and_strings_are_ignored() {
         let source = r##"
-            //! Only adapters may use std::fs.
+            //! Only adapters may use std::fs or unsafe code.
             use std::sync::{Arc, Mutex};
             use std::time::Duration;
             /* std::net /* nested std::env */ std::process */
@@ -742,6 +766,8 @@ mod tests {
             const QUOTE: char = '"';
             const ESCAPED: char = '\'';
             fn f<'a>(x: &'a str) -> &'a str { x } // std::process
+            const WORD: &str = "unsafe";
+            fn not_unsafe_at_all() {}
         "##;
 
         assert_eq!(os(source), Vec::<String>::new());

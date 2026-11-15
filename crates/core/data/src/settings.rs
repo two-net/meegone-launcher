@@ -15,10 +15,18 @@ use crate::storage::{
 
 /// Version of the saved settings format (MAINT-04). Changing the format means a new version, a
 /// migration in [`SETTINGS_MIGRATIONS`] and a fixture (ARCHITECTURE.md, "Persistence").
-pub const SETTINGS_VERSION: u32 = 1;
+pub const SETTINGS_VERSION: u32 = 2;
 
 /// Brings settings saved by older versions up to date, one version at a time.
-const SETTINGS_MIGRATIONS: [Migration; SETTINGS_VERSION as usize - 1] = [];
+const SETTINGS_MIGRATIONS: [Migration; SETTINGS_VERSION as usize - 1] = [add_home_banner];
+
+/// Version 2 adds when the "make MeeGone the default" banner was last dismissed (ONB-04). Older
+/// settings never dismissed it.
+fn add_home_banner(body: &str) -> Option<String> {
+    let mut added = Writer::default();
+    added.line("home_banner_dismissed", None::<u64>);
+    Some(format!("{body}{}", added.into_body()))
+}
 
 /// The user's theme choice (THEME-01).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -80,6 +88,9 @@ pub struct Settings {
     pub image: ImageOptions,
     /// Apps the user removed from Recent, with the time of removal (PRIV-03).
     pub removed_from_recent: BTreeMap<AppId, u64>,
+    /// When the user last dismissed or answered the "make MeeGone the default" banner, so it
+    /// shows at most once a day (ONB-04). Not a user-adjustable option (SET-04).
+    pub home_banner_dismissed_ms: Option<u64>,
 }
 
 impl Default for Settings {
@@ -93,6 +104,7 @@ impl Default for Settings {
             hidden_apps: BTreeSet::new(),
             image: ImageOptions::default(),
             removed_from_recent: BTreeMap::new(),
+            home_banner_dismissed_ms: None,
         }
     }
 }
@@ -170,6 +182,7 @@ impl Format for Settings {
         for removal in &self.removed_from_recent {
             out.line("removed", removal);
         }
+        out.line("home_banner_dismissed", self.home_banner_dismissed_ms);
     }
 
     fn read(input: &mut Reader<'_>) -> Option<Self> {
@@ -187,6 +200,7 @@ impl Format for Settings {
                 show_card: input.line("image_show_card")?,
             },
             removed_from_recent: input.lines("removed")?.into_iter().collect(),
+            home_banner_dismissed_ms: input.line("home_banner_dismissed")?,
         })
     }
 }
@@ -239,8 +253,13 @@ mod tests {
 
     /// Every saved version, oldest first, with the settings it must load as (MAINT-04). Never
     /// change or remove a fixture; add one for each new version.
-    const FIXTURES: [Fixture; SETTINGS_VERSION as usize] =
-        [(include_str!("../fixtures/settings-v1.txt"), sample)];
+    const FIXTURES: [Fixture; SETTINGS_VERSION as usize] = [
+        (include_str!("../fixtures/settings-v1.txt"), || Settings {
+            home_banner_dismissed_ms: None,
+            ..sample()
+        }),
+        (include_str!("../fixtures/settings-v2.txt"), sample),
+    ];
 
     /// Settings with no default left in place.
     fn sample() -> Settings {
@@ -261,6 +280,7 @@ mod tests {
                 (app_id("chat"), 1_763_251_200_000),
                 (app_id("maps"), 1_763_254_800_000),
             ]),
+            home_banner_dismissed_ms: Some(1_763_290_000_000),
         }
     }
 

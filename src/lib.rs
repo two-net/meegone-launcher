@@ -1,8 +1,12 @@
 //! MeeGone Launcher, the one installable app (ARCH-01).
 //!
 //! This crate is the entry point. It receives the platform adapters and hands them to the Home
-//! shell, the only place features are put together (ARCH-03). The Android entry point, home
-//! activity and manifest arrive with HOME-01. See ARCHITECTURE.md for the crate map and rules.
+//! shell, the only place features are put together (ARCH-03). On Android, the home activity
+//! calls the entry points in `android.rs` (ADR 0005). See ARCHITECTURE.md for the crate map and
+//! rules.
+
+#[cfg(target_os = "android")]
+mod android;
 
 pub use meegone_core_data::Platform;
 pub use meegone_shell_state::{Direction, HomeShell, HomeView, ShellIntent};

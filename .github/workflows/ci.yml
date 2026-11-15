@@ -57,5 +57,28 @@ jobs:
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           exit "$status"
 
+      # Lints the Android-only code (the JNI binding and entry points) too, which the host
+      # build never compiles (ADR 0005).
       - name: Android target
-        run: cargo check --workspace --exclude arch-check --target aarch64-linux-android
+        run: cargo clippy --workspace --exclude arch-check --all-targets --target aarch64-linux-android -- -D warnings
+
+  # Builds the APK: the Java host plus the Rust app as a native library (ADR 0005). The runner
+  # image already has JDK 17, the Android SDK and NDK 27.3.
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --target aarch64-linux-android
+          rustup default stable
+
+      - name: Install cargo-ndk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk@4.1.2
+
+      - name: Build the APK
+        working-directory: android
+        run: ./gradlew assembleDebug assembleRelease

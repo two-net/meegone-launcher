@@ -29,10 +29,10 @@ Each crate is `crates/<area>/<layer>`, with the package name `meegone-<area>-<la
 | **events** | – | Notifications grouped by app | `EventsView` | Nothing (memory only) |
 | **recent** | – | Filtering, ordering, close mode | `RecentView` | Removed-apps list (in the settings store) |
 | **lockimage** | Image cache, image-feed interface | On/off, availability, current image | `ImageCard`, `ImageSettingsSection` | Image cache |
-| **settings** | – | Settings and access status | `SettingsView` | The settings screens |
+| **settings** | – | Settings, access status, the home-app banner (ONB-04) | `SettingsView`, `HomeBanner` | The settings screens |
 | **shell** | – | `HomeShell`: carousel, Home and Back, composes every feature | `ShellView` | Nothing persistent |
 
-The root package `meegone-launcher` is the app. `Launcher::start(platform)` hands the platform adapters to the shell. `tools/arch-check` is a development tool that is never part of the app.
+The root package `meegone-launcher` is the app. `Launcher::start(platform)` hands the platform adapters to the shell. On Android it is also a native library, which the Java host in `android/` loads ([ADR 0005](docs/adr/0005-android-host-and-home-role.md)). `tools/arch-check` is a development tool that is never part of the app.
 
 ## Dependency rules
 
@@ -45,7 +45,7 @@ The root package `meegone-launcher` is the app. `Launcher::start(platform)` hand
 | App crate | `meegone-launcher` may depend only on `shell` and `core` crates. Nothing depends on it. |
 | Naming | Every member is `meegone-<area>-<layer>` with a known area, the root package, or a tool in `tools/`. Nothing in the app depends on a tool. |
 | Third-party crates (ARCH-08) | Each one must be listed with its reason in [DEPENDENCIES.md](DEPENDENCIES.md). A listed crate that nothing uses is also reported. |
-| OS access (ARCH-04) | No file in `crates/` or `src/` may use `std::{env, fs, net, os, process}` or read the clock (`Instant`, `SystemTime`), except those listed in `OS_ACCESS_ALLOWED` in arch-check. Today that is only `crates/core/data/src/storage/files.rs` (`FileStorage`). Comments and strings are ignored. The scan catches accidents, not determined workarounds. |
+| OS access (ARCH-04) | No file in `crates/` or `src/` may use `std::{env, fs, net, os, process}`, read the clock (`Instant`, `SystemTime`) or contain `unsafe`, which foreign code such as JNI needs. Only the files listed in `OS_ACCESS_ALLOWED` in arch-check may: `FileStorage` (`storage/files.rs`), the JNI binding and the Android `SystemConfigAdapter` (`android/jni.rs`, `android/system.rs` in core data), and the app's Android entry points (`src/android.rs`). Comments and strings are ignored. The scan catches accidents, not determined workarounds. |
 | Fakes (SEC-06) | A crate's `fakes` feature may be turned on only in `[dev-dependencies]`, so fakes never reach the app. |
 
 ## How a feature works
@@ -70,6 +70,8 @@ AppsView.icon_tapped(mail)                       ui     sends AppsIntent::Launch
 
 Everything MeeGone asks of Android goes through eight narrow traits in `meegone-core-data`, handed to the shell once as `Platform`: the seven in `adapters.rs`, and `StorageAdapter` (`storage/`) for MeeGone's own files. Each has a fake in `meegone_core_data::fakes`, so the core logic of MAINT-01 runs and is tested without a device. The decisions behind them are in [ADR 0003](docs/adr/0003-platform-adapters.md) and, for storage, [ADR 0004](docs/adr/0004-persistent-storage.md).
 
+On Android, `meegone_core_data::android` builds the `Platform` ([ADR 0005](docs/adr/0005-android-host-and-home-role.md)). Its adapters ask a Java `Bridge` object through a minimal, hand-written JNI binding. Today only the home-app role, the clock and storage are real; every other adapter answers with its "If unavailable" value below until its issue builds it.
+
 | Capability (SRS 8.1) | Adapter | Methods | If unavailable |
 |---|---|---|---|
 | Home-app role | `SystemConfigAdapter` | `is_default_home`, `request_default_home` | Banner (ONB-04) |
@@ -88,7 +90,7 @@ Everything MeeGone asks of Android goes through eight narrow traits in `meegone-
 | Device settings and clock | `SystemConfigAdapter` | `is_dark`, `animation_scale`, `now_ms`, `utc_offset_ms`, `locale` | – |
 | MeeGone's own files (ADR 0004) | `StorageAdapter` | `read`, `write`, `remove` | A failed save is the feature's `problem`; an unreadable file loads as defaults |
 
-- **Adapters never call back.** They answer questions and carry out requests. A change the system reports reaches MeeGone as a `ShellIntent` (`SystemThemeChanged`, `AppsChanged`, `NotificationsChanged`) that the platform's entry point passes to `Launcher::dispatch`.
+- **Adapters never call back.** They answer questions and carry out requests. A change the system reports reaches MeeGone as a `ShellIntent` (`Resumed`, `SystemThemeChanged`, `AppsChanged`, `NotificationsChanged`) that the platform's entry point passes to `Launcher::dispatch`. The Android activity sends `Resumed` on every `onResume`, including after the home-app role dialog.
 - **Expected failures are values.** Adapters return a `DataError` (`AccessDenied`, `Unsupported`, `Offline`, `Invalid` or `Failed`), and each feature turns it into its own state (ARCH-09).
 - **The image feed is the lock-screen image's own.** `ImageFeed` in `meegone-lockimage-data` returns format-free `FeedImage`s. Its one implementation, built on `NetworkAdapter`, is the only code that knows the Bing feed's format (SRS 8.2). Its fake is `FakeFeed`.
 - **Fakes.** Enable the `fakes` feature of `meegone-core-data` (and of `meegone-lockimage-data` for `FakeFeed`) in `[dev-dependencies]`. Every fake has public fields that set what the "system" reports and record what was asked of it. Its `error` field makes every call that can fail fail, and other fields reproduce each "if unavailable" case.
@@ -105,7 +107,7 @@ Bugs are contained by `Store`. It runs every intent inside `catch_unwind`. If a 
 |---|---|---|
 | App | The system, through `AppsAdapter` (memory only) | The system |
 | Layout item, folder | `LayoutStore` (`meegone-apps-data`), saved in `layout` | Applications |
-| Settings | `SettingsStore` (`meegone-core-data`), saved in `settings` | Each field has one writer: Settings (theme, Home target, wrap-around), Applications (hidden apps), Lock-screen image (image options), Recent (apps removed from Recent) |
+| Settings | `SettingsStore` (`meegone-core-data`), saved in `settings` | Each field has one writer: Settings (theme, Home target, wrap-around, when the home-app banner was dismissed), Applications (hidden apps), Lock-screen image (image options), Recent (apps removed from Recent) |
 | Image record | `ImageCache` (`meegone-lockimage-data`), saved in `images/details` | Lock-screen image |
 | Notification group | The system, through `NotificationsAdapter` (memory only) | The system |
 | Recent entry | The system, through `UsageAdapter` (memory only) | The system |
@@ -154,9 +156,9 @@ MeeGone keeps three persistent stores, each in its own file under one private fo
 
 ## Not built yet
 
-This is the skeleton from issue #1. The following arrive with later requirements:
+The skeleton is from issue #1; the Android host and the home-app role from #4. The following arrive with later requirements:
 
-- **Android.** The adapter implementations, the home activity and the manifest come with HOME-01 onward. So does handing `FileStorage` the app's files folder. The crates already compile for `aarch64-linux-android`.
+- **Android adapters.** The home-app role, the clock and storage are built (ADR 0005). The app catalogue, notifications, usage, wallpaper, network, scheduling and the remaining device settings are stubs until their issues.
 - **The daily image.** The Bing implementation of `ImageFeed` (#26) and the updater (SRS 7.5) come with the WALL requirements.
 - **The UI toolkit** is still to be chosen (ADR 0002). Views compile and send intents, but nothing is drawn yet.
 - **First-run setup** comes with the ONB requirements. The lock-screen image step is provided as a `Slot`, like its Settings section.
@@ -178,8 +180,11 @@ cargo test -p arch-check                       # architecture rules
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo coverage                                 # core-logic line coverage, fails below 80 %
-cargo check --workspace --exclude arch-check --target aarch64-linux-android
+cargo clippy --workspace --exclude arch-check --all-targets --target aarch64-linux-android -- -D warnings
+(cd android && ./gradlew assembleDebug assembleRelease)   # the APK (separate CI job)
 ```
+
+Building the APK needs JDK 17 or later, the Android SDK with NDK 27.3 (`ANDROID_HOME`, or `sdk.dir` in `android/local.properties`), cargo-ndk and the `aarch64-linux-android` Rust target. The workspace checks above need none of them.
 
 `cargo coverage` is an alias in `.cargo/config.toml` (MAINT-02). It runs every test in the workspace and measures line coverage of the data and state crates, where the core logic lives (MAINT-01). UI crates, test files and fakes are left out. Inline `#[cfg(test)]` modules still count, because stable Rust can't leave them out. It needs a one-time setup:
 

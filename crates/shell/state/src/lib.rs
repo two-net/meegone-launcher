@@ -13,7 +13,7 @@ use meegone_events_state::{EventsHolder, EventsIntent};
 use meegone_lockimage_data::PersistentImageCache;
 use meegone_lockimage_state::{LockImageHolder, LockImageIntent, LockImageState};
 use meegone_recent_state::{RecentHolder, RecentIntent};
-use meegone_settings_state::{SettingsHolder, SettingsIntent};
+use meegone_settings_state::{SettingsHolder, SettingsIntent, SettingsState};
 
 /// The three home views, left to right (HOME-02).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -67,6 +67,10 @@ pub enum ShellIntent {
     Back,
     /// Chosen from the home menu (HOME-10, SET-01).
     OpenSettings,
+    /// MeeGone came to the foreground: at start, after the system's role dialog, or back from
+    /// another app or a settings screen. The default home app or the day may have changed
+    /// (HOME-01, ONB-04).
+    Resumed,
     /// The device's dark-theme setting changed (THEME-02).
     SystemThemeChanged,
     /// An app was installed, updated or removed, or a profile was paused or resumed
@@ -178,6 +182,12 @@ impl HomeShell {
         self.lockimage.subscribe(listener);
     }
 
+    /// Calls `listener` with every new settings state, for the banner that offers to make
+    /// MeeGone the default home app on the home views (ONB-04, ADR 0002).
+    pub fn subscribe_settings(&mut self, listener: impl FnMut(&Arc<SettingsState>) + 'static) {
+        self.settings.subscribe(listener);
+    }
+
     pub fn dispatch(&mut self, intent: ShellIntent) {
         match intent {
             ShellIntent::Swipe(direction) => self.swipe(direction),
@@ -187,6 +197,7 @@ impl HomeShell {
                 self.settings.dispatch(SettingsIntent::Refresh);
                 self.state.settings_open = true;
             }
+            ShellIntent::Resumed => self.settings.dispatch(SettingsIntent::Refresh),
             ShellIntent::SystemThemeChanged => self.theme.dispatch(ThemeIntent::Refresh),
             ShellIntent::AppsChanged => {
                 self.apps.dispatch(AppsIntent::Refresh);
@@ -393,6 +404,20 @@ mod tests {
             &shell.apps().state().items[..],
             [GridItem::App(app)] if app.label == "Maps"
         ));
+    }
+
+    #[test]
+    fn coming_back_to_the_foreground_rechecks_the_default_home_app() {
+        // HOME-01, ONB-04: the role may have changed in the system dialog or in system settings.
+        let fakes = Fakes::default();
+        let mut shell = HomeShell::compose(fakes.platform());
+        assert!(shell.settings().state().home_banner);
+
+        *fakes.system.default_home.lock().unwrap() = true;
+        shell.dispatch(ShellIntent::Resumed);
+
+        assert!(shell.settings().state().default_home);
+        assert!(!shell.settings().state().home_banner);
     }
 
     #[test]

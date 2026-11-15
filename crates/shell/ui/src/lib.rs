@@ -8,11 +8,11 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use meegone_apps_ui::AppsView;
-use meegone_core_ui::{Dispatch, Latest, View, tokens};
+use meegone_core_ui::{Dispatch, Latest, Slot, View, tokens};
 use meegone_events_ui::EventsView;
 use meegone_lockimage_ui::{ImageCard, ImageSettingsSection};
 use meegone_recent_ui::RecentView;
-use meegone_settings_ui::SettingsView;
+use meegone_settings_ui::{HomeBanner, SettingsView};
 use meegone_shell_state::{HomeShell, HomeView, ShellIntent};
 
 type Outbox = Rc<RefCell<VecDeque<ShellIntent>>>;
@@ -23,6 +23,7 @@ pub struct ShellView {
     events: EventsView,
     recent: RecentView,
     settings: SettingsView,
+    home_banner: HomeBanner,
 }
 
 impl ShellView {
@@ -46,11 +47,21 @@ impl ShellView {
             dispatch(&outbox, ShellIntent::LockImage),
         )));
 
+        // Settings and setup offers to make MeeGone the default home app on the home views
+        // (ONB-04).
+        let settings_state = Latest::new(shell.settings().state());
+        shell.subscribe_settings({
+            let settings_state = settings_state.clone();
+            move |state| settings_state.set(Arc::clone(state))
+        });
+        let home_banner = HomeBanner::new(settings_state, dispatch(&outbox, ShellIntent::Settings));
+
         Self {
             apps: AppsView::new(dispatch(&outbox, ShellIntent::Apps)),
             recent: RecentView::new(dispatch(&outbox, ShellIntent::Recent)),
             events,
             settings,
+            home_banner,
             outbox,
         }
     }
@@ -72,6 +83,7 @@ impl ShellView {
             HomeView::Applications => self.apps.render(&shell.apps().state(), tokens),
             HomeView::Recent => self.recent.render(&shell.recent().state(), tokens),
         }
+        self.home_banner.render(tokens);
     }
 
     pub fn apps(&self) -> &AppsView {
@@ -88,6 +100,11 @@ impl ShellView {
 
     pub fn settings(&self) -> &SettingsView {
         &self.settings
+    }
+
+    /// Shown over the home views, never over Settings (ONB-04).
+    pub fn home_banner(&self) -> &HomeBanner {
+        &self.home_banner
     }
 }
 
