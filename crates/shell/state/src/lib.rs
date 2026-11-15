@@ -5,12 +5,12 @@
 
 use std::sync::Arc;
 
-use meegone_apps_data::MemoryLayoutStore;
+use meegone_apps_data::PersistentLayoutStore;
 use meegone_apps_state::{AppsHolder, AppsIntent};
-use meegone_core_data::{MemorySettingsStore, Platform, SettingsStore};
+use meegone_core_data::{PersistentSettingsStore, Platform, SettingsStore};
 use meegone_core_state::{Store, ThemeHolder, ThemeIntent};
 use meegone_events_state::{EventsHolder, EventsIntent};
-use meegone_lockimage_data::MemoryImageCache;
+use meegone_lockimage_data::PersistentImageCache;
 use meegone_lockimage_state::{LockImageHolder, LockImageIntent, LockImageState};
 use meegone_recent_state::{RecentHolder, RecentIntent};
 use meegone_settings_state::{SettingsHolder, SettingsIntent};
@@ -97,11 +97,11 @@ pub struct HomeShell {
 }
 
 impl HomeShell {
-    /// Builds every feature's stores and state holders from the platform adapters.
-    ///
-    /// The stores are kept in memory until persistence lands (APPS-18, REL-03).
+    /// Builds every feature's stores and state holders from the platform adapters. The three
+    /// persistent stores share the platform's storage (SRS 7.1, REL-03).
     pub fn compose(platform: Platform) -> Self {
-        let settings_store: Arc<dyn SettingsStore> = Arc::new(MemorySettingsStore::default());
+        let settings_store: Arc<dyn SettingsStore> =
+            Arc::new(PersistentSettingsStore::new(platform.storage.clone()));
         let mut shell = Self {
             state: ShellState::default(),
             theme: Store::new(ThemeHolder::new(
@@ -110,7 +110,7 @@ impl HomeShell {
             )),
             apps: Store::new(AppsHolder::new(
                 platform.apps.clone(),
-                Arc::new(MemoryLayoutStore::default()),
+                Arc::new(PersistentLayoutStore::new(platform.storage.clone())),
             )),
             events: Store::new(EventsHolder::new(platform.notifications.clone())),
             recent: Store::new(RecentHolder::new(
@@ -121,7 +121,7 @@ impl HomeShell {
             )),
             lockimage: Store::new(LockImageHolder::new(
                 settings_store.clone(),
-                Arc::new(MemoryImageCache::default()),
+                Arc::new(PersistentImageCache::new(platform.storage.clone())),
                 platform.wallpaper.clone(),
                 platform.scheduler.clone(),
             )),

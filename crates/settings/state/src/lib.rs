@@ -115,14 +115,14 @@ impl StateHolder for SettingsHolder {
 
 #[cfg(test)]
 mod tests {
-    use meegone_core_data::MemorySettingsStore;
+    use meegone_core_data::PersistentSettingsStore;
     use meegone_core_data::fakes::Fakes;
 
     use super::*;
 
-    fn setup() -> (Fakes, Arc<MemorySettingsStore>, SettingsHolder) {
+    fn setup() -> (Fakes, Arc<PersistentSettingsStore>, SettingsHolder) {
         let fakes = Fakes::default();
-        let store = Arc::new(MemorySettingsStore::default());
+        let store = Arc::new(PersistentSettingsStore::new(fakes.storage.clone()));
         let mut holder = SettingsHolder::new(
             store.clone(),
             fakes.notifications.clone(),

@@ -1,8 +1,10 @@
 //! Platform adapters (ARCH-04): the only way any crate reaches the operating system.
 //!
-//! There are seven narrow traits, one per group of capabilities in SRS 8.1. Tests replace each
-//! one with a fake (MAINT-01). The table in ARCHITECTURE.md maps every capability to its
-//! adapter. Android implementations arrive with the platform work (HOME-01 onwards).
+//! There are seven narrow traits, one per group of capabilities in SRS 8.1, plus
+//! [`StorageAdapter`] for MeeGone's own files (ADR 0004). Tests replace each one with a fake
+//! (MAINT-01). The table in ARCHITECTURE.md maps every capability to its adapter. Android
+//! implementations arrive with the platform work (HOME-01 onwards); storage already has
+//! `FileStorage`.
 //!
 //! Adapters only answer questions and carry out requests; they never call back. Changes the
 //! system reports, such as an app being installed, reach MeeGone as a `ShellIntent` that the
@@ -18,6 +20,7 @@ use crate::model::{
     Access, App, AppId, DataError, ImageJob, NetworkState, Notification, Profile, RecentUse,
     Shortcut, Size,
 };
+use crate::storage::StorageAdapter;
 
 /// The app catalogue: installed apps, profiles, shortcuts and uninstall requests (SRS 8.1).
 pub trait AppsAdapter: Send + Sync {
@@ -143,4 +146,6 @@ pub struct Platform {
     pub network: Arc<dyn NetworkAdapter>,
     pub scheduler: Arc<dyn SchedulerAdapter>,
     pub system: Arc<dyn SystemConfigAdapter>,
+    /// Where the layout, settings and image cache are kept (REL-03).
+    pub storage: Arc<dyn StorageAdapter>,
 }

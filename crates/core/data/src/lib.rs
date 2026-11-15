@@ -3,15 +3,18 @@
 //! - [`model`]: data that several features read, such as [`App`].
 //! - [`adapters`]: narrow traits for everything MeeGone asks of the operating system (ARCH-04),
 //!   bundled in [`Platform`].
+//! - [`storage`]: MeeGone's own files and the versioned format its stores save in (REL-03,
+//!   MAINT-04).
 //! - [`settings`]: the settings store, which several features share (ADR 0002).
 //!
 //! Nothing here knows about state holders or the UI (ARCH-02).
 
 pub mod adapters;
-#[cfg(feature = "fakes")]
+#[cfg(any(test, feature = "fakes"))]
 pub mod fakes;
 pub mod model;
 pub mod settings;
+pub mod storage;
 
 pub use adapters::{
     AppsAdapter, NetworkAdapter, NotificationsAdapter, Platform, SchedulerAdapter,
@@ -22,6 +25,7 @@ pub use model::{
     ProfileId, RecentUse, Rgb, Shortcut, Size,
 };
 pub use settings::{
-    HomeTarget, ImageOptions, MemorySettingsStore, RecentDensity, SETTINGS_VERSION, Settings,
+    HomeTarget, ImageOptions, PersistentSettingsStore, RecentDensity, SETTINGS_VERSION, Settings,
     SettingsStore, ThemeChoice,
 };
+pub use storage::{FileStorage, MAX_STORED_BYTES, StorageAdapter, StoredFile};

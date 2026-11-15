@@ -39,10 +39,10 @@ pub const FAKES: &str = "fakes";
 pub const OS_MODULES: [&str; 5] = ["env", "fs", "net", "os", "process"];
 /// The types that read the clock. Only `SystemConfigAdapter` may (ARCH-04).
 pub const CLOCKS: [&str; 2] = ["Instant", "SystemTime"];
-/// Source files, relative to the workspace root, that may reach the operating system directly.
-/// The Android adapter implementations (HOME-01) and the persistent stores (REL-03) add theirs
-/// here.
-pub const OS_ACCESS_ALLOWED: [&str; 0] = [];
+/// Source files, relative to the workspace root, that may reach the operating system directly:
+/// `FileStorage`, which keeps the three persistent stores' files (REL-03, ADR 0004). The Android
+/// adapter implementations (HOME-01) add theirs here.
+pub const OS_ACCESS_ALLOWED: [&str; 1] = ["crates/core/data/src/storage/files.rs"];
 
 const CORE: &str = "core";
 const SHELL: &str = "shell";

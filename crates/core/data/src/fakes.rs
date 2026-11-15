@@ -1,4 +1,4 @@
-//! Configurable fakes of every platform adapter, for tests (MAINT-01).
+//! Configurable fakes of every platform adapter and of storage, for tests (MAINT-01).
 //!
 //! Enable the `fakes` feature in `[dev-dependencies]` only (SEC-06); arch-check rejects it
 //! anywhere else. Each fake's fields are public: set them to shape what the "system" reports,
@@ -19,6 +19,7 @@ use crate::model::{
     Access, App, AppId, DataError, ImageJob, NetworkState, Notification, Profile, ProfileId,
     RecentUse, Rgb, Shortcut, Size,
 };
+use crate::storage::{MAX_STORED_BYTES, StorageAdapter, StoredFile, check_budget};
 
 /// Every fake, and the [`Platform`] built from them.
 #[derive(Clone, Default)]
@@ -30,6 +31,7 @@ pub struct Fakes {
     pub network: Arc<FakeNetwork>,
     pub scheduler: Arc<FakeScheduler>,
     pub system: Arc<FakeSystem>,
+    pub storage: Arc<FakeStorage>,
 }
 
 impl Fakes {
@@ -42,6 +44,7 @@ impl Fakes {
             network: self.network.clone(),
             scheduler: self.scheduler.clone(),
             system: self.system.clone(),
+            storage: self.storage.clone(),
         }
     }
 }
@@ -494,6 +497,54 @@ impl SystemConfigAdapter for FakeSystem {
     fn web_search(&self, query: &str) -> Result<(), DataError> {
         self.check_browser()?;
         record(&self.web_searches, query.to_owned());
+        Ok(())
+    }
+}
+
+/// MeeGone's files, kept in memory. Writes are atomic and stay within the same budget as
+/// `FileStorage` (PERF-08).
+#[derive(Default)]
+pub struct FakeStorage {
+    pub files: Mutex<BTreeMap<StoredFile, Vec<u8>>>,
+    /// Every file written, in order.
+    pub writes: Mutex<Vec<StoredFile>>,
+    pub error: Mutex<Option<DataError>>,
+}
+
+impl FakeStorage {
+    /// Every stored byte, for checking what was and wasn't stored (PRIV-03).
+    pub fn stored_text(&self) -> String {
+        let files = self.files.lock().unwrap();
+        files
+            .values()
+            .map(|bytes| String::from_utf8_lossy(bytes))
+            .collect()
+    }
+}
+
+impl StorageAdapter for FakeStorage {
+    fn read(&self, file: StoredFile) -> Result<Option<Vec<u8>>, DataError> {
+        check(&self.error)?;
+        Ok(self.files.lock().unwrap().get(&file).cloned())
+    }
+
+    fn write(&self, file: StoredFile, bytes: &[u8]) -> Result<(), DataError> {
+        check(&self.error)?;
+        let mut files = self.files.lock().unwrap();
+        let others = files
+            .iter()
+            .filter(|(stored, _)| **stored != file)
+            .map(|(_, bytes)| bytes.len() as u64)
+            .sum();
+        check_budget(others, bytes.len(), MAX_STORED_BYTES)?;
+        files.insert(file, bytes.to_vec());
+        record(&self.writes, file);
+        Ok(())
+    }
+
+    fn remove(&self, file: StoredFile) -> Result<(), DataError> {
+        check(&self.error)?;
+        self.files.lock().unwrap().remove(&file);
         Ok(())
     }
 }

@@ -125,23 +125,23 @@ impl StateHolder for LockImageHolder {
 
 #[cfg(test)]
 mod tests {
-    use meegone_core_data::MemorySettingsStore;
+    use meegone_core_data::PersistentSettingsStore;
     use meegone_core_data::fakes::Fakes;
-    use meegone_lockimage_data::MemoryImageCache;
+    use meegone_lockimage_data::PersistentImageCache;
 
     use super::*;
 
     struct Setup {
         fakes: Fakes,
-        settings: Arc<MemorySettingsStore>,
-        cache: Arc<MemoryImageCache>,
+        settings: Arc<PersistentSettingsStore>,
+        cache: Arc<PersistentImageCache>,
         holder: LockImageHolder,
     }
 
     fn setup() -> Setup {
         let fakes = Fakes::default();
-        let settings = Arc::new(MemorySettingsStore::default());
-        let cache = Arc::new(MemoryImageCache::default());
+        let settings = Arc::new(PersistentSettingsStore::new(fakes.storage.clone()));
+        let cache = Arc::new(PersistentImageCache::new(fakes.storage.clone()));
         let mut holder = LockImageHolder::new(
             settings.clone(),
             cache.clone(),

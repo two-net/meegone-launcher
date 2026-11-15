@@ -77,7 +77,7 @@ impl StateHolder for ThemeHolder {
 
 #[cfg(test)]
 mod tests {
-    use meegone_core_data::MemorySettingsStore;
+    use meegone_core_data::PersistentSettingsStore;
     use meegone_core_data::fakes::Fakes;
 
     use super::*;
@@ -94,7 +94,7 @@ mod tests {
     fn a_light_choice_stays_light_when_the_device_turns_dark() {
         // AC-06
         let fakes = Fakes::default();
-        let settings = Arc::new(MemorySettingsStore::default());
+        let settings = Arc::new(PersistentSettingsStore::new(fakes.storage.clone()));
         settings
             .update(&mut |s| s.theme = ThemeChoice::Light)
             .unwrap();
@@ -111,7 +111,7 @@ mod tests {
         // AC-05
         let fakes = Fakes::default();
         let mut holder = ThemeHolder::new(
-            Arc::new(MemorySettingsStore::default()),
+            Arc::new(PersistentSettingsStore::new(fakes.storage.clone())),
             fakes.system.clone(),
         );
         holder.handle(ThemeIntent::Refresh);

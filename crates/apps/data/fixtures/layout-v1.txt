@@ -1,0 +1,6 @@
+meegone-layout 1
+app 0 phone phone.Main
+folder 7 Fun\s&\sgames 2 0 chess chess.Main 0 go go.Main
+app 10 com.example.mail com.example.mail.Inbox
+folder 8 \e 0
+end 2231a4f770adc959

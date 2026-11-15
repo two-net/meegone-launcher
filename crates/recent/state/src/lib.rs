@@ -153,7 +153,7 @@ impl StateHolder for RecentHolder {
 #[cfg(test)]
 mod tests {
     use meegone_core_data::fakes::{Fakes, app, app_id};
-    use meegone_core_data::{MemorySettingsStore, RecentUse};
+    use meegone_core_data::{PersistentSettingsStore, RecentUse};
 
     use super::*;
 
@@ -166,7 +166,7 @@ mod tests {
         }
     }
 
-    fn setup(uses: Vec<RecentUse>) -> (Fakes, Arc<MemorySettingsStore>, RecentHolder) {
+    fn setup(uses: Vec<RecentUse>) -> (Fakes, Arc<PersistentSettingsStore>, RecentHolder) {
         let fakes = Fakes::default();
         *fakes.usage.access.lock().unwrap() = Access::Granted;
         *fakes.usage.uses.lock().unwrap() = uses;
@@ -175,7 +175,7 @@ mod tests {
             .iter()
             .map(|package| app(package, package))
             .collect();
-        let settings = Arc::new(MemorySettingsStore::default());
+        let settings = Arc::new(PersistentSettingsStore::new(fakes.storage.clone()));
         let holder = RecentHolder::new(
             fakes.usage.clone(),
             fakes.apps.clone(),

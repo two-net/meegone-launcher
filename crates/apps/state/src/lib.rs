@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use meegone_apps_data::{LAYOUT_VERSION, Layout, LayoutEntry, LayoutStore};
+use meegone_apps_data::{Layout, LayoutEntry, LayoutStore};
 use meegone_core_data::AppsAdapter;
 use meegone_core_state::{App, AppId, StateHolder};
 
@@ -160,10 +160,7 @@ fn reconcile(saved: &Layout, installed: &[App]) -> Layout {
     new.sort_by_cached_key(|app| app.label.to_lowercase());
     entries.extend(new.into_iter().map(|app| LayoutEntry::App(app.id.clone())));
 
-    Layout {
-        version: LAYOUT_VERSION,
-        entries,
-    }
+    Layout { entries }
 }
 
 fn grid(layout: &Layout, installed: &[App]) -> Vec<GridItem> {
@@ -185,16 +182,20 @@ fn grid(layout: &Layout, installed: &[App]) -> Vec<GridItem> {
 
 #[cfg(test)]
 mod tests {
-    use meegone_apps_data::MemoryLayoutStore;
+    use meegone_apps_data::PersistentLayoutStore;
     use meegone_core_data::DataError;
-    use meegone_core_data::fakes::{Fakes, app, app_id};
+    use meegone_core_data::fakes::{FakeStorage, Fakes, app, app_id};
 
     use super::*;
 
-    fn holder(fakes: &Fakes, layout: &Arc<MemoryLayoutStore>) -> AppsHolder {
+    fn holder(fakes: &Fakes, layout: &Arc<PersistentLayoutStore>) -> AppsHolder {
         let mut holder = AppsHolder::new(fakes.apps.clone(), layout.clone());
         holder.handle(AppsIntent::Refresh);
         holder
+    }
+
+    fn layout_store() -> Arc<PersistentLayoutStore> {
+        Arc::new(PersistentLayoutStore::new(Arc::new(FakeStorage::default())))
     }
 
     fn labels(state: &AppsState) -> Vec<String> {
@@ -223,7 +224,7 @@ mod tests {
             &fakes,
             &[("mail", "Mail"), ("camera", "camera"), ("phone", "Phone")],
         );
-        let layout = Arc::new(MemoryLayoutStore::default());
+        let layout = layout_store();
 
         let holder = holder(&fakes, &layout);
 
@@ -235,10 +236,9 @@ mod tests {
     fn the_saved_order_is_kept_and_new_apps_go_at_the_end() {
         // APPS-06, APPS-18
         let fakes = Fakes::default();
-        let layout = Arc::new(MemoryLayoutStore::default());
+        let layout = layout_store();
         layout
             .save(&Layout {
-                version: LAYOUT_VERSION,
                 entries: vec![
                     LayoutEntry::App(app_id("phone")),
                     LayoutEntry::App(app_id("gone")),
@@ -260,10 +260,9 @@ mod tests {
     fn a_folder_left_with_one_app_becomes_that_app() {
         // FOLD-06
         let fakes = Fakes::default();
-        let layout = Arc::new(MemoryLayoutStore::default());
+        let layout = layout_store();
         layout
             .save(&Layout {
-                version: LAYOUT_VERSION,
                 entries: vec![
                     LayoutEntry::Folder {
                         id: FolderId(1),
@@ -293,7 +292,7 @@ mod tests {
         // APPS-10; the side effect runs in the data layer (ARCH-05).
         let fakes = Fakes::default();
         install(&fakes, &[("mail", "Mail")]);
-        let mut holder = holder(&fakes, &Arc::new(MemoryLayoutStore::default()));
+        let mut holder = holder(&fakes, &layout_store());
 
         holder.handle(AppsIntent::Launch(app_id("mail")));
 
@@ -305,7 +304,7 @@ mod tests {
         let fakes = Fakes::default();
         *fakes.apps.error.lock().unwrap() = Some(DataError::Failed("App list unavailable".into()));
 
-        let holder = holder(&fakes, &Arc::new(MemoryLayoutStore::default()));
+        let holder = holder(&fakes, &layout_store());
 
         assert_eq!(
             holder.state().problem.as_deref(),
@@ -317,10 +316,9 @@ mod tests {
     fn back_closes_the_folder_then_edit_mode() {
         // HOME-08
         let fakes = Fakes::default();
-        let layout = Arc::new(MemoryLayoutStore::default());
+        let layout = layout_store();
         layout
             .save(&Layout {
-                version: LAYOUT_VERSION,
                 entries: vec![LayoutEntry::Folder {
                     id: FolderId(1),
                     name: "Folder".into(),
