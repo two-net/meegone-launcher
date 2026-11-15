@@ -1,0 +1,15 @@
+[package]
+name = "meegone-lockimage-state"
+description = "Lock-screen image state: whether the daily image is on, available, and what it shows."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+meegone-core-data.workspace = true
+meegone-core-state.workspace = true
+meegone-lockimage-data.workspace = true
+
+[dev-dependencies]
+meegone-core-data = { workspace = true, features = ["fakes"] }

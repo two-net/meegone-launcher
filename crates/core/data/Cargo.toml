@@ -1,0 +1,12 @@
+[package]
+name = "meegone-core-data"
+description = "Data layer shared by every feature: models, platform adapter traits and the settings store."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[features]
+# Configurable fakes of every platform adapter. Enabled only as a dev-dependency, for tests;
+# the app never enables it (SEC-06).
+fakes = []

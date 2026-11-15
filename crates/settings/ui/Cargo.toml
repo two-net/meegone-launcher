@@ -1,0 +1,12 @@
+[package]
+name = "meegone-settings-ui"
+description = "Settings screens."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+meegone-core-state.workspace = true
+meegone-core-ui.workspace = true
+meegone-settings-state.workspace = true

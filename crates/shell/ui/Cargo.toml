@@ -1,0 +1,16 @@
+[package]
+name = "meegone-shell-ui"
+description = "Home shell UI: puts the feature views together and places one feature's content inside another's."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+meegone-apps-ui.workspace = true
+meegone-core-ui.workspace = true
+meegone-events-ui.workspace = true
+meegone-lockimage-ui.workspace = true
+meegone-recent-ui.workspace = true
+meegone-settings-ui.workspace = true
+meegone-shell-state.workspace = true

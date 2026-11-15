@@ -1,0 +1,21 @@
+[package]
+name = "meegone-shell-state"
+description = "Home shell state: the carousel, Home and Back, and the one place features are put together."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+meegone-apps-data.workspace = true
+meegone-apps-state.workspace = true
+meegone-core-data.workspace = true
+meegone-core-state.workspace = true
+meegone-events-state.workspace = true
+meegone-lockimage-data.workspace = true
+meegone-lockimage-state.workspace = true
+meegone-recent-state.workspace = true
+meegone-settings-state.workspace = true
+
+[dev-dependencies]
+meegone-core-data = { workspace = true, features = ["fakes"] }

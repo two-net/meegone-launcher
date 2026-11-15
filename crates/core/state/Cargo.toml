@@ -1,0 +1,13 @@
+[package]
+name = "meegone-core-state"
+description = "State layer shared by every feature: the state-holder pattern, failure containment and theme resolution."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+meegone-core-data.workspace = true
+
+[dev-dependencies]
+meegone-core-data = { workspace = true, features = ["fakes"] }

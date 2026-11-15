@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy --target aarch64-linux-android
+          rustup default stable
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      # Fails on any feature-to-feature, upward (data → UI) or layer-skipping dependency,
+      # and on any third-party crate missing from DEPENDENCIES.md. See ARCHITECTURE.md.
+      - name: Architecture rules
+        run: cargo test -p arch-check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace
+
+      - name: Android target
+        run: cargo check --workspace --exclude arch-check --target aarch64-linux-android

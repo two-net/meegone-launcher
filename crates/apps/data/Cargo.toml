@@ -1,0 +1,10 @@
+[package]
+name = "meegone-apps-data"
+description = "Applications data layer: the layout store."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+meegone-core-data.workspace = true

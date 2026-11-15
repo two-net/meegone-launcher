@@ -1,0 +1,11 @@
+[package]
+name = "meegone-lockimage-ui"
+description = "Lock-screen image UI: the image-of-the-day card and the settings section."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+meegone-core-ui.workspace = true
+meegone-lockimage-state.workspace = true

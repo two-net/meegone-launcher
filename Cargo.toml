@@ -1,6 +1,47 @@
 [package]
 name = "meegone-launcher"
-version = "0.1.0"
-edition = "2024"
+description = "MeeGone Launcher, the one installable app: hands the platform to the Home shell."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
 
 [dependencies]
+meegone-core-data.workspace = true
+meegone-shell-state.workspace = true
+meegone-shell-ui.workspace = true
+
+[dev-dependencies]
+meegone-core-data = { workspace = true, features = ["fakes"] }
+meegone-core-state.workspace = true
+
+[workspace]
+members = ["crates/*/*", "tools/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+# Every internal crate, by path. Which crate may depend on which is checked by
+# tools/arch-check (see ARCHITECTURE.md).
+[workspace.dependencies]
+meegone-core-data = { path = "crates/core/data" }
+meegone-core-state = { path = "crates/core/state" }
+meegone-core-ui = { path = "crates/core/ui" }
+meegone-apps-data = { path = "crates/apps/data" }
+meegone-apps-state = { path = "crates/apps/state" }
+meegone-apps-ui = { path = "crates/apps/ui" }
+meegone-events-state = { path = "crates/events/state" }
+meegone-events-ui = { path = "crates/events/ui" }
+meegone-recent-state = { path = "crates/recent/state" }
+meegone-recent-ui = { path = "crates/recent/ui" }
+meegone-lockimage-data = { path = "crates/lockimage/data" }
+meegone-lockimage-state = { path = "crates/lockimage/state" }
+meegone-lockimage-ui = { path = "crates/lockimage/ui" }
+meegone-settings-state = { path = "crates/settings/state" }
+meegone-settings-ui = { path = "crates/settings/ui" }
+meegone-shell-state = { path = "crates/shell/state" }
+meegone-shell-ui = { path = "crates/shell/ui" }

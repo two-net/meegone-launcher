@@ -1,0 +1,10 @@
+[package]
+name = "meegone-core-ui"
+description = "UI layer shared by every feature: colour tokens, motion specifications and view contracts."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+meegone-core-state.workspace = true
