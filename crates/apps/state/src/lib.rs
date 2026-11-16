@@ -44,6 +44,15 @@ pub struct AppsState {
     pub problem: Option<String>,
 }
 
+impl AppsState {
+    /// How many rows the grid lays out in `columns` columns: every item's, plus one empty row
+    /// below the last, so a long-press on empty space can always open the home menu (HOME-14,
+    /// HOME-10). The grid (#9) lays out this many rows.
+    pub fn rows(&self, columns: usize) -> usize {
+        self.items.len().div_ceil(columns.max(1)) + 1
+    }
+}
+
 #[derive(Debug)]
 pub enum AppsIntent {
     /// Rebuilds the grid from the installed apps and the saved layout.
@@ -370,6 +379,29 @@ mod tests {
         holder.handle(AppsIntent::Scrolled(300.0));
         holder.handle(AppsIntent::ScrollToTop);
         assert_eq!(holder.state().scroll_px, 0.0);
+    }
+
+    #[test]
+    fn the_grid_always_ends_with_an_empty_row() {
+        // HOME-14: below the last row, a whole row is left empty for the home menu.
+        let fakes = Fakes::default();
+        let rows = |count: usize| {
+            let apps: Vec<(String, String)> = (0..count)
+                .map(|i| (format!("app{i:02}"), format!("App {i:02}")))
+                .collect();
+            let apps: Vec<(&str, &str)> = apps
+                .iter()
+                .map(|(package, label)| (package.as_str(), label.as_str()))
+                .collect();
+            install(&fakes, &apps);
+            holder(&fakes, &layout_store()).state().rows(4)
+        };
+
+        assert_eq!(rows(0), 1);
+        assert_eq!(rows(4), 2);
+        assert_eq!(rows(5), 3);
+        assert_eq!(rows(40), 11);
+        assert_eq!(AppsState::default().rows(0), 1);
     }
 
     #[test]

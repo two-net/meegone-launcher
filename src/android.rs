@@ -1,5 +1,5 @@
-//! The native methods of `HomeActivity` (ADR 0005, ADR 0007) and `HomeViews` (ADR 0006),
-//! called by Android on the main thread.
+//! The native methods of `HomeActivity` (ADR 0005, ADR 0007) and `HomeViews` (ADR 0006,
+//! ADR 0008), called by Android on the main thread.
 //!
 //! The process has one [`Launcher`], kept on the main thread. Every `HomeActivity` shares it:
 //! the one opened from the app drawer and the one Home starts can be alive at once, and two
@@ -23,8 +23,8 @@ use meegone_core_data::Rgb;
 use meegone_core_data::android::{self, Env, JObject, LocalRef, RawEnv};
 
 use crate::{
-    Direction, HomeFrame, HomeView, Launcher, Layout, PointerEvent, PointerKind, SavedHome,
-    ShellIntent,
+    Direction, HomeFrame, HomeView, Launcher, Layout, MenuItem, PointerEvent, PointerKind,
+    SavedHome, SettingsGroup, ShellIntent,
 };
 
 /// JNI's `jboolean`.
@@ -223,8 +223,8 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeLayo
 }
 
 /// `boolean nativePointer(int action, float x, float y, long timeNanos)`: the first finger on
-/// the home views, with `MotionEvent`'s action. Returns whether the carousel has taken the
-/// gesture, so the content below gets no more of it (HOME-03).
+/// the home views, with `MotionEvent`'s action. Returns whether the carousel or a long-press
+/// has taken the gesture, so the content below gets no more of it (HOME-03, HOME-10).
 ///
 /// # Safety
 ///
@@ -248,7 +248,7 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativePoin
         3 => PointerKind::Cancel,
         _ => return 0,
     };
-    let mut dragging = false;
+    let mut taken = false;
     with_launcher(env, |launcher| {
         launcher.dispatch(ShellIntent::Pointer(PointerEvent {
             kind,
@@ -257,9 +257,79 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativePoin
             at: uptime(time_nanos),
         }));
         launcher.frame();
-        dragging = launcher.shell().state().carousel.dragging;
+        let carousel = launcher.shell().state().carousel;
+        taken = carousel.dragging || carousel.held;
     });
-    JBoolean::from(dragging)
+    JBoolean::from(taken)
+}
+
+/// `boolean nativeLongPress()`: the finger that is down has stayed on empty space for the
+/// platform's long-press time (HOME-10). Returns whether the long-press was taken, so the
+/// content below gets no more of the gesture.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeLongPress(
+    env: RawEnv,
+    _views: JObject,
+) -> JBoolean {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    let mut taken = false;
+    with_launcher(env, |launcher| {
+        launcher.dispatch(ShellIntent::LongPress);
+        launcher.frame();
+        taken = launcher.shell().state().carousel.held;
+    });
+    JBoolean::from(taken)
+}
+
+/// `boolean nativeOpenMenu()`: opens the home menu without a gesture, for screen readers
+/// (A11Y-05). Returns false if the current view has none.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeOpenMenu(
+    env: RawEnv,
+    _views: JObject,
+) -> JBoolean {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    let mut opened = false;
+    with_launcher(env, |launcher| {
+        launcher.dispatch(ShellIntent::OpenMenu);
+        launcher.frame();
+        opened = launcher.shell().state().menu.is_some();
+    });
+    JBoolean::from(opened)
+}
+
+/// `void nativeMenu(int item)`: an item of the home menu was chosen, 0 to 2 in [`MenuItem::ALL`]
+/// order, or -1 for a touch outside it, which closes it (HOME-10).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeMenu(
+    env: RawEnv,
+    _views: JObject,
+    item: i32,
+) {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    let intent = match usize::try_from(item).ok().and_then(MenuItem::from_index) {
+        Some(item) => ShellIntent::ChooseMenuItem(item),
+        None => ShellIntent::CloseMenu,
+    };
+    with_launcher(env, |launcher| {
+        launcher.dispatch(intent);
+        launcher.frame();
+    });
 }
 
 /// `void nativeFrame(long frameTimeNanos)`: the display is about to draw a frame (ANIM-04).
@@ -346,8 +416,24 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRead
 /// | 7–9 | The background, foreground and dim colours, as opaque ARGB |
 /// | 10 | The home content's scale in ten-thousandths, 10 000 at rest (ANIM-09) |
 /// | 11 | The home content's opacity, 0 to 255 (ANIM-09) |
-fn frame_slots(frame: &HomeFrame) -> [i32; 12] {
+/// | 12 | The home menu's items, as bits 1 << [`MenuItem::index`]; 0 while it is closed (HOME-10) |
+/// | 13 | 1 when the current view offers the home menu and nothing covers it (A11Y-05) |
+/// | 14–15 | Where the home menu opens, in px from the top left, or -1 to centre it |
+/// | 16 | The surface colour of menus and Settings, as opaque ARGB |
+/// | 17 | Settings: 0 closed, 1 open, 2 open at its Lock-screen image group |
+fn frame_slots(frame: &HomeFrame) -> [i32; 18] {
     let [events, applications, recent] = frame.pages;
+    let menu_items = frame.menu.map_or(0, |menu| {
+        menu.items
+            .iter()
+            .fold(0, |bits, item| bits | 1 << item.index())
+    });
+    let (menu_x, menu_y) = frame.menu.and_then(|menu| menu.anchor).unwrap_or((-1, -1));
+    let settings = match (frame.settings_open, frame.settings_group) {
+        (false, _) => 0,
+        (true, None) => 1,
+        (true, Some(SettingsGroup::LockScreenImage)) => 2,
+    };
     [
         events,
         applications,
@@ -361,6 +447,12 @@ fn frame_slots(frame: &HomeFrame) -> [i32; 12] {
         argb(frame.dim),
         i32::from(frame.content_scale),
         i32::from(frame.content_alpha),
+        menu_items,
+        i32::from(frame.menu_offered),
+        menu_x,
+        menu_y,
+        argb(frame.surface),
+        settings,
     ]
 }
 

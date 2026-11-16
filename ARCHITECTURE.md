@@ -30,7 +30,7 @@ Each crate is `crates/<area>/<layer>`, with the package name `meegone-<area>-<la
 | **recent** | – | Filtering, ordering, close mode | `RecentView` | Removed-apps list (in the settings store) |
 | **lockimage** | Image cache, image-feed interface | On/off, availability, current image | `ImageCard`, `ImageSettingsSection` | Image cache |
 | **settings** | – | Settings, access status, the home-app banner (ONB-04) | `SettingsView`, `HomeBanner` | The settings screens |
-| **shell** | – | `HomeShell`: the carousel of views, Home and Back, coming back to the home, composes every feature | `ShellView`, `HomeFrame` | Nothing persistent |
+| **shell** | – | `HomeShell`: the carousel of views, the home menu, Home and Back, coming back to the home, composes every feature | `ShellView`, `HomeFrame` | Nothing persistent |
 
 The root package `meegone-launcher` is the app. `Launcher::start(platform)` hands the platform adapters to the shell. On Android it is also a native library, which the Java host in `android/` loads ([ADR 0005](docs/adr/0005-android-host-and-home-role.md)) and asks what to draw ([ADR 0006](docs/adr/0006-android-views-and-the-carousel.md)). `tools/arch-check` is a development tool that is never part of the app.
 
@@ -65,34 +65,38 @@ AppsView.icon_tapped(mail)                       ui     sends AppsIntent::Launch
 - **State holders** implement `StateHolder`: `state()`, `handle(intent)` and `on_back()`. They take their adapters and stores as `Arc<dyn …>` traits, so tests drive them with the fakes in `meegone-core-data` (feature `fakes`), without any UI (MAINT-01).
 - **Constructors do no I/O.** Each feature loads on its first `Refresh` intent, which runs inside its store.
 - **Home and Back** ([ADR 0007](docs/adr/0007-home-back-and-returning.md)).
-  - Back goes to the current view's `on_back`, which closes that feature's topmost open element, or does nothing (HOME-08).
-  - Home on the home closes everything open in the current view, then moves to Applications, then scrolls it to the top (HOME-07).
+  - Back closes Settings, then the home menu, then goes to the current view's `on_back`, which closes that feature's topmost open element, or does nothing (HOME-08).
+  - Home on the home closes Settings, or the home menu and everything open in the current view, then moves to Applications, then scrolls it to the top (HOME-07).
   - Coming back from an app (`Returned`) shows the view the user left. With "Home button opens: Always Applications", Home from an app shows Applications with nothing open (HOME-06).
   - After the system ends the process, the activity's saved state brings back the view and the Applications scroll position (`Restore`, REL-05).
+- **The home menu** ([ADR 0008](docs/adr/0008-the-home-menu.md)). A long-press on empty space opens it in Events and Applications, and enters close mode in Recent (HOME-10, REC-07). It lives in `ShellState.menu`, and its items route to Settings and to Applications' edit mode.
 
 ## Drawing (ADR 0006)
 
 Android's own views draw MeeGone, and the Rust app decides what they show. The decisions are in [ADR 0006](docs/adr/0006-android-views-and-the-carousel.md).
 
 ```
-HomeViews (Java)                                    Rust
-  dispatchTouchEvent ── nativePointer ──▶ ShellIntent::Pointer ─┐
-  Choreographer      ── nativeFrame   ──▶ ShellIntent::Frame   ─┼▶ HomeShell: carousel
-  onSizeChanged      ── nativeLayout  ──▶ ShellIntent::Layout  ─┘   (gesture, spring, indicator)
-                                                                     and return-home motion
-  translationX, scale, alpha ◀── nativeRead(int[]) ◀── ShellView::frame ◀── ShellState
+HomeViews (Java)                                       Rust
+  dispatchTouchEvent ── nativePointer   ──▶ ShellIntent::Pointer   ─┐
+  long-press timer   ── nativeLongPress ──▶ ShellIntent::LongPress ─┤
+  Choreographer      ── nativeFrame     ──▶ ShellIntent::Frame     ─┼▶ HomeShell: carousel
+  onSizeChanged      ── nativeLayout    ──▶ ShellIntent::Layout    ─┘   (gesture, spring,
+                                                                         indicator), home menu
+                                                                         and return-home motion
+  translationX, scale, alpha, menu ◀── nativeRead(int[]) ◀── ShellView::frame ◀── ShellState
 ```
 
 - **Java pulls.** After every touch, frame or layout change, `HomeViews` reads the frame and applies it. It asks `Choreographer` for another frame only while the frame says something moves. Rust never calls Java to draw.
 - **Motion is state.** A moving element's position and velocity live in the state layer, and the motion specs, easing and spring physics in `meegone-core-state::motion`. Time comes in with each event, on the host's monotonic clock, so tests pass explicit times. The return-home motion (ANIM-09) scales and fades the pages, never the background.
 - **Touches.** Every touch reaches the carousel first. The content below keeps a gesture until the carousel takes it: sideways, past the platform's touch slop, from anywhere in the view (HOME-03, HOME-13). An element that uses horizontal drags itself calls `requestDisallowInterceptTouchEvent(true)` first.
-- **Text** is in Android string resources (L10N-01). **Accessibility** comes from Android's views: the home views offer scroll, page and named actions (A11Y-05).
+- **Long-press** (ADR 0008). The host times a finger held still and, on empty space, sends `LongPress`. Empty space is where no clickable or long-clickable element is under the finger, so an element with its own long-press only needs to be clickable. The shell takes it only while the finger is within the touch slop. The home menu and Settings cover the home views: while either is open, the carousel gets no new touches.
+- **Text** is in Android string resources (L10N-01). **Accessibility** comes from Android's views: the home views offer scroll, page and named actions, including "Home menu" (A11Y-05).
 
 ## Platform adapters (ARCH-04)
 
 Everything MeeGone asks of Android goes through eight narrow traits in `meegone-core-data`, handed to the shell once as `Platform`: the seven in `adapters.rs`, and `StorageAdapter` (`storage/`) for MeeGone's own files. Each has a fake in `meegone_core_data::fakes`, so the core logic of MAINT-01 runs and is tested without a device. The decisions behind them are in [ADR 0003](docs/adr/0003-platform-adapters.md) and, for storage, [ADR 0004](docs/adr/0004-persistent-storage.md).
 
-On Android, `meegone_core_data::android` builds the `Platform` ([ADR 0005](docs/adr/0005-android-host-and-home-role.md)). Its adapters ask a Java `Bridge` object through a minimal, hand-written JNI binding. Today only the home-app role, whether the system animates the return home, the clock and storage are real; every other adapter answers with its "If unavailable" value below until its issue builds it.
+On Android, `meegone_core_data::android` builds the `Platform` ([ADR 0005](docs/adr/0005-android-host-and-home-role.md)). Its adapters ask a Java `Bridge` object through a minimal, hand-written JNI binding. Today only the home-app role, whether the system animates the return home, the haptic tick, the clock and storage are real; every other adapter answers with its "If unavailable" value below until its issue builds it.
 
 | Capability (SRS 8.1) | Adapter | Methods | If unavailable |
 |---|---|---|---|
@@ -178,11 +182,14 @@ MeeGone keeps three persistent stores, each in its own file under one private fo
 
 ## Not built yet
 
-The skeleton is from issue #1; the Android host and the home-app role from #4; the carousel of home views from #5; Home, Back and coming back to the home from #6. The following arrive with later requirements:
+The skeleton is from issue #1; the Android host and the home-app role from #4; the carousel of home views from #5; Home, Back and coming back to the home from #6; the home menu from #7. The following arrive with later requirements:
 
-- **Android adapters.** The home-app role, the clock and storage are built (ADR 0005), and the navigation-mode check for the return-home motion (ADR 0007). The app catalogue, notifications, usage, wallpaper, network, scheduling and the remaining device settings are stubs until their issues.
+- **Android adapters.** The home-app role, the clock and storage are built (ADR 0005), as are the navigation-mode check for the return-home motion (ADR 0007) and the haptic tick (ADR 0008). The app catalogue, notifications, usage, wallpaper, network, scheduling and the remaining device settings are stubs until their issues. The ticks on entering edit mode and on creating a folder (ANIM-24) come with #13 and #14.
 - **The daily image.** The Bing implementation of `ImageFeed` (#26) and the updater (SRS 7.5) come with the WALL requirements.
-- **Drawing.** The home views, their carousel, the view indicator and the return-home motion are drawn (ADR 0006, ADR 0007). Each view shows only its name until its content arrives (#9, #19, #22). The Applications grid (#9) will report its scroll position and follow `AppsState.scroll_px`. Settings, including "Home button opens", the home-app banner and first-run setup send intents but aren't drawn yet.
+- **Drawing.** The home views, their carousel, the view indicator, the return-home motion and the home menu are drawn (ADR 0006 to ADR 0008). Each view shows only its name until its content arrives (#9, #19, #22).
+  - The Applications grid (#9) will report its scroll position, follow `AppsState.scroll_px`, and lay out `AppsState::rows`, which ends with an empty row (HOME-14).
+  - Settings covers the home views with only its name, and its group's, until #34 draws it. "Home button opens", the home-app banner and first-run setup send intents but aren't drawn yet.
+  - Edit mode and close mode change state but aren't drawn yet (#13, #24).
 - **First-run setup** comes with the ONB requirements. The lock-screen image step is provided as a `Slot`, like its Settings section.
 
 ## Adding a crate

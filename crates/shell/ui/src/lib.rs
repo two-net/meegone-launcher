@@ -3,8 +3,8 @@
 //! Only the shell depends on other features (ARCH-03).
 //!
 //! It also tells the host what to draw for the home views in each frame, as a [`HomeFrame`]:
-//! where the carousel's views are, how the view indicator looks, and how the content comes back
-//! from an app (ADR 0006, ADR 0007).
+//! where the carousel's views are, how the view indicator looks, how the content comes back
+//! from an app, and the home menu (ADR 0006, ADR 0007, ADR 0008).
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -17,9 +17,19 @@ use meegone_events_ui::EventsView;
 use meegone_lockimage_ui::{ImageCard, ImageSettingsSection};
 use meegone_recent_ui::RecentView;
 use meegone_settings_ui::{HomeBanner, SettingsView};
-use meegone_shell_state::{HomeShell, HomeView, ShellIntent};
+use meegone_shell_state::{HomeShell, HomeView, MenuItem, SettingsGroup, ShellIntent};
 
 type Outbox = Rc<RefCell<VecDeque<ShellIntent>>>;
+
+/// The home menu as the host draws it (HOME-10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MenuFrame {
+    /// What it offers, in order.
+    pub items: &'static [MenuItem],
+    /// Where the finger was held, in whole pixels from the home views' top left, or `None` to
+    /// centre it, when a screen reader opened it (A11Y-05).
+    pub anchor: Option<(i32, i32)>,
+}
 
 /// What the host draws for the home views in one frame (ADR 0006).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,8 +52,19 @@ pub struct HomeFrame {
     pub content_alpha: u8,
     /// Something is still moving or fading, so the host should draw another frame.
     pub animating: bool,
+    /// The home menu, while it is open (HOME-10).
+    pub menu: Option<MenuFrame>,
+    /// The current view offers the home menu and nothing covers it, so screen readers can open
+    /// it with an action (A11Y-05).
+    pub menu_offered: bool,
+    /// Settings covers the home views.
+    pub settings_open: bool,
+    /// The group Settings opened at, or `None` for its top.
+    pub settings_group: Option<SettingsGroup>,
     /// The home views' solid background (HOME-11, THEME-04).
     pub background: Rgb,
+    /// Menus and Settings (THEME-03).
+    pub surface: Rgb,
     /// Text, and the indicator's highlighted segment.
     pub foreground: Rgb,
     /// The indicator's other segments.
@@ -116,7 +137,17 @@ impl ShellView {
             content_scale: (state.return_home.scale.clamp(0.0, 1.0) * 10_000.0).round() as u16,
             content_alpha: (state.return_home.alpha.clamp(0.0, 1.0) * 255.0).round() as u8,
             animating: state.carousel.animating || state.return_home.animating,
+            menu: state.menu.map(|menu| MenuFrame {
+                items: menu.items,
+                anchor: menu
+                    .anchor
+                    .map(|(x, y)| (x.round() as i32, y.round() as i32)),
+            }),
+            menu_offered: state.menu_offered(),
+            settings_open: state.settings_open,
+            settings_group: state.settings_group,
             background: tokens.background,
+            surface: tokens.surface,
             foreground: tokens.text_primary,
             dim: tokens.text_secondary,
         }

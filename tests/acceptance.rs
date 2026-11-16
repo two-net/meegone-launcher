@@ -19,11 +19,13 @@ use meegone_core_data::fakes::{Fakes, app, app_id};
 use meegone_core_data::{HomeTarget, Notification, RecentUse, ThemeChoice};
 use meegone_core_state::{Access, Health, Theme};
 use meegone_launcher::{
-    Direction, HomeView, Launcher, Layout, PointerEvent, PointerKind, ShellIntent,
+    Direction, HomeView, Launcher, Layout, MenuItem, PointerEvent, PointerKind, SettingsGroup,
+    ShellIntent,
 };
 
-/// A phone 1080 px wide at 2.75 px per dp.
+/// A phone 1080 × 2400 px at 2.75 px per dp.
 const WIDTH: f64 = 1080.0;
+const HEIGHT: f64 = 2400.0;
 
 fn notification(key: &str, package: &str) -> Notification {
     Notification {
@@ -77,6 +79,26 @@ fn swipe(launcher: &mut Launcher, clock: &mut u64, from: f64, to: f64, length: u
         }
     }
     panic!("still moving");
+}
+
+/// A finger held still on empty space at `(x, y)` until the host's long-press time passes,
+/// then lifted (HOME-10).
+fn long_press(launcher: &mut Launcher, clock: &mut u64, x: f64, y: f64) {
+    let touch = |launcher: &mut Launcher, kind, at| {
+        launcher.dispatch(ShellIntent::Pointer(PointerEvent {
+            kind,
+            x,
+            y,
+            at: Duration::from_millis(at),
+        }));
+        launcher.frame();
+    };
+    touch(launcher, PointerKind::Down, *clock);
+    *clock += 400;
+    launcher.dispatch(ShellIntent::LongPress);
+    launcher.frame();
+    *clock += 300;
+    touch(launcher, PointerKind::Up, *clock);
 }
 
 fn grid(launcher: &Launcher) -> Vec<String> {
@@ -218,6 +240,83 @@ fn home06_with_always_applications_home_from_an_app_shows_applications() {
     // The content comes back scaled down and faded out (ANIM-09).
     assert_eq!((frame.content_scale, frame.content_alpha), (9_400, 0));
     assert!(frame.animating);
+}
+
+#[test]
+fn home10_long_pressing_the_empty_row_below_a_long_grid_opens_the_home_menu() {
+    // Issue #7, HOME-14. The grid's views (#9) find what is under the finger; here the host
+    // reports a finger held on the empty row. Rows are 96 dp high, four to a row.
+    let fakes = Fakes::default();
+    *fakes.apps.apps.lock().unwrap() = (0..40)
+        .map(|i| app(&format!("app{i:02}"), &format!("App {i:02}")))
+        .collect();
+    let (mut launcher, mut clock) = on_a_phone(&fakes);
+    let row_px = 96.0 * 2.75;
+
+    // Given a grid longer than the screen, which ends with an empty row,
+    let rows = launcher.shell().apps().state().rows(4);
+    assert_eq!(rows, 11);
+    assert!(rows as f64 * row_px > HEIGHT);
+    // when the user scrolls to the bottom and long-presses the empty row,
+    let bottom = rows as f64 * row_px - HEIGHT;
+    launcher.view().apps().grid_scrolled(bottom);
+    launcher.frame();
+    let empty_row = (rows - 1) as f64 * row_px - bottom + row_px / 2.0;
+    long_press(&mut launcher, &mut clock, WIDTH / 2.0, empty_row);
+
+    // then the home menu opens there.
+    let menu = launcher.frame().menu.expect("the home menu is open");
+    assert_eq!(menu.items, MenuItem::ALL);
+    assert_eq!(menu.anchor, Some((540, empty_row.round() as i32)));
+    assert_eq!(*fakes.system.haptic_ticks.lock().unwrap(), 1);
+
+    // Edit applications enters edit mode where the grid was.
+    launcher.dispatch(ShellIntent::ChooseMenuItem(MenuItem::EditApplications));
+    let frame = launcher.frame();
+    assert_eq!(frame.menu, None);
+    assert!(launcher.shell().apps().state().edit_mode);
+    assert_eq!(launcher.shell().apps().state().scroll_px, bottom);
+}
+
+#[test]
+fn home10_in_events_the_home_menu_has_no_edit_applications() {
+    // Issue #7
+    let (mut launcher, mut clock) = on_a_phone(&Fakes::default());
+    swipe(&mut launcher, &mut clock, 200.0, 800.0, 400, 100);
+    assert_eq!(launcher.shell().state().current, HomeView::Events);
+
+    long_press(&mut launcher, &mut clock, 400.0, 1800.0);
+
+    let menu = launcher.frame().menu.expect("the home menu is open");
+    assert_eq!(
+        menu.items,
+        [MenuItem::LauncherSettings, MenuItem::LockScreenImage]
+    );
+
+    // Lock-screen image opens Settings at its group; Back closes it (SET-02, HOME-08).
+    launcher.dispatch(ShellIntent::ChooseMenuItem(MenuItem::LockScreenImage));
+    let frame = launcher.frame();
+    assert!(frame.settings_open);
+    assert_eq!(frame.settings_group, Some(SettingsGroup::LockScreenImage));
+    launcher.dispatch(ShellIntent::Back);
+    let frame = launcher.frame();
+    assert!(!frame.settings_open);
+    assert_eq!(frame.current, HomeView::Events);
+}
+
+#[test]
+fn home10_in_recent_a_long_press_enters_close_mode_instead() {
+    // Issue #7, REC-07
+    let fakes = Fakes::default();
+    let (mut launcher, mut clock) = on_a_phone(&fakes);
+    swipe(&mut launcher, &mut clock, 900.0, 300.0, 400, 100);
+    assert_eq!(launcher.shell().state().current, HomeView::Recent);
+
+    long_press(&mut launcher, &mut clock, 540.0, 1200.0);
+
+    assert_eq!(launcher.frame().menu, None);
+    assert!(launcher.shell().recent().state().close_mode);
+    assert_eq!(*fakes.system.haptic_ticks.lock().unwrap(), 1);
 }
 
 #[test]

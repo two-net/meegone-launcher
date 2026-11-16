@@ -1,10 +1,10 @@
-//! [`SystemConfigAdapter`] on Android: the home-app role, the clock (HOME-01, ONB-04) and
-//! whether the system animates the return home (ANIM-09).
+//! [`SystemConfigAdapter`] on Android: the home-app role, the clock (HOME-01, ONB-04), whether
+//! the system animates the return home (ANIM-09) and the haptic tick (ANIM-24).
 //!
 //! Questions go to the Java `Bridge` object (`android/app/src/main/java/…/Bridge.java`), whose
 //! method names and signatures must stay in step with the ones looked up here. The device
-//! settings, the next alarm, haptics and the browser answer with their "if unavailable" values
-//! until their issues build them.
+//! settings, the next alarm and the browser answer with their "if unavailable" values until
+//! their issues build them.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -24,6 +24,8 @@ pub struct AndroidSystem {
     utc_offset_ms: MethodId,
     /// `boolean animatesReturnHome()`
     animates_return_home: MethodId,
+    /// `boolean hapticTick()`: whether a view could play it.
+    haptic_tick: MethodId,
 }
 
 impl AndroidSystem {
@@ -39,6 +41,7 @@ impl AndroidSystem {
             )?,
             utc_offset_ms: env.method_id(bridge, c"utcOffsetMs", c"(J)J")?,
             animates_return_home: env.method_id(bridge, c"animatesReturnHome", c"()Z")?,
+            haptic_tick: env.method_id(bridge, c"hapticTick", c"()Z")?,
             bridge: env.global_ref(bridge)?,
         })
     }
@@ -108,8 +111,13 @@ impl SystemConfigAdapter for AndroidSystem {
         Err(not_yet())
     }
 
+    /// Played by a view, so it follows the system's touch-feedback setting and needs no
+    /// permission (SEC-03). Nothing happens if it can't be played.
     fn haptic_tick(&self) {
-        // Haptics arrive with the long-press menu, #12.
+        let _played = self
+            .vm
+            .env()
+            .and_then(|env| env.call_bool(&self.bridge, self.haptic_tick, &[]));
     }
 
     fn has_browser(&self) -> bool {

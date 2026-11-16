@@ -10,10 +10,11 @@ mod android;
 
 pub use meegone_core_data::Platform;
 pub use meegone_shell_state::{
-    Direction, HomeShell, HomeView, Layout, PointerEvent, PointerKind, SavedHome, ShellIntent,
+    Direction, HomeMenu, HomeShell, HomeView, Layout, MenuItem, PointerEvent, PointerKind,
+    SavedHome, SettingsGroup, ShellIntent,
 };
-pub use meegone_shell_ui::HomeFrame;
 use meegone_shell_ui::ShellView;
+pub use meegone_shell_ui::{HomeFrame, MenuFrame};
 
 pub struct Launcher {
     shell: HomeShell,

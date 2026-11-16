@@ -3,4 +3,5 @@
     <!-- The home views' screen-reader actions (A11Y-05). -->
     <item name="action_next_view" type="id" />
     <item name="action_previous_view" type="id" />
+    <item name="action_home_menu" type="id" />
 </resources>

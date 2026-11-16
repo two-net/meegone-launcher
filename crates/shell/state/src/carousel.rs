@@ -65,6 +65,9 @@ pub struct CarouselState {
     pub indicator: f64,
     /// A finger is moving the row, so the content below gets no touches.
     pub dragging: bool,
+    /// A long-press took the finger that is down (HOME-10): neither the row nor the content
+    /// below gets the rest of its gesture, so lifting it never taps anything.
+    pub held: bool,
     /// Something is still moving or fading, so the host should draw another frame.
     pub animating: bool,
 }
@@ -78,6 +81,7 @@ impl Default for CarouselState {
             wrap: true,
             indicator: 0.0,
             dragging: false,
+            held: false,
             animating: false,
         }
     }
@@ -146,6 +150,8 @@ enum Gesture {
     /// The finger moved vertically first, so the content below keeps the gesture until it
     /// lifts.
     Declined,
+    /// A long-press took the gesture (HOME-10): nothing gets the rest of it until it lifts.
+    Held,
     /// The finger moves the row. At `origin_x` the row was at `start`; `travel` is how far the
     /// finger has moved since, in widths. Both are before the stretch past an end.
     Dragging {
@@ -306,7 +312,8 @@ impl Carousel {
     }
 
     /// Ends the gesture in progress, if any, as if the system had cancelled it: something now
-    /// covers the home views, or their layout changed.
+    /// covers the home views, or their layout changed. A gesture a long-press took stays taken
+    /// until the finger lifts.
     pub fn end_gesture(&mut self, current: HomeView) -> Option<Release> {
         let release = match self.gesture {
             Gesture::Dragging { .. } => Some(self.release(self.now, current, false)),
@@ -314,10 +321,23 @@ impl Carousel {
                 self.gesture = Gesture::Idle;
                 None
             }
-            Gesture::Idle | Gesture::Settling { .. } => None,
+            Gesture::Idle | Gesture::Settling { .. } | Gesture::Held => None,
         };
         self.publish();
         release
+    }
+
+    /// The finger has stayed down on empty space for the platform's long-press time, as the
+    /// host measures it (HOME-10). It counts only while the gesture is still a press: down, not
+    /// past the touch slop, not dragging or catching the row. Returns where the finger went
+    /// down, and takes the rest of the gesture from the row and the content below.
+    pub fn long_press(&mut self) -> Option<(f64, f64)> {
+        let Gesture::Pressed { x, y } = self.gesture else {
+            return None;
+        };
+        self.gesture = Gesture::Held;
+        self.publish();
+        Some((x, y))
     }
 
     /// Follows the finger (HOME-03, ANIM-01). Returns where the row settles when a drag ends.
@@ -351,7 +371,7 @@ impl Carousel {
             }
             (
                 PointerKind::Up | PointerKind::Cancel,
-                Gesture::Pressed { .. } | Gesture::Declined,
+                Gesture::Pressed { .. } | Gesture::Declined | Gesture::Held,
             ) => {
                 self.gesture = Gesture::Idle;
                 None
@@ -540,6 +560,7 @@ impl Carousel {
     fn publish(&mut self) {
         self.state.indicator = self.indicator.opacity;
         self.state.dragging = matches!(self.gesture, Gesture::Dragging { .. });
+        self.state.held = self.gesture == Gesture::Held;
         self.state.animating =
             matches!(self.gesture, Gesture::Settling { .. }) || self.indicator.is_animating();
     }
@@ -1196,6 +1217,84 @@ mod tests {
                 assert!(at < 60_000, "{scale}: still moving");
             }
         }
+    }
+
+    #[test]
+    fn a_long_press_counts_only_while_the_finger_is_still_a_press() {
+        // HOME-10: a finger that moved past the touch slop scrolls or drags instead.
+        let fakes = Fakes::default();
+        let ticks = || *fakes.system.haptic_ticks.lock().unwrap();
+        let held = |shell: &mut HomeShell| {
+            shell.dispatch(ShellIntent::LongPress);
+            shell.state().carousel.held
+        };
+
+        // Before the host has laid the views out.
+        let mut unlaid = HomeShell::compose(fakes.platform());
+        touch(&mut unlaid, PointerKind::Down, 500.0, 0);
+        assert!(!held(&mut unlaid));
+
+        let mut shell = laid_out(&fakes, false);
+        // Up or down past the slop.
+        touch(&mut shell, PointerKind::Down, 500.0, 0);
+        shell.dispatch(ShellIntent::Pointer(PointerEvent {
+            kind: PointerKind::Move,
+            x: 500.0,
+            y: 830.0,
+            at: ms(8),
+        }));
+        assert!(!held(&mut shell));
+        touch(&mut shell, PointerKind::Up, 500.0, 16);
+
+        // Sideways past the slop.
+        touch(&mut shell, PointerKind::Down, 500.0, 100);
+        touch(&mut shell, PointerKind::Move, 480.0, 200);
+        assert!(shell.state().carousel.dragging);
+        assert!(!held(&mut shell));
+        touch(&mut shell, PointerKind::Up, 480.0, 300);
+        let rested = settle(&mut shell, 300);
+
+        // Lifted already.
+        touch(&mut shell, PointerKind::Down, 500.0, rested + 100);
+        touch(&mut shell, PointerKind::Up, 500.0, rested + 150);
+        assert!(!held(&mut shell));
+
+        // Catching the moving row.
+        shell.dispatch(ShellIntent::Swipe(Direction::Next));
+        touch(&mut shell, PointerKind::Down, 500.0, rested + 200);
+        assert!(!held(&mut shell));
+        touch(&mut shell, PointerKind::Up, 500.0, rested + 250);
+        let rested = settle(&mut shell, rested + 250);
+        assert_eq!(ticks(), 0);
+
+        // Still, within the slop.
+        touch(&mut shell, PointerKind::Down, 500.0, rested + 100);
+        touch(&mut shell, PointerKind::Move, 508.0, rested + 108);
+        assert!(held(&mut shell));
+        assert_eq!(ticks(), 1);
+    }
+
+    #[test]
+    fn after_a_long_press_the_finger_moves_nothing_until_it_lifts() {
+        // HOME-10, REC-07: in Recent, which has no menu to cover the views.
+        let mut shell = shell();
+        shell.dispatch(ShellIntent::Swipe(Direction::Next));
+        settle(&mut shell, 0);
+        touch(&mut shell, PointerKind::Down, 500.0, 1000);
+        shell.dispatch(ShellIntent::LongPress);
+        assert!(shell.recent().state().close_mode);
+
+        touch(&mut shell, PointerKind::Move, 100.0, 1008);
+        touch(&mut shell, PointerKind::Move, 50.0, 1016);
+        let carousel = shell.state().carousel;
+        assert!(carousel.held);
+        assert!(!carousel.dragging);
+        assert_eq!(carousel.offset, 0.0);
+
+        touch(&mut shell, PointerKind::Up, 50.0, 1024);
+        assert!(!shell.state().carousel.held);
+        drag(&mut shell, 600.0, 300.0, 2000, 80);
+        assert!(shell.state().carousel.dragging);
     }
 
     #[test]

@@ -12,6 +12,7 @@ import android.os.Build;
 import android.os.SystemClock;
 import android.provider.Settings;
 import android.util.Log;
+import android.view.HapticFeedbackConstants;
 import android.view.View;
 import android.view.WindowInsets;
 import java.util.TimeZone;
@@ -163,6 +164,23 @@ final class Bridge {
         } catch (RuntimeException e) {
             Log.w(TAG, "Couldn't check the navigation mode", e);
             return true;
+        }
+    }
+
+    /**
+     * A light haptic tick, as on a long-press (ANIM-24). A view plays it, so it follows the
+     * system's touch-feedback setting and needs no permission (SEC-03). Returns whether a view
+     * could play it. Called from Rust.
+     */
+    boolean hapticTick() {
+        Activity current = activity;
+        try {
+            View decor = current == null ? null : current.getWindow().peekDecorView();
+            return decor != null
+                    && decor.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Couldn't play the haptic tick", e);
+            return false;
         }
     }
 

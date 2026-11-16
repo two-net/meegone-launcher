@@ -12,4 +12,16 @@
     <!-- Screen-reader actions that switch home views without a gesture (A11Y-05). -->
     <string name="action_next_view">Next view</string>
     <string name="action_previous_view">Previous view</string>
+
+    <!-- The home menu, opened by a long-press on empty space in Events or Applications
+         (HOME-10). Screen readers announce its title and open it with the action
+         (A11Y-05). -->
+    <string name="home_menu">Home menu</string>
+    <string name="action_home_menu">Home menu</string>
+    <string name="menu_launcher_settings">Launcher settings</string>
+    <string name="menu_lock_screen_image">Lock-screen image</string>
+    <string name="menu_edit_applications">Edit applications</string>
+
+    <!-- Settings' title (SET-01). -->
+    <string name="settings_title">Launcher settings</string>
 </resources>

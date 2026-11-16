@@ -1,8 +1,12 @@
 package io.github.twonet.meegone;
 
 import android.content.Context;
+import android.content.res.ColorStateList;
 import android.graphics.Color;
+import android.graphics.Matrix;
+import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.RippleDrawable;
 import android.os.Build;
 import android.os.Bundle;
 import android.util.TypedValue;
@@ -11,8 +15,10 @@ import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewConfiguration;
+import android.view.ViewGroup;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
+import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
 import android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction;
 import android.widget.FrameLayout;
@@ -22,15 +28,19 @@ import android.widget.TextView;
 /**
  * The three home views, Events, Applications and Recent, in a wrap-around carousel (HOME-02 to
  * HOME-04), drawn with Android's own views (ADR 0006). They come back from an app with a short
- * scale and fade (ANIM-09, ADR 0007).
+ * scale and fade (ANIM-09, ADR 0007). A long-press on empty space opens the home menu, or enters
+ * close mode in Recent (HOME-10, ADR 0008).
  *
- * <p>The Rust app owns the gesture, the motion and the view indicator. This view passes it every
- * touch, frame time and layout change, then reads what to draw with {@link #nativeRead} and
- * applies it. It keeps nothing else. The frame slots below must stay in step with {@code
- * frame_slots} in {@code src/android.rs}.
+ * <p>The Rust app owns the gesture, the motion, the view indicator and the home menu. This view
+ * passes it every touch, frame time and layout change, says when a finger has been held on
+ * empty space, then reads what to draw with {@link #nativeRead} and applies it. It keeps nothing
+ * else. The frame slots below must stay in step with {@code frame_slots} in {@code
+ * src/android.rs}.
  *
  * <p>An element inside a view that uses horizontal drags itself keeps them by calling {@link
- * #requestDisallowInterceptTouchEvent} before the carousel takes the gesture (HOME-03).
+ * #requestDisallowInterceptTouchEvent} before the carousel takes the gesture (HOME-03). An
+ * element with its own long-press is clickable or long-clickable, so a long-press on it never
+ * opens the home menu.
  */
 final class HomeViews extends FrameLayout implements Choreographer.FrameCallback {
     // The slots of the frame that nativeRead fills.
@@ -44,12 +54,27 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private static final int DIM = 9; // ARGB
     private static final int CONTENT_SCALE = 10; // ten-thousandths; 10 000 at rest
     private static final int CONTENT_ALPHA = 11; // 0 to 255
-    private static final int FRAME_SIZE = 12;
+    private static final int MENU = 12; // the home menu's items as bits 1 << item; 0 if closed
+    private static final int MENU_OFFERED = 13; // 1 when the current view offers the menu
+    private static final int MENU_X = 14; // px from the left, or -1 to centre
+    private static final int MENU_Y = 15; // px from the top, or -1 to centre
+    private static final int SURFACE = 16; // ARGB
+    private static final int SETTINGS = 17; // 0 closed, 1 open, 2 at Lock-screen image
+    private static final int FRAME_SIZE = 18;
 
     private static final int VIEWS = 3;
     private static final int[] NAMES = {
         R.string.view_events, R.string.view_applications, R.string.view_recent
     };
+    /** The home menu's items, in the order of {@code MenuItem::ALL}. */
+    private static final int[] MENU_ITEMS = {
+        R.string.menu_launcher_settings,
+        R.string.menu_lock_screen_image,
+        R.string.menu_edit_applications
+    };
+    /** Passed to {@link #nativeMenu} for a touch outside the menu. */
+    private static final int CLOSE_MENU = -1;
+    private static final int SETTINGS_AT_LOCK_SCREEN_IMAGE = 2;
 
     private final int[] frame = new int[FRAME_SIZE];
     private final FrameLayout[] pages = new FrameLayout[VIEWS];
@@ -63,27 +88,51 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
      * no size or no opacity isn't.
      */
     private final TextView status;
+    /** Covers the home views while Settings is open. Until #34 draws it, it shows its name. */
+    private final LinearLayout settings;
+    private final TextView settingsTitle;
+    private final TextView settingsGroup;
+    /** The home menu (HOME-10): a card at the finger, over the home views. */
+    private final LinearLayout menu;
+    private final GradientDrawable menuCard;
+    private final TextView[] menuItems = new TextView[MENU_ITEMS.length];
     private final int indicatorMargin;
+    private final int menuMargin;
     private final int touchSlop;
+    /** Asks the Rust app about a finger held on empty space (HOME-10). */
+    private final Runnable longPress = this::longPressed;
+    private final Matrix inverse = new Matrix();
+    private final float[] point = new float[2];
 
-    /** Whether the carousel has taken the current gesture from the content. */
+    /** Whether the carousel, or a long-press, has taken the current gesture from the content. */
     private boolean claimed;
     /** A child element claimed the current gesture, so the carousel gets none of it. */
     private boolean childClaimed;
+    /** The current gesture began outside the open menu: it closed the menu and goes nowhere. */
+    private boolean swallowing;
     /** The finger that drives the carousel. */
     private int pointerId = MotionEvent.INVALID_POINTER_ID;
+    /** Where the driving finger went down, for finding what is under it after a long-press. */
+    private float downX;
+    private float downY;
     private boolean framePosted;
     private int announced = -1;
     private int selected = -1;
     private int background;
+    private int surface;
     private int foreground;
     private int dim;
+    private int menuShown;
+    private int settingsShown;
+    private int menuOffered = -1;
+    private int topInset;
 
     HomeViews(Context context) {
         super(context);
         touchSlop = ViewConfiguration.get(context).getScaledTouchSlop();
         indicatorMargin = dp(12);
-        // Carries the screen-reader actions that switch views (A11Y-05).
+        menuMargin = dp(16);
+        // Carries the screen-reader actions that switch views and open the menu (A11Y-05).
         setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_YES);
 
         for (int i = 0; i < VIEWS; i++) {
@@ -128,6 +177,58 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         status.setTextColor(Color.TRANSPARENT);
         status.setAccessibilityLiveRegion(ACCESSIBILITY_LIVE_REGION_POLITE);
         addView(status, new LayoutParams(1, 1, Gravity.TOP | Gravity.START));
+
+        settings = new LinearLayout(context);
+        settings.setOrientation(LinearLayout.VERTICAL);
+        settings.setGravity(Gravity.CENTER);
+        // Touches on Settings stay there.
+        settings.setClickable(true);
+        settings.setVisibility(GONE);
+        settings.setAccessibilityPaneTitle(getResources().getString(R.string.settings_title));
+        settingsTitle = new TextView(context);
+        settingsTitle.setText(R.string.settings_title);
+        settingsTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 28);
+        settings.addView(settingsTitle, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+        settingsGroup = new TextView(context);
+        settingsGroup.setText(R.string.menu_lock_screen_image);
+        settingsGroup.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
+        settingsGroup.setVisibility(GONE);
+        settings.addView(settingsGroup, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+        addView(settings, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
+
+        menu = new LinearLayout(context);
+        menu.setOrientation(LinearLayout.VERTICAL);
+        menu.setPadding(0, dp(8), 0, dp(8));
+        menuCard = new GradientDrawable();
+        menuCard.setCornerRadius(dp(16));
+        menu.setBackground(menuCard);
+        menu.setClipToOutline(true);
+        menu.setElevation(dp(8));
+        menu.setVisibility(GONE);
+        menu.setAccessibilityPaneTitle(getResources().getString(R.string.home_menu));
+        for (int i = 0; i < MENU_ITEMS.length; i++) {
+            TextView item = new TextView(context);
+            item.setText(MENU_ITEMS[i]);
+            item.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
+            item.setGravity(Gravity.CENTER_VERTICAL | Gravity.START);
+            item.setMinHeight(dp(48));
+            item.setMinWidth(dp(200));
+            item.setPaddingRelative(dp(24), 0, dp(24), 0);
+            int index = i;
+            item.setOnClickListener(view -> {
+                nativeMenu(index);
+                apply();
+            });
+            menu.addView(item, new LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT));
+            menuItems[i] = item;
+        }
+        // Placed from the left whatever the layout direction; placeMenu mirrors it.
+        addView(menu, new LayoutParams(
+                LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT, Gravity.TOP | Gravity.LEFT));
     }
 
     /** MeeGone came to the foreground; another activity may have moved the carousel. */
@@ -162,7 +263,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         }
     }
 
-    /** Keeps the indicator below the status bar and any display cut-out. */
+    /** Keeps the indicator and the menu below the status bar and any display cut-out. */
     @Override
     @SuppressWarnings("deprecation") // The only way on Android 10.
     public WindowInsets onApplyWindowInsets(WindowInsets insets) {
@@ -173,6 +274,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         } else {
             top = insets.getSystemWindowInsetTop();
         }
+        topInset = top;
         LayoutParams params = (LayoutParams) indicator.getLayoutParams();
         if (params.topMargin != top + indicatorMargin) {
             params.topMargin = top + indicatorMargin;
@@ -182,16 +284,26 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     }
 
     // Every touch reaches the carousel once, here; the content below gets it too until the
-    // carousel takes the gesture.
+    // carousel or a long-press takes the gesture. While the home menu is open, a touch outside
+    // it closes it and goes nowhere.
     @Override
     public boolean dispatchTouchEvent(MotionEvent event) {
         if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
             childClaimed = false;
+            swallowing = frame[MENU] != 0 && !isOver(menu, event.getX(), event.getY());
+            if (swallowing) {
+                nativeMenu(CLOSE_MENU);
+                apply();
+            }
+        }
+        if (swallowing) {
+            return true;
         }
         if (!childClaimed) {
             claimed = forward(event);
             apply();
         }
+        watchForLongPress(event);
         return super.dispatchTouchEvent(event);
     }
 
@@ -211,6 +323,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         super.requestDisallowInterceptTouchEvent(disallow);
         if (disallow && !claimed && !childClaimed) {
             childClaimed = true;
+            removeCallbacks(longPress);
             nativePointer(MotionEvent.ACTION_CANCEL, 0f, 0f, System.nanoTime());
             apply();
         }
@@ -254,6 +367,87 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         }
     }
 
+    /**
+     * Times a finger held still, as Android's own views do: the system's long-press time follows
+     * the accessibility touch-and-hold delay. Lifting it, a second finger, or the carousel or a
+     * child taking the gesture stops the wait. Whether it moved too far is the Rust app's call.
+     */
+    private void watchForLongPress(MotionEvent event) {
+        switch (event.getActionMasked()) {
+            case MotionEvent.ACTION_DOWN:
+                removeCallbacks(longPress);
+                if (!claimed && frame[MENU] == 0 && frame[SETTINGS] == 0) {
+                    downX = event.getX();
+                    downY = event.getY();
+                    postDelayed(longPress, ViewConfiguration.getLongPressTimeout());
+                }
+                break;
+            case MotionEvent.ACTION_MOVE:
+                if (claimed || childClaimed) {
+                    removeCallbacks(longPress);
+                }
+                break;
+            default:
+                removeCallbacks(longPress);
+        }
+    }
+
+    /**
+     * The finger has been held long enough. On empty space, the Rust app decides: the home menu
+     * or close mode (HOME-10). If it takes the long-press, the content gets no more of the
+     * gesture, so lifting the finger taps nothing.
+     */
+    private void longPressed() {
+        if (claimed || childClaimed || handlesTouch(this, pages[frame[CURRENT]], downX, downY)) {
+            return;
+        }
+        claimed = nativeLongPress();
+        apply();
+    }
+
+    /**
+     * Whether {@code child}, or anything inside it, handles touches itself at ({@code x}, {@code
+     * y}) in {@code parent}'s coordinates: an element that is clickable or long-clickable. Any
+     * other point is empty space (HOME-10).
+     */
+    private boolean handlesTouch(ViewGroup parent, View child, float x, float y) {
+        if (child.getVisibility() != VISIBLE) {
+            return false;
+        }
+        point[0] = x + parent.getScrollX() - child.getLeft();
+        point[1] = y + parent.getScrollY() - child.getTop();
+        Matrix matrix = child.getMatrix();
+        if (!matrix.isIdentity() && matrix.invert(inverse)) {
+            inverse.mapPoints(point);
+        }
+        float localX = point[0];
+        float localY = point[1];
+        if (localX < 0 || localY < 0 || localX >= child.getWidth()
+                || localY >= child.getHeight()) {
+            return false;
+        }
+        // The page itself is the empty space.
+        if (parent != this && (child.isClickable() || child.isLongClickable())) {
+            return true;
+        }
+        if (child instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) child;
+            for (int i = group.getChildCount() - 1; i >= 0; i--) {
+                if (handlesTouch(group, group.getChildAt(i), localX, localY)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /** Whether ({@code x}, {@code y}) in this view's coordinates falls on {@code child}. */
+    private static boolean isOver(View child, float x, float y) {
+        float left = child.getLeft() + child.getTranslationX();
+        float top = child.getTop() + child.getTranslationY();
+        return x >= left && x < left + child.getWidth() && y >= top && y < top + child.getHeight();
+    }
+
     @Override
     public void doFrame(long frameTimeNanos) {
         framePosted = false;
@@ -273,6 +467,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     protected void onDetachedFromWindow() {
         Choreographer.getInstance().removeFrameCallback(this);
         framePosted = false;
+        removeCallbacks(longPress);
         super.onDetachedFromWindow();
     }
 
@@ -299,12 +494,26 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             setBackgroundColor(background);
             matchSystemBars(background);
         }
-        boolean coloursChanged = frame[FOREGROUND] != foreground || frame[DIM] != dim;
+        boolean coloursChanged = frame[FOREGROUND] != foreground || frame[DIM] != dim
+                || frame[SURFACE] != surface;
         if (coloursChanged) {
             foreground = frame[FOREGROUND];
             dim = frame[DIM];
+            surface = frame[SURFACE];
             for (TextView title : titles) {
                 title.setTextColor(foreground);
+            }
+            settings.setBackgroundColor(surface);
+            settingsTitle.setTextColor(foreground);
+            settingsGroup.setTextColor(dim);
+            menuCard.setColor(surface);
+            // A pressed item shows a light wash of the text colour.
+            ColorStateList pressed = ColorStateList.valueOf(
+                    (foreground & 0x00FFFFFF) | 0x1F000000);
+            for (TextView item : menuItems) {
+                item.setTextColor(foreground);
+                item.setBackground(
+                        new RippleDrawable(pressed, null, new ColorDrawable(Color.WHITE)));
             }
         }
         if (coloursChanged || frame[INDICATOR_SELECTED] != selected) {
@@ -320,9 +529,103 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             status.setText(getResources().getString(R.string.view_position,
                     getResources().getString(NAMES[current]), current + 1, VIEWS));
         }
+        applySettings();
+        applyMenu();
+        if (frame[MENU_OFFERED] != menuOffered) {
+            // Screen readers ask again which actions the home views offer.
+            menuOffered = frame[MENU_OFFERED];
+            sendAccessibilityEvent(AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED);
+        }
         if (frame[ANIMATING] != 0 && !framePosted && isAttachedToWindow()) {
             framePosted = true;
             Choreographer.getInstance().postFrameCallback(this);
+        }
+    }
+
+    /** Shows Settings over the home views while it is open; until #34, only its name. */
+    private void applySettings() {
+        if (frame[SETTINGS] == settingsShown) {
+            return;
+        }
+        settingsShown = frame[SETTINGS];
+        settings.setVisibility(settingsShown != 0 ? VISIBLE : GONE);
+        settingsGroup.setVisibility(
+                settingsShown == SETTINGS_AT_LOCK_SCREEN_IMAGE ? VISIBLE : GONE);
+        hidePagesFromScreenReaders();
+    }
+
+    /** Shows the home menu with the items it offers, where the Rust app says (HOME-10). */
+    private void applyMenu() {
+        int items = frame[MENU];
+        if (items != 0) {
+            for (int i = 0; i < menuItems.length; i++) {
+                menuItems[i].setVisibility((items & (1 << i)) != 0 ? VISIBLE : GONE);
+            }
+            menu.setVisibility(VISIBLE);
+            placeMenu(frame[MENU_X], frame[MENU_Y]);
+        } else {
+            menu.setVisibility(GONE);
+        }
+        if (items != menuShown) {
+            boolean opened = menuShown == 0;
+            menuShown = items;
+            hidePagesFromScreenReaders();
+            if (opened) {
+                // A screen reader moves to the first item (A11Y-05).
+                menu.post(() -> {
+                    for (TextView item : menuItems) {
+                        if (item.getVisibility() == VISIBLE) {
+                            item.performAccessibilityAction(
+                                    AccessibilityNodeInfo.ACTION_ACCESSIBILITY_FOCUS, null);
+                            return;
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    /**
+     * Opens the menu where the finger was held: from there towards the end of the line, and
+     * above the finger if there is no room below. Without a finger, it is centred. Either way it
+     * stays inside the home views, below the status bar.
+     */
+    private void placeMenu(int anchorX, int anchorY) {
+        int width = getWidth();
+        int height = getHeight();
+        menu.measure(
+                MeasureSpec.makeMeasureSpec(Math.max(0, width - 2 * menuMargin),
+                        MeasureSpec.AT_MOST),
+                MeasureSpec.makeMeasureSpec(Math.max(0, height - 2 * menuMargin),
+                        MeasureSpec.AT_MOST));
+        int menuWidth = menu.getMeasuredWidth();
+        int menuHeight = menu.getMeasuredHeight();
+        float x;
+        float y;
+        if (anchorX < 0 || anchorY < 0) {
+            x = (width - menuWidth) / 2f;
+            y = (height - menuHeight) / 2f;
+        } else {
+            boolean rtl = getLayoutDirection() == LAYOUT_DIRECTION_RTL;
+            x = rtl ? anchorX - menuWidth : anchorX;
+            y = anchorY + menuHeight <= height - menuMargin ? anchorY : anchorY - menuHeight;
+        }
+        menu.setTranslationX(within(x, menuMargin, width - menuWidth - menuMargin));
+        menu.setTranslationY(
+                within(y, topInset + menuMargin, height - menuHeight - menuMargin));
+    }
+
+    private static float within(float value, float low, float high) {
+        return Math.max(low, Math.min(value, high));
+    }
+
+    /** While the menu or Settings covers the home views, screen readers skip them. */
+    private void hidePagesFromScreenReaders() {
+        int importance = menuShown != 0 || settingsShown != 0
+                ? IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+                : IMPORTANT_FOR_ACCESSIBILITY_AUTO;
+        for (FrameLayout page : pages) {
+            page.setImportantForAccessibility(importance);
         }
     }
 
@@ -344,7 +647,8 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         }
     }
 
-    // Screen readers switch views with actions instead of gestures (A11Y-05).
+    // Screen readers switch views and open the home menu with actions instead of gestures
+    // (A11Y-05).
     @Override
     public void onInitializeAccessibilityNodeInfo(AccessibilityNodeInfo info) {
         super.onInitializeAccessibilityNodeInfo(info);
@@ -357,10 +661,19 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
                 R.id.action_next_view, getResources().getString(R.string.action_next_view)));
         info.addAction(new AccessibilityAction(R.id.action_previous_view,
                 getResources().getString(R.string.action_previous_view)));
+        if (frame[MENU_OFFERED] != 0) {
+            info.addAction(new AccessibilityAction(
+                    R.id.action_home_menu, getResources().getString(R.string.action_home_menu)));
+        }
     }
 
     @Override
     public boolean performAccessibilityAction(int action, Bundle arguments) {
+        if (action == R.id.action_home_menu) {
+            boolean opened = nativeOpenMenu();
+            apply();
+            return opened;
+        }
         boolean rtl = getLayoutDirection() == LAYOUT_DIRECTION_RTL;
         Boolean next = null;
         if (action == AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
@@ -405,7 +718,8 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
 
     /**
      * The driving finger, with a {@code MotionEvent} action and a time in the {@code
-     * System.nanoTime()} base. Returns whether the carousel has taken the gesture.
+     * System.nanoTime()} base. Returns whether the carousel or a long-press has taken the
+     * gesture.
      */
     private native boolean nativePointer(int action, float x, float y, long timeNanos);
 
@@ -417,6 +731,18 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
      * an end with wrap-around off.
      */
     private native boolean nativeShow(boolean next);
+
+    /**
+     * The driving finger has been held on empty space for the system's long-press time. Returns
+     * whether the long-press was taken, so the content gets no more of the gesture.
+     */
+    private native boolean nativeLongPress();
+
+    /** Opens the home menu without a gesture. Returns false if the current view has none. */
+    private native boolean nativeOpenMenu();
+
+    /** An item of the home menu was chosen, 0 to 2, or {@link #CLOSE_MENU}. */
+    private native void nativeMenu(int item);
 
     /** Fills {@code frame} with what to draw now, in the slots above. */
     private native void nativeRead(int[] frame);

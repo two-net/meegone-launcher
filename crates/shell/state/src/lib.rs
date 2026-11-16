@@ -1,10 +1,11 @@
-//! Home shell state (SRS 4.1): the carousel of views, Home and Back, coming back to the home,
-//! and the theme.
+//! Home shell state (SRS 4.1): the carousel of views, the home menu, Home and Back, coming back
+//! to the home, and the theme.
 //!
 //! [`HomeShell::compose`] is the only place features are put together (ARCH-03). Each feature
 //! runs in its own [`Store`], so a failing feature never takes down the shell (ARCH-09).
 
 mod carousel;
+mod home_menu;
 mod return_home;
 
 use std::sync::Arc;
@@ -24,6 +25,8 @@ use meegone_settings_state::{SettingsHolder, SettingsIntent, SettingsState};
 
 use carousel::{Carousel, Release};
 pub use carousel::{CarouselState, Layout, PointerEvent, PointerKind};
+pub use home_menu::{HomeMenu, MenuItem};
+pub use meegone_settings_state::SettingsGroup;
 use return_home::ReturnHome;
 pub use return_home::ReturnHomeState;
 
@@ -85,7 +88,13 @@ impl HomeView {
 pub struct ShellState {
     /// The view on screen, or the one the carousel is settling on.
     pub current: HomeView,
+    /// Settings covers the home views.
     pub settings_open: bool,
+    /// The group Settings opened at, or `None` for its top.
+    pub settings_group: Option<SettingsGroup>,
+    /// The home menu, open over the current view (HOME-10). It covers the home views: they get
+    /// no touches while it is open.
+    pub menu: Option<HomeMenu>,
     pub carousel: CarouselState,
     /// The home content's scale and opacity while it comes back from an app (ANIM-09).
     pub return_home: ReturnHomeState,
@@ -101,6 +110,12 @@ impl ShellState {
     /// (HOME-09).
     pub fn nearest_view(&self) -> HomeView {
         self.carousel.nearest(self.current)
+    }
+
+    /// Whether the current view offers the home menu now, which it can open without a gesture
+    /// (A11Y-05): Events and Applications do, while nothing covers them.
+    pub fn menu_offered(&self) -> bool {
+        !self.settings_open && self.menu.is_none() && HomeMenu::items_for(self.current).is_some()
     }
 }
 
@@ -128,7 +143,19 @@ pub enum ShellIntent {
     Home,
     /// The system Back action (HOME-08).
     Back,
-    /// Chosen from the home menu (HOME-10, SET-01).
+    /// The finger that is down has stayed on empty space for the platform's long-press time
+    /// (HOME-10). The host sends it only where no element under the finger has its own
+    /// long-press; the shell takes it only if the finger hasn't moved past the touch slop. In
+    /// Events and Applications it opens the home menu, and in Recent it enters close mode
+    /// (REC-07).
+    LongPress,
+    /// Opens the home menu without a gesture, from a screen-reader action (A11Y-05).
+    OpenMenu,
+    /// A touch outside the home menu closes it.
+    CloseMenu,
+    /// An item of the home menu was chosen (HOME-10).
+    ChooseMenuItem(MenuItem),
+    /// Opens Settings at its top (SET-01).
     OpenSettings,
     /// MeeGone came to the foreground: at start, after the system's role dialog, or back from
     /// another app or a settings screen. The default home app or the day may have changed
@@ -280,6 +307,10 @@ impl HomeShell {
         match intent {
             ShellIntent::Swipe(direction) => self.swipe(direction),
             ShellIntent::Layout(layout) => {
+                if layout != self.state.carousel.layout {
+                    // The menu opened where the finger was, which no longer fits.
+                    self.state.menu = None;
+                }
                 let release = self.carousel.layout(layout, self.state.current);
                 self.settle(release);
             }
@@ -288,8 +319,10 @@ impl HomeShell {
                     // A touch never waits for the return motion (ANIM-03).
                     self.return_home.finish();
                 }
-                // Settings covers the home views.
-                if !self.state.settings_open {
+                // Settings and the home menu cover the home views, but a finger that was
+                // already down may still lift.
+                let covered = self.state.settings_open || self.state.menu.is_some();
+                if !covered || matches!(event.kind, PointerKind::Up | PointerKind::Cancel) {
                     let release = self.carousel.pointer(event, self.state.current);
                     self.settle(release);
                 }
@@ -300,13 +333,11 @@ impl HomeShell {
             }
             ShellIntent::Home => self.home(),
             ShellIntent::Back => self.back(),
-            ShellIntent::OpenSettings => {
-                // Settings covers the home views, so a drag on them ends.
-                let release = self.carousel.end_gesture(self.state.current);
-                self.settle(release);
-                self.settings.dispatch(SettingsIntent::Refresh);
-                self.state.settings_open = true;
-            }
+            ShellIntent::LongPress => self.long_press(),
+            ShellIntent::OpenMenu => self.open_menu(None),
+            ShellIntent::CloseMenu => self.state.menu = None,
+            ShellIntent::ChooseMenuItem(item) => self.choose(item),
+            ShellIntent::OpenSettings => self.open_settings(None),
             ShellIntent::Resumed => {
                 self.settings.dispatch(SettingsIntent::Refresh);
                 // The animation speed may have changed in system settings (ANIM-05).
@@ -371,13 +402,75 @@ impl HomeShell {
         }
     }
 
+    /// HOME-10: a long-press on empty space opens the home menu where the finger is, or, in
+    /// Recent, enters close mode (REC-07). Either way it ticks (ANIM-24).
+    fn long_press(&mut self) {
+        if self.state.settings_open || self.state.menu.is_some() {
+            return;
+        }
+        let Some(at) = self.carousel.long_press() else {
+            return;
+        };
+        match self.state.current {
+            HomeView::Recent => self.recent.dispatch(RecentIntent::EnterCloseMode),
+            HomeView::Events | HomeView::Applications => self.open_menu(Some(at)),
+        }
+        self.system.haptic_tick();
+    }
+
+    /// Opens the current view's home menu at `anchor`, or centred, if it has one (HOME-10).
+    fn open_menu(&mut self, anchor: Option<(f64, f64)>) {
+        if self.state.settings_open || self.state.menu.is_some() {
+            return;
+        }
+        let Some(items) = HomeMenu::items_for(self.state.current) else {
+            return;
+        };
+        // The menu covers the home views, so a drag on them ends.
+        let release = self.carousel.end_gesture(self.state.current);
+        self.settle(release);
+        self.state.menu = Some(HomeMenu { items, anchor });
+    }
+
+    /// Closes the home menu and does what its item says (HOME-10, SET-01).
+    fn choose(&mut self, item: MenuItem) {
+        if !self.state.menu.is_some_and(|menu| menu.offers(item)) {
+            return;
+        }
+        self.state.menu = None;
+        match item {
+            MenuItem::LauncherSettings => self.open_settings(None),
+            MenuItem::LockScreenImage => self.open_settings(Some(SettingsGroup::LockScreenImage)),
+            MenuItem::EditApplications => self.apps.dispatch(AppsIntent::EnterEditMode),
+        }
+    }
+
+    /// Opens Settings over the home views, at `group` or at its top.
+    fn open_settings(&mut self, group: Option<SettingsGroup>) {
+        // Settings covers the home views, so a drag on them ends and the menu closes.
+        let release = self.carousel.end_gesture(self.state.current);
+        self.settle(release);
+        self.state.menu = None;
+        self.settings.dispatch(SettingsIntent::Refresh);
+        self.state.settings_open = true;
+        self.state.settings_group = group;
+    }
+
+    /// Closes Settings. Returns whether it was open.
+    fn close_settings(&mut self) -> bool {
+        self.state.settings_group = None;
+        std::mem::take(&mut self.state.settings_open)
+    }
+
     /// HOME-07: close what is open; otherwise go to Applications, or, on Applications, scroll
     /// it to the top.
     fn home(&mut self) {
-        if std::mem::take(&mut self.state.settings_open) {
+        if self.close_settings() {
             return;
         }
-        if self.close_everything_in(self.state.current) {
+        // The menu and everything open in the view close together.
+        let menu_closed = self.state.menu.take().is_some();
+        if self.close_everything_in(self.state.current) || menu_closed {
             return;
         }
         if self.state.current != HomeView::Applications || self.carousel.state().dragging {
@@ -390,9 +483,10 @@ impl HomeShell {
         }
     }
 
-    /// HOME-08: close the topmost open element; otherwise do nothing.
+    /// HOME-08: close the topmost open element (Settings, then the home menu, then the view's
+    /// own); otherwise do nothing.
     fn back(&mut self) {
-        if !std::mem::take(&mut self.state.settings_open) {
+        if !self.close_settings() && self.state.menu.take().is_none() {
             self.close_topmost(self.state.current);
         }
     }
@@ -403,7 +497,8 @@ impl HomeShell {
     /// animates the return (ANIM-09).
     fn returned(&mut self, home: bool) {
         if home && self.settings_store.get().home_target == HomeTarget::Applications {
-            self.state.settings_open = false;
+            self.close_settings();
+            self.state.menu = None;
             for view in HomeView::ALL {
                 self.close_everything_in(view);
             }
@@ -455,6 +550,8 @@ impl HomeShell {
 
     fn show(&mut self, view: HomeView) {
         self.state.current = view;
+        // The menu belongs to the view it opened over.
+        self.state.menu = None;
         // Recent refreshes whenever it becomes visible (REC-09); Events does too, to stay live.
         match view {
             HomeView::Events => self.events.dispatch(EventsIntent::Refresh),
@@ -955,6 +1052,312 @@ mod tests {
         let after = HomeShell::compose(fakes.platform());
 
         assert_eq!(after.state().current, HomeView::Applications);
+    }
+
+    /// A phone 1000 px wide, laid out.
+    fn laid_out(fakes: &Fakes) -> HomeShell {
+        let mut shell = HomeShell::compose(fakes.platform());
+        shell.dispatch(ShellIntent::Layout(Layout {
+            width_px: 1000.0,
+            density: 2.0,
+            touch_slop_px: 16.0,
+            rtl: false,
+        }));
+        shell
+    }
+
+    /// Shows the neighbouring view and lets the row come to rest.
+    fn go(shell: &mut HomeShell, direction: Direction) {
+        shell.dispatch(ShellIntent::Swipe(direction));
+        for frame in 0..100 {
+            shell.dispatch(ShellIntent::Frame(ms(frame * 16)));
+        }
+        assert!(!shell.state().carousel.animating);
+    }
+
+    /// A finger held still at `(x, y)` until the host's long-press time has passed.
+    fn hold(shell: &mut HomeShell, x: f64, y: f64) {
+        shell.dispatch(ShellIntent::Pointer(PointerEvent {
+            kind: PointerKind::Down,
+            x,
+            y,
+            at: ms(10_000),
+        }));
+        shell.dispatch(ShellIntent::LongPress);
+    }
+
+    fn lift(shell: &mut HomeShell) {
+        shell.dispatch(ShellIntent::Pointer(PointerEvent {
+            kind: PointerKind::Up,
+            x: 0.0,
+            y: 0.0,
+            at: ms(10_500),
+        }));
+    }
+
+    fn ticks(fakes: &Fakes) -> u32 {
+        *fakes.system.haptic_ticks.lock().unwrap()
+    }
+
+    #[test]
+    fn a_long_press_on_applications_opens_the_home_menu_where_the_finger_is() {
+        // HOME-10, ANIM-24
+        let fakes = Fakes::default();
+        let mut shell = laid_out(&fakes);
+
+        hold(&mut shell, 300.0, 1200.0);
+
+        assert_eq!(
+            shell.state().menu,
+            Some(HomeMenu {
+                items: &MenuItem::ALL,
+                anchor: Some((300.0, 1200.0)),
+            })
+        );
+        assert_eq!(ticks(&fakes), 1);
+        // The rest of the gesture goes nowhere, so lifting taps nothing.
+        assert!(shell.state().carousel.held);
+        lift(&mut shell);
+        assert!(!shell.state().carousel.held);
+        assert!(shell.state().menu.is_some());
+    }
+
+    #[test]
+    fn on_events_the_home_menu_has_no_edit_applications() {
+        // HOME-10, the issue's acceptance criteria
+        let fakes = Fakes::default();
+        let mut shell = laid_out(&fakes);
+        go(&mut shell, Direction::Previous);
+
+        hold(&mut shell, 500.0, 900.0);
+
+        let menu = shell.state().menu.expect("the menu is open");
+        assert_eq!(
+            menu.items,
+            [MenuItem::LauncherSettings, MenuItem::LockScreenImage]
+        );
+    }
+
+    #[test]
+    fn in_recent_a_long_press_enters_close_mode_instead() {
+        // HOME-10, REC-07, ANIM-24
+        let fakes = Fakes::default();
+        let mut shell = laid_out(&fakes);
+        go(&mut shell, Direction::Next);
+
+        hold(&mut shell, 500.0, 900.0);
+
+        assert_eq!(shell.state().menu, None);
+        assert!(shell.recent().state().close_mode);
+        assert_eq!(ticks(&fakes), 1);
+    }
+
+    #[test]
+    fn under_settings_or_the_menu_a_long_press_does_nothing() {
+        let fakes = Fakes::default();
+        let mut shell = laid_out(&fakes);
+        shell.dispatch(ShellIntent::OpenSettings);
+        hold(&mut shell, 500.0, 900.0);
+        assert_eq!(shell.state().menu, None);
+        lift(&mut shell);
+
+        shell.dispatch(ShellIntent::Back);
+        shell.dispatch(ShellIntent::OpenMenu);
+        hold(&mut shell, 500.0, 900.0);
+        assert_eq!(shell.state().menu.map(|menu| menu.anchor), Some(None));
+        assert!(!shell.state().carousel.held);
+
+        assert_eq!(ticks(&fakes), 0);
+    }
+
+    #[test]
+    fn back_closes_the_menu_before_edit_mode() {
+        // HOME-08
+        let mut shell = laid_out(&Fakes::default());
+        shell.dispatch(ShellIntent::Apps(AppsIntent::EnterEditMode));
+        shell.dispatch(ShellIntent::OpenMenu);
+
+        shell.dispatch(ShellIntent::Back);
+        assert_eq!(shell.state().menu, None);
+        assert!(shell.apps().state().edit_mode);
+
+        shell.dispatch(ShellIntent::Back);
+        assert!(!shell.apps().state().edit_mode);
+    }
+
+    #[test]
+    fn home_closes_the_menu_and_everything_open_with_it_and_goes_no_further() {
+        // HOME-07: Home first closes any open menu, and only then moves or scrolls.
+        let mut shell = laid_out(&Fakes::default());
+        shell.dispatch(ShellIntent::Apps(AppsIntent::Scrolled(480.0)));
+        shell.dispatch(ShellIntent::Apps(AppsIntent::EnterEditMode));
+        hold(&mut shell, 500.0, 900.0);
+        lift(&mut shell);
+
+        shell.dispatch(ShellIntent::Home);
+        assert_eq!(shell.state().menu, None);
+        assert!(!shell.apps().state().edit_mode);
+        assert_eq!(shell.apps().state().scroll_px, 480.0);
+        shell.dispatch(ShellIntent::Home);
+        assert_eq!(shell.apps().state().scroll_px, 0.0);
+
+        go(&mut shell, Direction::Previous);
+        shell.dispatch(ShellIntent::OpenMenu);
+        shell.dispatch(ShellIntent::Home);
+        assert_eq!(shell.state().menu, None);
+        assert_eq!(shell.state().current, HomeView::Events);
+        shell.dispatch(ShellIntent::Home);
+        assert_eq!(shell.state().current, HomeView::Applications);
+    }
+
+    #[test]
+    fn each_menu_item_does_what_it_says() {
+        // HOME-10, SET-01
+        let mut shell = laid_out(&Fakes::default());
+
+        shell.dispatch(ShellIntent::OpenMenu);
+        shell.dispatch(ShellIntent::ChooseMenuItem(MenuItem::LauncherSettings));
+        let state = shell.state();
+        assert_eq!(state.menu, None);
+        assert!(state.settings_open);
+        assert_eq!(state.settings_group, None);
+        shell.dispatch(ShellIntent::Back);
+        assert!(!shell.state().settings_open);
+
+        shell.dispatch(ShellIntent::OpenMenu);
+        shell.dispatch(ShellIntent::ChooseMenuItem(MenuItem::LockScreenImage));
+        assert!(shell.state().settings_open);
+        assert_eq!(
+            shell.state().settings_group,
+            Some(SettingsGroup::LockScreenImage)
+        );
+        shell.dispatch(ShellIntent::Home);
+        assert!(!shell.state().settings_open);
+        assert_eq!(shell.state().settings_group, None);
+
+        shell.dispatch(ShellIntent::OpenMenu);
+        shell.dispatch(ShellIntent::ChooseMenuItem(MenuItem::EditApplications));
+        assert_eq!(shell.state().menu, None);
+        assert!(shell.apps().state().edit_mode);
+    }
+
+    #[test]
+    fn an_item_the_menu_doesnt_offer_or_with_no_menu_open_does_nothing() {
+        let mut shell = laid_out(&Fakes::default());
+        shell.dispatch(ShellIntent::ChooseMenuItem(MenuItem::LauncherSettings));
+        assert!(!shell.state().settings_open);
+
+        go(&mut shell, Direction::Previous);
+        shell.dispatch(ShellIntent::OpenMenu);
+        shell.dispatch(ShellIntent::ChooseMenuItem(MenuItem::EditApplications));
+
+        assert!(shell.state().menu.is_some());
+        assert!(!shell.apps().state().edit_mode);
+    }
+
+    #[test]
+    fn a_screen_reader_opens_the_menu_in_events_and_applications_only() {
+        // A11Y-05: centred, since no finger says where; no long-press, so no tick.
+        let fakes = Fakes::default();
+        let mut shell = laid_out(&fakes);
+        assert!(shell.state().menu_offered());
+
+        shell.dispatch(ShellIntent::OpenMenu);
+        assert_eq!(
+            shell.state().menu,
+            Some(HomeMenu {
+                items: &MenuItem::ALL,
+                anchor: None,
+            })
+        );
+        assert!(!shell.state().menu_offered());
+        shell.dispatch(ShellIntent::CloseMenu);
+        assert_eq!(shell.state().menu, None);
+
+        go(&mut shell, Direction::Next);
+        assert!(!shell.state().menu_offered());
+        shell.dispatch(ShellIntent::OpenMenu);
+        assert_eq!(shell.state().menu, None);
+        assert_eq!(ticks(&fakes), 0);
+    }
+
+    #[test]
+    fn while_the_menu_is_open_a_drag_moves_nothing() {
+        // The menu covers the home views.
+        let mut shell = laid_out(&Fakes::default());
+        shell.dispatch(ShellIntent::OpenMenu);
+
+        for (kind, x, at) in [
+            (PointerKind::Down, 800.0, 0),
+            (PointerKind::Move, 600.0, 16),
+            (PointerKind::Move, 300.0, 32),
+        ] {
+            shell.dispatch(ShellIntent::Pointer(PointerEvent {
+                kind,
+                x,
+                y: 900.0,
+                at: ms(at),
+            }));
+        }
+
+        assert!(!shell.state().carousel.dragging);
+        assert_eq!(shell.state().carousel.offset, 0.0);
+        assert!(shell.state().menu.is_some());
+    }
+
+    #[test]
+    fn opening_the_menu_ends_a_drag() {
+        let mut shell = laid_out(&Fakes::default());
+        for (kind, x, at) in [
+            (PointerKind::Down, 800.0, 0),
+            (PointerKind::Move, 600.0, 16),
+        ] {
+            shell.dispatch(ShellIntent::Pointer(PointerEvent {
+                kind,
+                x,
+                y: 900.0,
+                at: ms(at),
+            }));
+        }
+        assert!(shell.state().carousel.dragging);
+
+        shell.dispatch(ShellIntent::OpenMenu);
+
+        assert!(!shell.state().carousel.dragging);
+        assert!(shell.state().menu.is_some());
+    }
+
+    #[test]
+    fn the_menu_closes_when_the_view_or_the_layout_changes() {
+        let mut shell = laid_out(&Fakes::default());
+        shell.dispatch(ShellIntent::OpenMenu);
+        shell.dispatch(ShellIntent::Swipe(Direction::Previous));
+        assert_eq!(shell.state().menu, None);
+
+        shell.dispatch(ShellIntent::OpenMenu);
+        let layout = shell.state().carousel.layout;
+        shell.dispatch(ShellIntent::Layout(layout));
+        assert!(shell.state().menu.is_some());
+        shell.dispatch(ShellIntent::Layout(Layout {
+            width_px: 2000.0,
+            ..layout
+        }));
+        assert_eq!(shell.state().menu, None);
+    }
+
+    #[test]
+    fn coming_back_keeps_the_menu_unless_home_opens_applications() {
+        // HOME-06: by default the home comes back as it was; with Always Applications, Home
+        // from an app closes everything.
+        let mut shell = laid_out(&Fakes::default());
+        shell.dispatch(ShellIntent::OpenMenu);
+        shell.dispatch(ShellIntent::Returned { home: true });
+        assert!(shell.state().menu.is_some());
+
+        always_applications(&mut shell);
+        shell.dispatch(ShellIntent::OpenMenu);
+        shell.dispatch(ShellIntent::Returned { home: true });
+        assert_eq!(shell.state().menu, None);
     }
 
     #[test]

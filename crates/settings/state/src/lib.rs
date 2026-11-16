@@ -27,6 +27,14 @@ pub struct SettingsState {
     pub problem: Option<String>,
 }
 
+/// A group of Settings (SET-02) that Settings can open at, rather than at its top. Only the
+/// groups something opens directly are listed; the others arrive with the Settings screen (#34).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsGroup {
+    /// The lock-screen image's options, opened from the home menu (HOME-10).
+    LockScreenImage,
+}
+
 #[derive(Debug)]
 pub enum SettingsIntent {
     Refresh,
