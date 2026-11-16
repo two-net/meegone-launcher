@@ -203,6 +203,26 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeActivity_nativeA
     });
 }
 
+/// `static void nativeClockChanged()`: the date, the time, the time zone, the 12- or 24-hour
+/// setting or the next alarm changed (EVT-01, EVT-02, L10N-03, ADR 0019). `Bridge` coalesces a
+/// burst of them into one call.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeActivity_nativeClockChanged(
+    env: RawEnv,
+    _class: JObject,
+) {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_launcher(env, |launcher| {
+        launcher.dispatch(ShellIntent::ClockChanged);
+        launcher.frame();
+    });
+}
+
 /// `static int nativeAccent(int[] argb)`: the accent colour of an app's icon, drawn in
 /// MeeGone's shape, from its pixels as `0xAARRGGBB`. Returns `0xRRGGBB` (APPS-17, ADR 0011).
 ///
@@ -575,13 +595,90 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeUnhi
 
 /// Applications' problem as a Java string, or `null` if there is none.
 fn problem(env: Env, launcher: &Launcher) -> Result<JObject, String> {
-    match &launcher.shell().apps().state().problem {
-        Some(problem) => env
-            .new_string(problem)
+    message(env, launcher.shell().apps().state().problem.as_deref())
+}
+
+/// A message for the host to show as a Java string, or `null` for none.
+fn message(env: Env, text: Option<&str>) -> Result<JObject, String> {
+    match text {
+        Some(text) => env
+            .new_string(text)
             .map(|text| text.into_raw())
             .map_err(|error| format!("Couldn't pass the message: {error}")),
         None => Ok(std::ptr::null_mut()),
     }
+}
+
+/// `String[] nativeEventsHeader()`: the Events header as of the last frame (EVT-01, EVT-02),
+/// mirrored in `EventsHeader.java`:
+/// 1. today's weekday;
+/// 2. today's day and month;
+/// 3. when the next alarm rings, or empty to hide the alarm row.
+///
+/// Empty while Events isn't working (ARCH-09).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeEventsHeader(
+    env: RawEnv,
+    _views: JObject,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    let mut fields = std::ptr::null_mut();
+    guarded(env, || {
+        LAUNCHER.with_borrow(|launcher| {
+            let launcher = launcher.as_ref().ok_or("MeeGone hasn't started")?;
+            let header = launcher.view().events().header();
+            let texts: Vec<&str> = if launcher.shell().events_ready() {
+                vec![
+                    header.weekday.as_str(),
+                    header.date.as_str(),
+                    header.alarm.as_deref().unwrap_or_default(),
+                ]
+            } else {
+                Vec::new()
+            };
+            let array = env
+                .new_string_array(texts.into_iter())
+                .map_err(|error| format!("Couldn't pass the Events header: {error}"))?;
+            fields = array.into_raw();
+            Ok(())
+        })
+    });
+    fields
+}
+
+/// `String nativeOpenAlarm()`: the alarm row of the Events header was tapped, so the app that
+/// set the alarm opens (EVT-02). Returns `null`, or a short message to show when it couldn't.
+/// Does nothing while Events isn't working (ARCH-09).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeOpenAlarm(
+    env: RawEnv,
+    _views: JObject,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    let mut shown = std::ptr::null_mut();
+    guarded(env, || {
+        LAUNCHER.with_borrow_mut(|launcher| {
+            let launcher = launcher.as_mut().ok_or("MeeGone hasn't started")?;
+            if !launcher.shell().events_ready() {
+                return Ok(());
+            }
+            launcher.view().events().alarm_tapped();
+            launcher.frame();
+            shown = message(env, launcher.shell().events().state().problem.as_deref())?;
+            Ok(())
+        })
+    });
+    shown
 }
 
 /// `void nativeFrame(long frameTimeNanos)`: the display is about to draw a frame (ANIM-04).
@@ -1462,7 +1559,7 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRead
 }
 
 /// How many slots the frame has.
-const FRAME_SLOTS: usize = 80;
+const FRAME_SLOTS: usize = 82;
 
 /// A `HomeFrame` as the `int[]` that `HomeViews.java` reads, slot by slot:
 ///
@@ -1529,6 +1626,8 @@ const FRAME_SLOTS: usize = 80;
 /// | 77 | The results grid's rows |
 /// | 78 | 1 while Settings offers Hidden apps, which Applications must be working for (APPS-19, ARCH-09); otherwise 0 |
 /// | 79 | Hidden apps' revision: when it changes, Settings reads the list again with `nativeHiddenApps` |
+/// | 80 | 1 while Events works, so its header is drawn (EVT-01, ARCH-09); otherwise 0 |
+/// | 81 | The Events header's revision: when it changes, the header is read again with `nativeEventsHeader` |
 fn frame_slots(frame: &HomeFrame) -> [i32; FRAME_SLOTS] {
     let [events, applications, recent] = frame.pages;
     let menu_items = frame.menu.map_or(0, |menu| {
@@ -1650,6 +1749,8 @@ fn frame_slots(frame: &HomeFrame) -> [i32; FRAME_SLOTS] {
         i32::from(frame.hidden_apps.is_some()),
         // The revision travels as Java's `int`.
         frame.hidden_apps.map_or(0, |revision| revision as i32),
+        i32::from(frame.events_header.is_some()),
+        frame.events_header.map_or(0, |revision| revision as i32),
     ];
     slots[40 + BADGE_ROWS..].copy_from_slice(&rest);
     slots

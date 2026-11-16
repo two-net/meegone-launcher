@@ -1,18 +1,19 @@
 //! [`SystemConfigAdapter`] on Android: the home-app role, the clock (HOME-01, ONB-04), whether
 //! the system animates the return home (ANIM-09), the haptic tick (ANIM-24), whether a browser
-//! is installed and web search (SRCH-05, ADR 0016).
+//! is installed and web search (SRCH-05, ADR 0016), and the Events header's dates, times and
+//! next alarm (EVT-01, EVT-02, L10N-03, ADR 0019).
 //!
 //! Questions go to the Java `Bridge` object (`android/app/src/main/java/…/Bridge.java`), whose
-//! method names and signatures must stay in step with the ones looked up here. The device
-//! settings, the next alarm and opening links answer with their "if unavailable" values until
-//! their issues build them.
+//! method names and signatures must stay in step with the ones looked up here. The other device
+//! settings and opening links answer with their "if unavailable" values until their issues
+//! build them.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::jni::{Env, GlobalRef, JValue, LocalRef, MethodId, Vm};
 use super::not_yet;
 use crate::adapters::SystemConfigAdapter;
-use crate::model::DataError;
+use crate::model::{DataError, TimeStyle};
 
 pub struct AndroidSystem {
     vm: Vm,
@@ -34,6 +35,13 @@ pub struct AndroidSystem {
     has_browser: MethodId,
     /// `String webSearch(String query)`: `null`, or a short message when nothing could search.
     web_search: MethodId,
+    /// `String formatTime(long atMs, int style)`: `at_ms` in the style numbered by
+    /// [`style_code`], or `null`.
+    format_time: MethodId,
+    /// `long nextAlarmMs()`: when the next alarm rings, or -1 if none is set.
+    next_alarm_ms: MethodId,
+    /// `String openNextAlarm()`: `null`, or a short message when nothing could be opened.
+    open_next_alarm: MethodId,
 }
 
 impl AndroidSystem {
@@ -57,8 +65,21 @@ impl AndroidSystem {
                 c"webSearch",
                 c"(Ljava/lang/String;)Ljava/lang/String;",
             )?,
+            format_time: env.method_id(bridge, c"formatTime", c"(JI)Ljava/lang/String;")?,
+            next_alarm_ms: env.method_id(bridge, c"nextAlarmMs", c"()J")?,
+            open_next_alarm: env.method_id(bridge, c"openNextAlarm", c"()Ljava/lang/String;")?,
             bridge: env.global_ref(bridge)?,
         })
+    }
+}
+
+/// The number `Bridge.formatTime` knows each style by; `Bridge.java` mirrors them.
+fn style_code(style: TimeStyle) -> i32 {
+    match style {
+        TimeStyle::Weekday => 0,
+        TimeStyle::DayMonth => 1,
+        TimeStyle::Time => 2,
+        TimeStyle::WeekdayTime => 3,
     }
 }
 
@@ -107,6 +128,20 @@ impl SystemConfigAdapter for AndroidSystem {
         "en-US".into() // The device's locale arrives with #39.
     }
 
+    /// Written by `android.text.format.DateFormat` in the default locale and time zone, so it
+    /// follows the device's language and 12- or 24-hour setting (L10N-03). Empty if the bridge
+    /// can't answer, and the header then leaves that line out.
+    fn format_time(&self, at_ms: u64, style: TimeStyle) -> String {
+        let at = JValue::long(i64::try_from(at_ms).unwrap_or(i64::MAX));
+        let style = JValue::int(style_code(style));
+        self.vm
+            .env()
+            .and_then(|env| env.call_string(&self.bridge, self.format_time, &[at, style]))
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+    }
+
     fn is_default_home(&self) -> bool {
         self.vm
             .env()
@@ -122,12 +157,24 @@ impl SystemConfigAdapter for AndroidSystem {
         }
     }
 
+    /// `AlarmManager.getNextAlarmClock()`, which needs no permission. `None`, which hides the
+    /// alarm row, if none is set or the bridge can't answer (SRS 8.1).
     fn next_alarm_ms(&self) -> Option<u64> {
-        None // The next alarm arrives with #18.
+        self.vm
+            .env()
+            .and_then(|env| env.call_long(&self.bridge, self.next_alarm_ms, &[]))
+            .ok()
+            .and_then(|ms| u64::try_from(ms).ok())
     }
 
+    /// Sends the alarm's show intent, which the app that set it provides, or opens the clock
+    /// app's alarms when there is none (EVT-02).
     fn open_next_alarm(&self) -> Result<(), DataError> {
-        Err(not_yet())
+        let env = self.vm.env()?;
+        match env.call_string(&self.bridge, self.open_next_alarm, &[])? {
+            None => Ok(()),
+            Some(message) => Err(DataError::Unsupported(message)),
+        }
     }
 
     /// Played by a view, so it follows the system's touch-feedback setting and needs no

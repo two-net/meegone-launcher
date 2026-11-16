@@ -853,6 +853,106 @@ fn ac21_revoking_notification_access_shows_the_explainer_and_applications_still_
     assert_eq!(*fakes.apps.launched.lock().unwrap(), [app_id("mail")]);
 }
 
+/// Sunday 15 November 2026, 00:00 UTC: the day of the SRS's layout mock.
+const SUNDAY_MS: u64 = 1_794_700_800_000;
+/// An hour, in ms.
+const HOUR_MS: u64 = 60 * 60 * 1000;
+
+/// The Events header as the host draws it after a frame: its lines, the alarm's last if it
+/// shows, and its revision.
+fn events_header(launcher: &mut Launcher) -> (Vec<String>, u32) {
+    let revision = launcher.frame().events_header.expect("Events works");
+    let header = launcher.view().events().header();
+    let mut lines = vec![header.weekday.clone(), header.date.clone()];
+    lines.extend(header.alarm.clone());
+    (lines, revision)
+}
+
+#[test]
+fn evt01_given_the_date_changes_at_midnight_or_the_time_zone_changes_then_the_header_updates() {
+    // Issue #18: EVT-01. The host passes on the system's date, time and time-zone broadcasts.
+    let fakes = Fakes::default();
+    *fakes.system.now_ms.lock().unwrap() = SUNDAY_MS + DAY_MS - 60_000;
+    let (mut launcher, _) = on_a_phone(&fakes);
+    launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
+    let (lines, before) = events_header(&mut launcher);
+    assert_eq!(lines, ["Sunday", "15 November"]);
+
+    *fakes.system.now_ms.lock().unwrap() = SUNDAY_MS + DAY_MS;
+    launcher.dispatch(ShellIntent::ClockChanged);
+    let (lines, midnight) = events_header(&mut launcher);
+    assert_eq!(lines, ["Monday", "16 November"]);
+    assert_ne!(midnight, before, "the host reads the header again");
+
+    // A time zone five hours west, where it is still Sunday evening.
+    *fakes.system.utc_offset_ms.lock().unwrap() = -5 * HOUR_MS as i64;
+    launcher.dispatch(ShellIntent::ClockChanged);
+    let (lines, west) = events_header(&mut launcher);
+    assert_eq!(lines, ["Sunday", "15 November"]);
+    assert_ne!(west, midnight);
+
+    // When nothing changed, the host has nothing to read again.
+    launcher.dispatch(ShellIntent::ClockChanged);
+    assert_eq!(events_header(&mut launcher).1, west);
+}
+
+#[test]
+fn evt01_the_header_shows_the_date_without_notification_access() {
+    // Issue #18: EVT-01, EVT-03.
+    let fakes = Fakes::default();
+    *fakes.system.now_ms.lock().unwrap() = SUNDAY_MS + 9 * HOUR_MS;
+    let (mut launcher, _) = on_a_phone(&fakes);
+    launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
+
+    assert_eq!(launcher.shell().events().state().access, Access::Missing);
+    assert_eq!(events_header(&mut launcher).0, ["Sunday", "15 November"]);
+}
+
+#[test]
+fn evt02_given_an_alarm_at_7_on_a_24_hour_device_then_the_header_shows_07_00_and_opens_its_app() {
+    // Issue #18: EVT-02, L10N-03. The alarm is set on Sunday evening for Monday morning.
+    let fakes = Fakes::default();
+    *fakes.system.hour_24.lock().unwrap() = true;
+    *fakes.system.now_ms.lock().unwrap() = SUNDAY_MS + 22 * HOUR_MS;
+    let (mut launcher, _) = on_a_phone(&fakes);
+    launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
+    assert_eq!(events_header(&mut launcher).0, ["Sunday", "15 November"]);
+
+    *fakes.system.next_alarm_ms.lock().unwrap() = Some(SUNDAY_MS + DAY_MS + 7 * HOUR_MS);
+    launcher.dispatch(ShellIntent::ClockChanged);
+    assert_eq!(
+        events_header(&mut launcher).0,
+        ["Sunday", "15 November", "07:00"]
+    );
+
+    launcher.view().events().alarm_tapped();
+    launcher.frame();
+    assert_eq!(*fakes.system.alarm_opened.lock().unwrap(), 1);
+    assert_eq!(launcher.shell().events().state().problem, None);
+}
+
+#[test]
+fn evt02_without_a_next_alarm_the_alarm_row_is_hidden() {
+    // Issue #18: EVT-02, SRS 8.1. The alarm rings at 07:00 on a 12-hour device, then is turned
+    // off.
+    let fakes = Fakes::default();
+    *fakes.system.next_alarm_ms.lock().unwrap() = Some(SUNDAY_MS + 7 * HOUR_MS);
+    *fakes.system.now_ms.lock().unwrap() = SUNDAY_MS;
+    let (mut launcher, _) = on_a_phone(&fakes);
+    assert_eq!(
+        events_header(&mut launcher).0,
+        ["Sunday", "15 November", "7:00 AM"]
+    );
+
+    *fakes.system.next_alarm_ms.lock().unwrap() = None;
+    launcher.dispatch(ShellIntent::ClockChanged);
+    assert_eq!(events_header(&mut launcher).0, ["Sunday", "15 November"]);
+    // A tap that raced the change opens nothing.
+    launcher.view().events().alarm_tapped();
+    launcher.frame();
+    assert_eq!(*fakes.system.alarm_opened.lock().unwrap(), 0);
+}
+
 /// The cells the host draws, after a frame: label, work profile, available.
 fn cells(launcher: &mut Launcher) -> Vec<(String, bool, bool)> {
     launcher.frame();

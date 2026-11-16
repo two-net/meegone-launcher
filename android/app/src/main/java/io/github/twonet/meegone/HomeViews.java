@@ -148,7 +148,10 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     // Settings → Applications → Hidden apps (APPS-19, ADR 0017):
     private static final int HIDDEN_APPS_OFFERED = 78; // 1 while Applications works
     private static final int HIDDEN_APPS_REVISION = 79; // changes when the list changes
-    private static final int FRAME_SIZE = 80;
+    // The Events header (EVT-01, EVT-02, ADR 0019):
+    private static final int EVENTS_HEADER_SHOWN = 80; // 1 while Events works
+    private static final int EVENTS_HEADER_REVISION = 81; // changes when its text changes
+    private static final int FRAME_SIZE = 82;
     private static final int SEARCH_OPEN = 1; // the field has the keyboard
     private static final int SEARCH_RESULTS = 2; // the results show instead of the grid
     private static final int SEARCH_NOTHING = 4; // nothing matches
@@ -160,6 +163,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private static final int MAX_FOLDER_NAME = 64;
 
     private static final int VIEWS = 3;
+    private static final int EVENTS = 0;
     private static final int APPLICATIONS = 1;
     private static final int[] NAMES = {
         R.string.view_events, R.string.view_applications, R.string.view_recent
@@ -190,8 +194,13 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
 
     private final int[] frame = new int[FRAME_SIZE];
     private final FrameLayout[] pages = new FrameLayout[VIEWS];
-    /** Each view's name, until its content arrives; null for Applications, which has its grid. */
+    /**
+     * Each view's name, until its content arrives; null for Events, which has its header, and
+     * Applications, which has its grid.
+     */
     private final TextView[] titles = new TextView[VIEWS];
+    /** The date and the next alarm at the top of Events (EVT-01, EVT-02). */
+    private final EventsHeader eventsHeader;
     private final AppsGrid apps;
     /** The open folder's grid, in its panel (FOLD-04). */
     private final AppsGrid folderApps;
@@ -274,6 +283,8 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private int settingsShown;
     /** Hidden apps' revision as shown, as an unsigned int, or -1 before it is first read. */
     private long hiddenAppsShown = -1;
+    /** The Events header's revision as shown, as an unsigned int, or -1 before it is first read. */
+    private long eventsHeaderShown = -1;
     private int menuOffered = -1;
     /** Whether screen readers can open search, as last told, or -1 before the first frame. */
     private int searchOffered = -1;
@@ -319,6 +330,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             toast(message);
         });
         searchPanel.setScreen(this);
+        eventsHeader = new EventsHeader(context, this::openAlarm);
         doneMargin = dp(16);
         done = new TextView(context);
         done.setText(R.string.edit_done);
@@ -345,8 +357,12 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
                 // An open folder covers both.
                 page.addView(folderPanel, new LayoutParams(
                         LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
+            } else if (i == EVENTS) {
+                // The notifications come below it with #19.
+                page.addView(eventsHeader, new LayoutParams(LayoutParams.MATCH_PARENT,
+                        LayoutParams.WRAP_CONTENT, Gravity.TOP | Gravity.START));
             } else {
-                // Until Events' and Recent's content arrives (#19, #22), each shows its name.
+                // Until Recent's content arrives (#22), it shows its name.
                 TextView title = new TextView(context);
                 title.setText(NAMES[i]);
                 title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 28);
@@ -886,6 +902,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             }
             editingShown = frame[EDITING];
         }
+        applyEventsHeader();
         applySettings();
         applyMenu();
         applyRename();
@@ -1100,6 +1117,28 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             done.setBackground(new RippleDrawable(pressed, doneShape, null));
             done.setTextColor(background);
         }
+    }
+
+    /**
+     * The Events header (EVT-01, EVT-02): drawn only while Events works (ARCH-09), and read again
+     * whenever its revision changes, such as at midnight or when an alarm is set.
+     */
+    private void applyEventsHeader() {
+        boolean shown = frame[EVENTS_HEADER_SHOWN] != 0;
+        eventsHeader.setVisibility(shown ? VISIBLE : GONE);
+        eventsHeader.colour(foreground, dim);
+        long revision = frame[EVENTS_HEADER_REVISION] & 0xFFFF_FFFFL;
+        if (shown && revision != eventsHeaderShown) {
+            eventsHeaderShown = revision;
+            eventsHeader.fill(nativeEventsHeader());
+        }
+    }
+
+    /** The alarm row was tapped (EVT-02): the app that set the alarm opens. */
+    private void openAlarm() {
+        String message = nativeOpenAlarm();
+        apply();
+        toast(message);
     }
 
     /**
@@ -1536,6 +1575,18 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
      * Returns null, or a short message when it couldn't be saved.
      */
     private native String nativeUnhide(int revision, int index);
+
+    /**
+     * The Events header as of the last frame, in {@link EventsHeader#FIELDS} fields (EVT-01,
+     * EVT-02).
+     */
+    private native String[] nativeEventsHeader();
+
+    /**
+     * The alarm row of the Events header was tapped (EVT-02). Returns null, or a short message
+     * when nothing could open.
+     */
+    private native String nativeOpenAlarm();
 
     /** Fills {@code frame} with what to draw now, in the slots above. */
     private native void nativeRead(int[] frame);

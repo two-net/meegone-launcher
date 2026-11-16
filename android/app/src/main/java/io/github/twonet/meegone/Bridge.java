@@ -2,6 +2,8 @@ package io.github.twonet.meegone;
 
 import android.app.Activity;
 import android.app.ActivityOptions;
+import android.app.AlarmManager;
+import android.app.PendingIntent;
 import android.app.SearchManager;
 import android.app.role.RoleManager;
 import android.content.ActivityNotFoundException;
@@ -21,6 +23,8 @@ import android.graphics.Insets;
 import android.graphics.Rect;
 import android.icu.lang.UCharacter;
 import android.icu.text.Collator;
+import android.icu.text.DateFormat;
+import android.icu.text.DisplayContext;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -30,6 +34,7 @@ import android.os.Process;
 import android.os.SystemClock;
 import android.os.UserHandle;
 import android.os.UserManager;
+import android.provider.AlarmClock;
 import android.provider.MediaStore;
 import android.provider.Settings;
 import android.provider.Telephony;
@@ -40,7 +45,9 @@ import android.view.View;
 import android.view.WindowInsets;
 import java.text.Normalizer;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.List;
+import java.util.Locale;
 import java.util.TimeZone;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
@@ -80,6 +87,24 @@ final class Bridge {
         Intent.ACTION_MANAGED_PROFILE_UNLOCKED,
         Intent.ACTION_LOCALE_CHANGED,
     };
+    /**
+     * The system's broadcasts that change the Events header: a new day, the clock or the 12- or
+     * 24-hour setting set (both {@code TIME_SET}), a new time zone, and a new next alarm (EVT-01,
+     * EVT-02, L10N-03, ADR 0019).
+     */
+    private static final String[] CLOCK_CHANGES = {
+        Intent.ACTION_DATE_CHANGED,
+        Intent.ACTION_TIME_CHANGED,
+        Intent.ACTION_TIMEZONE_CHANGED,
+        AlarmManager.ACTION_NEXT_ALARM_CLOCK_CHANGED,
+    };
+    // The styles formatTime writes, mirrored in style_code in
+    // crates/core/data/src/android/system.rs: the weekday, the day and month, the time, and the
+    // short weekday with the time.
+    private static final int STYLE_WEEKDAY = 0;
+    private static final int STYLE_DAY_MONTH = 1;
+    private static final int STYLE_TIME = 2;
+    private static final int STYLE_WEEKDAY_TIME = 3;
     private static final char[] HEX = "0123456789abcdef".toCharArray();
     /** Accents and other marks that sit on a letter, removed for search (L10N-04). */
     private static final Pattern MARKS = Pattern.compile("\\p{Mn}+");
@@ -101,12 +126,15 @@ final class Bridge {
     private final Handler main = new Handler(Looper.getMainLooper());
     /** Tells the Rust app about a burst of app and profile changes once (ADR 0010). */
     private final Runnable reportAppsChanged = () -> HomeActivity.appsChanged(this.activity);
+    /** Tells the Rust app about a burst of clock and alarm changes once (ADR 0019). */
+    private final Runnable reportClockChanged = () -> HomeActivity.clockChanged(this.activity);
     /** Each app's accent colour, derived from its icon (APPS-17, ADR 0011). */
     private final AppAccents accents;
     /** The resumed activity, which can start the system's screens; null while none is. */
     private Activity activity;
     private long roleRequestedAt;
     private boolean watchingApps;
+    private boolean watchingClock;
 
     private Bridge(Context context) {
         this.context = context.getApplicationContext();
@@ -650,21 +678,7 @@ final class Bridge {
         watchingApps = true;
         try {
             context.getSystemService(LauncherApps.class).registerCallback(new AppsCallback(), main);
-            BroadcastReceiver receiver = new BroadcastReceiver() {
-                @Override
-                public void onReceive(Context context, Intent intent) {
-                    appsChanged();
-                }
-            };
-            IntentFilter filter = new IntentFilter();
-            for (String action : CATALOGUE_CHANGES) {
-                filter.addAction(action);
-            }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED);
-            } else {
-                context.registerReceiver(receiver, filter);
-            }
+            receive(CATALOGUE_CHANGES, this::appsChanged);
         } catch (RuntimeException e) {
             Log.w(TAG, "Couldn't watch the apps", e);
         }
@@ -673,6 +687,46 @@ final class Bridge {
     private void appsChanged() {
         main.removeCallbacks(reportAppsChanged);
         main.post(reportAppsChanged);
+    }
+
+    /**
+     * Starts telling the Rust app when the day, the clock, the 12- or 24-hour setting, the time
+     * zone or the next alarm changes, so the Events header follows them (EVT-01, EVT-02,
+     * L10N-03, ADR 0019). Once per process; later calls do nothing. A burst of changes, such as
+     * a new time zone that also moves the date, is reported once, on the main thread.
+     */
+    void watchClock() {
+        if (watchingClock) {
+            return;
+        }
+        watchingClock = true;
+        try {
+            receive(CLOCK_CHANGES, () -> {
+                main.removeCallbacks(reportClockChanged);
+                main.post(reportClockChanged);
+            });
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Couldn't watch the clock", e);
+        }
+    }
+
+    /** Runs {@code report} on the main thread for each of the system's {@code actions}. */
+    private void receive(String[] actions, Runnable report) {
+        BroadcastReceiver receiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                report.run();
+            }
+        };
+        IntentFilter filter = new IntentFilter();
+        for (String action : actions) {
+            filter.addAction(action);
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED);
+        } else {
+            context.registerReceiver(receiver, filter);
+        }
     }
 
     /**
@@ -722,6 +776,108 @@ final class Bridge {
         public void onPackagesUnsuspended(String[] packageNames, UserHandle user) {
             appsChanged();
         }
+    }
+
+    /**
+     * {@code atMs} in the style numbered by {@code style}, in the device's language, time zone
+     * and 12- or 24-hour setting, or null (EVT-01, EVT-02, L10N-03, ADR 0019). The language's
+     * own patterns order the fields, such as "17 November" or "November 17", and a weekday or a
+     * month shown on its own is capitalised as the language does at the start of a line. Called
+     * from Rust.
+     */
+    String formatTime(long atMs, int style) {
+        try {
+            boolean hour24 = android.text.format.DateFormat.is24HourFormat(context);
+            String skeleton;
+            switch (style) {
+                case STYLE_WEEKDAY:
+                    skeleton = "EEEE";
+                    break;
+                case STYLE_DAY_MONTH:
+                    skeleton = "MMMMd";
+                    break;
+                case STYLE_TIME:
+                    skeleton = hour24 ? "Hm" : "hm";
+                    break;
+                case STYLE_WEEKDAY_TIME:
+                    skeleton = hour24 ? "EHm" : "Ehm";
+                    break;
+                default:
+                    return null;
+            }
+            DateFormat format = DateFormat.getInstanceForSkeleton(skeleton, Locale.getDefault());
+            // The time zone as of now, which the system sets before TIMEZONE_CHANGED arrives.
+            format.setTimeZone(
+                    android.icu.util.TimeZone.getTimeZone(TimeZone.getDefault().getID()));
+            format.setContext(DisplayContext.CAPITALIZATION_FOR_STANDALONE);
+            return format.format(new Date(atMs));
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Couldn't write a time: " + e.getClass().getSimpleName());
+            return null;
+        }
+    }
+
+    /**
+     * When the next alarm rings, in ms since the epoch, or -1 if none is set (EVT-02). It needs
+     * no permission. Called from Rust.
+     */
+    long nextAlarmMs() {
+        try {
+            AlarmManager.AlarmClockInfo next =
+                    context.getSystemService(AlarmManager.class).getNextAlarmClock();
+            return next != null ? next.getTriggerTime() : -1;
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Couldn't read the next alarm: " + e.getClass().getSimpleName());
+            return -1;
+        }
+    }
+
+    /**
+     * Opens what the app that set the next alarm shows for it, or the clock app's alarms if it
+     * shows nothing (EVT-02, ADR 0019). Returns null, or a short message if nothing could open.
+     * Called from Rust.
+     */
+    String openNextAlarm() {
+        Activity current = activity;
+        Context from = current != null ? current : context;
+        try {
+            AlarmManager.AlarmClockInfo next =
+                    context.getSystemService(AlarmManager.class).getNextAlarmClock();
+            PendingIntent show = next != null ? next.getShowIntent() : null;
+            if (show != null) {
+                show.send(from, 0, null, null, null, null, startFromHome());
+                return null;
+            }
+        } catch (PendingIntent.CanceledException | RuntimeException e) {
+            Log.w(TAG, "Couldn't open the alarm's app: " + e.getClass().getSimpleName());
+        }
+        try {
+            from.startActivity(new Intent(AlarmClock.ACTION_SHOW_ALARMS)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+            return null;
+        } catch (RuntimeException e) {
+            // ActivityNotFoundException: no clock app shows alarms.
+            Log.w(TAG, "Couldn't show the alarms: " + e.getClass().getSimpleName());
+            return context.getString(R.string.alarm_unavailable);
+        }
+    }
+
+    /**
+     * Lets an intent another app made, such as an alarm's, start its screen as if MeeGone did,
+     * while MeeGone shows. From Android 14 the sender must say so, or the system may block it
+     * because the app that made it is in the background.
+     */
+    @SuppressWarnings("deprecation") // ALLOWED is the only mode on Android 14 and 15.
+    private static Bundle startFromHome() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            return null;
+        }
+        int mode = Build.VERSION.SDK_INT >= Build.VERSION_CODES.BAKLAVA
+                ? ActivityOptions.MODE_BACKGROUND_ACTIVITY_START_ALLOW_IF_VISIBLE
+                : ActivityOptions.MODE_BACKGROUND_ACTIVITY_START_ALLOWED;
+        return ActivityOptions.makeBasic()
+                .setPendingIntentBackgroundActivityStartMode(mode)
+                .toBundle();
     }
 
     /** The UTC offset of the device's time zone at {@code atMs}, in ms. Called from Rust. */

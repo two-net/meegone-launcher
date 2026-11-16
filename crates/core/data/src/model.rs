@@ -170,6 +170,21 @@ impl Rect {
     }
 }
 
+/// How [`SystemConfigAdapter::format_time`](crate::SystemConfigAdapter::format_time) writes a
+/// moment: in the device's language, time zone and 12- or 24-hour setting (L10N-03).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TimeStyle {
+    /// The weekday in full, such as "Tuesday" (EVT-01).
+    Weekday,
+    /// The day of the month and the month in full, in the language's order, such as
+    /// "17 November" or "November 17" (EVT-01).
+    DayMonth,
+    /// Hours and minutes, such as "07:00" on a 24-hour device or "7:00 AM" (EVT-02).
+    Time,
+    /// The short weekday and the time, such as "Wed 07:00" (EVT-02).
+    WeekdayTime,
+}
+
 /// A size in physical pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Size {

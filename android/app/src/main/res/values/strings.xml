@@ -118,4 +118,14 @@
     <!-- What screen readers read for that button, e.g. "Unhide Maps" (A11Y-01). %1$s is the
          app's name, with "work" when it has it. -->
     <string name="action_unhide">Unhide %1$s</string>
+
+    <!-- The Events header's alarm row: when the next alarm rings, e.g. "Alarm 07:00", or
+         "Alarm Wed 07:00" when it is more than a day away (EVT-02). %1$s is the time, in the
+         device's 12- or 24-hour setting. Tapping it opens the app that set the alarm. -->
+    <string name="events_alarm">Alarm %1$s</string>
+    <!-- What screen readers say a tap on the alarm row does (A11Y-01). -->
+    <string name="action_open_alarm">Open alarm</string>
+    <!-- Shown briefly when neither the app that set the alarm nor a clock app could open
+         (EVT-02). -->
+    <string name="alarm_unavailable">The alarm can\'t open right now</string>
 </resources>

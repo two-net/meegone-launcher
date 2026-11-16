@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use crate::model::{
     Access, App, AppId, DataError, ImageJob, NetworkState, Notification, Profile, RecentUse, Rect,
-    Shortcut, Size,
+    Shortcut, Size, TimeStyle,
 };
 use crate::storage::StorageAdapter;
 
@@ -127,19 +127,24 @@ pub trait SystemConfigAdapter: Send + Sync {
     /// When this copy of MeeGone was first installed, in milliseconds since the Unix epoch, or 0
     /// if the system can't say. A layout saved by another copy came from a backup (APPS-21).
     fn installed_ms(&self) -> u64;
-    /// The local time zone's offset from UTC at `at_ms`, for local midnight (WALL-03) and the
-    /// date (EVT-01).
+    /// The local time zone's offset from UTC at `at_ms`, for local midnight, such as the daily
+    /// image's check (WALL-03) and the home-app banner's day (ONB-04). Text for people comes
+    /// from [`SystemConfigAdapter::format_time`].
     fn utc_offset_ms(&self, at_ms: u64) -> i64;
     /// The device's language and region as a BCP 47 tag, such as `en-US` (WALL-05, L10N).
     fn locale(&self) -> String;
+    /// `at_ms` written in `style`, in the device's language, time zone and 12- or 24-hour
+    /// setting (L10N-03), for the Events header (EVT-01, EVT-02). Empty if the platform can't
+    /// write it.
+    fn format_time(&self, at_ms: u64, style: TimeStyle) -> String;
     /// Whether MeeGone is the default home app (ONB-04).
     fn is_default_home(&self) -> bool;
     /// Opens the system dialog for choosing the default home app, or the default-apps screen
     /// (ONB-01, ONB-04).
     fn request_default_home(&self) -> Result<(), DataError>;
-    /// When the next alarm rings, if one is set (EVT-02).
+    /// When the next alarm rings, if one is set and the system says when (EVT-02).
     fn next_alarm_ms(&self) -> Option<u64>;
-    /// Opens the app that set the next alarm (EVT-02).
+    /// Opens the app that set the next alarm, or the clock app's alarms (EVT-02).
     fn open_next_alarm(&self) -> Result<(), DataError>;
     /// A light haptic tick. Follows the system haptics setting and does nothing without a
     /// vibrator (ANIM-24).

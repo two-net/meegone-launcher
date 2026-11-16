@@ -64,6 +64,8 @@ public final class HomeActivity extends Activity {
         boolean started = nativeStart(bridge, getFilesDir().getPath(), savedView, savedAppsScroll);
         // Applications follows the system's app and profile changes (ADR 0010).
         bridge.watchApps();
+        // Events' header follows the date, the clock and the next alarm (ADR 0019).
+        bridge.watchClock();
         // Saved state with a launcher this call started: the system had ended the process while
         // the user was elsewhere. A recreation after a configuration change finds it running.
         away = started && savedInstanceState != null;
@@ -223,6 +225,18 @@ public final class HomeActivity extends Activity {
         }
     }
 
+    /**
+     * The date, the time, the time zone, the 12- or 24-hour setting or the next alarm changed
+     * (EVT-01, EVT-02, ADR 0019). The shared launcher writes the Events header again, and {@code
+     * resumed}, if it is a home, redraws. Called by {@link Bridge} on the main thread.
+     */
+    static void clockChanged(Activity resumed) {
+        nativeClockChanged();
+        if (resumed instanceof HomeActivity) {
+            ((HomeActivity) resumed).views.refresh();
+        }
+    }
+
     private static boolean isHome(Intent intent) {
         return Intent.ACTION_MAIN.equals(intent.getAction())
                 && intent.hasCategory(Intent.CATEGORY_HOME);
@@ -259,6 +273,9 @@ public final class HomeActivity extends Activity {
 
     /** An app or a profile changed; the launcher reloads the app list. */
     private static native void nativeAppsChanged();
+
+    /** The date, the clock, the time zone or the next alarm changed (ADR 0019). */
+    private static native void nativeClockChanged();
 
     /** Taps the banner's "make default" button; only debug builds' {@link DebugHooks} call it. */
     private native void nativeRequestDefaultHome();

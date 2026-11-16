@@ -18,7 +18,7 @@ use crate::adapters::{
 };
 use crate::model::{
     Access, App, AppId, DataError, ImageJob, NetworkState, Notification, Profile, ProfileId,
-    RecentUse, Rect, Shortcut, Size,
+    RecentUse, Rect, Shortcut, Size, TimeStyle,
 };
 use crate::storage::{MAX_STORED_BYTES, StorageAdapter, StoredFile, check_budget};
 
@@ -460,6 +460,8 @@ pub struct FakeSystem {
     pub utc_offset_ms: Mutex<i64>,
     /// `en-US` unless set.
     pub locale: Mutex<String>,
+    /// The device's 24-hour setting: false unless set, as in `en-US` (L10N-03).
+    pub hour_24: Mutex<bool>,
     pub default_home: Mutex<bool>,
     pub default_home_requested: Mutex<u32>,
     pub next_alarm_ms: Mutex<Option<u64>>,
@@ -482,6 +484,7 @@ impl Default for FakeSystem {
             installed_ms: Mutex::default(),
             utc_offset_ms: Mutex::default(),
             locale: Mutex::new("en-US".into()),
+            hour_24: Mutex::default(),
             default_home: Mutex::default(),
             default_home_requested: Mutex::default(),
             next_alarm_ms: Mutex::default(),
@@ -535,6 +538,35 @@ impl SystemConfigAdapter for FakeSystem {
         self.locale.lock().unwrap().clone()
     }
 
+    /// English in every locale, day before month as in the SRS's layout mock: "Tuesday",
+    /// "17 November", "07:00" or "7:00 AM", "Wed 07:00". Local time is `utc_offset_ms` from UTC.
+    fn format_time(&self, at_ms: u64, style: TimeStyle) -> String {
+        let local = i64::try_from(at_ms)
+            .unwrap_or(i64::MAX)
+            .saturating_add(self.utc_offset_ms(at_ms));
+        let days = local.div_euclid(DAY_MS);
+        let minutes = local.rem_euclid(DAY_MS) / 60_000;
+        let (hour, minute) = (minutes / 60, minutes % 60);
+        // 1 January 1970 was a Thursday.
+        let weekday = WEEKDAYS[(days + 4).rem_euclid(7) as usize];
+        let time = if *self.hour_24.lock().unwrap() {
+            format!("{hour:02}:{minute:02}")
+        } else {
+            let half = if hour < 12 { "AM" } else { "PM" };
+            let hour = if hour % 12 == 0 { 12 } else { hour % 12 };
+            format!("{hour}:{minute:02} {half}")
+        };
+        match style {
+            TimeStyle::Weekday => weekday.to_owned(),
+            TimeStyle::DayMonth => {
+                let (month, day) = month_and_day(days);
+                format!("{day} {}", MONTHS[month - 1])
+            }
+            TimeStyle::Time => time,
+            TimeStyle::WeekdayTime => format!("{} {time}", &weekday[..3]),
+        }
+    }
+
     fn is_default_home(&self) -> bool {
         *self.default_home.lock().unwrap()
     }
@@ -580,6 +612,51 @@ impl SystemConfigAdapter for FakeSystem {
         record(&self.web_searches, query.to_owned());
         Ok(())
     }
+}
+
+const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+
+const WEEKDAYS: [&str; 7] = [
+    "Sunday",
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+];
+
+const MONTHS: [&str; 12] = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+];
+
+/// The month (1 to 12) and day of the month of the day `days` after 1 January 1970, in the
+/// proleptic Gregorian calendar (Howard Hinnant's `civil_from_days`).
+fn month_and_day(days: i64) -> (usize, i64) {
+    let z = days + 719_468;
+    let day_of_era = z.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    };
+    (month as usize, day)
 }
 
 /// MeeGone's files, kept in memory. Writes are atomic and stay within the same budget as
@@ -644,5 +721,30 @@ mod tests {
         assert_eq!(fold("STRASSE Straße"), "strasse strasse");
         assert_eq!(app("cafe", "Café").search_key, "cafe");
         assert_eq!(FakeApps::default().search_key("CAFÉ"), "cafe");
+    }
+
+    #[test]
+    fn the_fake_clock_writes_english_in_the_local_time_zone() {
+        // L10N-03, as the platform writes it. 17 November 2026, 07:05 UTC, was a Tuesday.
+        let at = 1_794_873_600_000 + 7 * 3_600_000 + 5 * 60_000;
+        let system = FakeSystem::default();
+        assert_eq!(system.format_time(at, TimeStyle::Weekday), "Tuesday");
+        assert_eq!(system.format_time(at, TimeStyle::DayMonth), "17 November");
+        assert_eq!(system.format_time(at, TimeStyle::Time), "7:05 AM");
+        assert_eq!(
+            system.format_time(at, TimeStyle::WeekdayTime),
+            "Tue 7:05 AM"
+        );
+
+        *system.hour_24.lock().unwrap() = true;
+        assert_eq!(system.format_time(at, TimeStyle::Time), "07:05");
+        *system.utc_offset_ms.lock().unwrap() = -8 * 3_600_000;
+        assert_eq!(system.format_time(at, TimeStyle::WeekdayTime), "Mon 23:05");
+        assert_eq!(system.format_time(at, TimeStyle::DayMonth), "16 November");
+
+        // Leap days and the turn of the year.
+        assert_eq!(month_and_day(0), (1, 1));
+        assert_eq!(month_and_day(11_016), (2, 29)); // 2000-02-29
+        assert_eq!(month_and_day(20_818), (12, 31)); // 2026-12-31
     }
 }

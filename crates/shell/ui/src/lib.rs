@@ -223,6 +223,9 @@ pub struct HomeFrame {
     /// whenever its apps do, or `None` while Applications isn't working, so Settings doesn't
     /// offer it (ARCH-09).
     pub hidden_apps: Option<u32>,
+    /// The Events header (EVT-01, EVT-02): its revision, which changes whenever its text does,
+    /// or `None` while Events isn't working, so it isn't drawn (ARCH-09).
+    pub events_header: Option<u32>,
     /// The home views' solid background (HOME-11, THEME-04).
     pub background: Rgb,
     /// Menus and Settings (THEME-03).
@@ -414,6 +417,9 @@ impl ShellView {
             settings_open: state.settings_open,
             settings_group: state.settings_group,
             hidden_apps: shell.apps_ready().then(|| self.hidden_apps.revision()),
+            events_header: shell
+                .events_ready()
+                .then(|| self.events.show_header(&shell.events().state())),
             background: tokens.background,
             surface: tokens.surface,
             foreground: tokens.text_primary,

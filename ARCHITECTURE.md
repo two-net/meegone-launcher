@@ -26,7 +26,7 @@ Each crate is `crates/<area>/<layer>`, with the package name `meegone-<area>-<la
 |---|---|---|---|---|
 | **core** | Models, platform adapter traits and fakes, storage and the saved-file format, the settings store, app accents and colour contrast | `StateHolder`, `Store`, theme resolution, motion specs and spring physics | Colour tokens, each app's accent per theme, `View`, `Slot`, `Dispatch` | Nothing persistent |
 | **apps** | Layout store | Grid, its columns, scroll position and geometry, an app's long-press menu, edit mode and its arrangement, folders, search and its ranking, hidden apps, keeping the layout in step with the installed apps, the apps a restore waits for | `AppsView`, `HiddenAppsSection` | Layout store; hidden apps (in the settings store) |
-| **events** | – | Notifications grouped by app | `EventsView` | Nothing (memory only) |
+| **events** | – | The header with the date and the next alarm, notifications grouped by app | `EventsView` | Nothing (memory only) |
 | **recent** | – | Filtering, ordering, close mode | `RecentView` | Removed-apps list (in the settings store) |
 | **lockimage** | Image cache, image-feed interface | On/off, availability, current image | `ImageCard`, `ImageSettingsSection` | Image cache |
 | **settings** | – | Settings, access status, the home-app banner (ONB-04) | `SettingsView`, `HomeBanner` | The settings screens |
@@ -97,6 +97,9 @@ AppsView.cell_tapped(revision, 4, icon)          ui     sends AppsIntent::Launch
   - Every layout Applications saves records when this copy of MeeGone was installed (`SystemConfigAdapter::installed_ms`). A layout another copy saved came from a backup, and is saved at once as this copy's.
   - At a restore, its apps that aren't installed yet keep their places, out of sight, for 7 days. Each one installed in that time takes its place, without a dot. When the wait ends, those still missing leave.
   - Apps the backup doesn't hold join the end, alphabetically and unmarked. Settings come back whole.
+- **The Events header** ([ADR 0019](docs/adr/0019-the-events-header.md)). Events opens with today's weekday and date and, while an alarm is set, the next alarm; a tap on the alarm opens the app that set it (EVT-01, EVT-02).
+  - The platform writes each date and time in the device's language and 12- or 24-hour setting (`SystemConfigAdapter::format_time`, L10N-03); Events decides what shows. An alarm within 24 hours shows its time, a later one its weekday too.
+  - The header never needs notification access (EVT-03). `ClockChanged`, `Resumed` and a swipe to Events read it again.
 
 ## Drawing (ADR 0006)
 
@@ -125,6 +128,7 @@ HomeViews (Java)                                            Rust
 - **Apps coming, going and moving** ([ADR 0012](docs/adr/0012-keeping-the-layout-in-step.md), [ADR 0014](docs/adr/0014-edit-mode.md)). Each cell says where it was in the cells the host last read, so `AppsGrid` moves the same view, icon and all, to its new place. When cells come, go or move, the shell's grid-change motion runs for 200 ms: new cells grow and fade in, cells that left shrink away where they were, and the rest slide to their new places from where they are drawn (ANIM-21). A revision that only refreshes cells, such as a new accent, keeps a change playing. A new app has a dot in the accent colour before its label until it is opened from MeeGone (APPS-07).
 - **Edit mode** ([ADR 0014](docs/adr/0014-edit-mode.md)). The cells shrink to 92 % and the ✕ badges pop in row by row, from frame slots per visible row (ANIM-12). A dragged icon lifts to 110 % with a shadow, stays under the finger as cells move and the grid scrolls, and settles into its cell on a spring (ANIM-13). `DragShadow` draws it above the pages, so it can leave an open folder, and its cell stays as a gap (ADR 0015). Done is a flat pill at the bottom of Applications. Screen readers get "Uninstall ‹app›" and "Move to…" actions on each cell, and hear "Edit mode" (A11Y-01, A11Y-05, A11Y-08).
 - **Folders** ([ADR 0015](docs/adr/0015-folders.md)). `AppCell` draws a folder as a plate in the icons' shape with a 2×2 preview of its first apps, and the icon held over grows and pulses (FOLD-02, ANIM-14). `FolderPanel`, inside the Applications page, draws the scrim and a panel four cells wide, with the folder's name over its own `AppsGrid`, growing from the folder's icon (ANIM-15). A tap on the name opens a rename dialog (FOLD-03). Screen readers hear "Folder: ‹name›, N apps", and make and empty folders with actions (A11Y-01, A11Y-05).
+- **The Events header** ([ADR 0019](docs/adr/0019-the-events-header.md)). `EventsHeader`, at the top of the Events page, draws the weekday and the date in 40 sp light type that scales with the system font size and wraps rather than overlap, and the alarm row below them (EVT-01, A11Y-04). It reads its text with `nativeEventsHeader` only when its revision changes, and the alarm row calls `nativeOpenAlarm`.
 - **Settings** shows its name until #34 draws it, and below it `HiddenAppsList`: Applications → Hidden apps, each app with its icon and Unhide, read by revision like the cells ([ADR 0017](docs/adr/0017-hiding-apps.md)).
 - **Search** ([ADR 0016](docs/adr/0016-app-search.md)). `SearchPanel`, inside the Applications page, draws the field in a pill as far as the frame's reveal, and moves the grid down with it. Once something is typed, its own `AppsGrid` shows the results instead of the grid, which keeps its scroll position. Each change of the field's text goes to Rust; Go launches the first result. The window asks for `adjustResize`, and only the results take the keyboard's height, as padding, so the safe area never changes with it.
 - **Icons and accents** ([ADR 0011](docs/adr/0011-icon-shape-and-app-accents.md)). Every icon is one rounded square: adaptive icons are masked to it, and legacy ones sit on a white plate of that shape (APPS-15). Each app's accent comes from its icon once per process: `AppAccents` samples the icon on a background thread, and the Rust app's pure `nativeAccent` picks the colour (APPS-17). It reaches Rust in the app catalogue, and a theme draws it with `Tokens::app_accent`, at 3:1 or more against its background (THEME-07).
@@ -145,6 +149,7 @@ On Android, `meegone_core_data::android` builds the `Platform` ([ADR 0005](docs/
   - The app catalogue ([ADR 0010](docs/adr/0010-the-applications-grid.md)) and the default apps ([ADR 0012](docs/adr/0012-keeping-the-layout-in-step.md)).
   - Shortcuts, App info and uninstall requests ([ADR 0013](docs/adr/0013-the-app-long-press-menu.md)).
   - Folding text for search, whether a browser is installed, and web search ([ADR 0016](docs/adr/0016-app-search.md)).
+  - Writing dates and times, and the next alarm ([ADR 0019](docs/adr/0019-the-events-header.md)).
 - Every other adapter answers with its "If unavailable" value below until its issue builds it.
 
 | Capability (SRS 8.1) | Adapter | Methods | If unavailable |
@@ -163,11 +168,11 @@ On Android, `meegone_core_data::android` builds the `Platform` ([ADR 0005](docs/
 | Vibration | `SystemConfigAdapter` | `haptic_tick` | Does nothing |
 | System settings screens | The adapter that owns the subject | `open_access_settings` (notifications, usage), `open_app_info`, `open_wallpaper_settings`, `request_default_home` | `Unsupported`: written instructions |
 | Web browser | `SystemConfigAdapter` | `has_browser`, `open_in_browser`, `web_search` | `has_browser` is false: link and web search hidden |
-| Device settings and clock | `SystemConfigAdapter` | `is_dark`, `animation_scale`, `animates_return_home`, `now_ms`, `utc_offset_ms`, `locale` | `animates_return_home` is true: no return-home motion |
+| Device settings and clock | `SystemConfigAdapter` | `is_dark`, `animation_scale`, `animates_return_home`, `now_ms`, `utc_offset_ms`, `locale`, `format_time`; `ShellIntent::ClockChanged` | `animates_return_home` is true: no return-home motion; `format_time` is empty: that line of the header is left out |
 | MeeGone's install time (ADR 0018) | `SystemConfigAdapter` | `installed_ms` | 0: a restore is recognised only by the other device's time |
 | MeeGone's own files (ADR 0004) | `StorageAdapter` | `read`, `write`, `remove` | A failed save is the feature's `problem`; an unreadable file loads as defaults |
 
-- **Adapters never call back.** They answer questions and carry out requests. A change the system reports reaches MeeGone as a `ShellIntent` (`Home`, `Back`, `Resumed`, `Returned`, `Restore`, `SystemThemeChanged`, `AppsChanged`, `NotificationsChanged`) that the platform's entry point passes to `Launcher::dispatch`. The Android activity sends `Resumed` on every `onResume`, including after the home-app role dialog, and `Returned` after it when an app or a system screen had covered the home (ADR 0007). `Bridge` sends `AppsChanged` once for each burst of app, profile and language changes (ADR 0010, ADR 0012).
+- **Adapters never call back.** They answer questions and carry out requests. A change the system reports reaches MeeGone as a `ShellIntent` (`Home`, `Back`, `Resumed`, `Returned`, `Restore`, `SystemThemeChanged`, `AppsChanged`, `NotificationsChanged`, `ClockChanged`) that the platform's entry point passes to `Launcher::dispatch`. The Android activity sends `Resumed` on every `onResume`, including after the home-app role dialog, and `Returned` after it when an app or a system screen had covered the home (ADR 0007). `Bridge` sends `AppsChanged` once for each burst of app, profile and language changes (ADR 0010, ADR 0012), and `ClockChanged` once for each burst of date, time, time-zone, 12- or 24-hour and next-alarm changes (ADR 0019).
 - **Expected failures are values.** Adapters return a `DataError` (`AccessDenied`, `Unsupported`, `Offline`, `Invalid` or `Failed`), and each feature turns it into its own state (ARCH-09).
 - **The image feed is the lock-screen image's own.** `ImageFeed` in `meegone-lockimage-data` returns format-free `FeedImage`s. Its one implementation, built on `NetworkAdapter`, is the only code that knows the Bing feed's format (SRS 8.2). Its fake is `FakeFeed`.
 - **Fakes.** Enable the `fakes` feature of `meegone-core-data` (and of `meegone-lockimage-data` for `FakeFeed`) in `[dev-dependencies]`. Every fake has public fields that set what the "system" reports and record what was asked of it. Its `error` field makes every call that can fail fail, and other fields reproduce each "if unavailable" case.
@@ -235,7 +240,7 @@ MeeGone keeps three persistent stores, each in its own file under one private fo
 
 ## Not built yet
 
-The skeleton is from issue #1; the Android host and the home-app role from #4; the carousel of home views from #5; Home, Back and coming back to the home from #6; the home menu from #7; edge to edge, screen sizes and navigation modes from #8; the Applications grid and the app catalogue from #9; one icon shape and each app's accent from #10; the layout kept in step with the installed apps from #11; the app long-press menu from #12; edit mode from #13; folders from #14; app search from #15; hiding apps from #16; backup and restore from #17. The following arrive with later requirements:
+The skeleton is from issue #1; the Android host and the home-app role from #4; the carousel of home views from #5; Home, Back and coming back to the home from #6; the home menu from #7; edge to edge, screen sizes and navigation modes from #8; the Applications grid and the app catalogue from #9; one icon shape and each app's accent from #10; the layout kept in step with the installed apps from #11; the app long-press menu from #12; edit mode from #13; folders from #14; app search from #15; hiding apps from #16; backup and restore from #17; the Events header from #18. The following arrive with later requirements:
 
 - **Android adapters.**
   - Built:
@@ -243,9 +248,10 @@ The skeleton is from issue #1; the Android host and the home-app role from #4; t
     - The navigation-mode check for the return-home motion (ADR 0007) and the haptic tick (ADR 0008), which also marks a folder made (ADR 0015).
     - The app catalogue (ADR 0010), with its shortcuts, App info and uninstall requests (ADR 0013), and its search keys (ADR 0016).
     - Whether a browser is installed, and web search (ADR 0016).
+    - Dates and times in the device's language and 12- or 24-hour setting, and the next alarm (ADR 0019).
   - Stubs until their issues: notifications, usage, wallpaper, network, scheduling, opening links (#30) and the remaining device settings.
 - **The daily image.** The Bing implementation of `ImageFeed` (#26) and the updater (SRS 7.5) come with the WALL requirements.
-- **Drawing.** The home views, their carousel, the view indicator, the return-home motion, the home menu, the Applications grid, its edit mode, its folders, search and Settings' Hidden apps are drawn (ADR 0006 to ADR 0008, ADR 0010, ADR 0014 to ADR 0017). Events and Recent show only their names until their content arrives (#19, #22).
+- **Drawing.** The home views, their carousel, the view indicator, the return-home motion, the home menu, the Applications grid, its edit mode, its folders, search, Settings' Hidden apps and the Events header are drawn (ADR 0006 to ADR 0008, ADR 0010, ADR 0014 to ADR 0017, ADR 0019). Events shows only its header until its notifications arrive (#19), and Recent only its name until its cards arrive (#22).
   - Recent's cards adapt to large screens when #22 builds them. Today the pages, the carousel, the safe area, the menu, Settings and the Applications columns adapt (HOME-12, APPS-02).
   - Events' group marker and Recent's card fill draw each app's accent with `Tokens::app_accent` when #19 and #22 draw them.
   - Settings covers the home views with only its name, its group's and Applications' Hidden apps until #34 draws it. "Home button opens", the home-app banner and first-run setup send intents but aren't drawn yet.

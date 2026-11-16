@@ -253,8 +253,8 @@ pub enum ShellIntent {
     /// Opens Settings at its top (SET-01).
     OpenSettings,
     /// MeeGone came to the foreground: at start, after the system's role dialog, or back from
-    /// another app or a settings screen. The default home app or the day may have changed
-    /// (HOME-01, ONB-04).
+    /// another app or a settings screen. The default home app, the day or the language may have
+    /// changed (HOME-01, ONB-04, EVT-01).
     Resumed,
     /// The home is back on screen after an app or a system screen covered it (HOME-06). `home`
     /// is true when the system Home action brought it back, and false when the app closed or
@@ -272,6 +272,9 @@ pub enum ShellIntent {
     AppsChanged,
     /// A notification was posted or removed, or notification access changed (EVT-10).
     NotificationsChanged,
+    /// The date, the time, the time zone, the 12- or 24-hour setting or the next alarm changed
+    /// (EVT-01, EVT-02, L10N-03, ADR 0019).
+    ClockChanged,
     Apps(AppsIntent),
     Events(EventsIntent),
     Recent(RecentIntent),
@@ -350,7 +353,10 @@ impl HomeShell {
                 // Applications writes the hidden apps there (APPS-19, ADR 0002).
                 settings_store.clone(),
             )),
-            events: Store::new(EventsHolder::new(platform.notifications.clone())),
+            events: Store::new(EventsHolder::new(
+                platform.notifications.clone(),
+                platform.system.clone(),
+            )),
             recent: Store::new(RecentHolder::new(
                 platform.usage.clone(),
                 platform.apps.clone(),
@@ -411,6 +417,11 @@ impl HomeShell {
     /// Settings, is offered only then (ARCH-09).
     pub fn apps_ready(&self) -> bool {
         *self.apps.health() == Health::Ready
+    }
+
+    /// Whether Events works. Its header is drawn only then (ARCH-09).
+    pub fn events_ready(&self) -> bool {
+        *self.events.health() == Health::Ready
     }
 
     pub fn events(&self) -> &Store<EventsHolder> {
@@ -520,6 +531,8 @@ impl HomeShell {
             ShellIntent::OpenSettings => self.open_settings(None),
             ShellIntent::Resumed => {
                 self.settings.dispatch(SettingsIntent::Refresh);
+                // The day or the language may have changed while MeeGone was away (EVT-01).
+                self.events.dispatch(EventsIntent::RefreshHeader);
                 // The animation speed may have changed in system settings (ANIM-05).
                 self.configure_carousel();
             }
@@ -528,6 +541,7 @@ impl HomeShell {
             ShellIntent::SystemThemeChanged => self.theme.dispatch(ThemeIntent::Refresh),
             ShellIntent::AppsChanged => self.apps_changed(),
             ShellIntent::NotificationsChanged => self.events.dispatch(EventsIntent::Refresh),
+            ShellIntent::ClockChanged => self.events.dispatch(EventsIntent::RefreshHeader),
             ShellIntent::Apps(AppsIntent::OpenSearch) => self.open_search(),
             ShellIntent::Apps(intent) => self.apps.dispatch(intent),
             ShellIntent::Events(intent) => self.events.dispatch(intent),
@@ -1408,6 +1422,28 @@ mod tests {
         shell.dispatch(ShellIntent::NotificationsChanged);
 
         assert_eq!(shell.events().state().access, Access::Granted);
+    }
+
+    #[test]
+    fn clock_changes_and_coming_back_refresh_the_events_header() {
+        // EVT-01, EVT-02
+        let fakes = Fakes::default();
+        let mut shell = HomeShell::compose(fakes.platform());
+        assert_eq!(shell.events().state().header.weekday, "Thursday");
+
+        *fakes.system.now_ms.lock().unwrap() = 24 * 60 * 60 * 1000;
+        *fakes.system.next_alarm_ms.lock().unwrap() = Some(25 * 60 * 60 * 1000);
+        shell.dispatch(ShellIntent::ClockChanged);
+        assert_eq!(shell.events().state().header.weekday, "Friday");
+        assert_eq!(
+            shell.events().state().header.alarm.as_deref(),
+            Some("1:00 AM")
+        );
+
+        *fakes.system.now_ms.lock().unwrap() = 2 * 24 * 60 * 60 * 1000;
+        shell.dispatch(ShellIntent::Resumed);
+        assert_eq!(shell.events().state().header.weekday, "Saturday");
+        assert!(shell.events_ready());
     }
 
     /// Works like [`FakeApps`], except that it panics when asked to launch or uninstall an app.
