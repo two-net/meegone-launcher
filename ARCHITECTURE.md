@@ -25,7 +25,7 @@ Each crate is `crates/<area>/<layer>`, with the package name `meegone-<area>-<la
 | Area | data | state | ui | Owns |
 |---|---|---|---|---|
 | **core** | Models, platform adapter traits and fakes, storage and the saved-file format, the settings store, app accents and colour contrast | `StateHolder`, `Store`, theme resolution, motion specs and spring physics | Colour tokens, each app's accent per theme, `View`, `Slot`, `Dispatch` | Nothing persistent |
-| **apps** | Layout store | Grid, its columns, scroll position and geometry, an app's long-press menu, edit mode and its arrangement, folders, search and its ranking, hidden apps, keeping the layout in step with the installed apps | `AppsView`, `HiddenAppsSection` | Layout store; hidden apps (in the settings store) |
+| **apps** | Layout store | Grid, its columns, scroll position and geometry, an app's long-press menu, edit mode and its arrangement, folders, search and its ranking, hidden apps, keeping the layout in step with the installed apps, the apps a restore waits for | `AppsView`, `HiddenAppsSection` | Layout store; hidden apps (in the settings store) |
 | **events** | – | Notifications grouped by app | `EventsView` | Nothing (memory only) |
 | **recent** | – | Filtering, ordering, close mode | `RecentView` | Removed-apps list (in the settings store) |
 | **lockimage** | Image cache, image-feed interface | On/off, availability, current image | `ImageCard`, `ImageSettingsSection` | Image cache |
@@ -93,6 +93,10 @@ AppsView.cell_tapped(revision, 4, icon)          ui     sends AppsIntent::Launch
   - A hidden app is forgotten when it is gone, by the rule that keeps its place (`follow_hidden`), so reinstalling it shows it.
   - Applications provides `HiddenAppsSection`, which the shell puts into Settings. It is offered only while Applications works (ARCH-09).
   - When the hidden apps change, the shell refreshes Recent at once, in `dispatch`.
+- **Backup and restore** ([ADR 0018](docs/adr/0018-backing-up-and-restoring.md)). The system's backup and device-to-device transfer keep the layout and settings files, and nothing else (APPS-21).
+  - Every layout Applications saves records when this copy of MeeGone was installed (`SystemConfigAdapter::installed_ms`). A layout another copy saved came from a backup, and is saved at once as this copy's.
+  - At a restore, its apps that aren't installed yet keep their places, out of sight, for 7 days. Each one installed in that time takes its place, without a dot. When the wait ends, those still missing leave.
+  - Apps the backup doesn't hold join the end, alphabetically and unmarked. Settings come back whole.
 
 ## Drawing (ADR 0006)
 
@@ -137,7 +141,7 @@ Everything MeeGone asks of Android goes through eight narrow traits in `meegone-
 
 On Android, `meegone_core_data::android` builds the `Platform` ([ADR 0005](docs/adr/0005-android-host-and-home-role.md)). Its adapters ask a Java `Bridge` object through a minimal, hand-written JNI binding.
 - Real today:
-  - The home-app role, whether the system animates the return home, the haptic tick, the clock and storage.
+  - The home-app role, whether the system animates the return home, the haptic tick, the clock, MeeGone's install time and storage.
   - The app catalogue ([ADR 0010](docs/adr/0010-the-applications-grid.md)) and the default apps ([ADR 0012](docs/adr/0012-keeping-the-layout-in-step.md)).
   - Shortcuts, App info and uninstall requests ([ADR 0013](docs/adr/0013-the-app-long-press-menu.md)).
   - Folding text for search, whether a browser is installed, and web search ([ADR 0016](docs/adr/0016-app-search.md)).
@@ -160,6 +164,7 @@ On Android, `meegone_core_data::android` builds the `Platform` ([ADR 0005](docs/
 | System settings screens | The adapter that owns the subject | `open_access_settings` (notifications, usage), `open_app_info`, `open_wallpaper_settings`, `request_default_home` | `Unsupported`: written instructions |
 | Web browser | `SystemConfigAdapter` | `has_browser`, `open_in_browser`, `web_search` | `has_browser` is false: link and web search hidden |
 | Device settings and clock | `SystemConfigAdapter` | `is_dark`, `animation_scale`, `animates_return_home`, `now_ms`, `utc_offset_ms`, `locale` | `animates_return_home` is true: no return-home motion |
+| MeeGone's install time (ADR 0018) | `SystemConfigAdapter` | `installed_ms` | 0: a restore is recognised only by the other device's time |
 | MeeGone's own files (ADR 0004) | `StorageAdapter` | `read`, `write`, `remove` | A failed save is the feature's `problem`; an unreadable file loads as defaults |
 
 - **Adapters never call back.** They answer questions and carry out requests. A change the system reports reaches MeeGone as a `ShellIntent` (`Home`, `Back`, `Resumed`, `Returned`, `Restore`, `SystemThemeChanged`, `AppsChanged`, `NotificationsChanged`) that the platform's entry point passes to `Launcher::dispatch`. The Android activity sends `Resumed` on every `onResume`, including after the home-app role dialog, and `Returned` after it when an app or a system screen had covered the home (ADR 0007). `Bridge` sends `AppsChanged` once for each burst of app, profile and language changes (ADR 0010, ADR 0012).
@@ -178,7 +183,7 @@ Bugs are contained by `Store`. It runs every intent inside `catch_unwind`. If a 
 | Entity | Single source of truth | Written by |
 |---|---|---|
 | App | The system, through `AppsAdapter` (memory only) | The system |
-| Layout item, folder, new-app mark | `LayoutStore` (`meegone-apps-data`), saved in `layout` | Applications |
+| Layout item, folder, new-app mark, a restore's waiting apps | `LayoutStore` (`meegone-apps-data`), saved in `layout` | Applications |
 | Settings | `SettingsStore` (`meegone-core-data`), saved in `settings` | Each field has one writer: Settings (theme, Home target, wrap-around, when the home-app banner was dismissed), Applications (hidden apps), Lock-screen image (image options), Recent (apps removed from Recent) |
 | Image record | `ImageCache` (`meegone-lockimage-data`), saved in `images/details` | Lock-screen image |
 | Notification group | The system, through `NotificationsAdapter` (memory only) | The system |
@@ -205,6 +210,7 @@ MeeGone keeps three persistent stores, each in its own file under one private fo
   - A file that is cut short, damaged, of another kind or from a newer version loads as the defaults instead of crashing (MAINT-04).
   - The layout's records stand alone, so a damaged layout keeps the ones that still read, and the grid is rebuilt around them and saved at once (REL-02, ADR 0012). A layout that can't be read at all, because storage failed, is shown rebuilt but never saved over.
 - **Budget.** A write that would take stored data past 50 MB fails and changes nothing (PERF-08).
+- **Backup** ([ADR 0018](docs/adr/0018-backing-up-and-restoring.md)). The system's backup and device-to-device transfer keep `layout` and `settings`, as `res/xml/backup_rules.xml` (Android 10 and 11) and `res/xml/data_extraction_rules.xml` (from Android 12) list them, and nothing else (APPS-21). `tests/backup/mod.rs` checks the lists against `StoredFile`. Android restores them as it installs MeeGone, before MeeGone first runs.
 - **Failures.** A failed save keeps the previous data. Each feature shows the error as its `problem`.
 
 ### Changing a saved format
@@ -229,11 +235,11 @@ MeeGone keeps three persistent stores, each in its own file under one private fo
 
 ## Not built yet
 
-The skeleton is from issue #1; the Android host and the home-app role from #4; the carousel of home views from #5; Home, Back and coming back to the home from #6; the home menu from #7; edge to edge, screen sizes and navigation modes from #8; the Applications grid and the app catalogue from #9; one icon shape and each app's accent from #10; the layout kept in step with the installed apps from #11; the app long-press menu from #12; edit mode from #13; folders from #14; app search from #15; hiding apps from #16. The following arrive with later requirements:
+The skeleton is from issue #1; the Android host and the home-app role from #4; the carousel of home views from #5; Home, Back and coming back to the home from #6; the home menu from #7; edge to edge, screen sizes and navigation modes from #8; the Applications grid and the app catalogue from #9; one icon shape and each app's accent from #10; the layout kept in step with the installed apps from #11; the app long-press menu from #12; edit mode from #13; folders from #14; app search from #15; hiding apps from #16; backup and restore from #17. The following arrive with later requirements:
 
 - **Android adapters.**
   - Built:
-    - The home-app role, the clock and storage (ADR 0005).
+    - The home-app role, the clock and storage (ADR 0005), and MeeGone's install time (ADR 0018).
     - The navigation-mode check for the return-home motion (ADR 0007) and the haptic tick (ADR 0008), which also marks a folder made (ADR 0015).
     - The app catalogue (ADR 0010), with its shortcuts, App info and uninstall requests (ADR 0013), and its search keys (ADR 0016).
     - Whether a browser is installed, and web search (ADR 0016).

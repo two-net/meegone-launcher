@@ -11,13 +11,21 @@ use meegone_core_data::{AppId, DataError, StorageAdapter, StoredFile};
 
 /// Version of the saved layout format (MAINT-04). Changing the format means a new version, a
 /// migration in [`LAYOUT_MIGRATIONS`] and a fixture (ARCHITECTURE.md, "Persistence").
-pub const LAYOUT_VERSION: u32 = 2;
+pub const LAYOUT_VERSION: u32 = 3;
 
 /// Brings layouts saved by older versions up to date, one version at a time.
-const LAYOUT_MIGRATIONS: [Migration; LAYOUT_VERSION as usize - 1] = [add_new_apps];
+const LAYOUT_MIGRATIONS: [Migration; LAYOUT_VERSION as usize - 1] =
+    [add_new_apps, add_installed_and_restore];
 
 /// Version 2 added `new` records (APPS-07). A version 1 body is a version 2 body without any.
 fn add_new_apps(body: &str) -> Option<String> {
+    Some(body.to_owned())
+}
+
+/// Version 3 added the `installed` and `restore` records (APPS-21). A version 2 body is a
+/// version 3 body without them: only this copy of MeeGone could have saved it, since earlier
+/// versions took no part in backups.
+fn add_installed_and_restore(body: &str) -> Option<String> {
     Some(body.to_owned())
 }
 
@@ -42,6 +50,21 @@ pub struct Layout {
     /// Apps that joined the grid after it was first set up and haven't been opened from MeeGone
     /// since. Each carries a dot (APPS-07).
     pub new: BTreeSet<AppId>,
+    /// When the copy of MeeGone that saved this layout was first installed. A layout saved by
+    /// another copy came from a backup (APPS-21). `None` in a layout saved before version 3,
+    /// which only this copy could have saved.
+    pub installed_ms: Option<u64>,
+    /// After a restore, the backed-up apps that aren't installed yet (APPS-21).
+    pub restore: Option<Restore>,
+}
+
+/// The apps a restored layout is still waiting for (APPS-21, ADR 0018). Each keeps its place,
+/// out of sight, until it is installed or the wait ends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Restore {
+    /// When the wait ends. Apps still not installed then leave the layout.
+    pub until_ms: u64,
+    pub waiting: BTreeSet<AppId>,
 }
 
 /// What the layout store holds.
@@ -95,12 +118,15 @@ fn recover(bytes: &[u8]) -> Layout {
         .fold(Layout::default(), |mut layout, part| {
             layout.entries.extend(part.entries);
             layout.new.extend(part.new);
+            layout.installed_ms = part.installed_ms.or(layout.installed_ms);
+            layout.restore = part.restore.or(layout.restore);
             layout
         })
 }
 
 /// One record per grid cell, in order: `app <app>` or `folder <id> <name> <apps>`. Then one
-/// `new <app>` record per app not yet opened. Each record stands alone, so a damaged file can be
+/// `new <app>` record per app not yet opened, then `installed <ms>` and
+/// `restore <until_ms> <apps>` if there are. Each record stands alone, so a damaged file can be
 /// recovered record by record.
 impl Format for Layout {
     const KIND: &'static str = "layout";
@@ -117,6 +143,13 @@ impl Format for Layout {
         for app in &self.new {
             out.line("new", app);
         }
+        if let Some(installed_ms) = self.installed_ms {
+            out.line("installed", installed_ms);
+        }
+        if let Some(Restore { until_ms, waiting }) = &self.restore {
+            let waiting: Vec<&AppId> = waiting.iter().collect();
+            out.line("restore", (until_ms, waiting));
+        }
     }
 
     fn read(input: &mut Reader<'_>) -> Option<Self> {
@@ -132,7 +165,26 @@ impl Format for Layout {
             }
         }
         let new = input.lines("new")?.into_iter().collect();
-        Some(Self { entries, new })
+        let installed_ms = match input.peek_key() {
+            Some(key @ "installed") => Some(input.line(key)?),
+            _ => None,
+        };
+        let restore = match input.peek_key() {
+            Some(key @ "restore") => {
+                let (until_ms, waiting): (u64, Vec<AppId>) = input.line(key)?;
+                Some(Restore {
+                    until_ms,
+                    waiting: waiting.into_iter().collect(),
+                })
+            }
+            _ => None,
+        };
+        Some(Self {
+            entries,
+            new,
+            installed_ms,
+            restore,
+        })
     }
 }
 
@@ -163,7 +215,8 @@ mod tests {
     /// change or remove a fixture; add one for each new version.
     const FIXTURES: [Fixture; LAYOUT_VERSION as usize] = [
         (include_str!("../fixtures/layout-v1.txt"), sample_v1),
-        (include_str!("../fixtures/layout-v2.txt"), sample),
+        (include_str!("../fixtures/layout-v2.txt"), sample_v2),
+        (include_str!("../fixtures/layout-v3.txt"), sample),
     ];
 
     /// The layout of the version 1 fixture: no app is marked new.
@@ -187,17 +240,30 @@ mod tests {
                     apps: Vec::new(),
                 },
             ],
-            new: BTreeSet::new(),
+            ..Layout::default()
         }
     }
 
     /// Version 2: Atlas and Zoom were installed later and haven't been opened (APPS-07).
-    fn sample() -> Layout {
+    fn sample_v2() -> Layout {
         let mut layout = sample_v1();
         layout.entries.push(LayoutEntry::App(app_id("atlas")));
         layout.entries.push(LayoutEntry::App(app_id("zoom")));
         layout.new = [app_id("zoom"), app_id("atlas")].into();
         layout
+    }
+
+    /// Version 3: saved by the copy of MeeGone installed at 1 763 000 000 000, a week after a
+    /// restore that is still waiting for Chess and Go (APPS-21).
+    fn sample() -> Layout {
+        Layout {
+            installed_ms: Some(1_763_000_000_000),
+            restore: Some(Restore {
+                until_ms: 1_763_604_800_000,
+                waiting: [app_id("go"), app_id("chess")].into(),
+            }),
+            ..sample_v2()
+        }
     }
 
     fn store() -> (Arc<FakeStorage>, PersistentLayoutStore) {
@@ -287,8 +353,22 @@ mod tests {
 
         let (saved, mark) = saved_with("new 0 zoom");
         put(&storage, saved[..mark].to_vec());
-        expected = sample();
+        expected = sample_v2();
         expected.new.remove(&app_id("zoom"));
+        assert_eq!(store.load(), Ok(SavedLayout::Recovered(expected)));
+    }
+
+    #[test]
+    fn recovery_keeps_the_install_and_the_restore() {
+        // REL-02, APPS-21: each record stands alone, so a damaged cell loses only itself.
+        let (mut damaged, phone) = saved_with("app 0 phone");
+        damaged[phone + 1] ^= 0x20;
+        let mut expected = sample();
+        expected.entries.remove(0);
+
+        let (storage, store) = store();
+        put(&storage, damaged);
+
         assert_eq!(store.load(), Ok(SavedLayout::Recovered(expected)));
     }
 
@@ -323,6 +403,12 @@ mod tests {
             "folder 1 Games 2 0 a a.Main\n",
             "new 0 a a.Main\napp 0 a a.Main\n",
             "new 0 a\n",
+            "installed 5\nnew 0 a a.Main\n",
+            "restore 9 1 0 a a.Main\ninstalled 5\n",
+            "installed\n",
+            "installed 5 6\n",
+            "restore 9\n",
+            "restore 9 2 0 a a.Main\n",
         ] {
             assert_eq!(
                 decode::<Layout>(&seal("layout", LAYOUT_VERSION, body)),

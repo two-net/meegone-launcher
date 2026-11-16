@@ -12,6 +12,9 @@
 //! removed and its screen-reader actions in `meegone-shell-state`, and the folders'
 //! screen-reader actions here (A11Y-05).
 
+mod backup;
+
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use meegone_core_data::fakes::{Fakes, WORK_PROFILE, app, app_id, work_app};
@@ -527,7 +530,7 @@ fn saved_layout(fakes: &Fakes, records: &str) {
         .files
         .lock()
         .unwrap()
-        .insert(StoredFile::Layout, seal("layout", 2, records));
+        .insert(StoredFile::Layout, seal("layout", 3, records));
 }
 
 #[test]
@@ -607,7 +610,7 @@ fn rel02_given_an_unreadable_layout_meegone_shows_an_alphabetical_grid_and_doesn
     assert_eq!(grid(&launcher), ["Atlas", "Mail", "Zoom"]);
     assert_eq!(dots(&mut launcher), [false, false, false]);
     let stored = fakes.storage.stored_text();
-    assert!(stored.starts_with("meegone-layout 2\n"), "{stored}");
+    assert!(stored.starts_with("meegone-layout 3\n"), "{stored}");
     drop(launcher);
     assert_eq!(
         grid(&Launcher::start(fakes.platform())),
@@ -2140,4 +2143,129 @@ fn apps19_given_a_hidden_app_is_unhidden_in_settings_then_it_returns_to_the_grid
     assert_eq!(recent(&launcher), ["Mail", "Maps"]);
     // A tap on the list as it was does nothing.
     assert!(!launcher.view().hidden_apps().unhide_tapped(revision, 0));
+}
+
+/// A day, in ms.
+const DAY_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// The backup of a user's old device (APPS-21): Phone, a Games folder with Chess and Go, Maps,
+/// Bank, which they hid, and Mail, in the dark theme. MeeGone was installed there at 1 000 ms.
+fn backed_up_home() -> BTreeMap<StoredFile, Vec<u8>> {
+    let old = Fakes::default();
+    *old.system.installed_ms.lock().unwrap() = 1_000;
+    *old.apps.apps.lock().unwrap() = vec![
+        app("phone", "Phone"),
+        app("chess", "Chess"),
+        app("go", "Go"),
+        app("maps", "Maps"),
+        app("bank", "Bank"),
+        app("mail", "Mail"),
+    ];
+    saved_layout(
+        &old,
+        "app 0 phone phone.Main\n\
+         folder 1 Games 2 0 chess chess.Main 0 go go.Main\n\
+         app 0 maps maps.Main\n\
+         app 0 bank bank.Main\n\
+         app 0 mail mail.Main\n",
+    );
+    let (mut launcher, _) = on_a_phone(&old);
+    hide(&mut launcher, "bank");
+    launcher.dispatch(ShellIntent::OpenSettings);
+    launcher.view().settings().theme_chosen(ThemeChoice::Dark);
+    launcher.frame();
+    assert_eq!(grid(&launcher), ["Phone", "Games", "Maps", "Mail"]);
+    backup::back_up(&old.storage)
+}
+
+/// A new device with `installed` apps, where the system restores `backup` as it installs
+/// MeeGone, at 5 000 ms, before MeeGone first runs (APPS-21).
+fn new_device(backup: &BTreeMap<StoredFile, Vec<u8>>, installed: Vec<App>) -> Fakes {
+    let new = Fakes::default();
+    *new.system.installed_ms.lock().unwrap() = 5_000;
+    *new.system.now_ms.lock().unwrap() = 6_000;
+    *new.apps.apps.lock().unwrap() = installed;
+    backup::restore(&new.storage, backup);
+    new
+}
+
+#[test]
+fn apps21_given_a_backup_restored_on_another_device_then_the_home_matches_minus_apps_not_installed()
+{
+    // Issue #17: APPS-21. Chess and Maps aren't installed yet: they are skipped. Notes, which the
+    // backup doesn't hold, joins the end, without a dot.
+    let backup = backed_up_home();
+    let new = new_device(
+        &backup,
+        vec![
+            app("phone", "Phone"),
+            app("go", "Go"),
+            app("bank", "Bank"),
+            app("mail", "Mail"),
+            app("notes", "Notes"),
+        ],
+    );
+
+    let (mut launcher, _) = on_a_phone(&new);
+
+    assert_eq!(launcher.shell().theme().state().theme, Theme::Dark);
+    assert_eq!(grid(&launcher), ["Phone", "Games", "Mail", "Notes"]);
+    assert_eq!(dots(&mut launcher), [false; 4]);
+    open_folder(&mut launcher, 1);
+    assert_eq!(in_folder(&launcher), ["Go"]);
+    launcher.dispatch(ShellIntent::Back);
+    launcher.dispatch(ShellIntent::OpenSettings);
+    launcher.frame();
+    assert_eq!(hidden_apps(&launcher), ["Bank"]);
+    launcher.dispatch(ShellIntent::Back);
+
+    // As the system installs the rest, each takes its old place, in its folder too.
+    new.apps
+        .apps
+        .lock()
+        .unwrap()
+        .extend([app("maps", "Maps"), app("chess", "Chess")]);
+    launcher.dispatch(ShellIntent::AppsChanged);
+
+    assert_eq!(grid(&launcher), ["Phone", "Games", "Maps", "Mail", "Notes"]);
+    assert_eq!(dots(&mut launcher), [false; 5]);
+    open_folder(&mut launcher, 1);
+    assert_eq!(in_folder(&launcher), ["Chess", "Go"]);
+}
+
+#[test]
+fn apps21_given_a_backed_up_app_comes_after_a_week_then_it_is_new_at_the_end() {
+    // Issue #17: APPS-21, APPS-06. A week after the restore, MeeGone stops keeping Maps' place.
+    let backup = backed_up_home();
+    let new = new_device(
+        &backup,
+        vec![
+            app("phone", "Phone"),
+            app("chess", "Chess"),
+            app("go", "Go"),
+            app("bank", "Bank"),
+            app("mail", "Mail"),
+        ],
+    );
+    let (mut launcher, _) = on_a_phone(&new);
+    assert_eq!(grid(&launcher), ["Phone", "Games", "Mail"]);
+
+    *new.system.now_ms.lock().unwrap() += 7 * DAY_MS;
+    launcher.dispatch(ShellIntent::AppsChanged);
+    new.apps.apps.lock().unwrap().push(app("maps", "Maps"));
+    launcher.dispatch(ShellIntent::AppsChanged);
+
+    assert_eq!(grid(&launcher), ["Phone", "Games", "Mail", "Maps"]);
+    assert_eq!(dots(&mut launcher), [false, false, false, true]);
+
+    // After a restart, the layout is this device's own: an app uninstalled meanwhile is gone,
+    // and its folder turns back into Chess (APPS-08, FOLD-06).
+    drop(launcher);
+    new.apps
+        .apps
+        .lock()
+        .unwrap()
+        .retain(|app| app.id != app_id("go"));
+    let restarted = Launcher::start(new.platform());
+    assert_eq!(grid(&restarted), ["Phone", "Chess", "Mail", "Maps"]);
 }

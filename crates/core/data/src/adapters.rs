@@ -124,6 +124,9 @@ pub trait SystemConfigAdapter: Send + Sync {
     fn animates_return_home(&self) -> bool;
     /// Wall-clock time in milliseconds since the Unix epoch.
     fn now_ms(&self) -> u64;
+    /// When this copy of MeeGone was first installed, in milliseconds since the Unix epoch, or 0
+    /// if the system can't say. A layout saved by another copy came from a backup (APPS-21).
+    fn installed_ms(&self) -> u64;
     /// The local time zone's offset from UTC at `at_ms`, for local midnight (WALL-03) and the
     /// date (EVT-01).
     fn utc_offset_ms(&self, at_ms: u64) -> i64;

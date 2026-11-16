@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- What the system's backup keeps on Android 10 and 11 (APPS-21, ADR 0018): the layout and the
+     settings, which FileStorage keeps in getFilesDir(). Listing them leaves everything else out:
+     the image cache, and any temporary file a crash left behind. Notification content and usage
+     history are never stored, so they are never backed up (PRIV-03). The paths are
+     StoredFile::path; tests/backup.rs checks them. -->
+<full-backup-content>
+    <include domain="file" path="layout" />
+    <include domain="file" path="settings" />
+</full-backup-content>

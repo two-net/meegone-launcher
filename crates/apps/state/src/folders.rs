@@ -53,10 +53,7 @@ pub fn combine(layout: &Layout, app: &AppId, onto: &CellKey) -> Option<Layout> {
         CellKey::App(_) => return None,
     }
     entries.remove(own);
-    Some(Layout {
-        entries,
-        new: layout.new.clone(),
-    })
+    Some(with_entries(layout, entries))
 }
 
 /// `layout` with `app` taken out of its folder and shown at place `to` in the grid (FOLD-05).
@@ -70,10 +67,7 @@ pub fn take_out(layout: &Layout, shown: &[App], app: &AppId, to: usize) -> Optio
         apps.retain(|id| id != app);
     }
     entries.insert(at + 1, LayoutEntry::App(app.clone()));
-    let out = Layout {
-        entries,
-        new: layout.new.clone(),
-    };
+    let out = with_entries(layout, entries);
     arrange(&out, shown, &CellKey::App(app.clone()), to)
 }
 
@@ -108,10 +102,7 @@ pub fn arrange_in_folder(layout: &Layout, shown: &[App], app: &AppId, to: usize)
     for (&slot, id) in slots.iter().zip(visible) {
         apps[slot] = id;
     }
-    Some(Layout {
-        entries,
-        new: layout.new.clone(),
-    })
+    Some(with_entries(layout, entries))
 }
 
 /// FOLD-06: a folder left with one app turns back into that app, and an empty folder goes.
@@ -126,9 +117,15 @@ pub fn tidy(layout: &Layout) -> Layout {
             other => Some(other.clone()),
         })
         .collect();
+    with_entries(layout, entries)
+}
+
+/// `layout` with these `entries`, and everything else about it as it was: its marks, and a
+/// restore's waiting apps, which keep their slots (APPS-21).
+fn with_entries(layout: &Layout, entries: Vec<LayoutEntry>) -> Layout {
     Layout {
         entries,
-        new: layout.new.clone(),
+        ..layout.clone()
     }
 }
 
@@ -200,7 +197,6 @@ impl GridItem {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
 
     use meegone_core_data::fakes::{app, app_id, work_app};
 
@@ -216,7 +212,7 @@ mod tests {
     fn layout(entries: Vec<LayoutEntry>) -> Layout {
         Layout {
             entries,
-            new: BTreeSet::new(),
+            ..Layout::default()
         }
     }
 

@@ -3,7 +3,8 @@
 //! [`reconcile`] keeps the layout in step with the installed apps (ADR 0012), [`folders`] holds
 //! the pure edits a drag and the folder rules make (ADR 0014, ADR 0015), and [`search`] ranks the
 //! apps that match a query (ADR 0016). A hidden app keeps its place in the layout but shows no
-//! cell, so it is in neither the grid nor search until it is unhidden (APPS-19, ADR 0017).
+//! cell, so it is in neither the grid nor search until it is unhidden (APPS-19, ADR 0017). After
+//! a restore, so does a backed-up app until it is installed (APPS-21, ADR 0018).
 
 pub mod folders;
 mod reconcile;
@@ -17,7 +18,9 @@ use meegone_core_data::{AppsAdapter, DataError, Profile, SettingsStore, SystemCo
 use meegone_core_state::{App, AppId, Rect, Shortcut, StateHolder};
 
 pub use meegone_apps_data::FolderId;
-use reconcile::{Start, alphabetical, follow_hidden, grid, reconcile, reconcile_draft};
+use reconcile::{
+    Start, alphabetical, end_restore, follow_hidden, grid, is_restored, reconcile, reconcile_draft,
+};
 pub use reconcile::{cells_moved, previous_places};
 
 /// Columns on a phone (APPS-02).
@@ -30,6 +33,10 @@ pub const MIN_CELL_DP: f64 = 96.0;
 pub const FOLDER_COLUMNS: usize = 4;
 /// A folder's name is at most this many characters (FOLD-03).
 pub const MAX_FOLDER_NAME: usize = 64;
+/// How long a restored layout waits for its backed-up apps, in ms: an app installed in that time
+/// takes its old place (APPS-21, ADR 0018). The system's restore usually installs them within
+/// hours; a week also covers apps that wait for Wi-Fi, and those the user installs again by hand.
+pub const RESTORE_WAIT_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
 /// How many columns a grid `width_dp` wide has, inside its margins (APPS-02).
 ///
@@ -641,6 +648,10 @@ impl AppsHolder {
     /// Hidden apps are reconciled as installed, so they keep their places, but show no cell. A
     /// hidden app that is gone is forgotten, and saved so, so installing it again shows it
     /// (APPS-19).
+    ///
+    /// A layout another copy of MeeGone saved came from a backup: its apps that aren't installed
+    /// yet keep their places for [`RESTORE_WAIT_MS`], out of sight (APPS-21). Every layout is
+    /// saved with this copy's install time, so a restore is recognised once.
     fn refresh(&mut self) {
         let (installed, profiles) = match self.catalogue() {
             Ok(catalogue) => catalogue,
@@ -651,11 +662,16 @@ impl AppsHolder {
         };
         self.state.problem = None;
         let hidden = self.settings.get().hidden_apps;
-        // The layout `saved` becomes, whether it changed, and the hidden apps still standing.
+        let installed_ms = self.system.installed_ms();
+        let now_ms = self.system.now_ms();
+        // The layout `saved` becomes, saved as this copy's, whether it changed, and the hidden
+        // apps still standing. A restore whose wait is over ends first (APPS-21).
         let reconciled = |saved: &Layout, start: &Start| {
-            let layout = reconcile(saved, &installed, &profiles, start);
+            let current = end_restore(saved.clone(), now_ms);
+            let mut layout = reconcile(&current, &installed, &profiles, start);
+            layout.installed_ms = Some(installed_ms);
             let changed = layout != *saved;
-            let still = follow_hidden(&hidden, saved, &installed, &profiles);
+            let still = follow_hidden(&hidden, saved, &layout, &installed, &profiles);
             (layout, changed, still)
         };
         let (layout, changed, still) = match self.layout.take() {
@@ -666,6 +682,12 @@ impl AppsHolder {
                     let (layout, _, still) =
                         reconciled(&Layout::default(), &Start::First { defaults });
                     (layout, true, still)
+                }
+                // Saved at once with this copy's install time, which differs from the backup's,
+                // so it is restored only once (APPS-21).
+                Ok(SavedLayout::Read(saved)) if is_restored(&saved, installed_ms) => {
+                    let until_ms = now_ms.saturating_add(RESTORE_WAIT_MS);
+                    reconciled(&saved, &Start::Restored { until_ms })
                 }
                 Ok(SavedLayout::Read(saved)) => reconciled(&saved, &Start::Saved),
                 // Saved at once, so the damaged file is replaced before anything else can read
@@ -705,10 +727,14 @@ impl AppsHolder {
                 }
             }
         };
-        self.draft = self
-            .draft
-            .take()
-            .map(|draft| reconcile_draft(&draft, &installed, &profiles, &Start::Saved));
+        self.draft = self.draft.take().map(|draft| {
+            reconcile_draft(
+                &end_restore(draft, now_ms),
+                &installed,
+                &profiles,
+                &Start::Saved,
+            )
+        });
         self.take_on(installed, hidden);
         self.layout = Some(layout);
         self.show();
@@ -1296,7 +1322,7 @@ impl StateHolder for AppsHolder {
 
 #[cfg(test)]
 mod tests {
-    use meegone_apps_data::{LayoutEntry, PersistentLayoutStore};
+    use meegone_apps_data::{LayoutEntry, PersistentLayoutStore, Restore};
     use meegone_core_data::fakes::{FakeStorage, Fakes, app, app_id, work_app};
     use meegone_core_data::storage::format::seal;
     use meegone_core_data::{PersistentSettingsStore, ProfileId, StoredFile};
@@ -2424,6 +2450,8 @@ mod tests {
                     LayoutEntry::App(app_id("mail")),
                     LayoutEntry::App(app_id("atlas")),
                 ],
+                // Saved by this copy, so reading it changes nothing (APPS-21).
+                installed_ms: Some(0),
                 ..Layout::default()
             })
             .unwrap();
@@ -2551,9 +2579,16 @@ mod tests {
                         apps: vec![app_id("go"), app_id("chess")],
                     },
                     LayoutEntry::App(app_id("maps")),
+                    LayoutEntry::App(app_id("atlas")),
                     LayoutEntry::App(app_id("mail")),
                 ],
                 new: [app_id("mail")].into(),
+                // Saved by this copy, still waiting for Atlas after a restore (APPS-21).
+                installed_ms: Some(0),
+                restore: Some(Restore {
+                    until_ms: 1_000,
+                    waiting: [app_id("atlas")].into(),
+                }),
             })
             .unwrap();
         let bytes = storage.files.lock().unwrap()[&StoredFile::Layout].clone();
@@ -3610,5 +3645,160 @@ mod tests {
                 .place_of(Surface::Search, &CellKey::App(app_id("maps"))),
             Some(3)
         );
+    }
+
+    /// A layout as a backup restores it (APPS-21): Phone, Maps, then Mail, saved by another copy
+    /// of MeeGone, installed at 1.
+    fn restored(layout: &PersistentLayoutStore) {
+        layout
+            .save(&Layout {
+                entries: vec![
+                    LayoutEntry::App(app_id("phone")),
+                    LayoutEntry::App(app_id("maps")),
+                    LayoutEntry::App(app_id("mail")),
+                ],
+                installed_ms: Some(1),
+                ..Layout::default()
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn a_restored_layout_waits_for_its_apps_and_is_saved_as_this_copys() {
+        // APPS-21: Maps isn't installed yet. Notes, which the backup doesn't hold, joins the
+        // end without a dot.
+        let fakes = Fakes::default();
+        *fakes.system.installed_ms.lock().unwrap() = 5;
+        *fakes.system.now_ms.lock().unwrap() = 100;
+        let (_, layout) = storage_and_store();
+        restored(&layout);
+        install(
+            &fakes,
+            &[("mail", "Mail"), ("phone", "Phone"), ("notes", "Notes")],
+        );
+
+        let mut holder = holder(&fakes, &layout);
+
+        assert_eq!(labels(holder.state()), ["Phone", "Mail", "Notes"]);
+        let kept = saved(&layout);
+        assert_eq!(kept.installed_ms, Some(5));
+        assert_eq!(
+            kept.restore,
+            Some(Restore {
+                until_ms: 100 + RESTORE_WAIT_MS,
+                waiting: [app_id("maps")].into(),
+            })
+        );
+
+        fakes.apps.apps.lock().unwrap().push(app("maps", "Maps"));
+        holder.handle(AppsIntent::Refresh);
+
+        assert_eq!(labels(holder.state()), ["Phone", "Maps", "Mail", "Notes"]);
+        assert_eq!(saved(&layout).restore, None);
+    }
+
+    #[test]
+    fn a_layout_is_restored_only_once() {
+        // APPS-21: after a restart, an app that is gone leaves as usual (APPS-08).
+        let fakes = Fakes::default();
+        *fakes.system.installed_ms.lock().unwrap() = 5;
+        let (_, layout) = storage_and_store();
+        restored(&layout);
+        install(
+            &fakes,
+            &[("mail", "Mail"), ("phone", "Phone"), ("maps", "Maps")],
+        );
+        drop(holder(&fakes, &layout));
+
+        install(&fakes, &[("mail", "Mail"), ("phone", "Phone")]);
+        let restarted = holder(&fakes, &layout);
+
+        assert_eq!(labels(restarted.state()), ["Phone", "Mail"]);
+        assert_eq!(
+            saved(&layout),
+            Layout {
+                entries: vec![
+                    LayoutEntry::App(app_id("phone")),
+                    LayoutEntry::App(app_id("mail")),
+                ],
+                installed_ms: Some(5),
+                ..Layout::default()
+            }
+        );
+    }
+
+    #[test]
+    fn apps_still_missing_when_the_wait_ends_leave() {
+        // APPS-21: at the first refresh after it. Installed later, an app is new (APPS-06).
+        let fakes = Fakes::default();
+        *fakes.system.installed_ms.lock().unwrap() = 5;
+        let (_, layout) = storage_and_store();
+        restored(&layout);
+        install(&fakes, &[("mail", "Mail"), ("phone", "Phone")]);
+        let mut holder = holder(&fakes, &layout);
+
+        *fakes.system.now_ms.lock().unwrap() = RESTORE_WAIT_MS - 1;
+        holder.handle(AppsIntent::Refresh);
+        assert_eq!(
+            saved(&layout).restore.map(|restore| restore.waiting),
+            Some([app_id("maps")].into())
+        );
+
+        *fakes.system.now_ms.lock().unwrap() = RESTORE_WAIT_MS;
+        holder.handle(AppsIntent::Refresh);
+        assert_eq!(
+            saved(&layout),
+            Layout {
+                entries: vec![
+                    LayoutEntry::App(app_id("phone")),
+                    LayoutEntry::App(app_id("mail")),
+                ],
+                installed_ms: Some(5),
+                ..Layout::default()
+            }
+        );
+
+        fakes.apps.apps.lock().unwrap().push(app("maps", "Maps"));
+        holder.handle(AppsIntent::Refresh);
+        assert_eq!(labels(holder.state()), ["Phone", "Mail", "Maps•"]);
+    }
+
+    #[test]
+    fn an_app_first_seen_as_the_wait_ends_keeps_its_place_and_the_restore_is_over() {
+        // APPS-21: nothing refreshed between its install and the end of the wait.
+        let fakes = Fakes::default();
+        *fakes.system.installed_ms.lock().unwrap() = 5;
+        let (_, layout) = storage_and_store();
+        restored(&layout);
+        install(&fakes, &[("mail", "Mail"), ("phone", "Phone")]);
+        let mut holder = holder(&fakes, &layout);
+
+        fakes.apps.apps.lock().unwrap().push(app("maps", "Maps"));
+        *fakes.system.now_ms.lock().unwrap() = RESTORE_WAIT_MS;
+        holder.handle(AppsIntent::Refresh);
+
+        assert_eq!(labels(holder.state()), ["Phone", "Maps", "Mail"]);
+        assert_eq!(saved(&layout).restore, None);
+    }
+
+    #[test]
+    fn a_hidden_app_a_restore_waits_for_stays_hidden() {
+        // APPS-19, APPS-21: the backed-up settings hide Maps, which isn't installed yet.
+        let fakes = Fakes::default();
+        *fakes.system.installed_ms.lock().unwrap() = 5;
+        let (_, layout) = storage_and_store();
+        restored(&layout);
+        PersistentSettingsStore::new(fakes.storage.clone())
+            .update(&mut |settings| settings.hidden_apps = [app_id("maps")].into())
+            .unwrap();
+        install(&fakes, &[("mail", "Mail"), ("phone", "Phone")]);
+        let mut holder = holder(&fakes, &layout);
+        assert_eq!(saved_hidden(&fakes), [app_id("maps")].into());
+
+        fakes.apps.apps.lock().unwrap().push(app("maps", "Maps"));
+        holder.handle(AppsIntent::Refresh);
+
+        assert_eq!(labels(holder.state()), ["Phone", "Mail"]);
+        assert_eq!(hidden_labels(&holder), ["Maps"]);
     }
 }

@@ -453,6 +453,9 @@ pub struct FakeSystem {
     /// False unless set, so MeeGone plays its own return motion (ANIM-09).
     pub animates_return_home: Mutex<bool>,
     pub now_ms: Mutex<u64>,
+    /// When this copy of MeeGone was installed: 0 unless set, the same on every start. A test
+    /// that restores a backup on "another device" gives that device another time (APPS-21).
+    pub installed_ms: Mutex<u64>,
     /// UTC unless set.
     pub utc_offset_ms: Mutex<i64>,
     /// `en-US` unless set.
@@ -476,6 +479,7 @@ impl Default for FakeSystem {
             animation_scale: Mutex::new(1.0),
             animates_return_home: Mutex::default(),
             now_ms: Mutex::default(),
+            installed_ms: Mutex::default(),
             utc_offset_ms: Mutex::default(),
             locale: Mutex::new("en-US".into()),
             default_home: Mutex::default(),
@@ -517,6 +521,10 @@ impl SystemConfigAdapter for FakeSystem {
 
     fn now_ms(&self) -> u64 {
         *self.now_ms.lock().unwrap()
+    }
+
+    fn installed_ms(&self) -> u64 {
+        *self.installed_ms.lock().unwrap()
     }
 
     fn utc_offset_ms(&self, _at_ms: u64) -> i64 {

@@ -24,6 +24,8 @@ pub struct AndroidSystem {
     request_default_home: MethodId,
     /// `long utcOffsetMs(long atMs)`
     utc_offset_ms: MethodId,
+    /// `long installedMs()`: `PackageInfo.firstInstallTime`, or 0.
+    installed_ms: MethodId,
     /// `boolean animatesReturnHome()`
     animates_return_home: MethodId,
     /// `boolean hapticTick()`: whether a view could play it.
@@ -46,6 +48,7 @@ impl AndroidSystem {
                 c"()Ljava/lang/String;",
             )?,
             utc_offset_ms: env.method_id(bridge, c"utcOffsetMs", c"(J)J")?,
+            installed_ms: env.method_id(bridge, c"installedMs", c"()J")?,
             animates_return_home: env.method_id(bridge, c"animatesReturnHome", c"()Z")?,
             haptic_tick: env.method_id(bridge, c"hapticTick", c"()Z")?,
             has_browser: env.method_id(bridge, c"hasBrowser", c"()Z")?,
@@ -82,6 +85,14 @@ impl SystemConfigAdapter for AndroidSystem {
             .map_or(0, |since| {
                 u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
             })
+    }
+
+    /// 0 if the bridge can't answer, so a restore is told apart only when the time is known.
+    fn installed_ms(&self) -> u64 {
+        self.vm
+            .env()
+            .and_then(|env| env.call_long(&self.bridge, self.installed_ms, &[]))
+            .map_or(0, |ms| u64::try_from(ms).unwrap_or(0))
     }
 
     fn utc_offset_ms(&self, at_ms: u64) -> i64 {

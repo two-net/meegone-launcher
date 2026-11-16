@@ -733,6 +733,22 @@ final class Bridge {
         }
     }
 
+    /**
+     * When this copy of MeeGone was first installed, in ms since the epoch, or 0 if the system
+     * can't say. A reinstall or a new device gives a new time, so a layout saved by another copy
+     * is known to come from a backup (APPS-21, ADR 0018). Called from Rust.
+     */
+    long installedMs() {
+        try {
+            return context.getPackageManager()
+                    .getPackageInfo(context.getPackageName(), 0)
+                    .firstInstallTime;
+        } catch (PackageManager.NameNotFoundException | RuntimeException e) {
+            Log.w(TAG, "Couldn't read MeeGone's install time: " + e.getClass().getSimpleName());
+            return 0;
+        }
+    }
+
     private static boolean openHomeSettings(Activity from) {
         String[] actions = {
             Settings.ACTION_HOME_SETTINGS, Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS

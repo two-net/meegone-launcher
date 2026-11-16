@@ -1,0 +1,12 @@
+meegone-layout 3
+app 0 phone phone.Main
+folder 7 Fun\s&\sgames 2 0 chess chess.Main 0 go go.Main
+app 10 com.example.mail com.example.mail.Inbox
+folder 8 \e 0
+app 0 atlas atlas.Main
+app 0 zoom zoom.Main
+new 0 atlas atlas.Main
+new 0 zoom zoom.Main
+installed 1763000000000
+restore 1763604800000 2 0 chess chess.Main 0 go go.Main
+end 1c130967b01b51fb

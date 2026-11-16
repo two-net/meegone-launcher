@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- What the system's backup and device-to-device transfer keep from Android 12 (APPS-21,
+     ADR 0018): the same two files as backup_rules.xml, the layout and the settings. Listing them
+     leaves everything else out: the image cache, and any temporary file a crash left behind. The
+     paths are StoredFile::path; tests/backup.rs checks them. -->
+<data-extraction-rules>
+    <cloud-backup>
+        <include domain="file" path="layout" />
+        <include domain="file" path="settings" />
+    </cloud-backup>
+    <device-transfer>
+        <include domain="file" path="layout" />
+        <include domain="file" path="settings" />
+    </device-transfer>
+</data-extraction-rules>

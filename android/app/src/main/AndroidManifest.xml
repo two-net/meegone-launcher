@@ -26,11 +26,15 @@
         </intent>
     </queries>
 
-    <!-- Backup arrives with APPS-21 (#17). Back reaches the home through
+    <!-- The system's backup and device-to-device transfer keep the layout and the settings, and
+         nothing else (APPS-21, ADR 0018): backup_rules.xml up to Android 11,
+         data_extraction_rules.xml from Android 12. Back reaches the home through
          OnBackInvokedCallback from Android 13 (HOME-08, ADR 0007). -->
     <application
-        android:allowBackup="false"
+        android:allowBackup="true"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:enableOnBackInvokedCallback="true"
+        android:fullBackupContent="@xml/backup_rules"
         android:label="@string/app_name"
         android:supportsRtl="true"
         android:theme="@style/Theme.MeeGone">

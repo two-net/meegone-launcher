@@ -1,5 +1,5 @@
-//! Keeping the layout in step with the installed apps (APPS-04 to APPS-08, APPS-18, REL-02,
-//! FOLD-06; ADR 0012).
+//! Keeping the layout in step with the installed apps (APPS-04 to APPS-08, APPS-18, APPS-21,
+//! REL-02, FOLD-06; ADR 0012, ADR 0018).
 //!
 //! Pure logic, tested without a device (MAINT-01): the saved layout and what the system lists
 //! go in, and the layout to save and show comes out.
@@ -7,7 +7,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
-use meegone_apps_data::{FolderId, Layout, LayoutEntry};
+use meegone_apps_data::{FolderId, Layout, LayoutEntry, Restore};
 use meegone_core_data::{App, AppId, Profile, ProfileId};
 
 use crate::GridItem;
@@ -22,6 +22,11 @@ pub enum Start {
     /// The saved layout, read whole. Apps it doesn't hold yet join the end, oldest install first,
     /// and are marked new (APPS-06, APPS-07).
     Saved,
+    /// The saved layout, restored from a backup that another copy of MeeGone made (APPS-21,
+    /// ADR 0018). Its apps that aren't installed yet keep their places, out of sight, until
+    /// `until_ms`. The apps it doesn't hold join the end alphabetically, and none is marked new:
+    /// they were on this device before the backup arrived.
+    Restored { until_ms: u64 },
     /// What could be recovered from an unreadable layout, or nothing. The other apps join the
     /// end alphabetically, and none is marked new: they aren't new installs (REL-02).
     Rebuilt,
@@ -37,6 +42,8 @@ pub enum Start {
 ///   the layout but not in the [`grid`]. Apps of profiles that no longer exist are removed.
 /// - An update that renames an app's launcher activity keeps the app's place and mark: one app
 ///   gone, and one not placed yet, with the same profile and package (APPS-08).
+/// - After a restore, a backed-up app that isn't installed yet keeps its place, out of sight,
+///   while the restore waits for it (APPS-21). Installed, or under its new id, it shows there.
 /// - Apps not placed yet join the end, as `start` says.
 pub fn reconcile(saved: &Layout, installed: &[App], profiles: &[Profile], start: &Start) -> Layout {
     tidy(&reconcile_draft(saved, installed, profiles, start))
@@ -53,15 +60,27 @@ pub fn reconcile_draft(
     let present: HashMap<&AppId, &App> = installed.iter().map(|app| (&app.id, app)).collect();
     let waiting = waiting_profiles(installed, profiles);
     let renamed = renamed(saved, &present, &waiting);
+    let restoring = restoring(saved, start, &present, &renamed, profiles);
     let mut placed: HashSet<AppId> = HashSet::new();
+    let mut still_restoring: BTreeSet<AppId> = BTreeSet::new();
     // The app this saved id stands for now, if it keeps a place and hasn't one already.
     let mut place = |id: &AppId| {
-        let now = if present.contains_key(id) || waiting.contains(&id.profile) {
+        let now = if present.contains_key(id) {
+            id
+        } else if let Some(new) = renamed.get(id) {
+            new
+        } else if waiting.contains(&id.profile) || restoring.contains(id) {
             id
         } else {
-            renamed.get(id)?
+            return None;
         };
-        placed.insert(now.clone()).then(|| now.clone())
+        if !placed.insert(now.clone()) {
+            return None;
+        }
+        if restoring.contains(now) {
+            still_restoring.insert(now.clone());
+        }
+        Some(now.clone())
     };
     let mut folder_ids = FolderIds::new(saved);
 
@@ -91,7 +110,7 @@ pub fn reconcile_draft(
     match start {
         Start::First { defaults } => joining = defaults_first(joining, defaults),
         Start::Saved => joining.sort_by_key(|app| app.installed_at_ms),
-        Start::Rebuilt => {}
+        Start::Restored { .. } | Start::Rebuilt => {}
     }
 
     let mut new: BTreeSet<AppId> = saved
@@ -111,7 +130,44 @@ pub fn reconcile_draft(
             .map(|app| LayoutEntry::App(app.id.clone())),
     );
 
-    Layout { entries, new }
+    let until_ms = match start {
+        Start::Restored { until_ms } => Some(*until_ms),
+        _ => saved.restore.as_ref().map(|restore| restore.until_ms),
+    };
+    let restore = until_ms
+        .filter(|_| !still_restoring.is_empty())
+        .map(|until_ms| Restore {
+            until_ms,
+            waiting: still_restoring,
+        });
+
+    Layout {
+        entries,
+        new,
+        installed_ms: saved.installed_ms,
+        restore,
+    }
+}
+
+/// Whether `saved` came from a backup: another copy of MeeGone, installed at another time,
+/// saved it (APPS-21, ADR 0018). A layout saved before version 3 has no install time, so only
+/// this copy could have saved it.
+pub fn is_restored(saved: &Layout, installed_ms: u64) -> bool {
+    saved
+        .installed_ms
+        .is_some_and(|saved_by| saved_by != installed_ms)
+}
+
+/// `layout`, with its restore over once its wait has ended at `now_ms` (APPS-21). The apps it was
+/// still waiting for are then gone, by the usual rule, at the next [`reconcile`].
+pub fn end_restore(layout: Layout, now_ms: u64) -> Layout {
+    match &layout.restore {
+        Some(restore) if restore.until_ms <= now_ms => Layout {
+            restore: None,
+            ..layout
+        },
+        _ => layout,
+    }
 }
 
 /// The cells to show for `layout`: its apps that show, and its folders that hold any. `shown`
@@ -142,25 +198,31 @@ pub fn grid(layout: &Layout, shown: &[App]) -> Vec<GridItem> {
 }
 
 /// The `hidden` apps that still stand for an app once `saved` is reconciled with the `installed`
-/// apps of the listed `profiles` (APPS-19, ADR 0017). A hidden app keeps its hiding exactly as
-/// [`reconcile`] keeps its place:
+/// apps of the listed `profiles` into `reconciled` (APPS-19, ADR 0017). A hidden app keeps its
+/// hiding exactly as [`reconcile`] keeps its place:
 /// - while it is installed, or its profile can't list it yet (locked, or listing no apps);
-/// - under its new id when an update renamed its launcher activity.
+/// - under its new id when an update renamed its launcher activity;
+/// - while a restore waits for it (APPS-21).
 ///
 /// Any other is forgotten, so an app that is uninstalled and installed again shows.
 pub fn follow_hidden(
     hidden: &BTreeSet<AppId>,
     saved: &Layout,
+    reconciled: &Layout,
     installed: &[App],
     profiles: &[Profile],
 ) -> BTreeSet<AppId> {
     let present: HashMap<&AppId, &App> = installed.iter().map(|app| (&app.id, app)).collect();
     let waiting = waiting_profiles(installed, profiles);
     let renamed = renamed(saved, &present, &waiting);
+    let restoring = reconciled.restore.as_ref().map(|restore| &restore.waiting);
     hidden
         .iter()
         .filter_map(|id| {
-            if present.contains_key(id) || waiting.contains(&id.profile) {
+            if present.contains_key(id)
+                || waiting.contains(&id.profile)
+                || restoring.is_some_and(|waiting| waiting.contains(id))
+            {
                 Some(id.clone())
             } else {
                 renamed.get(id).cloned()
@@ -233,14 +295,11 @@ pub fn follow_order(layout: &Layout, shown: &[GridItem]) -> Layout {
         .collect();
     let mut visible: Vec<&LayoutEntry> = slots.iter().map(|&slot| &layout.entries[slot]).collect();
     visible.sort_by_key(|entry| order[&Key::of_entry(entry)]);
-    let mut entries = layout.entries.clone();
+    let mut arranged = layout.clone();
     for (&slot, entry) in slots.iter().zip(visible) {
-        entries[slot] = entry.clone();
+        arranged.entries[slot] = entry.clone();
     }
-    Layout {
-        entries,
-        new: layout.new.clone(),
-    }
+    arranged
 }
 
 /// What identifies a cell across changes.
@@ -283,21 +342,46 @@ fn waiting_profiles(installed: &[App], profiles: &[Profile]) -> HashSet<ProfileI
         .collect()
 }
 
+/// Every app `saved` places, in the grid or in a folder.
+fn saved_ids(saved: &Layout) -> impl Iterator<Item = &AppId> {
+    saved.entries.iter().flat_map(|entry| match entry {
+        LayoutEntry::App(id) => std::slice::from_ref(id),
+        LayoutEntry::Folder { apps, .. } => apps.as_slice(),
+    })
+}
+
+/// The saved apps a restore waits for (APPS-21): those of a listed profile that aren't installed
+/// and that no update renamed. At the restore that is every saved app so; afterwards, those it
+/// was waiting for that still are.
+fn restoring<'a>(
+    saved: &'a Layout,
+    start: &Start,
+    present: &HashMap<&AppId, &App>,
+    renamed: &HashMap<AppId, AppId>,
+    profiles: &[Profile],
+) -> HashSet<&'a AppId> {
+    let listed: HashSet<ProfileId> = profiles.iter().map(|profile| profile.id).collect();
+    let candidates: Box<dyn Iterator<Item = &AppId>> = match (start, &saved.restore) {
+        (Start::Restored { .. }, _) => Box::new(saved_ids(saved)),
+        (_, Some(restore)) => Box::new(restore.waiting.iter()),
+        (_, None) => Box::new(std::iter::empty()),
+    };
+    candidates
+        .filter(|id| {
+            !present.contains_key(id) && !renamed.contains_key(*id) && listed.contains(&id.profile)
+        })
+        .collect()
+}
+
 /// Saved apps that are gone, each paired with the one app not placed yet that has the same
-/// profile and package: an update renamed its launcher activity (APPS-08).
+/// profile and package: an update renamed its launcher activity (APPS-08). An app a restore waits
+/// for counts as gone here, so it takes the place of its package's app on this device.
 fn renamed(
     saved: &Layout,
     present: &HashMap<&AppId, &App>,
     waiting: &HashSet<ProfileId>,
 ) -> HashMap<AppId, AppId> {
-    let saved_ids: HashSet<&AppId> = saved
-        .entries
-        .iter()
-        .flat_map(|entry| match entry {
-            LayoutEntry::App(id) => std::slice::from_ref(id),
-            LayoutEntry::Folder { apps, .. } => apps.as_slice(),
-        })
-        .collect();
+    let saved_ids: HashSet<&AppId> = saved_ids(saved).collect();
     type Package<'a> = (ProfileId, &'a str);
     let mut gone: HashMap<Package<'_>, Vec<&AppId>> = HashMap::new();
     for id in &saved_ids {
@@ -406,10 +490,21 @@ mod tests {
         ids.iter().map(|id| LayoutEntry::App(app_id(id))).collect()
     }
 
+    /// [`follow_hidden`] after the usual reconcile of a saved layout.
+    fn followed(
+        hidden: &BTreeSet<AppId>,
+        saved: &Layout,
+        installed: &[App],
+        profiles: &[Profile],
+    ) -> BTreeSet<AppId> {
+        let reconciled = reconcile(saved, installed, profiles, &Start::Saved);
+        follow_hidden(hidden, saved, &reconciled, installed, profiles)
+    }
+
     fn layout(entries: Vec<LayoutEntry>) -> Layout {
         Layout {
             entries,
-            new: BTreeSet::new(),
+            ..Layout::default()
         }
     }
 
@@ -715,20 +810,17 @@ mod tests {
         };
 
         assert_eq!(
-            follow_hidden(&hidden, &saved, &personal, &[PERSONAL, locked]),
+            followed(&hidden, &saved, &personal, &[PERSONAL, locked]),
             hidden
         );
         // A profile that lists nothing at all is waiting too.
         assert_eq!(
-            follow_hidden(&hidden, &saved, &personal, &[PERSONAL, WORK]),
+            followed(&hidden, &saved, &personal, &[PERSONAL, WORK]),
             hidden
         );
         let mut all = personal.clone();
         all.push(docs);
-        assert_eq!(
-            follow_hidden(&hidden, &saved, &all, &[PERSONAL, WORK]),
-            hidden
-        );
+        assert_eq!(followed(&hidden, &saved, &all, &[PERSONAL, WORK]), hidden);
     }
 
     #[test]
@@ -742,7 +834,7 @@ mod tests {
         ]);
         let hidden: BTreeSet<AppId> = [docs.id.clone(), app_id("maps"), app_id("mail")].into();
 
-        let still = follow_hidden(
+        let still = followed(
             &hidden,
             &saved,
             &installed(&[("mail", "Mail")]),
@@ -759,7 +851,7 @@ mod tests {
         let mut apps = installed(&[("maps", "Maps"), ("mail", "Mail")]);
         apps[0].id.activity = "maps.Start".into();
 
-        let still = follow_hidden(&[app_id("maps")].into(), &saved, &apps, &[PERSONAL]);
+        let still = followed(&[app_id("maps")].into(), &saved, &apps, &[PERSONAL]);
 
         assert_eq!(still, [apps[0].id.clone()].into());
     }
@@ -884,6 +976,261 @@ mod tests {
             assert_eq!(ids.len(), folders, "folder ids repeat: {now:?}");
             // Reconciling again changes nothing.
             assert_eq!(reconcile(&now, &apps, &[PERSONAL], &Start::Saved), now);
+        }
+    }
+
+    /// How long the restores in these tests wait, from a start at 0.
+    const UNTIL_MS: u64 = 1_000;
+
+    fn restore(ids: &[&str]) -> Option<Restore> {
+        Some(Restore {
+            until_ms: UNTIL_MS,
+            waiting: ids.iter().map(|id| app_id(id)).collect(),
+        })
+    }
+
+    #[test]
+    fn a_restore_keeps_the_places_of_apps_not_installed_yet() {
+        // APPS-21: Chess and Maps aren't installed yet. Notes, which the backup doesn't hold,
+        // joins the end, unmarked: it was on this device before the backup arrived.
+        let saved = layout(vec![
+            LayoutEntry::App(app_id("phone")),
+            folder(1, &["chess", "go"]),
+            LayoutEntry::App(app_id("maps")),
+            LayoutEntry::App(app_id("mail")),
+        ]);
+        let apps = installed(&[
+            ("phone", "Phone"),
+            ("go", "Go"),
+            ("mail", "Mail"),
+            ("zoom", "Zoom"),
+            ("notes", "Notes"),
+        ]);
+
+        let now = reconcile(
+            &saved,
+            &apps,
+            &[PERSONAL],
+            &Start::Restored { until_ms: UNTIL_MS },
+        );
+
+        assert_eq!(
+            packages(&now),
+            ["phone", "[1: chess go]", "maps", "mail", "notes", "zoom"]
+        );
+        assert!(now.new.is_empty());
+        assert_eq!(now.restore, restore(&["chess", "maps"]));
+        let cells: Vec<String> = grid(&now, &apps)
+            .iter()
+            .map(|item| item.label().to_owned())
+            .collect();
+        assert_eq!(cells, ["Phone", "Folder 1", "Mail", "Notes", "Zoom"]);
+    }
+
+    #[test]
+    fn a_restore_doesnt_wait_for_another_devices_work_profile() {
+        // APPS-21: profile ids are the system's serial numbers, which differ on a new device.
+        let docs = work_app("docs", "Docs");
+        let saved = layout(vec![
+            LayoutEntry::App(docs.id.clone()),
+            LayoutEntry::App(app_id("mail")),
+        ]);
+
+        let now = reconcile(
+            &saved,
+            &installed(&[("mail", "Mail")]),
+            &[PERSONAL],
+            &Start::Restored { until_ms: UNTIL_MS },
+        );
+
+        assert_eq!(packages(&now), ["mail"]);
+        assert_eq!(now.restore, None);
+    }
+
+    #[test]
+    fn a_restore_with_everything_installed_waits_for_nothing() {
+        // APPS-21: as after reinstalling MeeGone on the same device.
+        let saved = layout(entries(&["mail", "maps"]));
+
+        let now = reconcile(
+            &saved,
+            &installed(&[("maps", "Maps"), ("mail", "Mail")]),
+            &[PERSONAL],
+            &Start::Restored { until_ms: UNTIL_MS },
+        );
+
+        assert_eq!(now, saved);
+    }
+
+    #[test]
+    fn a_backed_up_app_takes_its_place_once_installed() {
+        // APPS-21: in its folder, without a dot. An app the backup didn't hold is new.
+        let mut saved = layout(vec![
+            LayoutEntry::App(app_id("phone")),
+            folder(1, &["chess", "go"]),
+            LayoutEntry::App(app_id("maps")),
+        ]);
+        saved.restore = restore(&["chess", "maps"]);
+        let mut apps = installed(&[("phone", "Phone"), ("go", "Go"), ("chess", "Chess")]);
+
+        let chess = reconcile(&saved, &apps, &[PERSONAL], &Start::Saved);
+        assert_eq!(packages(&chess), ["phone", "[1: chess go]", "maps"]);
+        assert!(chess.new.is_empty());
+        assert_eq!(chess.restore, restore(&["maps"]));
+
+        apps.extend(installed(&[("maps", "Maps"), ("atlas", "Atlas")]));
+        let all = reconcile(&chess, &apps, &[PERSONAL], &Start::Saved);
+        assert_eq!(packages(&all), ["phone", "[1: chess go]", "maps", "atlas"]);
+        assert_eq!(all.new, [app_id("atlas")].into());
+        assert_eq!(all.restore, None);
+    }
+
+    #[test]
+    fn a_backed_up_app_under_another_activity_takes_its_place() {
+        // APPS-08, APPS-21: the version installed here names its launcher activity otherwise.
+        let mut saved = layout(entries(&["maps", "mail"]));
+        saved.restore = restore(&["maps"]);
+        let mut apps = installed(&[("mail", "Mail"), ("maps", "Maps")]);
+        apps[1].id.activity = "maps.Start".into();
+
+        let now = reconcile(&saved, &apps, &[PERSONAL], &Start::Saved);
+
+        assert_eq!(
+            now.entries,
+            [
+                LayoutEntry::App(apps[1].id.clone()),
+                LayoutEntry::App(app_id("mail"))
+            ]
+        );
+        assert!(now.new.is_empty());
+        assert_eq!(now.restore, None);
+    }
+
+    #[test]
+    fn apps_still_missing_when_the_wait_ends_leave() {
+        // APPS-21, FOLD-06: Go's folder turns back into Go.
+        let mut saved = layout(vec![
+            folder(1, &["chess", "go"]),
+            LayoutEntry::App(app_id("maps")),
+        ]);
+        saved.restore = restore(&["chess", "maps"]);
+        let apps = installed(&[("go", "Go")]);
+
+        let waiting = end_restore(saved.clone(), UNTIL_MS - 1);
+        assert_eq!(waiting, saved);
+        assert_eq!(
+            reconcile(&waiting, &apps, &[PERSONAL], &Start::Saved),
+            saved
+        );
+
+        let ended = end_restore(saved, UNTIL_MS);
+        assert_eq!(ended.restore, None);
+        assert_eq!(
+            packages(&reconcile(&ended, &apps, &[PERSONAL], &Start::Saved)),
+            ["go"]
+        );
+    }
+
+    #[test]
+    fn only_a_layout_another_copy_saved_is_restored() {
+        // APPS-21: one saved before version 3 has no install time, and only this copy saved it.
+        let mut saved = layout(entries(&["mail"]));
+        assert!(!is_restored(&saved, 5));
+        saved.installed_ms = Some(5);
+        assert!(!is_restored(&saved, 5));
+        assert!(is_restored(&saved, 7));
+    }
+
+    #[test]
+    fn a_hidden_app_a_restore_waits_for_stays_hidden() {
+        // APPS-19, APPS-21: hidden on the old device, it stays hidden when it arrives here.
+        let saved = layout(entries(&["maps", "mail"]));
+        let hidden: BTreeSet<AppId> = [app_id("maps")].into();
+        let apps = installed(&[("mail", "Mail")]);
+        let start = Start::Restored { until_ms: UNTIL_MS };
+
+        let restored = reconcile(&saved, &apps, &[PERSONAL], &start);
+        assert_eq!(
+            follow_hidden(&hidden, &saved, &restored, &apps, &[PERSONAL]),
+            hidden
+        );
+
+        let ended = end_restore(restored, UNTIL_MS);
+        let gone = reconcile(&ended, &apps, &[PERSONAL], &Start::Saved);
+        assert!(follow_hidden(&hidden, &ended, &gone, &apps, &[PERSONAL]).is_empty());
+    }
+
+    #[test]
+    fn restores_keep_every_backed_up_app_once_until_it_comes_or_the_wait_ends() {
+        // APPS-21, MAINT-01: properties over many generated restores.
+        let mut random = Random(17);
+        let names: Vec<String> = (0..12).map(|i| format!("app{i:02}")).collect();
+        let everything: Vec<App> = names.iter().map(|name| app(name, name)).collect();
+        let ids = |layout: &Layout| -> Vec<AppId> { saved_ids(layout).cloned().collect() };
+        for _ in 0..2_000 {
+            let pick = |random: &mut Random| app_id(&names[random.below(names.len())]);
+            let mut entries = Vec::new();
+            for _ in 0..random.below(10) {
+                entries.push(if random.below(4) == 0 {
+                    LayoutEntry::Folder {
+                        id: FolderId(random.below(3) as u32),
+                        name: String::new(),
+                        apps: (0..random.below(4)).map(|_| pick(&mut random)).collect(),
+                    }
+                } else {
+                    LayoutEntry::App(pick(&mut random))
+                });
+            }
+            let saved = layout(entries);
+            let apps: Vec<App> = everything
+                .iter()
+                .filter(|_| random.below(3) != 0)
+                .cloned()
+                .collect();
+            let is_installed = |id: &AppId| apps.iter().any(|app| app.id == *id);
+
+            let restored = reconcile(
+                &saved,
+                &apps,
+                &[PERSONAL],
+                &Start::Restored { until_ms: UNTIL_MS },
+            );
+
+            let placed = ids(&restored);
+            let unique: BTreeSet<&AppId> = placed.iter().collect();
+            assert_eq!(unique.len(), placed.len(), "an app twice: {restored:?}");
+            assert!(
+                apps.iter().all(|app| unique.contains(&app.id)),
+                "{restored:?}"
+            );
+            let missing: BTreeSet<AppId> = placed
+                .iter()
+                .filter(|id| !is_installed(id))
+                .cloned()
+                .collect();
+            let waiting = restored.restore.clone().map(|restore| restore.waiting);
+            assert_eq!(waiting.unwrap_or_default(), missing, "{restored:?}");
+            // Reconciling again changes nothing.
+            assert_eq!(
+                reconcile(&restored, &apps, &[PERSONAL], &Start::Saved),
+                restored
+            );
+
+            // Once every app is installed, each has its place, in the restored order.
+            let arrived = reconcile(&restored, &everything, &[PERSONAL], &Start::Saved);
+            assert_eq!(arrived.restore, None, "{arrived:?}");
+            assert_eq!(ids(&arrived)[..placed.len()], placed[..], "{arrived:?}");
+
+            // Once the wait ends, only installed apps are left.
+            let ended = reconcile(
+                &end_restore(restored, UNTIL_MS),
+                &apps,
+                &[PERSONAL],
+                &Start::Saved,
+            );
+            assert_eq!(ended.restore, None);
+            assert!(ids(&ended).iter().all(is_installed), "{ended:?}");
+            assert_eq!(ids(&ended).len(), apps.len(), "{ended:?}");
         }
     }
 

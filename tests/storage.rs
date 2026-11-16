@@ -1,6 +1,9 @@
 //! What the whole app stores, composed with fake platform adapters: data survives a restart,
-//! damaged or failing storage never stops the app, and nothing from notifications or app usage
-//! is written (REL-01, REL-03, MAINT-04, PRIV-03, EVT-13).
+//! damaged or failing storage never stops the app, nothing from notifications or app usage is
+//! written, and the system's backup keeps only the layout and the settings (REL-01, REL-03,
+//! MAINT-04, PRIV-03, EVT-13, APPS-21).
+
+mod backup;
 
 use std::collections::BTreeSet;
 
@@ -188,6 +191,15 @@ fn notification_content_and_usage_history_are_never_stored() {
         stored.contains(&format!("removed 0 chat chat.Main {NOW_MS}")),
         "{stored}"
     );
+    // So no backup holds them either (APPS-21).
+    let backed_up: String = backup::back_up(&fakes.storage)
+        .values()
+        .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+        .collect();
+    assert!(
+        backed_up.contains("removed 0 chat chat.Main"),
+        "{backed_up}"
+    );
     for private in [
         "notification-key-1".to_owned(),
         "Dinner".to_owned(),
@@ -201,5 +213,43 @@ fn notification_content_and_usage_history_are_never_stored() {
             !stored.contains(&private),
             "{private:?} was stored:\n{stored}"
         );
+        assert!(
+            !backed_up.contains(&private),
+            "{private:?} was backed up:\n{backed_up}"
+        );
     }
+}
+
+#[test]
+fn the_backup_keeps_the_layout_and_the_settings_and_nothing_else() {
+    // APPS-21: every rule, for every Android version and for transfers between devices, keeps
+    // the same two files. The image cache stays on the device that downloaded its images.
+    let only_those = BTreeSet::from([StoredFile::Layout, StoredFile::Settings]);
+    assert_eq!(backup::backed_up_files(), only_those);
+
+    let fakes = Fakes::default();
+    *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail")];
+    let mut launcher = Launcher::start(fakes.platform());
+    launcher.dispatch(ShellIntent::OpenSettings);
+    launcher.view().settings().theme_chosen(ThemeChoice::Dark);
+    launcher.frame();
+    drop(launcher);
+    fakes
+        .storage
+        .files
+        .lock()
+        .unwrap()
+        .insert(StoredFile::ImageDetails, b"meegone-images 1\n".to_vec());
+
+    let backup = backup::back_up(&fakes.storage);
+
+    assert_eq!(backup.keys().copied().collect::<BTreeSet<_>>(), only_those);
+    // Restored on another device, they are all MeeGone needs.
+    let other = Fakes::default();
+    *other.apps.apps.lock().unwrap() = vec![app("mail", "Mail")];
+    *other.system.installed_ms.lock().unwrap() = 1;
+    backup::restore(&other.storage, &backup);
+    let restored = Launcher::start(other.platform());
+    assert_eq!(restored.shell().theme().state().theme, Theme::Dark);
+    assert_eq!(grid(&restored), ["Mail"]);
 }
