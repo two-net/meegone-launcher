@@ -9,6 +9,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::jni::{Env, GlobalRef, JValue, LocalRef, MethodId, Vm};
+use super::not_yet;
 use crate::adapters::SystemConfigAdapter;
 use crate::model::DataError;
 
@@ -45,10 +46,6 @@ impl AndroidSystem {
             bridge: env.global_ref(bridge)?,
         })
     }
-}
-
-fn not_yet() -> DataError {
-    DataError::Unsupported("Not available yet".into())
 }
 
 impl SystemConfigAdapter for AndroidSystem {

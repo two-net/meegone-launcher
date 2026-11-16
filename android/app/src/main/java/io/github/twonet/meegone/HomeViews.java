@@ -39,12 +39,14 @@ import android.widget.TextView;
  * passes it every touch, frame time and layout change, says when a finger has been held on
  * empty space, then reads what to draw with {@link #nativeRead} and applies it. It keeps nothing
  * else. The frame slots below must stay in step with {@code frame_slots} in {@code
- * src/android.rs}.
+ * src/android.rs}. Applications is an {@link AppsGrid}, which draws the frame's Applications
+ * slots (ADR 0010); Events and Recent show their names until #19 and #22.
  *
  * <p>The background fills the window edge to edge, behind the system bars. Everything else stays
  * inside a safe area clear of the bars, display cut-outs and the screen's rounded corners: each
  * page and Settings get it as padding, so their content lays out inside it (HOME-11, ADR 0009).
- * Content that scrolls may draw under the bars by turning off {@code clipToPadding}.
+ * Content that scrolls draws under the bars instead: the Applications grid takes the safe area
+ * as its own padding, with {@code clipToPadding} off (ADR 0010).
  *
  * <p>An element inside a view that uses horizontal drags itself keeps them by calling {@link
  * #requestDisallowInterceptTouchEvent} before the carousel takes the gesture (HOME-03). An
@@ -69,9 +71,16 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private static final int MENU_Y = 15; // px from the top, or -1 to centre
     private static final int SURFACE = 16; // ARGB
     private static final int SETTINGS = 17; // 0 closed, 1 open, 2 at Lock-screen image
-    private static final int FRAME_SIZE = 18;
+    private static final int APPS_REVISION = 18; // changes when the grid's cells change
+    private static final int APPS_SCROLL = 19; // px from the top
+    private static final int APPS_COLUMNS = 20;
+    private static final int APPS_ROWS = 21; // the last one empty
+    private static final int PRESSED = 22; // the current view's pressed cell, or -1
+    private static final int PRESS_SCALE = 23; // its icon's scale in ten-thousandths
+    private static final int FRAME_SIZE = 24;
 
     private static final int VIEWS = 3;
+    private static final int APPLICATIONS = 1;
     private static final int[] NAMES = {
         R.string.view_events, R.string.view_applications, R.string.view_recent
     };
@@ -87,7 +96,9 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
 
     private final int[] frame = new int[FRAME_SIZE];
     private final FrameLayout[] pages = new FrameLayout[VIEWS];
+    /** Each view's name, until its content arrives; null for Applications, which has its grid. */
     private final TextView[] titles = new TextView[VIEWS];
+    private final AppsGrid apps;
     private final View[] segments = new View[VIEWS];
     /** The view indicator (HOME-09). Screen readers skip it; {@link #status} speaks instead. */
     private final LinearLayout indicator;
@@ -145,15 +156,21 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         // Carries the screen-reader actions that switch views and open the menu (A11Y-05).
         setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_YES);
 
+        apps = new AppsGrid(context, this::apply);
         for (int i = 0; i < VIEWS; i++) {
-            // Until each view's content arrives (#9, #19, #22), it shows its name.
-            TextView title = new TextView(context);
-            title.setText(NAMES[i]);
-            title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 28);
-            titles[i] = title;
             FrameLayout page = new FrameLayout(context);
-            page.addView(title, new LayoutParams(
-                    LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT, Gravity.CENTER));
+            if (i == APPLICATIONS) {
+                page.addView(apps, new LayoutParams(
+                        LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
+            } else {
+                // Until Events' and Recent's content arrives (#19, #22), each shows its name.
+                TextView title = new TextView(context);
+                title.setText(NAMES[i]);
+                title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 28);
+                titles[i] = title;
+                page.addView(title, new LayoutParams(
+                        LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT, Gravity.CENTER));
+            }
             page.setVisibility(INVISIBLE);
             pages[i] = page;
             addView(page, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
@@ -281,9 +298,13 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     @Override
     public WindowInsets onApplyWindowInsets(WindowInsets insets) {
         safe = safeArea(insets);
-        for (FrameLayout page : pages) {
-            page.setPadding(safe.left, safe.top, safe.right, safe.bottom);
+        for (int i = 0; i < VIEWS; i++) {
+            if (i != APPLICATIONS) {
+                pages[i].setPadding(safe.left, safe.top, safe.right, safe.bottom);
+            }
         }
+        // The grid scrolls under the bars, so it takes the safe area as its own padding.
+        apps.setSafeArea(safe);
         settings.setPadding(safe.left, safe.top, safe.right, safe.bottom);
         LayoutParams params = (LayoutParams) indicator.getLayoutParams();
         if (params.topMargin != safe.top + indicatorMargin) {
@@ -569,7 +590,9 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             dim = frame[DIM];
             surface = frame[SURFACE];
             for (TextView title : titles) {
-                title.setTextColor(foreground);
+                if (title != null) {
+                    title.setTextColor(foreground);
+                }
             }
             settings.setBackgroundColor(surface);
             settingsTitle.setTextColor(foreground);
@@ -592,6 +615,9 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             }
         }
         int current = frame[CURRENT];
+        apps.apply(frame[APPS_REVISION], frame[APPS_SCROLL], frame[APPS_COLUMNS],
+                frame[APPS_ROWS], current == APPLICATIONS ? frame[PRESSED] : -1,
+                frame[PRESS_SCALE], foreground, dim);
         if (current != announced) {
             announced = current;
             status.setText(getResources().getString(R.string.view_position,

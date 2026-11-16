@@ -17,7 +17,7 @@ use crate::adapters::{
 };
 use crate::model::{
     Access, App, AppId, DataError, ImageJob, NetworkState, Notification, Profile, ProfileId,
-    RecentUse, Rgb, Shortcut, Size,
+    RecentUse, Rect, Rgb, Shortcut, Size,
 };
 use crate::storage::{MAX_STORED_BYTES, StorageAdapter, StoredFile, check_budget};
 
@@ -58,6 +58,9 @@ pub fn app_id(package: &str) -> AppId {
     }
 }
 
+/// The work profile that [`work_app`] puts apps in.
+pub const WORK_PROFILE: ProfileId = ProfileId(10);
+
 /// An available app in the personal profile that the user can uninstall.
 pub fn app(package: &str, label: &str) -> App {
     App {
@@ -65,8 +68,22 @@ pub fn app(package: &str, label: &str) -> App {
         label: label.to_owned(),
         accent: Rgb::hex(0x808080),
         available: true,
+        work: false,
         can_uninstall: true,
         installed_at_ms: 0,
+    }
+}
+
+/// An available app in the work profile, [`WORK_PROFILE`] (APPS-20).
+pub fn work_app(package: &str, label: &str) -> App {
+    let personal = app(package, label);
+    App {
+        id: AppId {
+            profile: WORK_PROFILE,
+            ..personal.id
+        },
+        work: true,
+        ..personal
     }
 }
 
@@ -87,6 +104,8 @@ pub struct FakeApps {
     /// The system offers shortcuts only while MeeGone is the default home app (APPS-11).
     pub shortcuts_allowed: Mutex<bool>,
     pub launched: Mutex<Vec<AppId>>,
+    /// Where each launch in `launched` grew from (ANIM-08).
+    pub launched_from: Mutex<Vec<Option<Rect>>>,
     pub shortcuts_launched: Mutex<Vec<Shortcut>>,
     pub uninstall_requested: Mutex<Vec<AppId>>,
     pub app_info_opened: Mutex<Vec<AppId>>,
@@ -105,6 +124,7 @@ impl Default for FakeApps {
             shortcuts: Mutex::default(),
             shortcuts_allowed: Mutex::default(),
             launched: Mutex::default(),
+            launched_from: Mutex::default(),
             shortcuts_launched: Mutex::default(),
             uninstall_requested: Mutex::default(),
             app_info_opened: Mutex::default(),
@@ -124,9 +144,10 @@ impl AppsAdapter for FakeApps {
         Ok(self.profiles.lock().unwrap().clone())
     }
 
-    fn launch(&self, app: &AppId) -> Result<(), DataError> {
+    fn launch(&self, app: &AppId, from: Option<Rect>) -> Result<(), DataError> {
         check(&self.error)?;
         record(&self.launched, app.clone());
+        record(&self.launched_from, from);
         Ok(())
     }
 

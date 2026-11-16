@@ -12,7 +12,7 @@ fn a_tap_in_a_view_reaches_the_platform_through_the_state_layer() {
     fakes.apps.apps.lock().unwrap().push(app("mail", "Mail"));
     let mut launcher = Launcher::start(fakes.platform());
 
-    launcher.view().apps().icon_tapped(app_id("mail"));
+    launcher.view().apps().icon_tapped(app_id("mail"), None);
     assert!(fakes.apps.launched.lock().unwrap().is_empty());
     launcher.frame();
 

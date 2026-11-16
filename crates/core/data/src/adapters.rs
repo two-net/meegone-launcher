@@ -17,7 +17,7 @@
 use std::sync::Arc;
 
 use crate::model::{
-    Access, App, AppId, DataError, ImageJob, NetworkState, Notification, Profile, RecentUse,
+    Access, App, AppId, DataError, ImageJob, NetworkState, Notification, Profile, RecentUse, Rect,
     Shortcut, Size,
 };
 use crate::storage::StorageAdapter;
@@ -28,8 +28,12 @@ pub trait AppsAdapter: Send + Sync {
     fn launchable_apps(&self) -> Result<Vec<App>, DataError>;
     /// Every profile that holds apps, such as personal and work (APPS-09, APPS-20).
     fn profiles(&self) -> Result<Vec<Profile>, DataError>;
-    /// Starts or resumes an app (APPS-10, REC-06).
-    fn launch(&self, app: &AppId) -> Result<(), DataError>;
+    /// Starts or resumes an app (APPS-10, REC-06). Its window grows from `from`, the tapped icon
+    /// or card, with the platform's launch-from-bounds transition (ANIM-08).
+    ///
+    /// An unavailable app is launched too, so the system explains why it can't open (APPS-09).
+    /// Fails with a short message for a status line when the system can't start it.
+    fn launch(&self, app: &AppId, from: Option<Rect>) -> Result<(), DataError>;
     /// The app's shortcuts. The system offers them only while MeeGone is the default home app;
     /// otherwise this is `Unsupported` and menus show no shortcuts (APPS-11).
     fn shortcuts(&self, app: &AppId) -> Result<Vec<Shortcut>, DataError>;

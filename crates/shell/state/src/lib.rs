@@ -1,11 +1,12 @@
 //! Home shell state (SRS 4.1): the carousel of views, the home menu, Home and Back, coming back
-//! to the home, and the theme.
+//! to the home, the icon press, and the theme.
 //!
 //! [`HomeShell::compose`] is the only place features are put together (ARCH-03). Each feature
 //! runs in its own [`Store`], so a failing feature never takes down the shell (ARCH-09).
 
 mod carousel;
 mod home_menu;
+mod press;
 mod return_home;
 
 use std::sync::Arc;
@@ -27,6 +28,8 @@ use carousel::{Carousel, Release};
 pub use carousel::{CarouselState, Layout, PointerEvent, PointerKind};
 pub use home_menu::{HomeMenu, MenuItem};
 pub use meegone_settings_state::SettingsGroup;
+use press::Press;
+pub use press::PressState;
 use return_home::ReturnHome;
 pub use return_home::ReturnHomeState;
 
@@ -98,6 +101,8 @@ pub struct ShellState {
     pub carousel: CarouselState,
     /// The home content's scale and opacity while it comes back from an app (ANIM-09).
     pub return_home: ReturnHomeState,
+    /// The item of the current view under the finger, which shrinks while pressed (ANIM-10).
+    pub press: PressState,
 }
 
 impl ShellState {
@@ -139,6 +144,15 @@ pub enum ShellIntent {
     Pointer(PointerEvent),
     /// The display is about to draw a frame at this time on the host's monotonic clock.
     Frame(Duration),
+    /// A finger went down on an item of the current view, such as an app icon, at this time on
+    /// the host's monotonic clock. `item` is its place in the view's cells. Its icon shrinks
+    /// (ANIM-10).
+    Press {
+        item: usize,
+        at: Duration,
+    },
+    /// The finger lifted or left the pressed item, which springs back (ANIM-10).
+    Release(Duration),
     /// The system Home action while the home is on screen (HOME-07).
     Home,
     /// The system Back action (HOME-08).
@@ -195,6 +209,7 @@ pub struct HomeShell {
     system: Arc<dyn SystemConfigAdapter>,
     carousel: Carousel,
     return_home: ReturnHome,
+    press: Press,
     theme: Store<ThemeHolder>,
     apps: Store<AppsHolder>,
     events: Store<EventsHolder>,
@@ -214,6 +229,7 @@ impl HomeShell {
             system: platform.system.clone(),
             carousel: Carousel::new(true, 1.0),
             return_home: ReturnHome::default(),
+            press: Press::default(),
             theme: Store::new(ThemeHolder::new(
                 settings_store.clone(),
                 platform.system.clone(),
@@ -330,10 +346,20 @@ impl HomeShell {
                     let release = self.carousel.pointer(event, self.state.current);
                     self.settle(release);
                 }
+                if self.carousel.state().dragging {
+                    // The views move, so the icon under the finger lets go (ANIM-10).
+                    self.press
+                        .release(event.at, self.carousel.animation_scale());
+                }
             }
             ShellIntent::Frame(at) => {
                 self.carousel.frame(at);
                 self.return_home.frame(at);
+                self.press.frame(at);
+            }
+            ShellIntent::Press { item, at } => self.press_item(item, at),
+            ShellIntent::Release(at) => {
+                self.press.release(at, self.carousel.animation_scale());
             }
             ShellIntent::Home => self.home(),
             ShellIntent::Back => self.back(),
@@ -369,6 +395,7 @@ impl HomeShell {
         }
         self.state.carousel = self.carousel.state();
         self.state.return_home = self.return_home.state();
+        self.state.press = self.press.state();
     }
 
     /// Takes on the wrap-around setting and the system animation speed, which the carousel
@@ -384,6 +411,16 @@ impl HomeShell {
         if let Some(view) = self.state.current.neighbour(direction, wrap) {
             self.move_to(view, 0.0, None);
         }
+    }
+
+    /// ANIM-10: an item of the current view shrinks under the finger, unless the views are
+    /// moving or something covers them.
+    fn press_item(&mut self, item: usize, at: Duration) {
+        let covered = self.state.settings_open || self.state.menu.is_some();
+        if covered || self.carousel.state().dragging {
+            return;
+        }
+        self.press.press(item, at, self.carousel.animation_scale());
     }
 
     /// A drag ended: settle on the view it chose.
@@ -430,9 +467,10 @@ impl HomeShell {
         let Some(items) = HomeMenu::items_for(self.state.current) else {
             return;
         };
-        // The menu covers the home views, so a drag on them ends.
+        // The menu covers the home views, so a drag on them ends and a pressed icon lets go.
         let release = self.carousel.end_gesture(self.state.current);
         self.settle(release);
+        self.press.finish();
         self.state.menu = Some(HomeMenu { items, anchor });
     }
 
@@ -451,9 +489,11 @@ impl HomeShell {
 
     /// Opens Settings over the home views, at `group` or at its top.
     fn open_settings(&mut self, group: Option<SettingsGroup>) {
-        // Settings covers the home views, so a drag on them ends and the menu closes.
+        // Settings covers the home views, so a drag on them ends, the menu closes and a pressed
+        // icon lets go.
         let release = self.carousel.end_gesture(self.state.current);
         self.settle(release);
+        self.press.finish();
         self.state.menu = None;
         self.settings.dispatch(SettingsIntent::Refresh);
         self.state.settings_open = true;
@@ -554,8 +594,9 @@ impl HomeShell {
 
     fn show(&mut self, view: HomeView) {
         self.state.current = view;
-        // The menu belongs to the view it opened over.
+        // The menu and the pressed item belong to the view they were in.
         self.state.menu = None;
+        self.press.finish();
         // Recent refreshes whenever it becomes visible (REC-09); Events does too, to stay live.
         match view {
             HomeView::Events => self.events.dispatch(EventsIntent::Refresh),
@@ -570,7 +611,10 @@ mod tests {
     use meegone_apps_data::{Layout as SavedLayout, LayoutEntry, LayoutStore};
     use meegone_apps_state::{FolderId, GridItem};
     use meegone_core_data::fakes::{FakeApps, Fakes, app, app_id};
-    use meegone_core_data::{App, AppId, AppsAdapter, DataError, Profile, RecentUse, Shortcut};
+    use meegone_core_data::{
+        App, AppId, AppsAdapter, DataError, Profile, RecentUse, Rect, Shortcut,
+    };
+    use meegone_core_state::motion::ICON_PRESS_SCALE;
     use meegone_core_state::{Access, Health, Theme, ThemeChoice};
 
     use super::*;
@@ -769,7 +813,7 @@ mod tests {
             self.0.profiles()
         }
 
-        fn launch(&self, _app: &AppId) -> Result<(), DataError> {
+        fn launch(&self, _app: &AppId, _from: Option<Rect>) -> Result<(), DataError> {
             panic!("launcher bug");
         }
 
@@ -800,7 +844,10 @@ mod tests {
         platform.apps = Arc::new(BrokenLauncher(broken));
         let mut shell = HomeShell::compose(platform);
 
-        shell.dispatch(ShellIntent::Apps(AppsIntent::Launch(app_id("mail"))));
+        shell.dispatch(ShellIntent::Apps(AppsIntent::Launch {
+            app: app_id("mail"),
+            from: None,
+        }));
 
         assert_eq!(
             *shell.apps().health(),
@@ -1415,6 +1462,89 @@ mod tests {
         shell.dispatch(ShellIntent::OpenMenu);
         shell.dispatch(ShellIntent::Returned { home: true });
         assert_eq!(shell.state().menu, None);
+    }
+
+    #[test]
+    fn a_pressed_icon_shrinks_and_springs_back_with_the_frames() {
+        // ANIM-10: the host draws frames while it moves, and none while it is held.
+        let mut shell = laid_out(&Fakes::default());
+
+        shell.dispatch(ShellIntent::Press {
+            item: 5,
+            at: ms(1_000),
+        });
+        assert_eq!(shell.state().press.item, Some(5));
+        assert!(shell.state().press.animating);
+
+        shell.dispatch(ShellIntent::Frame(ms(1_100)));
+        assert_eq!(shell.state().press.scale, ICON_PRESS_SCALE);
+        assert!(!shell.state().press.animating);
+
+        shell.dispatch(ShellIntent::Release(ms(1_200)));
+        assert!(shell.state().press.animating);
+        for frame in 0..60 {
+            shell.dispatch(ShellIntent::Frame(ms(1_200 + frame * 16)));
+        }
+        assert_eq!(shell.state().press, PressState::default());
+    }
+
+    #[test]
+    fn a_drag_on_the_views_lets_the_pressed_icon_go() {
+        // HOME-03: the views move instead, so the icon springs back.
+        let mut shell = laid_out(&Fakes::default());
+        shell.dispatch(ShellIntent::Pointer(PointerEvent {
+            kind: PointerKind::Down,
+            x: 800.0,
+            y: 900.0,
+            at: ms(0),
+        }));
+        shell.dispatch(ShellIntent::Press { item: 2, at: ms(0) });
+        shell.dispatch(ShellIntent::Frame(ms(90)));
+        assert_eq!(shell.state().press.scale, ICON_PRESS_SCALE);
+
+        shell.dispatch(ShellIntent::Pointer(PointerEvent {
+            kind: PointerKind::Move,
+            x: 600.0,
+            y: 900.0,
+            at: ms(100),
+        }));
+        assert!(shell.state().carousel.dragging);
+        shell.dispatch(ShellIntent::Frame(ms(116)));
+
+        assert!(shell.state().press.scale > ICON_PRESS_SCALE);
+        // While the views move, nothing else is pressed.
+        shell.dispatch(ShellIntent::Press {
+            item: 3,
+            at: ms(120),
+        });
+        assert_eq!(shell.state().press.item, Some(2));
+    }
+
+    #[test]
+    fn the_menu_settings_or_another_view_let_the_pressed_icon_go_at_once() {
+        let mut shell = laid_out(&Fakes::default());
+        let press = |shell: &mut HomeShell| {
+            shell.dispatch(ShellIntent::Press { item: 1, at: ms(0) });
+            assert_eq!(shell.state().press.item, Some(1));
+        };
+
+        press(&mut shell);
+        shell.dispatch(ShellIntent::OpenMenu);
+        assert_eq!(shell.state().press, PressState::default());
+
+        // Under the menu or Settings, nothing is pressed.
+        shell.dispatch(ShellIntent::Press { item: 1, at: ms(0) });
+        assert_eq!(shell.state().press, PressState::default());
+        shell.dispatch(ShellIntent::CloseMenu);
+
+        press(&mut shell);
+        shell.dispatch(ShellIntent::OpenSettings);
+        assert_eq!(shell.state().press, PressState::default());
+        shell.dispatch(ShellIntent::Back);
+
+        press(&mut shell);
+        shell.dispatch(ShellIntent::Swipe(Direction::Next));
+        assert_eq!(shell.state().press, PressState::default());
     }
 
     #[test]

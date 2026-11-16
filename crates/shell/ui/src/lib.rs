@@ -4,7 +4,8 @@
 //!
 //! It also tells the host what to draw for the home views in each frame, as a [`HomeFrame`]:
 //! where the carousel's views are, how the view indicator looks, how the content comes back
-//! from an app, and the home menu (ADR 0006, ADR 0007, ADR 0008).
+//! from an app, the home menu, the Applications grid and the pressed icon (ADR 0006 to
+//! ADR 0008, ADR 0010).
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -12,6 +13,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use meegone_apps_ui::AppsView;
+pub use meegone_apps_ui::{AppsFrame, Cell};
 use meegone_core_ui::{Dispatch, Latest, Rgb, Slot, View, tokens};
 use meegone_events_ui::EventsView;
 use meegone_lockimage_ui::{ImageCard, ImageSettingsSection};
@@ -50,6 +52,13 @@ pub struct HomeFrame {
     /// The home content's opacity, from 0 to 255: 255 at rest (ANIM-09). The background stays
     /// opaque.
     pub content_alpha: u8,
+    /// The Applications grid (APPS-01, APPS-02).
+    pub apps: AppsFrame,
+    /// The item of the current view under the finger, by its place in the view's cells
+    /// (ANIM-10).
+    pub pressed: Option<usize>,
+    /// The pressed item's icon scale in ten-thousandths: 10 000 at rest, 9 200 held (ANIM-10).
+    pub press_scale: u16,
     /// Something is still moving or fading, so the host should draw another frame.
     pub animating: bool,
     /// The home menu, while it is open (HOME-10).
@@ -125,8 +134,9 @@ impl ShellView {
         self.outbox.borrow_mut().drain(..).collect()
     }
 
-    /// What the host draws for the home views now, in the current theme (THEME-03).
-    pub fn frame(&self, shell: &HomeShell) -> HomeFrame {
+    /// What the host draws for the home views now, in the current theme (THEME-03). The
+    /// Applications grid takes on its latest cells.
+    pub fn frame(&mut self, shell: &HomeShell) -> HomeFrame {
         let tokens = tokens(shell.theme().state().theme);
         let state = shell.state();
         HomeFrame {
@@ -136,7 +146,13 @@ impl ShellView {
             current: state.current,
             content_scale: (state.return_home.scale.clamp(0.0, 1.0) * 10_000.0).round() as u16,
             content_alpha: (state.return_home.alpha.clamp(0.0, 1.0) * 255.0).round() as u8,
-            animating: state.carousel.animating || state.return_home.animating,
+            apps: self.apps.frame(&shell.apps().state()),
+            pressed: state.press.item,
+            // A spring back overshoots full size a little.
+            press_scale: (state.press.scale.clamp(0.0, 1.5) * 10_000.0).round() as u16,
+            animating: state.carousel.animating
+                || state.return_home.animating
+                || state.press.animating,
             menu: state.menu.map(|menu| MenuFrame {
                 items: menu.items,
                 anchor: menu

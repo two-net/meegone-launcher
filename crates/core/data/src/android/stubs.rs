@@ -1,56 +1,17 @@
 //! The platform adapters whose Android implementations arrive with later issues.
 //!
 //! Each answers with its "if unavailable" value from SRS 8.1, so every feature shows its
-//! reduced state meanwhile: no apps, missing access, no lock-screen image, offline. Shortcuts
-//! are `Unsupported`, so menus show none (APPS-11); their implementation (#12) offers them only
-//! while MeeGone is the default home app.
+//! reduced state meanwhile: missing access, no lock-screen image, offline. The app catalogue is
+//! built (`apps.rs`); its shortcuts are `Unsupported` until #12, so menus show none (APPS-11).
 
+use super::not_yet;
 use crate::adapters::{
-    AppsAdapter, NetworkAdapter, NotificationsAdapter, SchedulerAdapter, UsageAdapter,
-    WallpaperAdapter,
+    NetworkAdapter, NotificationsAdapter, SchedulerAdapter, UsageAdapter, WallpaperAdapter,
 };
-use crate::model::{
-    Access, App, AppId, DataError, ImageJob, NetworkState, Notification, Profile, RecentUse,
-    Shortcut, Size,
-};
+use crate::model::{Access, DataError, ImageJob, NetworkState, Notification, RecentUse, Size};
 
 /// Every adapter not built yet.
 pub struct NotBuiltYet;
-
-fn not_yet() -> DataError {
-    DataError::Unsupported("Not available yet".into())
-}
-
-/// The app catalogue arrives with #9, shortcuts with #12, uninstalling with #13.
-impl AppsAdapter for NotBuiltYet {
-    fn launchable_apps(&self) -> Result<Vec<App>, DataError> {
-        Ok(Vec::new())
-    }
-
-    fn profiles(&self) -> Result<Vec<Profile>, DataError> {
-        Ok(Vec::new())
-    }
-
-    fn launch(&self, _app: &AppId) -> Result<(), DataError> {
-        Err(not_yet())
-    }
-
-    fn shortcuts(&self, _app: &AppId) -> Result<Vec<Shortcut>, DataError> {
-        Err(not_yet())
-    }
-
-    fn launch_shortcut(&self, _shortcut: &Shortcut) -> Result<(), DataError> {
-        Err(not_yet())
-    }
-
-    fn request_uninstall(&self, _app: &AppId) -> Result<(), DataError> {
-        Err(not_yet())
-    }
-
-    fn open_app_info(&self, _app: &AppId) -> Result<(), DataError> {
-        Err(not_yet())
-    }
-}
 
 /// Notifications arrive with #19 and #20.
 impl NotificationsAdapter for NotBuiltYet {

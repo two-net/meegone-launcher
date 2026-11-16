@@ -60,6 +60,8 @@ public final class HomeActivity extends Activity {
             savedAppsScroll = savedInstanceState.getInt(SAVED_APPS_SCROLL, 0);
         }
         boolean started = nativeStart(bridge, getFilesDir().getPath(), savedView, savedAppsScroll);
+        // Applications follows the system's app and profile changes (ADR 0010).
+        bridge.watchApps();
         // Saved state with a launcher this call started: the system had ended the process while
         // the user was elsewhere. A recreation after a configuration change finds it running.
         away = started && savedInstanceState != null;
@@ -207,6 +209,18 @@ public final class HomeActivity extends Activity {
         return Math.min(width, height) >= LARGE_SCREEN_DP * density;
     }
 
+    /**
+     * The system changed the apps or the profiles (APPS-09, ADR 0010). The shared launcher
+     * reloads the app list, and {@code resumed}, if it is a home, redraws. Called by {@link
+     * Bridge} on the main thread.
+     */
+    static void appsChanged(Activity resumed) {
+        nativeAppsChanged();
+        if (resumed instanceof HomeActivity) {
+            ((HomeActivity) resumed).views.refresh();
+        }
+    }
+
     private static boolean isHome(Intent intent) {
         return Intent.ACTION_MAIN.equals(intent.getAction())
                 && intent.hasCategory(Intent.CATEGORY_HOME);
@@ -240,6 +254,9 @@ public final class HomeActivity extends Activity {
 
     /** Fills {@code saved} with the current view and how far Applications is scrolled. */
     private native void nativeSave(int[] saved);
+
+    /** An app or a profile changed; the launcher reloads the app list. */
+    private static native void nativeAppsChanged();
 
     /** Taps the banner's "make default" button; only debug builds' {@link DebugHooks} call it. */
     private native void nativeRequestDefaultHome();

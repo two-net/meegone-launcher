@@ -8,13 +8,13 @@
 #[cfg(target_os = "android")]
 mod android;
 
-pub use meegone_core_data::Platform;
+pub use meegone_core_data::{Platform, Rect};
 pub use meegone_shell_state::{
     Direction, HomeMenu, HomeShell, HomeView, Layout, MenuItem, PointerEvent, PointerKind,
-    SavedHome, SettingsGroup, ShellIntent,
+    PressState, SavedHome, SettingsGroup, ShellIntent,
 };
 use meegone_shell_ui::ShellView;
-pub use meegone_shell_ui::{HomeFrame, MenuFrame};
+pub use meegone_shell_ui::{AppsFrame, Cell, HomeFrame, MenuFrame};
 
 pub struct Launcher {
     shell: HomeShell,

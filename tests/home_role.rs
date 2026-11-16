@@ -83,7 +83,7 @@ fn without_the_role_meegone_still_runs_as_a_normal_app() {
     let mut launcher = Launcher::start(fakes.platform());
     assert!(!launcher.shell().settings().state().default_home);
 
-    launcher.view().apps().icon_tapped(app_id("mail"));
+    launcher.view().apps().icon_tapped(app_id("mail"), None);
     launcher.frame();
 
     assert_eq!(*fakes.apps.launched.lock().unwrap(), [app_id("mail")]);

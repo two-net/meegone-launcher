@@ -3,6 +3,15 @@
      the system dialog (HOME-01). -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
+    <!-- Applications lists every app with a launcher entry (APPS-01). From Android 11, other
+         apps are hidden from MeeGone unless it declares this. It is not a permission (SEC-03). -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+
     <!-- Backup arrives with APPS-21 (#17). Back reaches the home through
          OnBackInvokedCallback from Android 13 (HOME-08, ADR 0007). -->
     <application

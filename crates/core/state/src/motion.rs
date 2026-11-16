@@ -83,6 +83,13 @@ pub const SETTLE: Spring = Spring {
     stiffness: 400.0,
 };
 
+/// A pressed icon springs back to full size on release, about twice as fast as a view settles,
+/// overshooting by about 1.5 % (ANIM-10, ANIM-02).
+pub const ICON_RELEASE: Spring = Spring {
+    damping_ratio: 0.8,
+    stiffness: 1600.0,
+};
+
 /// No settle overshoots its target by more than this fraction of the distance between views
 /// (ANIM-02).
 pub const MAX_OVERSHOOT: f64 = 0.03;
@@ -311,10 +318,10 @@ impl VelocityTracker {
 mod tests {
     use super::*;
 
-    /// The last time, in seconds, that a settle from `displacement` was further than `band`
-    /// from its target.
-    fn settle_time(displacement: f64, band: f64) -> f64 {
-        let mut motion = SpringMotion::new(SETTLE, displacement, 0.0);
+    /// The last time, in seconds, that `spring` settling from `displacement` was further than
+    /// `band` from its target.
+    fn settle_time(spring: Spring, displacement: f64, band: f64) -> f64 {
+        let mut motion = SpringMotion::new(spring, displacement, 0.0);
         let mut last_outside = 0.0;
         for step in 1..=2000 {
             motion.advance(ms(1));
@@ -337,9 +344,18 @@ mod tests {
         // ANIM-07: released at 35 % or half-way, still; within 0.5 % of the width is about
         // 5 px on a phone.
         for displacement in [-0.65, -0.5] {
-            let time = settle_time(displacement, 0.005);
+            let time = settle_time(SETTLE, displacement, 0.005);
             assert!((0.25..=0.35).contains(&time), "{displacement}: {time} s");
         }
+    }
+
+    #[test]
+    fn a_pressed_icon_springs_back_quickly_with_little_overshoot() {
+        // ANIM-10, ANIM-02: from 92 % to within a hundredth of a percent of full size.
+        assert!(ICON_RELEASE.overshoot() > 0.0);
+        assert!(ICON_RELEASE.overshoot() <= MAX_OVERSHOOT);
+        let time = settle_time(ICON_RELEASE, -(1.0 - ICON_PRESS_SCALE), 0.0001);
+        assert!((0.1..=0.25).contains(&time), "{time} s");
     }
 
     #[test]

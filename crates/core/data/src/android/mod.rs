@@ -6,15 +6,17 @@
 //! `Context.getFilesDir()` (PRIV-05). Only `jni.rs` contains `unsafe` code.
 //!
 //! - [`system`]: the home-app role and the clock (HOME-01, ONB-04).
+//! - [`apps`]: the app catalogue and launching (APPS-01, APPS-10, ADR 0010).
 //! - [`stubs`]: every adapter not built yet, answering with its "if unavailable" value.
 
+mod apps;
 mod jni;
 mod stubs;
 mod system;
 
 use std::sync::Arc;
 
-pub use jni::{Env, JObject, LocalRef, RawEnv};
+pub use jni::{Env, JObject, Local, LocalRef, RawEnv};
 
 use crate::adapters::Platform;
 use crate::model::DataError;
@@ -26,7 +28,7 @@ pub fn platform(env: Env, bridge: &LocalRef, files_dir: &LocalRef) -> Result<Pla
     let files_dir = env.string(files_dir)?;
     let not_built = Arc::new(stubs::NotBuiltYet);
     Ok(Platform {
-        apps: not_built.clone(),
+        apps: Arc::new(apps::AndroidApps::new(env, bridge)?),
         notifications: not_built.clone(),
         usage: not_built.clone(),
         wallpaper: not_built.clone(),
@@ -35,4 +37,9 @@ pub fn platform(env: Env, bridge: &LocalRef, files_dir: &LocalRef) -> Result<Pla
         system: Arc::new(system::AndroidSystem::new(env, bridge)?),
         storage: Arc::new(FileStorage::new(files_dir)),
     })
+}
+
+/// What a request answers until its issue builds it.
+fn not_yet() -> DataError {
+    DataError::Unsupported("Not available yet".into())
 }

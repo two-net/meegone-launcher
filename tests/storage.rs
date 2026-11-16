@@ -84,7 +84,7 @@ fn failing_storage_never_stops_the_app() {
     *fakes.storage.error.lock().unwrap() = Some(full);
     let mut launcher = Launcher::start(fakes.platform());
 
-    launcher.view().apps().icon_tapped(app_id("mail"));
+    launcher.view().apps().icon_tapped(app_id("mail"), None);
     launcher.frame();
     assert_eq!(*fakes.apps.launched.lock().unwrap(), [app_id("mail")]);
     assert_eq!(grid(&launcher), ["Mail"]);

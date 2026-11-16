@@ -7,7 +7,9 @@
 //!
 //! `HomeViews` draws the home views with Android's own views. It passes touches, frame times
 //! and its layout in, then reads what to draw with `nativeRead`, whose slots are listed in
-//! [`frame_slots`] and mirrored in `HomeViews.java`.
+//! [`frame_slots`] and mirrored in `HomeViews.java`. Its Applications grid, `AppsGrid`, reads
+//! its cells with `nativeAppsCells` whenever their revision changes, in the fields of
+//! [`cell_fields`] (ADR 0010).
 //!
 //! A bug in MeeGone becomes a Java `RuntimeException` instead of an abort, so its message
 //! reaches logcat. Containing it keeps `panic = "unwind"`, as ARCH-09 already requires.
@@ -19,11 +21,11 @@ use std::cell::RefCell;
 use std::panic::{self, AssertUnwindSafe};
 use std::time::Duration;
 
-use meegone_core_data::Rgb;
 use meegone_core_data::android::{self, Env, JObject, LocalRef, RawEnv};
+use meegone_core_data::{Rect, Rgb};
 
 use crate::{
-    Direction, HomeFrame, HomeView, Launcher, Layout, MenuItem, PointerEvent, PointerKind,
+    Cell, Direction, HomeFrame, HomeView, Launcher, Layout, MenuItem, PointerEvent, PointerKind,
     SavedHome, SettingsGroup, ShellIntent,
 };
 
@@ -172,6 +174,26 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeActivity_nativeS
             env.set_int_array(&saved, &slots)
                 .map_err(|error| format!("Couldn't save the home: {error}"))
         })
+    });
+}
+
+/// `static void nativeAppsChanged()`: the system reported that an app was installed, updated,
+/// removed, suspended or unsuspended, or that a profile was added, removed, paused or resumed
+/// (APPS-09, ADR 0010). `Bridge` coalesces a burst of them into one call.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeActivity_nativeAppsChanged(
+    env: RawEnv,
+    _class: JObject,
+) {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_launcher(env, |launcher| {
+        launcher.dispatch(ShellIntent::AppsChanged);
+        launcher.frame();
     });
 }
 
@@ -380,6 +402,221 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeShow
     JBoolean::from(moved)
 }
 
+/// `String[] nativeAppsCells()`: the Applications grid's cells, in order, as of the last frame,
+/// each in the fields of [`cell_fields`] (APPS-01).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_AppsGrid_nativeAppsCells(
+    env: RawEnv,
+    _grid: JObject,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    let mut cells = std::ptr::null_mut();
+    guarded(env, || {
+        LAUNCHER.with_borrow(|launcher| {
+            let launcher = launcher.as_ref().ok_or("MeeGone hasn't started")?;
+            let fields: Vec<String> = launcher
+                .view()
+                .apps()
+                .cells()
+                .flat_map(cell_fields)
+                .collect();
+            let array = env
+                .new_string_array(fields.iter().map(String::as_str))
+                .map_err(|error| format!("Couldn't pass the apps: {error}"))?;
+            cells = array.into_raw();
+            Ok(())
+        })
+    });
+    cells
+}
+
+/// The fields of one cell in `nativeAppsCells`, mirrored in `AppsGrid.java`: its label, then
+/// the package, activity and profile serial number of the app it launches (empty for a
+/// folder), then its flags: 1 an app, 2 available (APPS-09), 4 in a work profile (APPS-20).
+fn cell_fields(cell: Cell<'_>) -> [String; 5] {
+    let flags =
+        u8::from(cell.app.is_some()) | u8::from(cell.available) << 1 | u8::from(cell.work) << 2;
+    let (package, activity, profile) = match cell.app {
+        Some(app) => (
+            app.package.clone(),
+            app.activity.clone(),
+            app.profile.0.to_string(),
+        ),
+        None => Default::default(),
+    };
+    [
+        cell.label.to_owned(),
+        package,
+        activity,
+        profile,
+        flags.to_string(),
+    ]
+}
+
+/// `void nativeAppsLayout(int widthPx, int rowHeightPx, float density, int[] grid)`: the grid
+/// was laid out this wide inside its margins, with rows this far apart: at start, or after a
+/// size, density or font-size change (APPS-02, APPS-16). Fills `grid` with the columns and rows
+/// it now has, so the grid lays them out in the same pass.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_AppsGrid_nativeAppsLayout(
+    env: RawEnv,
+    _grid: JObject,
+    width_px: i32,
+    row_height_px: i32,
+    density: f32,
+    grid: JObject,
+) {
+    // SAFETY: the JVM passes this thread's environment and a live local reference to an
+    // `int[]`, used only during this call.
+    let (env, grid) = unsafe { (Env::from_raw(env), LocalRef::from_raw(grid)) };
+    guarded(env, || {
+        LAUNCHER.with_borrow_mut(|launcher| {
+            let launcher = launcher.as_mut().ok_or("MeeGone hasn't started")?;
+            launcher.view().apps().grid_laid_out(
+                f64::from(width_px),
+                f64::from(row_height_px),
+                f64::from(density),
+            );
+            let apps = launcher.frame().apps;
+            env.set_int_array(&grid, &[i32::from(apps.columns), i32::from(apps.rows)])
+                .map_err(|error| format!("Couldn't pass the grid: {error}"))
+        })
+    });
+}
+
+/// `void nativeAppsScrolled(int px)`: the user scrolled the grid this far from its top
+/// (HOME-07, REL-05).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_AppsGrid_nativeAppsScrolled(
+    env: RawEnv,
+    _grid: JObject,
+    px: i32,
+) {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_launcher(env, |launcher| {
+        launcher.view().apps().grid_scrolled(f64::from(px));
+        launcher.frame();
+    });
+}
+
+/// `void nativeAppPressed(int index, long timeNanos)`: a finger went down on cell `index`, so
+/// its icon shrinks (ANIM-10).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_AppsGrid_nativeAppPressed(
+    env: RawEnv,
+    _grid: JObject,
+    index: i32,
+    time_nanos: i64,
+) {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    let Ok(item) = usize::try_from(index) else {
+        return;
+    };
+    with_launcher(env, |launcher| {
+        launcher.dispatch(ShellIntent::Press {
+            item,
+            at: uptime(time_nanos),
+        });
+        launcher.frame();
+    });
+}
+
+/// `void nativeAppReleased(long timeNanos)`: the finger lifted or left the pressed cell, which
+/// springs back (ANIM-10).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_AppsGrid_nativeAppReleased(
+    env: RawEnv,
+    _grid: JObject,
+    time_nanos: i64,
+) {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_launcher(env, |launcher| {
+        launcher.dispatch(ShellIntent::Release(uptime(time_nanos)));
+        launcher.frame();
+    });
+}
+
+/// `String nativeAppTapped(int revision, int index, int left, int top, int right, int bottom)`:
+/// cell `index` of the cells at `revision` was tapped, and its icon is at that rect on the
+/// screen (APPS-10, ANIM-08). Launches its app at once (PERF-06). Returns `null`, or a short
+/// message to show when the system couldn't start the app and gave no explanation of its own
+/// (APPS-09).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)] // The JNI calling convention.
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_AppsGrid_nativeAppTapped(
+    env: RawEnv,
+    _grid: JObject,
+    revision: i32,
+    index: i32,
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    let Ok(index) = usize::try_from(index) else {
+        return std::ptr::null_mut();
+    };
+    let from = Rect {
+        left,
+        top,
+        right,
+        bottom,
+    };
+    let mut message = std::ptr::null_mut();
+    guarded(env, || {
+        LAUNCHER.with_borrow_mut(|launcher| {
+            let launcher = launcher.as_mut().ok_or("MeeGone hasn't started")?;
+            // The revision travels as Java's `int`.
+            if !launcher
+                .view()
+                .apps()
+                .cell_tapped(revision as u32, index, from)
+            {
+                return Ok(());
+            }
+            launcher.frame();
+            if let Some(problem) = &launcher.shell().apps().state().problem {
+                let text = env
+                    .new_string(problem)
+                    .map_err(|error| format!("Couldn't pass the message: {error}"))?;
+                message = text.into_raw();
+            }
+            Ok(())
+        })
+    });
+    message
+}
+
 /// `void nativeRead(int[] frame)`: fills `frame` with what to draw now, in the slots of
 /// [`frame_slots`].
 ///
@@ -421,7 +658,13 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRead
 /// | 14–15 | Where the home menu opens, in px from the top left, or -1 to centre it |
 /// | 16 | The surface colour of menus and Settings, as opaque ARGB |
 /// | 17 | Settings: 0 closed, 1 open, 2 open at its Lock-screen image group |
-fn frame_slots(frame: &HomeFrame) -> [i32; 18] {
+/// | 18 | Applications' cells revision: when it changes, `AppsGrid` reads its cells again |
+/// | 19 | How far Applications is scrolled, in px (HOME-07, REL-05) |
+/// | 20 | Applications' columns (APPS-02) |
+/// | 21 | Applications' rows, the last one empty (HOME-14) |
+/// | 22 | The pressed cell of the current view, or -1 (ANIM-10) |
+/// | 23 | The pressed cell's icon scale in ten-thousandths, 10 000 at rest (ANIM-10) |
+fn frame_slots(frame: &HomeFrame) -> [i32; 24] {
     let [events, applications, recent] = frame.pages;
     let menu_items = frame.menu.map_or(0, |menu| {
         menu.items
@@ -453,6 +696,16 @@ fn frame_slots(frame: &HomeFrame) -> [i32; 18] {
         menu_y,
         argb(frame.surface),
         settings,
+        // The revision wraps around; the host only compares it.
+        frame.apps.revision as i32,
+        frame.apps.scroll_px,
+        i32::from(frame.apps.columns),
+        i32::from(frame.apps.rows),
+        frame
+            .pressed
+            .and_then(|item| i32::try_from(item).ok())
+            .unwrap_or(-1),
+        i32::from(frame.press_scale),
     ]
 }
 

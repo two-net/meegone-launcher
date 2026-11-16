@@ -13,6 +13,8 @@
 pub mod adapters;
 #[cfg(target_os = "android")]
 pub mod android;
+#[cfg(any(test, target_os = "android"))]
+mod catalogue;
 #[cfg(any(test, feature = "fakes"))]
 pub mod fakes;
 pub mod model;
@@ -25,7 +27,7 @@ pub use adapters::{
 };
 pub use model::{
     Access, App, AppId, DataError, ImageJob, JobNetwork, NetworkState, Notification, Profile,
-    ProfileId, RecentUse, Rgb, Shortcut, Size,
+    ProfileId, RecentUse, Rect, Rgb, Shortcut, Size,
 };
 pub use settings::{
     HomeTarget, ImageOptions, PersistentSettingsStore, RecentDensity, SETTINGS_VERSION, Settings,

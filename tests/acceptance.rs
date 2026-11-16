@@ -15,8 +15,10 @@
 
 use std::time::Duration;
 
-use meegone_core_data::fakes::{Fakes, app, app_id};
-use meegone_core_data::{HomeTarget, Notification, RecentUse, ThemeChoice};
+use meegone_core_data::fakes::{Fakes, WORK_PROFILE, app, app_id, work_app};
+use meegone_core_data::{
+    DataError, HomeTarget, Notification, Profile, ProfileId, RecentUse, Rect, ThemeChoice,
+};
 use meegone_core_state::{Access, Health, Theme};
 use meegone_launcher::{
     Direction, HomeView, Launcher, Layout, MenuItem, PointerEvent, PointerKind, SettingsGroup,
@@ -264,7 +266,7 @@ fn home10_long_pressing_the_empty_row_below_a_long_grid_opens_the_home_menu() {
     let row_px = 96.0 * 2.75;
 
     // Given a grid longer than the screen, which ends with an empty row,
-    let rows = launcher.shell().apps().state().rows(4);
+    let rows = launcher.shell().apps().state().rows();
     assert_eq!(rows, 11);
     assert!(rows as f64 * row_px > HEIGHT);
     // when the user scrolls to the bottom and long-presses the empty row,
@@ -522,7 +524,164 @@ fn ac21_revoking_notification_access_shows_the_explainer_and_applications_still_
     assert_eq!(*launcher.shell().events().health(), Health::Ready);
 
     launcher.dispatch(ShellIntent::Swipe(Direction::Next));
-    launcher.view().apps().icon_tapped(app_id("mail"));
+    launcher.view().apps().icon_tapped(app_id("mail"), None);
     launcher.frame();
     assert_eq!(*fakes.apps.launched.lock().unwrap(), [app_id("mail")]);
+}
+
+/// The cells the host draws, after a frame: label, work profile, available.
+fn cells(launcher: &mut Launcher) -> Vec<(String, bool, bool)> {
+    launcher.frame();
+    launcher
+        .view()
+        .apps()
+        .cells()
+        .map(|cell| (cell.label.to_owned(), cell.work, cell.available))
+        .collect()
+}
+
+/// A personal profile, and a work profile that is paused or not.
+fn with_a_work_profile(fakes: &Fakes, paused: bool) {
+    *fakes.apps.profiles.lock().unwrap() = vec![
+        Profile {
+            id: ProfileId(0),
+            work: false,
+            paused: false,
+        },
+        Profile {
+            id: WORK_PROFILE,
+            work: true,
+            paused,
+        },
+    ];
+}
+
+#[test]
+fn apps01_given_personal_and_work_profiles_every_launchable_app_from_both_appears() {
+    // Issue #9: APPS-01, APPS-20. The system badges the work icons; the cell says "work" so
+    // screen readers can (A11Y-01).
+    let fakes = Fakes::default();
+    with_a_work_profile(&fakes, false);
+    *fakes.apps.apps.lock().unwrap() = vec![
+        app("mail", "Mail"),
+        app("maps", "Maps"),
+        work_app("mail", "Mail"),
+        work_app("docs", "Docs"),
+    ];
+
+    let mut launcher = Launcher::start(fakes.platform());
+
+    assert_eq!(
+        cells(&mut launcher),
+        [
+            ("Docs".to_owned(), true, true),
+            ("Mail".to_owned(), false, true),
+            ("Mail".to_owned(), true, true),
+            ("Maps".to_owned(), false, true),
+        ]
+    );
+}
+
+#[test]
+fn apps02_given_a_screen_600_dp_wide_or_more_every_cell_is_96_to_128_dp_wide() {
+    // Issue #9. The grid sits inside the safe area and 16 dp margins at each side. Phones keep
+    // four columns.
+    let fakes = Fakes::default();
+    *fakes.apps.apps.lock().unwrap() = (0..30)
+        .map(|i| app(&format!("app{i:02}"), &format!("App {i:02}")))
+        .collect();
+    let (mut launcher, _) = on_a_phone(&fakes);
+    let columns = |launcher: &mut Launcher, screen_dp: f64, insets_dp: f64, density: f64| {
+        let grid_dp = screen_dp - insets_dp - 2.0 * 16.0;
+        launcher
+            .view()
+            .apps()
+            .grid_laid_out(grid_dp * density, 112.0 * density, density);
+        let columns = f64::from(launcher.frame().apps.columns);
+        (grid_dp, columns)
+    };
+
+    for (screen_dp, insets_dp, density) in [
+        (600.0, 0.0, 2.0),    // the smallest large screen
+        (600.0, 48.0, 2.0),   // in landscape beside a three-button bar
+        (673.0, 0.0, 2.625),  // an unfolded foldable
+        (800.0, 0.0, 2.0),    // a tablet in portrait
+        (1_280.0, 48.0, 2.0), // the same tablet in landscape
+        (2_560.0, 0.0, 1.0),  // a large external display
+    ] {
+        let (grid_dp, columns) = columns(&mut launcher, screen_dp, insets_dp, density);
+        let cell_dp = grid_dp / columns;
+        assert!(
+            (96.0..=128.0).contains(&cell_dp),
+            "{screen_dp} dp: {columns} columns of {cell_dp} dp"
+        );
+    }
+    for phone_dp in [320.0, 360.0, 393.0, 412.0, 480.0] {
+        assert_eq!(
+            columns(&mut launcher, phone_dp, 0.0, 2.75).1,
+            4.0,
+            "{phone_dp} dp"
+        );
+    }
+}
+
+#[test]
+fn apps09_given_a_paused_work_profile_its_apps_are_dimmed_and_a_tap_defers_to_the_system() {
+    // Issue #9. The system shows its own explanation when a paused or suspended app is
+    // launched; MeeGone shows a short message only if the launch fails outright.
+    let fakes = Fakes::default();
+    with_a_work_profile(&fakes, true);
+    let mut paused = work_app("mail", "Mail");
+    paused.available = false;
+    *fakes.apps.apps.lock().unwrap() = vec![app("maps", "Maps"), paused.clone()];
+    let mut launcher = Launcher::start(fakes.platform());
+
+    assert_eq!(
+        cells(&mut launcher),
+        [
+            ("Mail".to_owned(), true, false),
+            ("Maps".to_owned(), false, true),
+        ]
+    );
+
+    let icon = Rect {
+        left: 44,
+        top: 300,
+        right: 198,
+        bottom: 454,
+    };
+    let revision = launcher.frame().apps.revision;
+    assert!(launcher.view().apps().cell_tapped(revision, 0, icon));
+    launcher.frame();
+    assert_eq!(*fakes.apps.launched.lock().unwrap(), [paused.id.clone()]);
+    assert_eq!(*fakes.apps.launched_from.lock().unwrap(), [Some(icon)]);
+    assert_eq!(launcher.shell().apps().state().problem, None);
+
+    *fakes.apps.error.lock().unwrap() = Some(DataError::Unsupported("App isn't available".into()));
+    assert!(launcher.view().apps().cell_tapped(revision, 0, icon));
+    launcher.frame();
+    assert_eq!(
+        launcher.shell().apps().state().problem.as_deref(),
+        Some("App isn't available")
+    );
+}
+
+#[test]
+fn apps_changed_while_open_reach_the_grid() {
+    // Issue #9: the system reports a resumed work profile while MeeGone shows; its apps are
+    // no longer dimmed.
+    let fakes = Fakes::default();
+    with_a_work_profile(&fakes, true);
+    let mut paused = work_app("mail", "Mail");
+    paused.available = false;
+    *fakes.apps.apps.lock().unwrap() = vec![paused];
+    let mut launcher = Launcher::start(fakes.platform());
+    let before = launcher.frame().apps.revision;
+
+    with_a_work_profile(&fakes, false);
+    *fakes.apps.apps.lock().unwrap() = vec![work_app("mail", "Mail")];
+    launcher.dispatch(ShellIntent::AppsChanged);
+
+    assert_ne!(launcher.frame().apps.revision, before);
+    assert_eq!(cells(&mut launcher), [("Mail".to_owned(), true, true)]);
 }

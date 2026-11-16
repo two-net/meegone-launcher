@@ -17,5 +17,5 @@ pub use store::{Health, StateHolder, Store};
 pub use theme::{Theme, ThemeHolder, ThemeIntent, ThemeState, resolve_theme};
 
 pub use meegone_core_data::{
-    Access, App, AppId, HomeTarget, Notification, ProfileId, RecentDensity, Rgb, ThemeChoice,
+    Access, App, AppId, HomeTarget, Notification, ProfileId, RecentDensity, Rect, Rgb, ThemeChoice,
 };

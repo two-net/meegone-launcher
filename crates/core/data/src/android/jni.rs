@@ -41,9 +41,14 @@ mod env_slot {
     pub const CALL_OBJECT_METHOD_A: usize = 36;
     pub const CALL_BOOLEAN_METHOD_A: usize = 39;
     pub const CALL_LONG_METHOD_A: usize = 54;
+    pub const NEW_STRING: usize = 163;
     pub const GET_STRING_LENGTH: usize = 164;
     pub const GET_STRING_CHARS: usize = 165;
     pub const RELEASE_STRING_CHARS: usize = 166;
+    pub const GET_ARRAY_LENGTH: usize = 171;
+    pub const NEW_OBJECT_ARRAY: usize = 172;
+    pub const GET_OBJECT_ARRAY_ELEMENT: usize = 173;
+    pub const SET_OBJECT_ARRAY_ELEMENT: usize = 174;
     pub const SET_INT_ARRAY_REGION: usize = 211;
     pub const GET_JAVA_VM: usize = 219;
     pub const EXCEPTION_CHECK: usize = 228;
@@ -54,16 +59,28 @@ mod vm_slot {
     pub const GET_ENV: usize = 6;
 }
 
-/// One argument of a `Call…MethodA` call: a `jvalue`. Only `long` arguments are used so far.
+/// One argument of a `Call…MethodA` call: a `jvalue`. Only the kinds MeeGone passes are here.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub union JValue {
     long: JLong,
+    int: JInt,
+    object: JObject,
 }
 
 impl JValue {
     pub fn long(value: i64) -> Self {
         Self { long: value }
+    }
+
+    pub fn int(value: i32) -> Self {
+        Self { int: value }
+    }
+
+    /// An object argument, such as a string from [`Env::new_string`]. It must stay alive until
+    /// the call that takes it returns.
+    pub fn object(value: &Local) -> Self {
+        Self { object: value.raw }
     }
 }
 
@@ -82,6 +99,30 @@ impl LocalRef {
     /// result is dropped before that method returns.
     pub unsafe fn from_raw(raw: JObject) -> Self {
         Self(raw)
+    }
+}
+
+/// A local reference this binding created, or that Java returned to it. It is deleted when
+/// dropped, so reading or building a long list never fills the JVM's local reference table.
+/// Like the [`Env`] that made it, it is valid only during the current native call.
+pub struct Local {
+    env: Env,
+    raw: JObject,
+}
+
+impl Local {
+    /// Hands the reference to the JVM as the running native method's return value, so it isn't
+    /// deleted here.
+    pub fn into_raw(self) -> JObject {
+        let raw = self.raw;
+        mem::forget(self);
+        raw
+    }
+}
+
+impl Drop for Local {
+    fn drop(&mut self) {
+        self.env.delete_local(self.raw);
     }
 }
 
@@ -305,16 +346,16 @@ impl Env {
         Ok(result)
     }
 
-    /// Calls a method returning `String`, which may be `null`.
-    pub fn call_string(
+    /// Calls a method returning an object, which may be `null`.
+    pub fn call_object(
         &self,
         object: &GlobalRef,
         method: MethodId,
         args: &[JValue],
-    ) -> Result<Option<String>, DataError> {
+    ) -> Result<Option<Local>, DataError> {
         type CallObjectMethodA =
             unsafe extern "system" fn(RawEnv, JObject, JMethodId, *const JValue) -> JObject;
-        // SAFETY: as for `call_bool`, for a `String` return type.
+        // SAFETY: as for `call_bool`, for an object return type.
         let result = unsafe {
             self.function::<CallObjectMethodA>(env_slot::CALL_OBJECT_METHOD_A)(
                 self.0,
@@ -323,13 +364,126 @@ impl Env {
                 args.as_ptr(),
             )
         };
+        let result = self.local(result);
         self.check()?;
-        if result.is_null() {
-            return Ok(None);
+        Ok(result)
+    }
+
+    /// Calls a method returning `String`, which may be `null`.
+    pub fn call_string(
+        &self,
+        object: &GlobalRef,
+        method: MethodId,
+        args: &[JValue],
+    ) -> Result<Option<String>, DataError> {
+        match self.call_object(object, method, args)? {
+            Some(text) => self.string_of(text.raw).map(Some),
+            None => Ok(None),
         }
-        let text = self.string_of(result);
-        self.delete_local(result);
-        text.map(Some)
+    }
+
+    /// Calls a method returning `String[]`, which may be `null`; a `null` element is `None`.
+    pub fn call_strings(
+        &self,
+        object: &GlobalRef,
+        method: MethodId,
+        args: &[JValue],
+    ) -> Result<Option<Vec<Option<String>>>, DataError> {
+        match self.call_object(object, method, args)? {
+            Some(array) => self.strings(&array).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Owns `raw`, a local reference this binding just got, unless it is `null`.
+    fn local(&self, raw: JObject) -> Option<Local> {
+        (!raw.is_null()).then_some(Local { env: *self, raw })
+    }
+
+    /// Every element of `array`, a `String[]`, deleting each element's reference once read.
+    fn strings(&self, array: &Local) -> Result<Vec<Option<String>>, DataError> {
+        type GetArrayLength = unsafe extern "system" fn(RawEnv, JObject) -> JInt;
+        type GetObjectArrayElement = unsafe extern "system" fn(RawEnv, JObject, JInt) -> JObject;
+        // SAFETY: the signature matches `jni.h`, and `array` is a live array reference.
+        let length = unsafe {
+            self.function::<GetArrayLength>(env_slot::GET_ARRAY_LENGTH)(self.0, array.raw)
+        };
+        self.check()?;
+        let mut strings = Vec::with_capacity(usize::try_from(length).unwrap_or(0));
+        for index in 0..length {
+            // SAFETY: the signature matches `jni.h`, and `index` is within the array.
+            let element = unsafe {
+                self.function::<GetObjectArrayElement>(env_slot::GET_OBJECT_ARRAY_ELEMENT)(
+                    self.0, array.raw, index,
+                )
+            };
+            let element = self.local(element);
+            self.check()?;
+            strings.push(match element {
+                Some(text) => Some(self.string_of(text.raw)?),
+                None => None,
+            });
+        }
+        Ok(strings)
+    }
+
+    /// A new Java string holding `text`, built from UTF-16 so every character survives.
+    pub fn new_string(&self, text: &str) -> Result<Local, DataError> {
+        type NewString = unsafe extern "system" fn(RawEnv, *const u16, JInt) -> JObject;
+        let chars: Vec<u16> = text.encode_utf16().collect();
+        let length = JInt::try_from(chars.len())
+            .map_err(|_| DataError::Failed("The system couldn't do that".into()))?;
+        // SAFETY: the signature matches `jni.h`, and `chars` holds `length` UTF-16 units.
+        let raw = unsafe {
+            self.function::<NewString>(env_slot::NEW_STRING)(self.0, chars.as_ptr(), length)
+        };
+        let string = self.local(raw);
+        self.check()?;
+        string.ok_or_else(|| DataError::Failed("The system couldn't do that".into()))
+    }
+
+    /// A new `String[]` holding `texts`, in order.
+    pub fn new_string_array<'a>(
+        &self,
+        texts: impl ExactSizeIterator<Item = &'a str>,
+    ) -> Result<Local, DataError> {
+        type FindClass = unsafe extern "system" fn(RawEnv, *const c_char) -> JObject;
+        type NewObjectArray = unsafe extern "system" fn(RawEnv, JInt, JObject, JObject) -> JObject;
+        type SetObjectArrayElement = unsafe extern "system" fn(RawEnv, JObject, JInt, JObject);
+        let failed = || DataError::Failed("The system couldn't do that".into());
+        let length = JInt::try_from(texts.len()).map_err(|_| failed())?;
+        // SAFETY: the signatures match `jni.h`; the class reference lives until the array is
+        // made.
+        let array = unsafe {
+            let class = self.function::<FindClass>(env_slot::FIND_CLASS)(
+                self.0,
+                c"java/lang/String".as_ptr(),
+            );
+            let class = self.local(class);
+            self.check()?;
+            let class = class.ok_or_else(failed)?;
+            let array = self.function::<NewObjectArray>(env_slot::NEW_OBJECT_ARRAY)(
+                self.0,
+                length,
+                class.raw,
+                ptr::null_mut(),
+            );
+            self.local(array)
+        };
+        self.check()?;
+        let array = array.ok_or_else(failed)?;
+        for (index, text) in (0..length).zip(texts) {
+            let string = self.new_string(text)?;
+            // SAFETY: the signature matches `jni.h`; `index` is within the array, and a
+            // `String` fits a `String[]`.
+            unsafe {
+                self.function::<SetObjectArrayElement>(env_slot::SET_OBJECT_ARRAY_ELEMENT)(
+                    self.0, array.raw, index, string.raw,
+                );
+            }
+            self.check()?;
+        }
+        Ok(array)
     }
 
     /// A Java string passed to a native method.

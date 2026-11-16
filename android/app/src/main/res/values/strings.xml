@@ -22,6 +22,16 @@
     <string name="menu_lock_screen_image">Lock-screen image</string>
     <string name="menu_edit_applications">Edit applications</string>
 
+    <!-- Applications (APPS-01). A work-profile app's name for screen readers, e.g. "Mail, work"
+         (A11Y-01). %1$s is the app's label. -->
+    <string name="app_work">%1$s, work</string>
+    <!-- Read by screen readers after the name of an app that can't open now: its work profile
+         is paused, it is suspended or its storage is missing (APPS-09). -->
+    <string name="app_state_unavailable">Unavailable</string>
+    <!-- Shown briefly when a tapped app couldn't open and the system said nothing itself
+         (APPS-09). -->
+    <string name="app_unavailable">This app can\'t open right now</string>
+
     <!-- Settings' title (SET-01). -->
     <string name="settings_title">Launcher settings</string>
 </resources>

@@ -54,6 +54,8 @@ pub struct App {
     /// False while the profile is paused, the app is suspended or its storage is missing
     /// (APPS-09).
     pub available: bool,
+    /// In a work profile: the system badges its icon and its name says so (APPS-20, A11Y-01).
+    pub work: bool,
     /// False for apps the user can't uninstall, which show no ✕ in edit mode (APPS-13).
     pub can_uninstall: bool,
     pub installed_at_ms: u64,
@@ -137,6 +139,23 @@ pub struct ImageJob {
     pub network: JobNetwork,
 }
 
+/// A rectangle on the screen, in physical pixels from its top left, such as where a launch
+/// grows from (ANIM-08).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct Rect {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+
+impl Rect {
+    /// Whether it covers no pixels.
+    pub fn is_empty(&self) -> bool {
+        self.right <= self.left || self.bottom <= self.top
+    }
+}
+
 /// A size in physical pixels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Size {
@@ -211,6 +230,21 @@ mod tests {
             DataError::Unsupported("Blocked by device policy".into()).to_string(),
             "Blocked by device policy"
         );
+    }
+
+    #[test]
+    fn a_rect_without_area_is_empty() {
+        let icon = Rect {
+            left: 10,
+            top: 20,
+            right: 66,
+            bottom: 76,
+        };
+
+        assert!(!icon.is_empty());
+        assert!(Rect::default().is_empty());
+        assert!(Rect { right: 10, ..icon }.is_empty());
+        assert!(Rect { bottom: 0, ..icon }.is_empty());
     }
 
     #[test]
