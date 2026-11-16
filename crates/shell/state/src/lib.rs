@@ -20,12 +20,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use meegone_apps_data::PersistentLayoutStore;
-use meegone_apps_state::{AppsHolder, AppsIntent, CellKey, FolderId, Surface, cells_moved};
+use meegone_apps_state::{
+    AppsHolder, AppsIntent, AppsState, CellKey, FolderId, Surface, cells_moved,
+};
 use meegone_core_data::{
     HomeTarget, PersistentSettingsStore, Platform, SettingsStore, SystemConfigAdapter,
 };
 use meegone_core_state::motion::{MODE_SCALE, VIEW_FLING_VELOCITY_DP};
-use meegone_core_state::{Health, Store, ThemeHolder, ThemeIntent};
+use meegone_core_state::{App, Health, Store, ThemeHolder, ThemeIntent};
 use meegone_events_state::{EventsHolder, EventsIntent};
 use meegone_lockimage_data::PersistentImageCache;
 use meegone_lockimage_state::{LockImageHolder, LockImageIntent, LockImageState};
@@ -303,6 +305,8 @@ pub struct HomeShell {
     seen_folder: (Option<FolderId>, Arc<[GridItem]>),
     /// How many folders Applications had made as of the last intent (ANIM-24).
     seen_folders_made: u32,
+    /// The apps Applications had hidden as of the last intent, so Recent follows (APPS-19).
+    seen_hidden: Arc<[App]>,
     search: SearchMotion,
     theme: Store<ThemeHolder>,
     apps: Store<AppsHolder>,
@@ -333,6 +337,7 @@ impl HomeShell {
             folder: FolderMotion::default(),
             seen_folder: (None, Arc::new([])),
             seen_folders_made: 0,
+            seen_hidden: Arc::new([]),
             search: SearchMotion::default(),
             theme: Store::new(ThemeHolder::new(
                 settings_store.clone(),
@@ -342,6 +347,8 @@ impl HomeShell {
                 platform.apps.clone(),
                 platform.system.clone(),
                 Arc::new(PersistentLayoutStore::new(platform.storage.clone())),
+                // Applications writes the hidden apps there (APPS-19, ADR 0002).
+                settings_store.clone(),
             )),
             events: Store::new(EventsHolder::new(platform.notifications.clone())),
             recent: Store::new(RecentHolder::new(
@@ -375,6 +382,8 @@ impl HomeShell {
         shell.configure_carousel();
         // The grid as it starts is shown as it is: nothing moves (ANIM-21).
         shell.seen_cells = shell.apps.state().items.clone();
+        // Recent read the hidden apps as it loaded.
+        shell.seen_hidden = shell.apps.state().hidden_apps.clone();
         shell
     }
 
@@ -398,6 +407,12 @@ impl HomeShell {
         &self.apps
     }
 
+    /// Whether Applications works. Its content shown elsewhere, such as Hidden apps in
+    /// Settings, is offered only then (ARCH-09).
+    pub fn apps_ready(&self) -> bool {
+        *self.apps.health() == Health::Ready
+    }
+
     pub fn events(&self) -> &Store<EventsHolder> {
         &self.events
     }
@@ -418,6 +433,12 @@ impl HomeShell {
     /// Events and Settings (ADR 0002).
     pub fn subscribe_lockimage(&mut self, listener: impl FnMut(&Arc<LockImageState>) + 'static) {
         self.lockimage.subscribe(listener);
+    }
+
+    /// Calls `listener` with every new Applications state, for its Hidden apps section shown
+    /// inside Settings (APPS-19, ADR 0002).
+    pub fn subscribe_apps(&mut self, listener: impl FnMut(&Arc<AppsState>) + 'static) {
+        self.apps.subscribe(listener);
     }
 
     /// Calls `listener` with every new settings state, for the banner that offers to make
@@ -525,6 +546,7 @@ impl HomeShell {
         self.keep_lift_in_step();
         self.keep_mode_in_step();
         self.keep_cells_in_step();
+        self.keep_recent_in_step();
         self.lift.sync(&self.drag_surfaces());
         self.state.carousel = self.carousel.state();
         self.state.return_home = self.return_home.state();
@@ -729,6 +751,18 @@ impl HomeShell {
         if moved {
             self.press.finish();
             self.grid_change.start(self.carousel.animation_scale());
+        }
+    }
+
+    /// Recent leaves out the apps Applications hides (APPS-19, REC-03). When they change, by a
+    /// Hide, an Unhide or a hidden app that is gone, Recent reads them again at once, so a swipe
+    /// never shows a hidden app's card on the next page. A failed save changes nothing, and a
+    /// failed Applications changes nothing either.
+    fn keep_recent_in_step(&mut self) {
+        let hidden = &self.apps.state().hidden_apps;
+        if !Arc::ptr_eq(hidden, &self.seen_hidden) {
+            self.seen_hidden = hidden.clone();
+            self.recent.dispatch(RecentIntent::Refresh);
         }
     }
 
@@ -1149,7 +1183,7 @@ impl HomeShell {
 #[cfg(test)]
 mod tests {
     use meegone_apps_data::{Layout as SavedLayout, LayoutEntry, LayoutStore};
-    use meegone_apps_state::{Bounds, FolderId, GridItem, GridLayout};
+    use meegone_apps_state::{AppMenuItem, Bounds, FolderId, GridItem, GridLayout};
     use meegone_core_data::fakes::{FakeApps, Fakes, app, app_id};
     use meegone_core_data::{
         App, AppId, AppsAdapter, DataError, Profile, RecentUse, Rect, Shortcut,
@@ -1436,6 +1470,7 @@ mod tests {
             *shell.apps().health(),
             Health::Failed("launcher bug".into())
         );
+        assert!(!shell.apps_ready());
         assert_eq!(*shell.events().health(), Health::Ready);
         shell.dispatch(ShellIntent::Swipe(Direction::Previous));
         assert_eq!(shell.state().current, HomeView::Events);
@@ -1593,6 +1628,79 @@ mod tests {
         let cards = &shell.recent().state().cards;
         assert_eq!(cards.len(), 2);
         assert_eq!(cards[0].app.label, "Mail");
+    }
+
+    /// A shell on Applications, with usage access, where Maps and then Mail were used.
+    fn with_recent_maps_and_mail(fakes: &Fakes) -> HomeShell {
+        *fakes.usage.access.lock().unwrap() = Access::Granted;
+        *fakes.apps.apps.lock().unwrap() = vec![app("maps", "Maps"), app("mail", "Mail")];
+        *fakes.system.now_ms.lock().unwrap() = 1_000_000;
+        *fakes.usage.uses.lock().unwrap() = ["maps", "mail"]
+            .iter()
+            .zip([900_000, 999_000])
+            .map(|(package, at)| RecentUse {
+                app: app_id(package),
+                last_used_ms: at,
+            })
+            .collect();
+        HomeShell::compose(fakes.platform())
+    }
+
+    fn recent_labels(shell: &HomeShell) -> Vec<String> {
+        let cards = &shell.recent().state().cards;
+        cards.iter().map(|card| card.app.label.clone()).collect()
+    }
+
+    fn hide_maps(shell: &mut HomeShell) {
+        shell.dispatch(ShellIntent::Apps(AppsIntent::OpenMenu(CellKey::App(
+            app_id("maps"),
+        ))));
+        shell.dispatch(ShellIntent::Apps(AppsIntent::ChooseMenuItem(
+            AppMenuItem::Hide,
+        )));
+    }
+
+    #[test]
+    fn hiding_or_unhiding_an_app_takes_it_out_of_recent_and_back_at_once() {
+        // APPS-19, REC-03: without waiting for Recent to show, so a swipe never shows it.
+        let fakes = Fakes::default();
+        let mut shell = with_recent_maps_and_mail(&fakes);
+        assert_eq!(recent_labels(&shell), ["Mail", "Maps"]);
+
+        hide_maps(&mut shell);
+        assert_eq!(shell.state().current, HomeView::Applications);
+        assert_eq!(recent_labels(&shell), ["Mail"]);
+
+        shell.dispatch(ShellIntent::Apps(AppsIntent::Unhide(app_id("maps"))));
+        assert_eq!(recent_labels(&shell), ["Mail", "Maps"]);
+    }
+
+    #[test]
+    fn a_hide_that_cant_be_saved_leaves_recent_as_it_was() {
+        // APPS-19, REL-03
+        let fakes = Fakes::default();
+        let mut shell = with_recent_maps_and_mail(&fakes);
+        *fakes.storage.error.lock().unwrap() = Some(DataError::Failed("disk full".into()));
+
+        hide_maps(&mut shell);
+
+        assert_eq!(shell.apps().state().problem.as_deref(), Some("disk full"));
+        assert_eq!(recent_labels(&shell), ["Mail", "Maps"]);
+    }
+
+    #[test]
+    fn hidden_apps_reach_recent_from_the_start() {
+        // APPS-19: Recent reads them as it loads, and nothing refreshes it twice.
+        let fakes = Fakes::default();
+        hide_maps(&mut with_recent_maps_and_mail(&fakes));
+
+        let restarted = HomeShell::compose(fakes.platform());
+
+        assert_eq!(recent_labels(&restarted), ["Mail"]);
+        assert!(Arc::ptr_eq(
+            &restarted.seen_hidden,
+            &restarted.apps().state().hidden_apps
+        ));
     }
 
     #[test]

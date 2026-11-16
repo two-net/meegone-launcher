@@ -248,6 +248,47 @@ mod tests {
     use crate::storage::format::seal;
     use crate::storage::{decode, encode};
 
+    #[test]
+    fn there_are_at_most_twelve_user_adjustable_options() {
+        // SET-04, SRS 7.1. Every field is named, with no `..`, so a new one doesn't compile
+        // until it is counted here as an option or set aside as not one.
+        let Settings {
+            theme,
+            home_target,
+            wrap_around,
+            // Recent's columns, chosen by pinching (REC-05).
+            recent_density,
+            recent_window_hours,
+            // Settings → Applications → Hidden apps (APPS-19).
+            hidden_apps,
+            image:
+                ImageOptions {
+                    enabled,
+                    region,
+                    use_mobile_data,
+                    show_card,
+                },
+            // What the user removed from Recent, not an option.
+            removed_from_recent: _,
+            // When the banner was last answered, not an option (ADR 0005).
+            home_banner_dismissed_ms: _,
+        } = Settings::default();
+        let options: &[&dyn std::fmt::Debug] = &[
+            &theme,
+            &home_target,
+            &wrap_around,
+            &recent_density,
+            &recent_window_hours,
+            &hidden_apps,
+            &enabled,
+            &region,
+            &use_mobile_data,
+            &show_card,
+        ];
+
+        assert!(options.len() <= 12, "SET-04 allows 12 at most");
+    }
+
     /// A saved file, and the value it must load as.
     type Fixture = (&'static str, fn() -> Settings);
 

@@ -14,10 +14,16 @@
 //! [`AppsView::menu_items`] when that changes, and refers to an item by its place in them. In edit
 //! mode, the host names a cell the same way when its ✕ is tapped or a screen reader moves it
 //! (ADR 0014).
+//!
+//! Applications also provides Settings' Hidden apps section, [`HiddenAppsSection`], which the
+//! shell puts into Settings (APPS-19, ADR 0017).
+
+mod hidden;
 
 use std::cell::RefCell;
 use std::sync::Arc;
 
+pub use hidden::HiddenAppsSection;
 use meegone_apps_state::{AppMenu, AppsIntent, AppsState, GridItem, previous_places};
 pub use meegone_apps_state::{AppMenuItem, Bounds, CellKey, FolderId, GridLayout, Surface};
 use meegone_core_state::{App, AppId, Rect};

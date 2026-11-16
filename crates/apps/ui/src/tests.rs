@@ -541,3 +541,74 @@ fn search_input_becomes_intents() {
     ));
     assert!(matches!(sent[5], AppsIntent::ResultsScrolled(25.0)));
 }
+
+/// Settings' Hidden apps section over `hidden`, the latest state it reads, and the intents it
+/// sends.
+fn hidden_section(
+    hidden: Arc<[App]>,
+) -> (
+    HiddenAppsSection,
+    meegone_core_ui::Latest<AppsState>,
+    Rc<RefCell<Vec<AppsIntent>>>,
+) {
+    let sent = Rc::new(RefCell::new(Vec::new()));
+    let latest = meegone_core_ui::Latest::new(Arc::new(AppsState {
+        hidden_apps: hidden,
+        ..AppsState::default()
+    }));
+    let section = HiddenAppsSection::new(
+        latest.clone(),
+        Dispatch::new({
+            let sent = Rc::clone(&sent);
+            move |intent| sent.borrow_mut().push(intent)
+        }),
+    );
+    (section, latest, sent)
+}
+
+#[test]
+fn the_hidden_apps_revision_changes_only_with_the_list() {
+    // APPS-19: the host reads the list again only when it changed.
+    let maps = app("maps", "Maps", true, false);
+    let hidden: Arc<[App]> = vec![maps.clone()].into();
+    let (section, latest, _) = hidden_section(Arc::clone(&hidden));
+
+    let first = section.revision();
+    assert_eq!(section.apps().to_vec(), [maps]);
+    // The same list in a new snapshot, as after a scroll, keeps the revision.
+    latest.set(Arc::new(AppsState {
+        hidden_apps: hidden,
+        scroll_px: 40.0,
+        ..AppsState::default()
+    }));
+    assert_eq!(section.revision(), first);
+    // A clone, as Settings holds, shares it.
+    assert_eq!(section.clone().revision(), first);
+
+    latest.set(Arc::new(AppsState::default()));
+    assert_ne!(section.revision(), first);
+    assert!(section.apps().is_empty());
+}
+
+#[test]
+fn unhide_names_the_app_by_revision_and_place_and_a_stale_list_does_nothing() {
+    // APPS-19
+    let (section, _, sent) = hidden_section(
+        vec![
+            app("chess", "Chess", true, false),
+            app("maps", "Maps", true, false),
+        ]
+        .into(),
+    );
+    let revision = section.revision();
+
+    assert!(!section.unhide_tapped(revision.wrapping_add(1), 1));
+    assert!(!section.unhide_tapped(revision, 2));
+    assert!(sent.borrow().is_empty());
+
+    assert!(section.unhide_tapped(revision, 1));
+    assert!(matches!(
+        sent.borrow()[..],
+        [AppsIntent::Unhide(ref id)] if id.package == "maps"
+    ));
+}

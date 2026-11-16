@@ -27,7 +27,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::time::Duration;
 
 use meegone_core_data::android::{self, Env, JObject, LocalRef, RawEnv};
-use meegone_core_data::{Rect, Rgb, accent};
+use meegone_core_data::{App, Rect, Rgb, accent};
 
 use crate::{
     AppMenuItem, BADGE_ROWS, Bounds, Cell, CellKey, Direction, FOLDER_COLUMNS, FolderId,
@@ -428,9 +428,9 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeAppM
 }
 
 /// The fields of one item of a cell's menu in `nativeAppMenu`, mirrored in `HomeViews.java`:
-/// its kind, 0 App info, 1 Uninstall, 2 Edit applications, 3 a shortcut or 4 Rename folder,
-/// then the shortcut's label, or nothing for the others, whose text is in Android's string
-/// resources (L10N-01).
+/// its kind, 0 App info, 1 Uninstall, 2 Edit applications, 3 a shortcut, 4 Rename folder or
+/// 5 Hide (APPS-19), then the shortcut's label, or nothing for the others, whose text is in
+/// Android's string resources (L10N-01).
 fn menu_item_fields(item: &AppMenuItem) -> [String; 2] {
     let (kind, label) = match item {
         AppMenuItem::AppInfo => (0, ""),
@@ -438,6 +438,7 @@ fn menu_item_fields(item: &AppMenuItem) -> [String; 2] {
         AppMenuItem::EditApplications => (2, ""),
         AppMenuItem::Shortcut(shortcut) => (3, shortcut.label.as_str()),
         AppMenuItem::RenameFolder => (4, ""),
+        AppMenuItem::Hide => (5, ""),
     };
     [kind.to_string(), label.to_owned()]
 }
@@ -470,6 +471,97 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeAppM
                 .view()
                 .apps()
                 .menu_item_chosen(revision as u32, item)
+            {
+                return Ok(());
+            }
+            launcher.frame();
+            message = problem(env, launcher)?;
+            Ok(())
+        })
+    });
+    message
+}
+
+/// `String[] nativeHiddenApps()`: Settings → Applications → Hidden apps as of the last frame,
+/// in order, each in the fields of [`hidden_app_fields`] (APPS-19). Empty while Applications
+/// isn't working (ARCH-09).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeHiddenApps(
+    env: RawEnv,
+    _views: JObject,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    let mut apps = std::ptr::null_mut();
+    guarded(env, || {
+        LAUNCHER.with_borrow(|launcher| {
+            let launcher = launcher.as_ref().ok_or("MeeGone hasn't started")?;
+            let fields: Vec<String> = if launcher.shell().apps_ready() {
+                let hidden = launcher.view().hidden_apps().apps();
+                hidden.iter().flat_map(hidden_app_fields).collect()
+            } else {
+                Vec::new()
+            };
+            let array = env
+                .new_string_array(fields.iter().map(String::as_str))
+                .map_err(|error| format!("Couldn't pass the hidden apps: {error}"))?;
+            apps = array.into_raw();
+            Ok(())
+        })
+    });
+    apps
+}
+
+/// The fields of one hidden app in `nativeHiddenApps`, mirrored in `HiddenAppsList.java`:
+/// 1. its label;
+/// 2. to 4. its package, activity and profile serial number, which its icon is loaded by;
+/// 5. its flags: 1 in a work profile (APPS-20), 2 available (APPS-09).
+fn hidden_app_fields(app: &App) -> [String; 5] {
+    let flags = u8::from(app.work) | u8::from(app.available) << 1;
+    [
+        app.label.clone(),
+        app.id.package.clone(),
+        app.id.activity.clone(),
+        app.id.profile.0.to_string(),
+        flags.to_string(),
+    ]
+}
+
+/// `String nativeUnhide(int revision, int index)`: Unhide was tapped on app `index` of the
+/// hidden apps at `revision` (APPS-19). It shows in the grid again, in its old place. Returns
+/// `null`, or a short message to show when it couldn't be saved. A list that changed
+/// meanwhile does nothing.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeUnhide(
+    env: RawEnv,
+    _views: JObject,
+    revision: i32,
+    index: i32,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    let Ok(index) = usize::try_from(index) else {
+        return std::ptr::null_mut();
+    };
+    let mut message = std::ptr::null_mut();
+    guarded(env, || {
+        LAUNCHER.with_borrow_mut(|launcher| {
+            let launcher = launcher.as_mut().ok_or("MeeGone hasn't started")?;
+            // A failed Applications drops the intent, and its old problem means nothing now
+            // (ARCH-09). The revision travels as Java's `int`.
+            if !launcher.shell().apps_ready()
+                || !launcher
+                    .view()
+                    .hidden_apps()
+                    .unhide_tapped(revision as u32, index)
             {
                 return Ok(());
             }
@@ -1370,7 +1462,7 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRead
 }
 
 /// How many slots the frame has.
-const FRAME_SLOTS: usize = 78;
+const FRAME_SLOTS: usize = 80;
 
 /// A `HomeFrame` as the `int[]` that `HomeViews.java` reads, slot by slot:
 ///
@@ -1435,6 +1527,8 @@ const FRAME_SLOTS: usize = 78;
 /// | 75 | Search's results revision: when it changes, the results grid reads its cells again |
 /// | 76 | How far the results grid is scrolled, in px |
 /// | 77 | The results grid's rows |
+/// | 78 | 1 while Settings offers Hidden apps, which Applications must be working for (APPS-19, ARCH-09); otherwise 0 |
+/// | 79 | Hidden apps' revision: when it changes, Settings reads the list again with `nativeHiddenApps` |
 fn frame_slots(frame: &HomeFrame) -> [i32; FRAME_SLOTS] {
     let [events, applications, recent] = frame.pages;
     let menu_items = frame.menu.map_or(0, |menu| {
@@ -1553,6 +1647,9 @@ fn frame_slots(frame: &HomeFrame) -> [i32; FRAME_SLOTS] {
         frame.apps.results.revision as i32,
         frame.apps.results.scroll_px,
         i32::from(frame.apps.results.rows),
+        i32::from(frame.hidden_apps.is_some()),
+        // The revision travels as Java's `int`.
+        frame.hidden_apps.map_or(0, |revision| revision as i32),
     ];
     slots[40 + BADGE_ROWS..].copy_from_slice(&rest);
     slots

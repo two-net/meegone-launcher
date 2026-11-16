@@ -25,12 +25,12 @@ Each crate is `crates/<area>/<layer>`, with the package name `meegone-<area>-<la
 | Area | data | state | ui | Owns |
 |---|---|---|---|---|
 | **core** | Models, platform adapter traits and fakes, storage and the saved-file format, the settings store, app accents and colour contrast | `StateHolder`, `Store`, theme resolution, motion specs and spring physics | Colour tokens, each app's accent per theme, `View`, `Slot`, `Dispatch` | Nothing persistent |
-| **apps** | Layout store | Grid, its columns, scroll position and geometry, an app's long-press menu, edit mode and its arrangement, folders, search and its ranking, keeping the layout in step with the installed apps | `AppsView` | Layout store |
+| **apps** | Layout store | Grid, its columns, scroll position and geometry, an app's long-press menu, edit mode and its arrangement, folders, search and its ranking, hidden apps, keeping the layout in step with the installed apps | `AppsView`, `HiddenAppsSection` | Layout store; hidden apps (in the settings store) |
 | **events** | – | Notifications grouped by app | `EventsView` | Nothing (memory only) |
 | **recent** | – | Filtering, ordering, close mode | `RecentView` | Removed-apps list (in the settings store) |
 | **lockimage** | Image cache, image-feed interface | On/off, availability, current image | `ImageCard`, `ImageSettingsSection` | Image cache |
 | **settings** | – | Settings, access status, the home-app banner (ONB-04) | `SettingsView`, `HomeBanner` | The settings screens |
-| **shell** | – | `HomeShell`: the carousel of views, the home menu, which long-press counts, Home and Back, coming back to the home, the icon press, the dragged icon across the grid and the open folder, the grid's motion as apps come, go and move, edit mode's motion, a folder's opening and closing, the search field's pull, composes every feature | `ShellView`, `HomeFrame` | Nothing persistent |
+| **shell** | – | `HomeShell`: the carousel of views, the home menu, which long-press counts, Home and Back, coming back to the home, the icon press, the dragged icon across the grid and the open folder, the grid's motion as apps come, go and move, edit mode's motion, a folder's opening and closing, the search field's pull, Recent following the hidden apps, composes every feature | `ShellView`, `HomeFrame` | Nothing persistent |
 
 The root package `meegone-launcher` is the app. `Launcher::start(platform)` hands the platform adapters to the shell. On Android it is also a native library, which the Java host in `android/` loads ([ADR 0005](docs/adr/0005-android-host-and-home-role.md)) and asks what to draw ([ADR 0006](docs/adr/0006-android-views-and-the-carousel.md)). `tools/arch-check` is a development tool that is never part of the app.
 
@@ -70,7 +70,7 @@ AppsView.cell_tapped(revision, 4, icon)          ui     sends AppsIntent::Launch
   - Coming back from an app (`Returned`) shows the view the user left. With "Home button opens: Always Applications", Home from an app shows Applications with nothing open (HOME-06).
   - After the system ends the process, the activity's saved state brings back the view and the Applications scroll position (`Restore`, REL-05).
 - **The home menu** ([ADR 0008](docs/adr/0008-the-home-menu.md)). A long-press on empty space opens it in Events and Applications, and enters close mode in Recent (HOME-10, REC-07). It lives in `ShellState.menu`, and its items route to Settings and to Applications' edit mode.
-- **An app's menu** ([ADR 0013](docs/adr/0013-the-app-long-press-menu.md)). A long-press on an app's icon opens it: App info, Uninstall when the app allows it, Edit applications and, while MeeGone is the default home app, the app's shortcuts (APPS-11, APPS-13). A folder's menu has Rename folder and Edit applications (ADR 0015).
+- **An app's menu** ([ADR 0013](docs/adr/0013-the-app-long-press-menu.md)). A long-press on an app's icon opens it: App info, Uninstall when the app allows it, Hide, Edit applications and, while MeeGone is the default home app, the app's shortcuts (APPS-11, APPS-13, APPS-19). A folder's menu has Rename folder and Edit applications (ADR 0015).
   - It lives in `AppsState.menu`, and each item's side effect goes through `AppsAdapter`. Back closes it before a folder or edit mode.
   - The shell decides whether the long-press counts and treats the menu as covering the views, but only while Applications works (ARCH-09).
   - Dragging on picks the icon up (`lift.rs`): edit mode starts, and the icon follows the finger until it lifts.
@@ -88,6 +88,11 @@ AppsView.cell_tapped(revision, 4, icon)          ui     sends AppsIntent::Launch
   - Applications owns the query and its results, a third surface, `Surface::Search`. The action key launches the first result, or searches the web when nothing matches and a browser is installed (SRCH-03, SRCH-05).
   - The shell owns the pull (`search.rs`). While search is open it locks the carousel and offers no menus. A screen reader opens search with "Search apps" (A11Y-05).
   - Back, Home, a launch, another view, Settings, or pushing the empty field away closes it. Search never moves the grid, so it is where it was (SRCH-04). Search counts only while Applications works (ARCH-09).
+- **Hidden apps** ([ADR 0017](docs/adr/0017-hiding-apps.md)). Hide in an app's menu leaves it out of the grid, search and Recent; Settings → Applications → Hidden apps unhides it (APPS-19).
+  - Applications writes `hidden_apps` in the settings store. Reconcile still sees every installed app, so a hidden app keeps its place and folder; the cells and the drag's edits see only the apps that aren't hidden. Unhiding changes nothing else, so the app comes back where it was.
+  - A hidden app is forgotten when it is gone, by the rule that keeps its place (`follow_hidden`), so reinstalling it shows it.
+  - Applications provides `HiddenAppsSection`, which the shell puts into Settings. It is offered only while Applications works (ARCH-09).
+  - When the hidden apps change, the shell refreshes Recent at once, in `dispatch`.
 
 ## Drawing (ADR 0006)
 
@@ -116,6 +121,7 @@ HomeViews (Java)                                            Rust
 - **Apps coming, going and moving** ([ADR 0012](docs/adr/0012-keeping-the-layout-in-step.md), [ADR 0014](docs/adr/0014-edit-mode.md)). Each cell says where it was in the cells the host last read, so `AppsGrid` moves the same view, icon and all, to its new place. When cells come, go or move, the shell's grid-change motion runs for 200 ms: new cells grow and fade in, cells that left shrink away where they were, and the rest slide to their new places from where they are drawn (ANIM-21). A revision that only refreshes cells, such as a new accent, keeps a change playing. A new app has a dot in the accent colour before its label until it is opened from MeeGone (APPS-07).
 - **Edit mode** ([ADR 0014](docs/adr/0014-edit-mode.md)). The cells shrink to 92 % and the ✕ badges pop in row by row, from frame slots per visible row (ANIM-12). A dragged icon lifts to 110 % with a shadow, stays under the finger as cells move and the grid scrolls, and settles into its cell on a spring (ANIM-13). `DragShadow` draws it above the pages, so it can leave an open folder, and its cell stays as a gap (ADR 0015). Done is a flat pill at the bottom of Applications. Screen readers get "Uninstall ‹app›" and "Move to…" actions on each cell, and hear "Edit mode" (A11Y-01, A11Y-05, A11Y-08).
 - **Folders** ([ADR 0015](docs/adr/0015-folders.md)). `AppCell` draws a folder as a plate in the icons' shape with a 2×2 preview of its first apps, and the icon held over grows and pulses (FOLD-02, ANIM-14). `FolderPanel`, inside the Applications page, draws the scrim and a panel four cells wide, with the folder's name over its own `AppsGrid`, growing from the folder's icon (ANIM-15). A tap on the name opens a rename dialog (FOLD-03). Screen readers hear "Folder: ‹name›, N apps", and make and empty folders with actions (A11Y-01, A11Y-05).
+- **Settings** shows its name until #34 draws it, and below it `HiddenAppsList`: Applications → Hidden apps, each app with its icon and Unhide, read by revision like the cells ([ADR 0017](docs/adr/0017-hiding-apps.md)).
 - **Search** ([ADR 0016](docs/adr/0016-app-search.md)). `SearchPanel`, inside the Applications page, draws the field in a pill as far as the frame's reveal, and moves the grid down with it. Once something is typed, its own `AppsGrid` shows the results instead of the grid, which keeps its scroll position. Each change of the field's text goes to Rust; Go launches the first result. The window asks for `adjustResize`, and only the results take the keyboard's height, as padding, so the safe area never changes with it.
 - **Icons and accents** ([ADR 0011](docs/adr/0011-icon-shape-and-app-accents.md)). Every icon is one rounded square: adaptive icons are masked to it, and legacy ones sit on a white plate of that shape (APPS-15). Each app's accent comes from its icon once per process: `AppAccents` samples the icon on a background thread, and the Rust app's pure `nativeAccent` picks the colour (APPS-17). It reaches Rust in the app catalogue, and a theme draws it with `Tokens::app_accent`, at 3:1 or more against its background (THEME-07).
 - **Long-press** (ADR 0008, ADR 0013).
@@ -213,7 +219,7 @@ MeeGone keeps three persistent stores, each in its own file under one private fo
 | Item | v1 limit |
 |---|---|
 | Home views | 3 (`HomeView`) |
-| User-adjustable settings | 12 at most |
+| User-adjustable settings | 12 at most; SET-02 lists 10, which a test in `settings.rs` counts (SET-04, ADR 0017) |
 | Setup screens | 4 at most |
 | Persistent stores | 3: layout, settings, image cache (`StoredFile`) |
 | Scheduled background jobs | 1: the daily image (`SchedulerAdapter`) |
@@ -223,7 +229,7 @@ MeeGone keeps three persistent stores, each in its own file under one private fo
 
 ## Not built yet
 
-The skeleton is from issue #1; the Android host and the home-app role from #4; the carousel of home views from #5; Home, Back and coming back to the home from #6; the home menu from #7; edge to edge, screen sizes and navigation modes from #8; the Applications grid and the app catalogue from #9; one icon shape and each app's accent from #10; the layout kept in step with the installed apps from #11; the app long-press menu from #12; edit mode from #13; folders from #14; app search from #15. The following arrive with later requirements:
+The skeleton is from issue #1; the Android host and the home-app role from #4; the carousel of home views from #5; Home, Back and coming back to the home from #6; the home menu from #7; edge to edge, screen sizes and navigation modes from #8; the Applications grid and the app catalogue from #9; one icon shape and each app's accent from #10; the layout kept in step with the installed apps from #11; the app long-press menu from #12; edit mode from #13; folders from #14; app search from #15; hiding apps from #16. The following arrive with later requirements:
 
 - **Android adapters.**
   - Built:
@@ -233,11 +239,11 @@ The skeleton is from issue #1; the Android host and the home-app role from #4; t
     - Whether a browser is installed, and web search (ADR 0016).
   - Stubs until their issues: notifications, usage, wallpaper, network, scheduling, opening links (#30) and the remaining device settings.
 - **The daily image.** The Bing implementation of `ImageFeed` (#26) and the updater (SRS 7.5) come with the WALL requirements.
-- **Drawing.** The home views, their carousel, the view indicator, the return-home motion, the home menu, the Applications grid, its edit mode, its folders and search are drawn (ADR 0006 to ADR 0008, ADR 0010, ADR 0014 to ADR 0016). Events and Recent show only their names until their content arrives (#19, #22).
+- **Drawing.** The home views, their carousel, the view indicator, the return-home motion, the home menu, the Applications grid, its edit mode, its folders, search and Settings' Hidden apps are drawn (ADR 0006 to ADR 0008, ADR 0010, ADR 0014 to ADR 0017). Events and Recent show only their names until their content arrives (#19, #22).
   - Recent's cards adapt to large screens when #22 builds them. Today the pages, the carousel, the safe area, the menu, Settings and the Applications columns adapt (HOME-12, APPS-02).
   - Events' group marker and Recent's card fill draw each app's accent with `Tokens::app_accent` when #19 and #22 draw them.
-  - Settings covers the home views with only its name, and its group's, until #34 draws it. "Home button opens", the home-app banner and first-run setup send intents but aren't drawn yet.
-  - Close mode changes state but isn't drawn yet (#24). Edit mode's "Sort A–Z" (APPS-14, Could) and folders' category names (FOLD-07, Could) come with later issues. Hidden apps (APPS-19, Could), which search will leave out, come with theirs.
+  - Settings covers the home views with only its name, its group's and Applications' Hidden apps until #34 draws it. "Home button opens", the home-app banner and first-run setup send intents but aren't drawn yet.
+  - Close mode changes state but isn't drawn yet (#24). Edit mode's "Sort A–Z" (APPS-14, Could) and folders' category names (FOLD-07, Could) come with later issues.
   - The Android host doesn't yet follow the system's dark mode (#32); the Rust app already does, open folders included.
 - **First-run setup** comes with the ONB requirements. The lock-screen image step is provided as a `Slot`, like its Settings section.
 

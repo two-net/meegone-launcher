@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 use meegone_core_data::fakes::{Fakes, app, app_id};
 use meegone_core_data::{Access, DataError, Notification, RecentUse, StoredFile, ThemeChoice};
 use meegone_core_state::{Health, Theme};
-use meegone_launcher::{Direction, Launcher, ShellIntent};
+use meegone_launcher::{AppMenuItem, CellKey, Direction, Launcher, ShellIntent};
 
 fn grid(launcher: &Launcher) -> Vec<String> {
     let state = launcher.shell().apps().state();
@@ -49,6 +49,44 @@ fn settings_and_the_layout_survive_a_restart() {
     assert_eq!(
         stored_files(&fakes),
         BTreeSet::from([StoredFile::Layout, StoredFile::Settings])
+    );
+}
+
+#[test]
+fn hidden_apps_stay_hidden_after_a_restart() {
+    // APPS-19: they are kept in the settings store, and nowhere else.
+    let fakes = Fakes::default();
+    *fakes.apps.apps.lock().unwrap() = vec![app("phone", "Phone"), app("mail", "Mail")];
+    let mut launcher = Launcher::start(fakes.platform());
+    launcher.dispatch(ShellIntent::OpenCellMenu(CellKey::App(app_id("mail"))));
+    let revision = launcher
+        .frame()
+        .apps
+        .menu
+        .expect("Mail's menu is open")
+        .revision;
+    let items = launcher.view().apps().menu_items().to_vec();
+    let hide = items.iter().position(|item| *item == AppMenuItem::Hide);
+    assert!(
+        launcher
+            .view()
+            .apps()
+            .menu_item_chosen(revision, hide.expect("the menu offers Hide"))
+    );
+    launcher.frame();
+    drop(launcher);
+
+    let restarted = Launcher::start(fakes.platform());
+
+    assert_eq!(grid(&restarted), ["Phone"]);
+    let hidden = &restarted.shell().apps().state().hidden_apps;
+    assert_eq!(hidden.len(), 1);
+    assert_eq!(hidden[0].label, "Mail");
+    assert!(
+        fakes
+            .storage
+            .stored_text()
+            .contains("hidden 0 mail mail.Main")
     );
 }
 

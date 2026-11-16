@@ -1,7 +1,8 @@
 //! Folder and arrangement edits (APPS-12, FOLD-01, FOLD-05, FOLD-06; ADR 0014, ADR 0015).
 //!
-//! Pure logic, tested without a device (MAINT-01): a layout and the installed apps go in, and
-//! the edited layout comes out. A drag edits a draft with these step by step; the drop tidies it
+//! Pure logic, tested without a device (MAINT-01): a layout and the apps that show go in, and
+//! the edited layout comes out. The apps that show are the installed ones the user hasn't hidden
+//! (APPS-19); entries that show no cell keep their slots. A drag edits a draft with these step by step; the drop tidies it
 //! and saves it once. Each edit returns `None` when it can't apply, changing nothing.
 
 use std::collections::HashSet;
@@ -15,8 +16,8 @@ use crate::{CellKey, GridItem};
 /// `layout` with `key`'s cell shown at place `to` among the cells the grid shows, or as far as
 /// it goes, the cells between moving aside (APPS-12). Entries that show no cell keep their
 /// slots.
-pub fn arrange(layout: &Layout, installed: &[App], key: &CellKey, to: usize) -> Option<Layout> {
-    let mut cells = grid(layout, installed);
+pub fn arrange(layout: &Layout, shown: &[App], key: &CellKey, to: usize) -> Option<Layout> {
+    let mut cells = grid(layout, shown);
     let from = cells.iter().position(|item| item.is(key))?;
     let cell = cells.remove(from);
     cells.insert(to.min(cells.len()), cell);
@@ -60,7 +61,7 @@ pub fn combine(layout: &Layout, app: &AppId, onto: &CellKey) -> Option<Layout> {
 
 /// `layout` with `app` taken out of its folder and shown at place `to` in the grid (FOLD-05).
 /// The folder may be left with one app, or none, until [`tidy`].
-pub fn take_out(layout: &Layout, installed: &[App], app: &AppId, to: usize) -> Option<Layout> {
+pub fn take_out(layout: &Layout, shown: &[App], app: &AppId, to: usize) -> Option<Layout> {
     let mut entries = layout.entries.clone();
     let at = entries.iter().position(
         |entry| matches!(entry, LayoutEntry::Folder { apps, .. } if apps.contains(app)),
@@ -73,28 +74,23 @@ pub fn take_out(layout: &Layout, installed: &[App], app: &AppId, to: usize) -> O
         entries,
         new: layout.new.clone(),
     };
-    arrange(&out, installed, &CellKey::App(app.clone()), to)
+    arrange(&out, shown, &CellKey::App(app.clone()), to)
 }
 
 /// `layout` with `app` out of its folder, just after it in the grid, as a screen reader's "Move
 /// out of folder" puts it (A11Y-05).
-pub fn move_out(layout: &Layout, installed: &[App], app: &AppId) -> Option<Layout> {
+pub fn move_out(layout: &Layout, shown: &[App], app: &AppId) -> Option<Layout> {
     let folder = folder_of(layout, app)?;
-    let place = grid(layout, installed)
+    let place = grid(layout, shown)
         .iter()
         .position(|item| item.is(&CellKey::Folder(folder)))?;
-    take_out(layout, installed, app, place + 1)
+    take_out(layout, shown, app, place + 1)
 }
 
 /// `layout` with `app`, in a folder, at place `to` among the folder's apps that show, or as far
 /// as it goes (FOLD-05). Apps that don't show keep their slots.
-pub fn arrange_in_folder(
-    layout: &Layout,
-    installed: &[App],
-    app: &AppId,
-    to: usize,
-) -> Option<Layout> {
-    let shown: HashSet<&AppId> = installed.iter().map(|app| &app.id).collect();
+pub fn arrange_in_folder(layout: &Layout, shown: &[App], app: &AppId, to: usize) -> Option<Layout> {
+    let showing: HashSet<&AppId> = shown.iter().map(|app| &app.id).collect();
     let mut entries = layout.entries.clone();
     let Some(LayoutEntry::Folder { apps, .. }) = entries
         .iter_mut()
@@ -103,7 +99,7 @@ pub fn arrange_in_folder(
         return None;
     };
     let slots: Vec<usize> = (0..apps.len())
-        .filter(|&slot| shown.contains(&apps[slot]))
+        .filter(|&slot| showing.contains(&apps[slot]))
         .collect();
     let mut visible: Vec<AppId> = slots.iter().map(|&slot| apps[slot].clone()).collect();
     let from = visible.iter().position(|id| id == app)?;

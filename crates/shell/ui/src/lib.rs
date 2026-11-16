@@ -6,18 +6,19 @@
 //! where the carousel's views are, how the view indicator looks, how the content comes back
 //! from an app, the home menu, the Applications grid, the pressed icon, the grid's cells as
 //! apps come, go and move, a cell's long-press menu, the dragged icon, edit mode, the open
-//! folder and search (ADR 0006 to ADR 0008, ADR 0010, ADR 0012 to ADR 0016).
+//! folder, search and Settings' Hidden apps list (ADR 0006 to ADR 0008, ADR 0010, ADR 0012 to
+//! ADR 0017).
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use meegone_apps_ui::AppsView;
 pub use meegone_apps_ui::{
     AppMenuFrame, AppMenuItem, AppsFrame, Bounds, Cell, CellKey, FolderId, GridLayout, Surface,
     SurfaceCellsFrame,
 };
+use meegone_apps_ui::{AppsView, HiddenAppsSection};
 use meegone_core_ui::{Dispatch, Latest, Rgb, Slot, View, tokens};
 use meegone_events_ui::EventsView;
 use meegone_lockimage_ui::{ImageCard, ImageSettingsSection};
@@ -218,6 +219,10 @@ pub struct HomeFrame {
     pub settings_open: bool,
     /// The group Settings opened at, or `None` for its top.
     pub settings_group: Option<SettingsGroup>,
+    /// Settings → Applications → Hidden apps (APPS-19): the list's revision, which changes
+    /// whenever its apps do, or `None` while Applications isn't working, so Settings doesn't
+    /// offer it (ARCH-09).
+    pub hidden_apps: Option<u32>,
     /// The home views' solid background (HOME-11, THEME-04).
     pub background: Rgb,
     /// Menus and Settings (THEME-03).
@@ -238,6 +243,7 @@ pub struct ShellView {
     events: EventsView,
     recent: RecentView,
     settings: SettingsView,
+    hidden_apps: HiddenAppsSection,
     home_banner: HomeBanner,
 }
 
@@ -256,7 +262,18 @@ impl ShellView {
         let mut events = EventsView::new(dispatch(&outbox, ShellIntent::Events));
         events.add_card(Box::new(ImageCard::new(image.clone())));
 
+        // Applications shows its Hidden apps section in Settings (APPS-19). It reads the latest
+        // Applications state, which the shell keeps current, and comes before the lock-screen
+        // image's, in SET-02's order.
+        let apps_state = Latest::new(shell.apps().state());
+        shell.subscribe_apps({
+            let apps_state = apps_state.clone();
+            move |state| apps_state.set(Arc::clone(state))
+        });
+        let hidden_apps = HiddenAppsSection::new(apps_state, dispatch(&outbox, ShellIntent::Apps));
+
         let mut settings = SettingsView::new(dispatch(&outbox, ShellIntent::Settings));
+        settings.add_section(Box::new(hidden_apps.clone()));
         settings.add_section(Box::new(ImageSettingsSection::new(
             image,
             dispatch(&outbox, ShellIntent::LockImage),
@@ -276,6 +293,7 @@ impl ShellView {
             recent: RecentView::new(dispatch(&outbox, ShellIntent::Recent)),
             events,
             settings,
+            hidden_apps,
             home_banner,
             outbox,
         }
@@ -395,6 +413,7 @@ impl ShellView {
             menu_offered: state.menu_offered(),
             settings_open: state.settings_open,
             settings_group: state.settings_group,
+            hidden_apps: shell.apps_ready().then(|| self.hidden_apps.revision()),
             background: tokens.background,
             surface: tokens.surface,
             foreground: tokens.text_primary,
@@ -433,6 +452,12 @@ impl ShellView {
 
     pub fn settings(&self) -> &SettingsView {
         &self.settings
+    }
+
+    /// Settings → Applications → Hidden apps (APPS-19). Offered only while
+    /// [`HomeFrame::hidden_apps`] is.
+    pub fn hidden_apps(&self) -> &HiddenAppsSection {
+        &self.hidden_apps
     }
 
     /// Shown over the home views, never over Settings (ONB-04).

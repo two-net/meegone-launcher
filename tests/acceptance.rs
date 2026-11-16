@@ -1169,9 +1169,10 @@ fn mail_and_settings(fakes: &Fakes) {
     ];
 }
 
-const FIXED: [AppMenuItem; 3] = [
+const FIXED: [AppMenuItem; 4] = [
     AppMenuItem::AppInfo,
     AppMenuItem::Uninstall,
+    AppMenuItem::Hide,
     AppMenuItem::EditApplications,
 ];
 
@@ -1185,7 +1186,11 @@ fn apps11_given_a_system_app_when_its_menu_opens_then_it_has_no_uninstall_item()
     assert!(long_press_cell(&mut launcher, &mut clock, 1, 400.0, 300.0));
     assert_eq!(
         app_menu(&mut launcher),
-        [AppMenuItem::AppInfo, AppMenuItem::EditApplications]
+        [
+            AppMenuItem::AppInfo,
+            AppMenuItem::Hide,
+            AppMenuItem::EditApplications
+        ]
     );
     // The host opens it at Settings' cell, and the long-press ticked.
     assert_eq!(launcher.frame().apps.menu.unwrap().cell, Some(1));
@@ -1230,10 +1235,10 @@ fn apps11_given_meegone_isnt_the_default_home_app_then_no_shortcuts_appear() {
     *fakes.apps.shortcuts_allowed.lock().unwrap() = true;
     assert!(long_press_cell(&mut launcher, &mut clock, 0, 150.0, 300.0));
     let items = app_menu(&mut launcher);
-    assert_eq!(items[..3], FIXED);
-    assert_eq!(items[3..], [AppMenuItem::Shortcut(compose.clone())]);
+    assert_eq!(items[..4], FIXED);
+    assert_eq!(items[4..], [AppMenuItem::Shortcut(compose.clone())]);
     finger(&mut launcher, &mut clock, PointerKind::Up, 150.0, 300.0);
-    choose(&mut launcher, 3);
+    choose(&mut launcher, 4);
     assert_eq!(*fakes.apps.shortcuts_launched.lock().unwrap(), [compose]);
     assert_eq!(launcher.frame().apps.menu, None);
 }
@@ -2056,4 +2061,83 @@ fn srch05_without_a_browser_nothing_is_offered() {
     launcher.view().apps().search_submitted(None);
     launcher.frame();
     assert!(fakes.system.web_searches.lock().unwrap().is_empty());
+}
+
+/// Gmail, Mail, Maps and Café ready to search, with usage access: Maps was used, then Mail.
+fn ready_to_hide(fakes: &Fakes) -> (Launcher, u64) {
+    *fakes.usage.access.lock().unwrap() = Access::Granted;
+    *fakes.system.now_ms.lock().unwrap() = 1_000_000;
+    *fakes.usage.uses.lock().unwrap() = [("maps", 900_000), ("mail", 999_000)]
+        .iter()
+        .map(|(package, at)| RecentUse {
+            app: app_id(package),
+            last_used_ms: *at,
+        })
+        .collect();
+    ready_to_search(fakes)
+}
+
+/// Recent's cards, newest first.
+fn recent(launcher: &Launcher) -> Vec<String> {
+    let state = launcher.shell().recent().state();
+    state
+        .cards
+        .iter()
+        .map(|card| card.app.label.clone())
+        .collect()
+}
+
+/// `package`'s menu opens, as a screen reader opens it, and Hide is tapped.
+fn hide(launcher: &mut Launcher, package: &str) {
+    launcher.dispatch(ShellIntent::OpenCellMenu(CellKey::App(app_id(package))));
+    let items = app_menu(launcher);
+    let hide = items.iter().position(|item| *item == AppMenuItem::Hide);
+    choose(launcher, hide.expect("the menu offers Hide"));
+}
+
+/// Settings → Applications → Hidden apps, as the host lists it.
+fn hidden_apps(launcher: &Launcher) -> Vec<String> {
+    let section = launcher.view().hidden_apps();
+    section.apps().iter().map(|app| app.label.clone()).collect()
+}
+
+#[test]
+fn apps19_given_an_app_is_hidden_then_it_doesnt_appear_in_the_grid_search_or_recent() {
+    // Issue #16: APPS-19, REC-03. Mail is hidden from its long-press menu.
+    let fakes = Fakes::default();
+    let (mut launcher, mut clock) = ready_to_hide(&fakes);
+    assert_eq!(grid(&launcher), ["Café", "Gmail", "Mail", "Maps"]);
+    assert_eq!(recent(&launcher), ["Mail", "Maps"]);
+
+    hide(&mut launcher, "mail");
+
+    assert_eq!(launcher.frame().apps.menu, None);
+    assert_eq!(grid(&launcher), ["Café", "Gmail", "Maps"]);
+    // Recent leaves it out at once, before the user even swipes to it.
+    assert_eq!(recent(&launcher), ["Maps"]);
+    open_search(&mut launcher, &mut clock);
+    type_in(&mut launcher, "ma");
+    assert_eq!(results(&launcher), ["Maps", "Gmail"]);
+}
+
+#[test]
+fn apps19_given_a_hidden_app_is_unhidden_in_settings_then_it_returns_to_the_grid() {
+    // Issue #16: APPS-19, SET-02, SET-03. It comes back in its old place, at once.
+    let fakes = Fakes::default();
+    let (mut launcher, _) = ready_to_hide(&fakes);
+    hide(&mut launcher, "mail");
+
+    launcher.dispatch(ShellIntent::OpenSettings);
+    let revision = launcher.frame().hidden_apps.expect("Settings offers it");
+    assert_eq!(hidden_apps(&launcher), ["Mail"]);
+    assert!(launcher.view().hidden_apps().unhide_tapped(revision, 0));
+    let frame = launcher.frame();
+
+    assert!(frame.settings_open);
+    assert_ne!(frame.hidden_apps, Some(revision));
+    assert!(hidden_apps(&launcher).is_empty());
+    assert_eq!(grid(&launcher), ["Café", "Gmail", "Mail", "Maps"]);
+    assert_eq!(recent(&launcher), ["Mail", "Maps"]);
+    // A tap on the list as it was does nothing.
+    assert!(!launcher.view().hidden_apps().unhide_tapped(revision, 0));
 }

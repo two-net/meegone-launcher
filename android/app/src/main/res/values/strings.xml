@@ -43,6 +43,9 @@
     <string name="action_app_menu">Open menu</string>
     <string name="menu_app_info">App info</string>
     <string name="menu_uninstall">Uninstall</string>
+    <!-- Leaves the app out of Applications, search and Recent until it is unhidden in
+         Settings (APPS-19). -->
+    <string name="menu_hide">Hide</string>
     <!-- Shown briefly when the system refuses an item of the app menu. -->
     <string name="app_info_unavailable">App info can\'t open right now</string>
     <string name="uninstall_unavailable">This app can\'t be uninstalled right now</string>
@@ -105,4 +108,14 @@
 
     <!-- Settings' title (SET-01). -->
     <string name="settings_title">Launcher settings</string>
+    <!-- The Applications group of Settings (SET-02). -->
+    <string name="settings_group_applications">Applications</string>
+    <!-- Settings → Applications → Hidden apps: the apps hidden from their long-press menu,
+         each with a button that shows it again in Applications (APPS-19). -->
+    <string name="hidden_apps">Hidden apps</string>
+    <string name="hidden_apps_none">No hidden apps</string>
+    <string name="hidden_app_unhide">Unhide</string>
+    <!-- What screen readers read for that button, e.g. "Unhide Maps" (A11Y-01). %1$s is the
+         app's name, with "work" when it has it. -->
+    <string name="action_unhide">Unhide %1$s</string>
 </resources>

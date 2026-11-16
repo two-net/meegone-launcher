@@ -114,10 +114,12 @@ pub fn reconcile_draft(
     Layout { entries, new }
 }
 
-/// The cells to show for `layout`: its apps that are installed, and its folders that hold any.
-/// Entries kept for a locked profile stay out of sight until it unlocks.
-pub fn grid(layout: &Layout, installed: &[App]) -> Vec<GridItem> {
-    let by_id: HashMap<&AppId, &App> = installed.iter().map(|app| (&app.id, app)).collect();
+/// The cells to show for `layout`: its apps that show, and its folders that hold any. `shown`
+/// is the installed apps the user hasn't hidden (APPS-19). Entries kept for a locked profile
+/// stay out of sight until it unlocks, and hidden apps until they are unhidden; both keep their
+/// slots.
+pub fn grid(layout: &Layout, shown: &[App]) -> Vec<GridItem> {
+    let by_id: HashMap<&AppId, &App> = shown.iter().map(|app| (&app.id, app)).collect();
     let app = |id: &AppId| by_id.get(id).map(|app| (*app).clone());
     layout
         .entries
@@ -134,6 +136,34 @@ pub fn grid(layout: &Layout, installed: &[App]) -> Vec<GridItem> {
                     name: name.clone(),
                     apps,
                 })
+            }
+        })
+        .collect()
+}
+
+/// The `hidden` apps that still stand for an app once `saved` is reconciled with the `installed`
+/// apps of the listed `profiles` (APPS-19, ADR 0017). A hidden app keeps its hiding exactly as
+/// [`reconcile`] keeps its place:
+/// - while it is installed, or its profile can't list it yet (locked, or listing no apps);
+/// - under its new id when an update renamed its launcher activity.
+///
+/// Any other is forgotten, so an app that is uninstalled and installed again shows.
+pub fn follow_hidden(
+    hidden: &BTreeSet<AppId>,
+    saved: &Layout,
+    installed: &[App],
+    profiles: &[Profile],
+) -> BTreeSet<AppId> {
+    let present: HashMap<&AppId, &App> = installed.iter().map(|app| (&app.id, app)).collect();
+    let waiting = waiting_profiles(installed, profiles);
+    let renamed = renamed(saved, &present, &waiting);
+    hidden
+        .iter()
+        .filter_map(|id| {
+            if present.contains_key(id) || waiting.contains(&id.profile) {
+                Some(id.clone())
+            } else {
+                renamed.get(id).cloned()
             }
         })
         .collect()
@@ -667,6 +697,71 @@ mod tests {
         assert_eq!(packages(&now), ["mail", "[1: maps chess]", "go"]);
         assert_eq!(now.entries[0], LayoutEntry::App(apps[2].id.clone()));
         assert_eq!(now.new, [apps[2].id.clone()].into());
+    }
+
+    #[test]
+    fn a_hidden_app_stays_hidden_while_it_keeps_its_place() {
+        // APPS-19: installed, or of a profile that can't list it yet.
+        let docs = work_app("docs", "Docs");
+        let saved = layout(vec![
+            LayoutEntry::App(docs.id.clone()),
+            folder(1, &["maps", "chess"]),
+        ]);
+        let hidden: BTreeSet<AppId> = [docs.id.clone(), app_id("maps")].into();
+        let personal = installed(&[("maps", "Maps"), ("chess", "Chess")]);
+        let locked = Profile {
+            locked: true,
+            ..WORK
+        };
+
+        assert_eq!(
+            follow_hidden(&hidden, &saved, &personal, &[PERSONAL, locked]),
+            hidden
+        );
+        // A profile that lists nothing at all is waiting too.
+        assert_eq!(
+            follow_hidden(&hidden, &saved, &personal, &[PERSONAL, WORK]),
+            hidden
+        );
+        let mut all = personal.clone();
+        all.push(docs);
+        assert_eq!(
+            follow_hidden(&hidden, &saved, &all, &[PERSONAL, WORK]),
+            hidden
+        );
+    }
+
+    #[test]
+    fn a_hidden_app_that_is_gone_is_forgotten() {
+        // APPS-19: so installing it again shows it. Its profile going counts too.
+        let docs = work_app("docs", "Docs");
+        let saved = layout(vec![
+            LayoutEntry::App(docs.id.clone()),
+            LayoutEntry::App(app_id("maps")),
+            LayoutEntry::App(app_id("mail")),
+        ]);
+        let hidden: BTreeSet<AppId> = [docs.id.clone(), app_id("maps"), app_id("mail")].into();
+
+        let still = follow_hidden(
+            &hidden,
+            &saved,
+            &installed(&[("mail", "Mail")]),
+            &[PERSONAL],
+        );
+
+        assert_eq!(still, [app_id("mail")].into());
+    }
+
+    #[test]
+    fn a_hidden_app_whose_activity_is_renamed_stays_hidden() {
+        // APPS-08, APPS-19
+        let saved = layout(entries(&["maps", "mail"]));
+        let mut apps = installed(&[("maps", "Maps"), ("mail", "Mail")]);
+        apps[0].id.activity = "maps.Start".into();
+
+        let still = follow_hidden(&[app_id("maps")].into(), &saved, &apps, &[PERSONAL]);
+
+        assert_eq!(still, [apps[0].id.clone()].into());
     }
 
     #[test]

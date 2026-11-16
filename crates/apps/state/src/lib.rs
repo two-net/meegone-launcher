@@ -1,21 +1,23 @@
 //! Applications state (SRS 4.2): the grid, its layout and scroll position, an app's or a folder's
-//! long-press menu, edit mode with the drag's draft, the open folder, and search. [`reconcile`]
-//! keeps the layout in step with the installed apps (ADR 0012), [`folders`] holds the pure edits
-//! a drag and the folder rules make (ADR 0014, ADR 0015), and [`search`] ranks the apps that
-//! match a query (ADR 0016).
+//! long-press menu, edit mode with the drag's draft, the open folder, search, and hidden apps.
+//! [`reconcile`] keeps the layout in step with the installed apps (ADR 0012), [`folders`] holds
+//! the pure edits a drag and the folder rules make (ADR 0014, ADR 0015), and [`search`] ranks the
+//! apps that match a query (ADR 0016). A hidden app keeps its place in the layout but shows no
+//! cell, so it is in neither the grid nor search until it is unhidden (APPS-19, ADR 0017).
 
 pub mod folders;
 mod reconcile;
 pub mod search;
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use meegone_apps_data::{Layout, LayoutStore, SavedLayout};
-use meegone_core_data::{AppsAdapter, DataError, Profile, SystemConfigAdapter};
+use meegone_core_data::{AppsAdapter, DataError, Profile, SettingsStore, SystemConfigAdapter};
 use meegone_core_state::{App, AppId, Rect, Shortcut, StateHolder};
 
 pub use meegone_apps_data::FolderId;
-use reconcile::{Start, grid, reconcile, reconcile_draft};
+use reconcile::{Start, alphabetical, follow_hidden, grid, reconcile, reconcile_draft};
 pub use reconcile::{cells_moved, previous_places};
 
 /// Columns on a phone (APPS-02).
@@ -96,6 +98,9 @@ pub enum AppMenuItem {
     /// Opens the system's uninstall confirmation (APPS-13). Only for apps the user can
     /// uninstall.
     Uninstall,
+    /// Leaves the app out of the grid, search and Recent until it is unhidden in Settings
+    /// (APPS-19). It keeps its place. An app's menu only.
+    Hide,
     /// Enters edit mode. Not offered while edit mode is on.
     EditApplications,
     /// Starts one of the app's shortcuts. Offered only while MeeGone is the default home app.
@@ -110,8 +115,8 @@ pub enum AppMenuItem {
 pub struct AppMenu {
     /// The app or folder it is for. The host opens it at that cell.
     pub item: CellKey,
-    /// What it offers, in order. An app's: App info, Uninstall, Edit applications, then the
-    /// shortcuts. A folder's: Rename folder, then Edit applications.
+    /// What it offers, in order. An app's: App info, Uninstall, Hide, Edit applications, then
+    /// the shortcuts. A folder's: Rename folder, then Edit applications.
     pub items: Vec<AppMenuItem>,
 }
 
@@ -358,6 +363,10 @@ pub struct AppsState {
     pub results_scroll_px: f64,
     /// Whether a query nothing matches offers a web search: a browser is installed (SRCH-05).
     pub web_search_offered: bool,
+    /// The installed apps the user hid, in the locale's alphabetical order, for Settings →
+    /// Applications → Hidden apps (APPS-19). Shared, so the UI and the shell can tell when it
+    /// changed.
+    pub hidden_apps: Arc<[App]>,
     /// The last problem, in plain words. The grid keeps working (REL-01).
     pub problem: Option<String>,
 }
@@ -384,6 +393,7 @@ impl Default for AppsState {
             search_band: None,
             results_scroll_px: 0.0,
             web_search_offered: false,
+            hidden_apps: Arc::new([]),
             problem: None,
         }
     }
@@ -568,6 +578,9 @@ pub enum AppsIntent {
     SearchLayout { layout: GridLayout, band: Bounds },
     /// The results grid was scrolled to this many pixels from its top.
     ResultsScrolled(f64),
+    /// Settings → Applications → Hidden apps: the app shows again, in its old place, in its
+    /// folder too (APPS-19). Ignored unless it is hidden. A failed save changes nothing.
+    Unhide(AppId),
 }
 
 pub struct AppsHolder {
@@ -575,13 +588,21 @@ pub struct AppsHolder {
     /// Whether a browser is installed, and web search (SRCH-05).
     system: Arc<dyn SystemConfigAdapter>,
     store: Arc<dyn LayoutStore>,
+    /// Where the hidden apps are kept (APPS-19). Applications is that field's only writer.
+    settings: Arc<dyn SettingsStore>,
     /// The layout, kept once the store has been read. Applications is its only writer, so the
     /// file is read at start, or until a read succeeds, and written after each change.
     layout: Option<Layout>,
     /// The kept layout's last save failed, so the next refresh saves it again.
     unsaved: bool,
-    /// The apps the system listed at the last refresh, which the cells show.
+    /// Every app the system listed at the last refresh, hidden ones too: [`reconcile`] keeps
+    /// their places.
     installed: Vec<App>,
+    /// The apps the user hid, as last read or saved (APPS-19).
+    hidden: BTreeSet<AppId>,
+    /// The installed apps that aren't hidden: the only ones the cells, the drag's edits and
+    /// search see.
+    shown: Vec<App>,
     /// In edit mode, the layout as the drag in progress has changed it, shown but not saved
     /// until it is dropped (APPS-12, FOLD-05). A refresh keeps it.
     draft: Option<Layout>,
@@ -595,14 +616,18 @@ impl AppsHolder {
         apps: Arc<dyn AppsAdapter>,
         system: Arc<dyn SystemConfigAdapter>,
         layout: Arc<dyn LayoutStore>,
+        settings: Arc<dyn SettingsStore>,
     ) -> Self {
         Self {
             apps,
             system,
             store: layout,
+            settings,
             layout: None,
             unsaved: false,
             installed: Vec::new(),
+            hidden: BTreeSet::new(),
+            shown: Vec::new(),
             draft: None,
             query_key: String::new(),
             state: AppsState::default(),
@@ -612,6 +637,10 @@ impl AppsHolder {
     /// Reconciles the layout with the installed apps, saves it if it changed, and shows it
     /// (APPS-06, APPS-08, APPS-18). A drag's draft is reconciled too, but keeps a folder it left
     /// with one app until the drop. If the system can't list the apps, the grid stays as it is.
+    ///
+    /// Hidden apps are reconciled as installed, so they keep their places, but show no cell. A
+    /// hidden app that is gone is forgotten, and saved so, so installing it again shows it
+    /// (APPS-19).
     fn refresh(&mut self) {
         let (installed, profiles) = match self.catalogue() {
             Ok(catalogue) => catalogue,
@@ -621,34 +650,38 @@ impl AppsHolder {
             }
         };
         self.state.problem = None;
+        let hidden = self.settings.get().hidden_apps;
+        // The layout `saved` becomes, whether it changed, and the hidden apps still standing.
         let reconciled = |saved: &Layout, start: &Start| {
             let layout = reconcile(saved, &installed, &profiles, start);
             let changed = layout != *saved;
-            (layout, changed)
+            let still = follow_hidden(&hidden, saved, &installed, &profiles);
+            (layout, changed, still)
         };
-        let (layout, changed) = match self.layout.take() {
+        let (layout, changed, still) = match self.layout.take() {
             Some(kept) => reconciled(&kept, &Start::Saved),
             None => match self.store.load() {
                 Ok(SavedLayout::Missing) => {
                     let defaults = self.apps.default_apps();
-                    (
-                        reconciled(&Layout::default(), &Start::First { defaults }).0,
-                        true,
-                    )
+                    let (layout, _, still) =
+                        reconciled(&Layout::default(), &Start::First { defaults });
+                    (layout, true, still)
                 }
                 Ok(SavedLayout::Read(saved)) => reconciled(&saved, &Start::Saved),
                 // Saved at once, so the damaged file is replaced before anything else can read
                 // it (REL-02).
                 Ok(SavedLayout::Recovered(recovered)) => {
-                    (reconciled(&recovered, &Start::Rebuilt).0, true)
+                    let (layout, _, still) = reconciled(&recovered, &Start::Rebuilt);
+                    (layout, true, still)
                 }
                 Err(error) => {
                     // Shown but never saved: the file may be fine, so the next refresh reads it
-                    // again instead of replacing it (REL-02). Nothing can be edited meanwhile.
-                    let shown = reconciled(&Layout::default(), &Start::Rebuilt).0;
-                    self.installed = installed;
+                    // again instead of replacing it (REL-02). Nothing can be edited meanwhile,
+                    // and no hidden app is forgotten.
+                    let rebuilt = reconciled(&Layout::default(), &Start::Rebuilt).0;
+                    self.take_on(installed, hidden);
                     self.draft = None;
-                    self.show_layout(&shown);
+                    self.show_layout(&rebuilt);
                     self.state.problem = Some(error.to_string());
                     return;
                 }
@@ -657,11 +690,26 @@ impl AppsHolder {
         if changed || self.unsaved {
             self.save(&layout);
         }
+        let hidden = if still == hidden {
+            hidden
+        } else {
+            // A failed save keeps them; the next refresh tries again.
+            match self
+                .settings
+                .update(&mut |settings| settings.hidden_apps = still.clone())
+            {
+                Ok(settings) => settings.hidden_apps,
+                Err(error) => {
+                    self.state.problem = Some(error.to_string());
+                    hidden
+                }
+            }
+        };
         self.draft = self
             .draft
             .take()
             .map(|draft| reconcile_draft(&draft, &installed, &profiles, &Start::Saved));
-        self.installed = installed;
+        self.take_on(installed, hidden);
         self.layout = Some(layout);
         self.show();
         // The menu of an app or folder that was just removed closes.
@@ -669,6 +717,56 @@ impl AppsHolder {
         if self.state.menu.as_ref().is_some_and(gone) {
             self.state.menu = None;
         }
+    }
+
+    /// Takes on the apps the system listed and the ones the user hid: the cells show only the
+    /// others, and Settings lists the hidden ones that are installed (APPS-19). The list is
+    /// replaced only when it changes.
+    fn take_on(&mut self, installed: Vec<App>, hidden: BTreeSet<AppId>) {
+        self.shown = installed
+            .iter()
+            .filter(|app| !hidden.contains(&app.id))
+            .cloned()
+            .collect();
+        let mut listed: Vec<App> = installed
+            .iter()
+            .filter(|app| hidden.contains(&app.id))
+            .cloned()
+            .collect();
+        listed.sort_by(alphabetical);
+        // An app the system listed twice is listed once.
+        listed.dedup_by(|a, b| a.id == b.id);
+        if *self.state.hidden_apps != *listed {
+            self.state.hidden_apps = listed.into();
+        }
+        self.installed = installed;
+        self.hidden = hidden;
+    }
+
+    /// APPS-19: changes which apps are hidden and saves it in the settings store; the cells,
+    /// the open folder, search and the list follow. The layout never changes, so a hidden app
+    /// keeps its place and comes back to it. A failed save changes nothing.
+    fn change_hidden(&mut self, change: impl Fn(&mut BTreeSet<AppId>)) -> Result<(), DataError> {
+        let settings = self
+            .settings
+            .update(&mut |settings| change(&mut settings.hidden_apps))?;
+        let installed = std::mem::take(&mut self.installed);
+        self.take_on(installed, settings.hidden_apps);
+        self.show();
+        Ok(())
+    }
+
+    /// Settings → Applications → Hidden apps: `app` shows again, in its old place (APPS-19).
+    fn unhide(&mut self, app: &AppId) {
+        if !self.hidden.contains(app) {
+            return;
+        }
+        self.state.problem = self
+            .change_hidden(|hidden| {
+                hidden.remove(app);
+            })
+            .err()
+            .map(|error| error.to_string());
     }
 
     fn catalogue(&self) -> Result<(Vec<App>, Vec<Profile>), DataError> {
@@ -688,14 +786,14 @@ impl AppsHolder {
     /// rebinds nothing it doesn't need to.
     fn show(&mut self) {
         let items = match self.draft.as_ref().or(self.layout.as_ref()) {
-            Some(shown) => grid(shown, &self.installed),
+            Some(layout) => grid(layout, &self.shown),
             None => return,
         };
         self.show_cells(items);
     }
 
     fn show_layout(&mut self, layout: &Layout) {
-        let items = grid(layout, &self.installed);
+        let items = grid(layout, &self.shown);
         self.show_cells(items);
     }
 
@@ -908,10 +1006,11 @@ impl AppsHolder {
         was_open
     }
 
-    /// APPS-11: App info, Uninstall when the user can uninstall the app (APPS-13), Edit
-    /// applications unless edit mode is on, then the app's first shortcuts. The system offers
-    /// shortcuts only while MeeGone is the default home app; otherwise, or if it can't say, the
-    /// menu has none. A folder's menu offers Rename folder, then Edit applications.
+    /// APPS-11: App info, Uninstall when the user can uninstall the app (APPS-13), Hide
+    /// (APPS-19), Edit applications unless edit mode is on, then the app's first shortcuts. The
+    /// system offers shortcuts only while MeeGone is the default home app; otherwise, or if it
+    /// can't say, the menu has none. A folder's menu offers Rename folder, then Edit
+    /// applications.
     fn open_menu(&mut self, key: CellKey) {
         let mut items = Vec::new();
         match &key {
@@ -923,6 +1022,7 @@ impl AppsHolder {
                 if app.can_uninstall {
                     items.push(AppMenuItem::Uninstall);
                 }
+                items.push(AppMenuItem::Hide);
             }
             CellKey::Folder(_) if self.has(&key) => items.push(AppMenuItem::RenameFolder),
             CellKey::Folder(_) => return,
@@ -953,6 +1053,9 @@ impl AppsHolder {
             (AppMenuItem::AppInfo, CellKey::App(app)) => self.apps.open_app_info(app),
             // MeeGone never uninstalls anything itself: the system asks the user (APPS-13).
             (AppMenuItem::Uninstall, CellKey::App(app)) => self.apps.request_uninstall(app),
+            (AppMenuItem::Hide, CellKey::App(app)) => self.change_hidden(|hidden| {
+                hidden.insert(app.clone());
+            }),
             (AppMenuItem::Shortcut(shortcut), _) => self.apps.launch_shortcut(&shortcut),
             (AppMenuItem::EditApplications, _) => {
                 self.state.edit_mode = true;
@@ -974,8 +1077,9 @@ impl AppsHolder {
     }
 
     /// Applies one step of a drag to its draft (APPS-12, FOLD-05). Only in edit mode, and only
-    /// while the layout could be read, since nothing could be saved otherwise (REL-02). Returns
-    /// whether the step applied.
+    /// while the layout could be read, since nothing could be saved otherwise (REL-02). The step
+    /// gets the apps that show, so hidden apps keep their slots (APPS-19). Returns whether it
+    /// applied.
     fn edit(&mut self, step: impl FnOnce(&Layout, &[App]) -> Option<Layout>) -> bool {
         if !self.state.edit_mode {
             return false;
@@ -983,7 +1087,7 @@ impl AppsHolder {
         let Some(base) = self.draft.as_ref().or(self.layout.as_ref()) else {
             return false;
         };
-        let Some(next) = step(base, &self.installed) else {
+        let Some(next) = step(base, &self.shown) else {
             return false;
         };
         self.draft = Some(next);
@@ -1101,15 +1205,13 @@ impl StateHolder for AppsHolder {
                 self.exit_edit_mode();
             }
             AppsIntent::Arrange { item, to } => {
-                self.edit(|layout, installed| folders::arrange(layout, installed, &item, to));
+                self.edit(|layout, shown| folders::arrange(layout, shown, &item, to));
             }
             AppsIntent::ArrangeInFolder { app, to } => {
-                self.edit(|layout, installed| {
-                    folders::arrange_in_folder(layout, installed, &app, to)
-                });
+                self.edit(|layout, shown| folders::arrange_in_folder(layout, shown, &app, to));
             }
             AppsIntent::TakeOut { app, to } => {
-                if self.edit(|layout, installed| folders::take_out(layout, installed, &app, to)) {
+                if self.edit(|layout, shown| folders::take_out(layout, shown, &app, to)) {
                     self.close_folder();
                 }
             }
@@ -1119,14 +1221,12 @@ impl StateHolder for AppsHolder {
             AppsIntent::Drop => self.commit(),
             AppsIntent::CancelArrange => self.cancel_draft(),
             AppsIntent::Move { item, to } => {
-                if self.edit(|layout, installed| folders::arrange(layout, installed, &item, to)) {
+                if self.edit(|layout, shown| folders::arrange(layout, shown, &item, to)) {
                     self.commit();
                 }
             }
             AppsIntent::MoveInFolder { app, to } => {
-                if self.edit(|layout, installed| {
-                    folders::arrange_in_folder(layout, installed, &app, to)
-                }) {
+                if self.edit(|layout, shown| folders::arrange_in_folder(layout, shown, &app, to)) {
                     self.commit();
                 }
             }
@@ -1136,7 +1236,7 @@ impl StateHolder for AppsHolder {
                 }
             }
             AppsIntent::MoveOutOfFolder(app) => {
-                if self.edit(|layout, installed| folders::move_out(layout, installed, &app)) {
+                if self.edit(|layout, shown| folders::move_out(layout, shown, &app)) {
                     self.commit();
                 }
             }
@@ -1181,6 +1281,7 @@ impl StateHolder for AppsHolder {
                     self.state.results_scroll_px = px.max(0.0);
                 }
             }
+            AppsIntent::Unhide(app) => self.unhide(&app),
         }
     }
 
@@ -1198,12 +1299,19 @@ mod tests {
     use meegone_apps_data::{LayoutEntry, PersistentLayoutStore};
     use meegone_core_data::fakes::{FakeStorage, Fakes, app, app_id, work_app};
     use meegone_core_data::storage::format::seal;
-    use meegone_core_data::{ProfileId, StoredFile};
+    use meegone_core_data::{PersistentSettingsStore, ProfileId, StoredFile};
 
     use super::*;
 
+    /// A holder over `layout`, with its settings in `fakes.storage`, so a test can fail settings
+    /// saves without failing the layout's.
     fn holder(fakes: &Fakes, layout: &Arc<PersistentLayoutStore>) -> AppsHolder {
-        let mut holder = AppsHolder::new(fakes.apps.clone(), fakes.system.clone(), layout.clone());
+        let mut holder = AppsHolder::new(
+            fakes.apps.clone(),
+            fakes.system.clone(),
+            layout.clone(),
+            Arc::new(PersistentSettingsStore::new(fakes.storage.clone())),
+        );
         holder.handle(AppsIntent::Refresh);
         holder
     }
@@ -1584,8 +1692,9 @@ mod tests {
     }
 
     #[test]
-    fn an_apps_menu_offers_app_info_uninstall_and_edit_applications() {
-        // APPS-11, APPS-13: a system app can't be uninstalled, so its menu doesn't offer it.
+    fn an_apps_menu_offers_app_info_uninstall_hide_and_edit_applications() {
+        // APPS-11, APPS-13, APPS-19: a system app can't be uninstalled, so its menu doesn't
+        // offer it. It can still be hidden.
         let fakes = Fakes::default();
         *fakes.apps.apps.lock().unwrap() = vec![
             app("mail", "Mail"),
@@ -1605,6 +1714,7 @@ mod tests {
                 items: vec![
                     AppMenuItem::AppInfo,
                     AppMenuItem::Uninstall,
+                    AppMenuItem::Hide,
                     AppMenuItem::EditApplications,
                 ],
             })
@@ -1613,7 +1723,11 @@ mod tests {
         holder.handle(AppsIntent::OpenMenu(CellKey::App(app_id("settings"))));
         assert_eq!(
             menu(&holder),
-            Some(vec![AppMenuItem::AppInfo, AppMenuItem::EditApplications])
+            Some(vec![
+                AppMenuItem::AppInfo,
+                AppMenuItem::Hide,
+                AppMenuItem::EditApplications
+            ])
         );
 
         // An app that isn't in the grid has no menu.
@@ -1635,21 +1749,22 @@ mod tests {
         let mut holder = holder(&fakes, &layout_store());
 
         holder.handle(AppsIntent::OpenMenu(CellKey::App(app_id("mail"))));
-        assert_eq!(menu(&holder).unwrap().len(), 3);
+        assert_eq!(menu(&holder).unwrap().len(), 4);
 
         *fakes.apps.shortcuts_allowed.lock().unwrap() = true;
         holder.handle(AppsIntent::OpenMenu(CellKey::App(app_id("mail"))));
         let items = menu(&holder).unwrap();
         assert_eq!(
-            items[..3],
+            items[..4],
             [
                 AppMenuItem::AppInfo,
                 AppMenuItem::Uninstall,
+                AppMenuItem::Hide,
                 AppMenuItem::EditApplications
             ]
         );
         assert_eq!(
-            items[3..],
+            items[4..],
             ids[..MAX_SHORTCUTS]
                 .iter()
                 .map(|id| AppMenuItem::Shortcut(shortcut("mail", id)))
@@ -1816,8 +1931,334 @@ mod tests {
         holder.handle(AppsIntent::OpenMenu(CellKey::App(app_id("mail"))));
         assert_eq!(
             menu(&holder),
-            Some(vec![AppMenuItem::AppInfo, AppMenuItem::Uninstall])
+            Some(vec![
+                AppMenuItem::AppInfo,
+                AppMenuItem::Uninstall,
+                AppMenuItem::Hide
+            ])
         );
+    }
+
+    fn hide(holder: &mut AppsHolder, app: AppId) {
+        holder.handle(AppsIntent::OpenMenu(CellKey::App(app)));
+        holder.handle(AppsIntent::ChooseMenuItem(AppMenuItem::Hide));
+    }
+
+    fn labels_of(items: &[GridItem]) -> Vec<&str> {
+        items.iter().map(GridItem::label).collect()
+    }
+
+    fn hidden_labels(holder: &AppsHolder) -> Vec<&str> {
+        holder
+            .state()
+            .hidden_apps
+            .iter()
+            .map(|app| app.label.as_str())
+            .collect()
+    }
+
+    /// The hidden apps as saved, read the way a restarted MeeGone would.
+    fn saved_hidden(fakes: &Fakes) -> BTreeSet<AppId> {
+        PersistentSettingsStore::new(fakes.storage.clone())
+            .get()
+            .hidden_apps
+    }
+
+    #[test]
+    fn hiding_leaves_an_app_out_of_the_grid_and_search_and_saves_it() {
+        // APPS-19: through its menu, which closes.
+        let fakes = Fakes::default();
+        install(
+            &fakes,
+            &[("phone", "Phone"), ("maps", "Maps"), ("mail", "Mail")],
+        );
+        let mut holder = holder(&fakes, &layout_store());
+
+        hide(&mut holder, app_id("maps"));
+
+        assert_eq!(holder.state().menu, None);
+        assert_eq!(holder.state().problem, None);
+        assert_eq!(labels(holder.state()), ["Mail", "Phone"]);
+        assert_eq!(hidden_labels(&holder), ["Maps"]);
+        assert_eq!(saved_hidden(&fakes), [app_id("maps")].into());
+        holder.handle(AppsIntent::OpenSearch);
+        holder.handle(AppsIntent::Search("ma".into()));
+        assert_eq!(
+            results(holder.state()),
+            ["Mail"],
+            "search leaves it out too"
+        );
+        // A hidden app has no menu of its own.
+        holder.handle(AppsIntent::CloseSearch);
+        holder.handle(AppsIntent::OpenMenu(CellKey::App(app_id("maps"))));
+        assert_eq!(holder.state().menu, None);
+    }
+
+    #[test]
+    fn an_unhidden_app_comes_back_in_its_old_place_without_a_layout_write() {
+        // APPS-19: the layout never changed, so nothing needs saving.
+        let fakes = Fakes::default();
+        install(
+            &fakes,
+            &[("phone", "Phone"), ("maps", "Maps"), ("mail", "Mail")],
+        );
+        let storage = Arc::new(FakeStorage::default());
+        let layout = Arc::new(PersistentLayoutStore::new(storage.clone()));
+        layout
+            .save(&Layout {
+                entries: ["phone", "maps", "mail"]
+                    .iter()
+                    .map(|id| LayoutEntry::App(app_id(id)))
+                    .collect(),
+                ..Layout::default()
+            })
+            .unwrap();
+        let mut holder = holder(&fakes, &layout);
+        let writes = storage.writes.lock().unwrap().len();
+
+        hide(&mut holder, app_id("maps"));
+        assert_eq!(labels(holder.state()), ["Phone", "Mail"]);
+        // Hiding again, or unhiding an app that isn't hidden, changes nothing.
+        holder.handle(AppsIntent::Unhide(app_id("phone")));
+        holder.handle(AppsIntent::Unhide(app_id("maps")));
+
+        assert_eq!(labels(holder.state()), ["Phone", "Maps", "Mail"]);
+        assert!(hidden_labels(&holder).is_empty());
+        assert!(saved_hidden(&fakes).is_empty());
+        assert_eq!(storage.writes.lock().unwrap().len(), writes);
+    }
+
+    #[test]
+    fn a_hidden_app_keeps_its_slot_in_its_folder_through_a_drag() {
+        // APPS-19, FOLD-05: arranging the folder's other apps leaves the hidden one's slot alone.
+        let fakes = Fakes::default();
+        let layout = layout_store();
+        layout
+            .save(&Layout {
+                entries: vec![
+                    LayoutEntry::Folder {
+                        id: FolderId(1),
+                        name: "Games".into(),
+                        apps: vec![app_id("chess"), app_id("go"), app_id("poker")],
+                    },
+                    LayoutEntry::App(app_id("mail")),
+                ],
+                ..Layout::default()
+            })
+            .unwrap();
+        install(
+            &fakes,
+            &[
+                ("chess", "Chess"),
+                ("go", "Go"),
+                ("poker", "Poker"),
+                ("mail", "Mail"),
+            ],
+        );
+        let mut holder = holder(&fakes, &layout);
+        holder.handle(AppsIntent::OpenFolder(FolderId(1)));
+        hide(&mut holder, app_id("go"));
+        assert_eq!(labels_of(&holder.state().folder_items), ["Chess", "Poker"]);
+
+        holder.handle(AppsIntent::EnterEditMode);
+        holder.handle(AppsIntent::MoveInFolder {
+            app: app_id("poker"),
+            to: 0,
+        });
+        assert_eq!(labels_of(&holder.state().folder_items), ["Poker", "Chess"]);
+        holder.handle(AppsIntent::Unhide(app_id("go")));
+
+        assert_eq!(
+            labels_of(&holder.state().folder_items),
+            ["Poker", "Go", "Chess"]
+        );
+        let Ok(SavedLayout::Read(saved)) = layout.load() else {
+            panic!("not saved");
+        };
+        assert_eq!(
+            saved.entries[0],
+            LayoutEntry::Folder {
+                id: FolderId(1),
+                name: "Games".into(),
+                apps: vec![app_id("poker"), app_id("go"), app_id("chess")],
+            }
+        );
+    }
+
+    #[test]
+    fn hiding_the_open_folders_last_shown_app_closes_it() {
+        // APPS-19, FOLD-04: a folder that shows no app has no cell, as if a refresh removed it.
+        let fakes = Fakes::default();
+        let layout = layout_store();
+        layout
+            .save(&Layout {
+                entries: vec![
+                    LayoutEntry::Folder {
+                        id: FolderId(1),
+                        name: "Games".into(),
+                        apps: vec![app_id("chess"), app_id("go")],
+                    },
+                    LayoutEntry::App(app_id("mail")),
+                ],
+                ..Layout::default()
+            })
+            .unwrap();
+        install(
+            &fakes,
+            &[("chess", "Chess"), ("go", "Go"), ("mail", "Mail")],
+        );
+        let mut holder = holder(&fakes, &layout);
+        holder.handle(AppsIntent::OpenFolder(FolderId(1)));
+        holder.handle(AppsIntent::StartRename(FolderId(1)));
+
+        hide(&mut holder, app_id("chess"));
+        assert_eq!(holder.state().open_folder, Some(FolderId(1)));
+        assert_eq!(labels(holder.state()), ["[Games]", "Mail"]);
+        hide(&mut holder, app_id("go"));
+
+        assert_eq!(holder.state().open_folder, None);
+        assert_eq!(holder.state().renaming, None);
+        assert_eq!(labels(holder.state()), ["Mail"]);
+        holder.handle(AppsIntent::Unhide(app_id("go")));
+        assert_eq!(labels(holder.state()), ["[Games]", "Mail"]);
+    }
+
+    #[test]
+    fn a_folders_menu_never_offers_hide() {
+        // APPS-19: Hide is an app's.
+        let fakes = Fakes::default();
+        let layout = layout_store();
+        layout
+            .save(&Layout {
+                entries: vec![LayoutEntry::Folder {
+                    id: FolderId(1),
+                    name: "Games".into(),
+                    apps: vec![app_id("chess"), app_id("go")],
+                }],
+                ..Layout::default()
+            })
+            .unwrap();
+        install(&fakes, &[("chess", "Chess"), ("go", "Go")]);
+        let mut holder = holder(&fakes, &layout);
+
+        holder.handle(AppsIntent::OpenMenu(CellKey::Folder(FolderId(1))));
+        holder.handle(AppsIntent::ChooseMenuItem(AppMenuItem::Hide));
+
+        assert!(holder.state().menu.is_some());
+        assert!(saved_hidden(&fakes).is_empty());
+        assert_eq!(labels(holder.state()), ["[Games]"]);
+    }
+
+    #[test]
+    fn a_hide_or_unhide_that_cant_be_saved_changes_nothing_and_is_the_problem() {
+        // APPS-19, REL-03
+        let fakes = Fakes::default();
+        install(&fakes, &[("mail", "Mail"), ("maps", "Maps")]);
+        let mut holder = holder(&fakes, &layout_store());
+        *fakes.storage.error.lock().unwrap() = Some(DataError::Failed("disk full".into()));
+
+        hide(&mut holder, app_id("maps"));
+        assert_eq!(holder.state().menu, None);
+        assert_eq!(holder.state().problem.as_deref(), Some("disk full"));
+        assert_eq!(labels(holder.state()), ["Mail", "Maps"]);
+        assert!(hidden_labels(&holder).is_empty());
+
+        *fakes.storage.error.lock().unwrap() = None;
+        hide(&mut holder, app_id("maps"));
+        assert_eq!(holder.state().problem, None);
+        *fakes.storage.error.lock().unwrap() = Some(DataError::Failed("disk full".into()));
+        holder.handle(AppsIntent::Unhide(app_id("maps")));
+        assert_eq!(holder.state().problem.as_deref(), Some("disk full"));
+        assert_eq!(labels(holder.state()), ["Mail"]);
+        assert_eq!(hidden_labels(&holder), ["Maps"]);
+    }
+
+    #[test]
+    fn hidden_apps_are_listed_alphabetically_and_kept_while_nothing_changes() {
+        // APPS-19, L10N-04: the collation keys decide. A refresh that changes nothing keeps the
+        // list, so the UI rereads nothing.
+        let fakes = Fakes::default();
+        let mut apps = vec![
+            app("zoom", "Zoom"),
+            app("eclair", "Éclair"),
+            app("docs", "docs"),
+            app("mail", "Mail"),
+        ];
+        apps[1].sort_key = b"eclair".to_vec();
+        *fakes.apps.apps.lock().unwrap() = apps;
+        let mut holder = holder(&fakes, &layout_store());
+        for package in ["zoom", "eclair", "docs"] {
+            hide(&mut holder, app_id(package));
+        }
+        assert_eq!(hidden_labels(&holder), ["docs", "Éclair", "Zoom"]);
+        let listed = holder.state().hidden_apps.clone();
+
+        holder.handle(AppsIntent::Refresh);
+
+        assert!(Arc::ptr_eq(&listed, &holder.state().hidden_apps));
+        assert_eq!(labels(holder.state()), ["Mail"]);
+    }
+
+    #[test]
+    fn hidden_apps_stay_hidden_after_a_restart() {
+        // APPS-19: they are in the settings store.
+        let fakes = Fakes::default();
+        install(&fakes, &[("mail", "Mail"), ("maps", "Maps")]);
+        let layout = layout_store();
+        hide(&mut holder(&fakes, &layout), app_id("maps"));
+
+        let restarted = holder(&fakes, &layout);
+
+        assert_eq!(labels(restarted.state()), ["Mail"]);
+        assert_eq!(hidden_labels(&restarted), ["Maps"]);
+    }
+
+    #[test]
+    fn an_uninstalled_hidden_app_is_forgotten_so_installing_it_again_shows_it() {
+        // APPS-19, APPS-06: it joins the end, with its dot.
+        let fakes = Fakes::default();
+        install(&fakes, &[("mail", "Mail"), ("maps", "Maps")]);
+        let mut holder = holder(&fakes, &layout_store());
+        hide(&mut holder, app_id("maps"));
+
+        install(&fakes, &[("mail", "Mail")]);
+        holder.handle(AppsIntent::Refresh);
+        assert!(saved_hidden(&fakes).is_empty());
+        assert!(hidden_labels(&holder).is_empty());
+
+        install(&fakes, &[("mail", "Mail"), ("maps", "Maps")]);
+        holder.handle(AppsIntent::Refresh);
+        assert_eq!(labels(holder.state()), ["Mail", "Maps•"]);
+    }
+
+    #[test]
+    fn a_locked_profiles_hidden_app_stays_hidden_once_it_unlocks() {
+        // APPS-19, APPS-18: while the profile is locked, the app isn't listed but isn't
+        // forgotten either.
+        let fakes = Fakes::default();
+        let docs = work_app("docs", "Docs");
+        fakes.apps.profiles.lock().unwrap().push(Profile {
+            id: docs.id.profile,
+            work: true,
+            paused: false,
+            locked: false,
+        });
+        *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail"), docs.clone()];
+        let mut holder = holder(&fakes, &layout_store());
+        hide(&mut holder, docs.id.clone());
+        assert_eq!(saved_hidden(&fakes), [docs.id.clone()].into());
+
+        *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail")];
+        fakes.apps.profiles.lock().unwrap()[1].locked = true;
+        holder.handle(AppsIntent::Refresh);
+        assert!(hidden_labels(&holder).is_empty());
+        assert_eq!(saved_hidden(&fakes), [docs.id.clone()].into());
+
+        *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail"), docs];
+        fakes.apps.profiles.lock().unwrap()[1].locked = false;
+        holder.handle(AppsIntent::Refresh);
+        assert_eq!(labels(holder.state()), ["Mail"]);
+        assert_eq!(hidden_labels(&holder), ["Docs"]);
     }
 
     #[test]

@@ -33,6 +33,7 @@ import android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 import java.util.ArrayList;
@@ -144,7 +145,10 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private static final int RESULTS_REVISION = 75; // changes when the results change
     private static final int RESULTS_SCROLL = 76; // px from the top
     private static final int RESULTS_ROWS = 77;
-    private static final int FRAME_SIZE = 78;
+    // Settings → Applications → Hidden apps (APPS-19, ADR 0017):
+    private static final int HIDDEN_APPS_OFFERED = 78; // 1 while Applications works
+    private static final int HIDDEN_APPS_REVISION = 79; // changes when the list changes
+    private static final int FRAME_SIZE = 80;
     private static final int SEARCH_OPEN = 1; // the field has the keyboard
     private static final int SEARCH_RESULTS = 2; // the results show instead of the grid
     private static final int SEARCH_NOTHING = 4; // nothing matches
@@ -176,11 +180,11 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private static final int APP_MENU_SHORTCUT = 3;
     /**
      * The text of each kind of item of a cell's menu: App info, Uninstall, Edit applications, a
-     * shortcut's own, and Rename folder.
+     * shortcut's own, Rename folder and Hide.
      */
     private static final int[] APP_MENU_ITEMS = {
         R.string.menu_app_info, R.string.menu_uninstall, R.string.menu_edit_applications, 0,
-        R.string.menu_rename_folder
+        R.string.menu_rename_folder, R.string.menu_hide
     };
     private static final int SETTINGS_AT_LOCK_SCREEN_IMAGE = 2;
 
@@ -212,10 +216,14 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
      * no size or no opacity isn't.
      */
     private final TextView status;
-    /** Covers the home views while Settings is open. Until #34 draws it, it shows its name. */
+    /**
+     * Covers the home views while Settings is open. Until #34 draws it, it shows its name and
+     * Applications' Hidden apps (APPS-19).
+     */
     private final LinearLayout settings;
     private final TextView settingsTitle;
     private final TextView settingsGroup;
+    private final HiddenAppsList hiddenApps;
     /**
      * The home menu (HOME-10), a card at the finger, or an app's menu (APPS-11), a card at its
      * icon: over the home views. Its items are made for the menu that opens.
@@ -264,6 +272,8 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     /** The app menu's revision as shown, from 0, or -1 while it is closed. */
     private long appMenuShown = -1;
     private int settingsShown;
+    /** Hidden apps' revision as shown, as an unsigned int, or -1 before it is first read. */
+    private long hiddenAppsShown = -1;
     private int menuOffered = -1;
     /** Whether screen readers can open search, as last told, or -1 before the first frame. */
     private int searchOffered = -1;
@@ -384,7 +394,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
 
         settings = new LinearLayout(context);
         settings.setOrientation(LinearLayout.VERTICAL);
-        settings.setGravity(Gravity.CENTER);
+        settings.setGravity(Gravity.TOP | Gravity.CENTER_HORIZONTAL);
         // Touches on Settings stay there.
         settings.setClickable(true);
         settings.setVisibility(GONE);
@@ -400,6 +410,22 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         settingsGroup.setVisibility(GONE);
         settings.addView(settingsGroup, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+        // Settings → Applications → Hidden apps (APPS-19), which scrolls when it is long.
+        hiddenApps = new HiddenAppsList(context, icons, (revision, index) -> {
+            String message = nativeUnhide(revision, index);
+            apply();
+            toast(message);
+        });
+        hiddenApps.setVisibility(GONE);
+        ScrollView hiddenAppsScroll = new ScrollView(context);
+        hiddenAppsScroll.addView(hiddenApps, new ScrollView.LayoutParams(
+                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
+        LinearLayout.LayoutParams scrollParams = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f);
+        scrollParams.topMargin = dp(24);
+        scrollParams.setMarginStart(dp(16));
+        scrollParams.setMarginEnd(dp(16));
+        settings.addView(hiddenAppsScroll, scrollParams);
         addView(settings, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
 
         menu = new LinearLayout(context);
@@ -773,6 +799,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         apps.refreshIcons();
         folderApps.refreshIcons();
         results.refreshIcons();
+        hiddenApps.refreshIcons();
         shadow.invalidate();
     }
 
@@ -1075,16 +1102,35 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         }
     }
 
-    /** Shows Settings over the home views while it is open; until #34, only its name. */
+    /**
+     * Shows Settings over the home views while it is open; until #34, only its name and Hidden
+     * apps.
+     */
     private void applySettings() {
-        if (frame[SETTINGS] == settingsShown) {
-            return;
+        if (frame[SETTINGS] != settingsShown) {
+            settingsShown = frame[SETTINGS];
+            settings.setVisibility(settingsShown != 0 ? VISIBLE : GONE);
+            settingsGroup.setVisibility(
+                    settingsShown == SETTINGS_AT_LOCK_SCREEN_IMAGE ? VISIBLE : GONE);
+            hidePagesFromScreenReaders();
         }
-        settingsShown = frame[SETTINGS];
-        settings.setVisibility(settingsShown != 0 ? VISIBLE : GONE);
-        settingsGroup.setVisibility(
-                settingsShown == SETTINGS_AT_LOCK_SCREEN_IMAGE ? VISIBLE : GONE);
-        hidePagesFromScreenReaders();
+        applyHiddenApps();
+    }
+
+    /**
+     * Settings → Applications → Hidden apps (APPS-19): offered only while Applications works
+     * (ARCH-09), and read again whenever its revision changes while Settings shows, such as
+     * after an Unhide.
+     */
+    private void applyHiddenApps() {
+        boolean offered = frame[HIDDEN_APPS_OFFERED] != 0;
+        hiddenApps.setVisibility(offered ? VISIBLE : GONE);
+        hiddenApps.colour(foreground, dim, frame[ACCENT]);
+        long revision = frame[HIDDEN_APPS_REVISION] & 0xFFFF_FFFFL;
+        if (offered && settingsShown != 0 && revision != hiddenAppsShown) {
+            hiddenAppsShown = revision;
+            hiddenApps.fill(frame[HIDDEN_APPS_REVISION], nativeHiddenApps());
+        }
     }
 
     /** Whether the home menu or an app's menu is open, as of the last frame. */
@@ -1478,6 +1524,18 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
 
     /** What the search field says while search is open, or null. */
     private native String nativeSearchQuery();
+
+    /**
+     * Settings → Applications → Hidden apps as of the last frame, in {@link
+     * HiddenAppsList#FIELDS} fields each (APPS-19).
+     */
+    private native String[] nativeHiddenApps();
+
+    /**
+     * Unhide was tapped on app {@code index} of the hidden apps at {@code revision} (APPS-19).
+     * Returns null, or a short message when it couldn't be saved.
+     */
+    private native String nativeUnhide(int revision, int index);
 
     /** Fills {@code frame} with what to draw now, in the slots above. */
     private native void nativeRead(int[] frame);
