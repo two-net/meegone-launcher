@@ -1,7 +1,9 @@
-//! Applications state (SRS 4.2): the grid, its layout and scroll position, an app's long-press
-//! menu, edit mode with its arrangement and the open folder. [`reconcile`] keeps the layout in
-//! step with the installed apps (ADR 0012).
+//! Applications state (SRS 4.2): the grid, its layout and scroll position, an app's or a folder's
+//! long-press menu, edit mode with the drag's draft, and the open folder. [`reconcile`] keeps
+//! the layout in step with the installed apps (ADR 0012), and [`folders`] holds the pure edits a
+//! drag and the folder rules make (ADR 0014, ADR 0015).
 
+pub mod folders;
 mod reconcile;
 
 use std::sync::Arc;
@@ -11,7 +13,7 @@ use meegone_core_data::{AppsAdapter, DataError, Profile};
 use meegone_core_state::{App, AppId, Rect, Shortcut, StateHolder};
 
 pub use meegone_apps_data::FolderId;
-use reconcile::{Start, arrange, follow_order, grid, reconcile};
+use reconcile::{Start, grid, reconcile, reconcile_draft};
 pub use reconcile::{cells_moved, previous_places};
 
 /// Columns on a phone (APPS-02).
@@ -20,13 +22,18 @@ pub const PHONE_COLUMNS: usize = 4;
 pub const MAX_CELL_DP: f64 = 128.0;
 /// …and none narrower than this, which holds for any grid at least four of them wide.
 pub const MIN_CELL_DP: f64 = 96.0;
+/// An open folder shows its apps in this many columns (FOLD-04).
+pub const FOLDER_COLUMNS: usize = 4;
+/// A folder's name is at most this many characters (FOLD-03).
+pub const MAX_FOLDER_NAME: usize = 64;
 
 /// How many columns a grid `width_dp` wide has, inside its margins (APPS-02).
 ///
 /// Four, unless four cells would be wider than [`MAX_CELL_DP`]: then as few columns as keep
 /// every cell at most that wide. A phone's grid is under 512 dp, so it always has four. A
 /// screen 600 dp wide or more leaves a grid of at least 384 dp inside its safe area and
-/// margins, where every cell is between [`MIN_CELL_DP`] and [`MAX_CELL_DP`].
+/// margins, where every cell is between [`MIN_CELL_DP`] and [`MAX_CELL_DP`]. A folder's panel is
+/// four of the grid's cells wide, so it has four too.
 pub fn columns_for(width_dp: f64) -> usize {
     if !width_dp.is_finite() || width_dp <= 0.0 {
         return PHONE_COLUMNS;
@@ -38,7 +45,46 @@ pub fn columns_for(width_dp: f64) -> usize {
 /// launcher does (APPS-11, ADR 0013).
 pub const MAX_SHORTCUTS: usize = 4;
 
-/// One item of an app's long-press menu (APPS-11), in the order it shows.
+/// A dragged app's centre within this fraction of an icon's size from another cell's icon
+/// centre is over that icon: holding it there makes a folder (FOLD-01). Elsewhere in the cell,
+/// it takes the cell's place (APPS-12).
+pub const MERGE_RADIUS: f64 = 0.4;
+
+/// A folder's icon shows its first apps as a 2×2 preview (FOLD-02).
+pub const PREVIEW_APPS: usize = 4;
+/// The preview's slots start this fraction of the icon in from its edges…
+pub const PREVIEW_INSET: f64 = 0.14;
+/// …with this fraction of it between them. The host draws them the same way.
+pub const PREVIEW_GAP: f64 = 0.06;
+
+/// Where slot `slot` of a folder's preview is: its centre, as fractions of the icon from its top
+/// left, and its size, as a fraction of the icon. Slots go in reading order, mirrored right to
+/// left (FOLD-02).
+pub fn preview_slot(slot: usize, rtl: bool) -> (f64, f64, f64) {
+    let size = (1.0 - 2.0 * PREVIEW_INSET - PREVIEW_GAP) / 2.0;
+    let column = slot % 2;
+    let column = if rtl { 1 - column } else { column };
+    let row = (slot / 2).min(1);
+    let at = |index: usize| PREVIEW_INSET + index as f64 * (size + PREVIEW_GAP) + size / 2.0;
+    (at(column), at(row), size)
+}
+
+/// What a cell shows, which identifies it across changes: an app's own cell, or a folder.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CellKey {
+    App(AppId),
+    Folder(FolderId),
+}
+
+/// Where cells are drawn: the grid, or the open folder's panel (FOLD-04).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Surface {
+    #[default]
+    Grid,
+    Folder,
+}
+
+/// One item of a cell's long-press menu (APPS-11), in the order it shows.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppMenuItem {
     /// Opens the system's App info screen.
@@ -50,14 +96,18 @@ pub enum AppMenuItem {
     EditApplications,
     /// Starts one of the app's shortcuts. Offered only while MeeGone is the default home app.
     Shortcut(Shortcut),
+    /// Asks the user for a folder's new name (FOLD-03). A folder's menu only.
+    RenameFolder,
 }
 
-/// An app's long-press menu (APPS-11). It covers the home views while it is open.
+/// A cell's long-press menu: an app's (APPS-11) or a folder's (ADR 0015). It covers the home
+/// views while it is open.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppMenu {
-    /// The app it is for. The host opens it at this app's icon.
-    pub app: AppId,
-    /// What it offers, in order: App info, Uninstall, Edit applications, then the shortcuts.
+    /// The app or folder it is for. The host opens it at that cell.
+    pub item: CellKey,
+    /// What it offers, in order. An app's: App info, Uninstall, Edit applications, then the
+    /// shortcuts. A folder's: Rename folder, then Edit applications.
     pub items: Vec<AppMenuItem>,
 }
 
@@ -79,6 +129,8 @@ pub enum GridItem {
     },
     Folder {
         id: FolderId,
+        /// Its name, or `""` until the user names it: then it shows as "Folder", in the user's
+        /// language (FOLD-03).
         name: String,
         apps: Vec<App>,
     },
@@ -95,11 +147,35 @@ impl GridItem {
     }
 }
 
-/// How the host laid the grid out, in physical pixels.
+/// A rectangle on screen, in px from the home views' top left.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Bounds {
+    pub left: f64,
+    pub top: f64,
+    pub right: f64,
+    pub bottom: f64,
+}
+
+impl Bounds {
+    pub fn contains(&self, (x, y): (f64, f64)) -> bool {
+        (self.left..self.right).contains(&x) && (self.top..self.bottom).contains(&y)
+    }
+
+    fn is_valid(&self) -> bool {
+        [self.left, self.top, self.right, self.bottom]
+            .iter()
+            .all(|value| value.is_finite())
+            && self.right >= self.left
+            && self.bottom >= self.top
+    }
+}
+
+/// How the host laid a grid out, in physical pixels: the Applications grid, or an open folder's
+/// (ADR 0015).
 ///
-/// The cells start `top_px` below the grid's top, which is the home views' top, and scroll under
-/// the system bars (ADR 0010). Cell places are worked out exactly as the host lays them out, in
-/// whole pixels, so the shell can tell which place is under a dragged icon (ADR 0014).
+/// The cells start `top_px` below the grid's top and scroll under the system bars (ADR 0010).
+/// Cell places are worked out exactly as the host lays them out, in whole pixels, so the shell
+/// can tell which place is under a dragged icon, and where on screen each icon is (ADR 0014).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GridLayout {
     /// The grid's width inside its margins and the safe area.
@@ -114,14 +190,30 @@ pub struct GridLayout {
     pub bottom_px: f64,
     /// The grid's height on screen, that room included, or 0 before it has one.
     pub height_px: f64,
+    /// Where the cells start, from the home views' left, and where the grid's top is, from the
+    /// home views' top.
+    pub left_px: f64,
+    pub view_top_px: f64,
+    /// How big each cell's icon is, and how far below the cell's top it starts, or 0 if the host
+    /// hasn't said.
+    pub icon_px: f64,
+    pub icon_top_px: f64,
 }
 
 impl GridLayout {
     fn is_valid(&self) -> bool {
         let sizes = [self.width_px, self.row_height_px, self.density];
-        let room = [self.top_px, self.bottom_px, self.height_px];
+        let room = [
+            self.top_px,
+            self.bottom_px,
+            self.height_px,
+            self.icon_px,
+            self.icon_top_px,
+        ];
         sizes.iter().all(|value| value.is_finite() && *value > 0.0)
             && room.iter().all(|value| value.is_finite() && *value >= 0.0)
+            && self.left_px.is_finite()
+            && self.view_top_px.is_finite()
     }
 
     /// How many columns it lays out (APPS-02).
@@ -157,6 +249,36 @@ impl GridLayout {
     /// Where cell `place` starts, in px from the cells' top.
     pub fn cell_top(&self, place: usize) -> f64 {
         (place / self.columns()) as f64 * self.row_height_px.round()
+    }
+
+    /// The centre of cell `place`'s icon, in px from the cells' top left, with the whole cell
+    /// drawn at `scale` around its centre, as edit mode draws it (ANIM-12). The cell's centre
+    /// if the host hasn't said where its icon is.
+    pub fn icon_centre(&self, place: usize, rtl: bool, scale: f64) -> (f64, f64) {
+        let row = self.row_height_px.round();
+        let x = self.cell_left(place, rtl) + self.cell_width(place, rtl) / 2.0;
+        let middle = self.cell_top(place) + row / 2.0;
+        if self.icon_px <= 0.0 {
+            return (x, middle);
+        }
+        let icon = self.cell_top(place) + self.icon_top_px + self.icon_px / 2.0;
+        (x, middle + (icon - middle) * scale)
+    }
+
+    /// Where the cells' top left is on screen, with the grid scrolled `scroll_px`.
+    pub fn origin(&self, scroll_px: f64) -> (f64, f64) {
+        (self.left_px, self.view_top_px + self.top_px - scroll_px)
+    }
+
+    /// Whether `point`, in px from the cells' top left, is over cell `place`'s icon, drawn at
+    /// `scale`: within [`MERGE_RADIUS`] of an icon of its centre (FOLD-01).
+    pub fn over_icon(&self, place: usize, rtl: bool, scale: f64, point: (f64, f64)) -> bool {
+        if self.icon_px <= 0.0 {
+            return false;
+        }
+        let (x, y) = self.icon_centre(place, rtl, scale);
+        let reach = MERGE_RADIUS * self.icon_px * scale;
+        (point.0 - x).hypot(point.1 - y) <= reach
     }
 
     /// The place of the cell at (`x`, `y`) px from the cells' top left, among `count` cells:
@@ -198,13 +320,26 @@ pub struct AppsState {
     pub scroll_px: f64,
     /// How the host last laid the grid out, if it has yet.
     pub layout: Option<GridLayout>,
-    /// An app's long-press menu, while it is open (APPS-11). Shared, so the UI can tell when it
+    /// A cell's long-press menu, while it is open (APPS-11). Shared, so the UI can tell when it
     /// changed.
     pub menu: Option<Arc<AppMenu>>,
     /// Edit mode (APPS-12): ✕ badges on the apps the user can uninstall, icons that can be
     /// dragged, and a Done button. A tap on an icon launches nothing.
     pub edit_mode: bool,
+    /// The folder open as a panel over the grid (FOLD-04).
     pub open_folder: Option<FolderId>,
+    /// The open folder's apps, in order, as its panel shows them; none while it is closed.
+    pub folder_items: Arc<[GridItem]>,
+    /// How the host laid the open folder's grid out, and where its panel is on screen.
+    pub folder_layout: Option<GridLayout>,
+    pub folder_bounds: Option<Bounds>,
+    /// How far the open folder's grid is scrolled, in pixels.
+    pub folder_scroll_px: f64,
+    /// The folder whose new name the host is asking the user for (FOLD-03).
+    pub renaming: Option<FolderId>,
+    /// How many folders have been made since MeeGone started, so the shell can tick for each
+    /// (ANIM-24).
+    pub folders_made: u32,
     /// The last problem, in plain words. The grid keeps working (REL-01).
     pub problem: Option<String>,
 }
@@ -219,6 +354,12 @@ impl Default for AppsState {
             menu: None,
             edit_mode: false,
             open_folder: None,
+            folder_items: Arc::new([]),
+            folder_layout: None,
+            folder_bounds: None,
+            folder_scroll_px: 0.0,
+            renaming: None,
+            folders_made: 0,
             problem: None,
         }
     }
@@ -231,11 +372,55 @@ impl AppsState {
         self.items.len().div_ceil(self.columns.max(1)) + 1
     }
 
-    /// The place of `app`'s own cell, if it has one: an app in a folder has none.
-    pub fn place_of(&self, app: &AppId) -> Option<usize> {
-        self.items
-            .iter()
-            .position(|item| matches!(item, GridItem::App { app: shown, .. } if shown.id == *app))
+    /// How many rows the open folder's grid lays out, in [`FOLDER_COLUMNS`] (FOLD-04).
+    pub fn folder_rows(&self) -> usize {
+        self.folder_items.len().div_ceil(FOLDER_COLUMNS)
+    }
+
+    /// The cells `surface` shows.
+    pub fn cells(&self, surface: Surface) -> &Arc<[GridItem]> {
+        match surface {
+            Surface::Grid => &self.items,
+            Surface::Folder => &self.folder_items,
+        }
+    }
+
+    /// How the host laid `surface` out, if it has.
+    pub fn layout_of(&self, surface: Surface) -> Option<GridLayout> {
+        match surface {
+            Surface::Grid => self.layout,
+            Surface::Folder => self.folder_layout,
+        }
+    }
+
+    /// How far `surface` is scrolled, in pixels.
+    pub fn scroll_of(&self, surface: Surface) -> f64 {
+        match surface {
+            Surface::Grid => self.scroll_px,
+            Surface::Folder => self.folder_scroll_px,
+        }
+    }
+
+    /// How many rows `surface` lays out.
+    pub fn rows_of(&self, surface: Surface) -> usize {
+        match surface {
+            Surface::Grid => self.rows(),
+            Surface::Folder => self.folder_rows(),
+        }
+    }
+
+    /// The place of `key`'s cell on `surface`, if it has one there. An app in a folder has a
+    /// place only in the open folder's panel.
+    pub fn place_of(&self, surface: Surface, key: &CellKey) -> Option<usize> {
+        self.cells(surface).iter().position(|item| item.is(key))
+    }
+
+    /// The app `id`, in a cell of its own or in a folder.
+    pub fn app(&self, id: &AppId) -> Option<&App> {
+        self.items.iter().find_map(|item| match item {
+            GridItem::App { app, .. } => (app.id == *id).then_some(app),
+            GridItem::Folder { apps, .. } => apps.iter().find(|app| app.id == *id),
+        })
     }
 }
 
@@ -246,47 +431,73 @@ pub enum AppsIntent {
     /// Launches an app, growing its window from `from`, the tapped icon (APPS-10, ANIM-08). An
     /// unavailable app is launched too, so the system explains why it can't open (APPS-09). In
     /// edit mode, nothing launches.
-    Launch {
-        app: AppId,
-        from: Option<Rect>,
-    },
+    Launch { app: AppId, from: Option<Rect> },
     /// The host laid the grid out, at start or after a size, density or font change.
     Layout(GridLayout),
-    /// Opens `app`'s long-press menu (APPS-11).
-    OpenMenu(AppId),
-    /// Closes the app menu, if it is open.
+    /// The host laid the open folder's grid out, in its panel at `bounds` (FOLD-04).
+    FolderLayout { layout: GridLayout, bounds: Bounds },
+    /// Opens the long-press menu of an app or a folder (APPS-11, ADR 0015).
+    OpenMenu(CellKey),
+    /// Closes the menu, if it is open.
     CloseMenu,
-    /// An item of the app menu was chosen. The menu closes, then does what the item says. An
-    /// item it doesn't offer is ignored.
+    /// An item of the menu was chosen. The menu closes, then does what the item says. An item it
+    /// doesn't offer is ignored.
     ChooseMenuItem(AppMenuItem),
-    /// Enters edit mode (APPS-12). An open app menu closes.
+    /// Enters edit mode (APPS-12). An open menu closes.
     EnterEditMode,
-    /// Done: leaves edit mode (APPS-12). An arrangement not dropped yet is undone.
+    /// Done: leaves edit mode (APPS-12). A drag's draft not dropped yet is undone.
     ExitEditMode,
-    /// In edit mode, shows `app`'s own cell at place `to`, or the last place, while the others
-    /// move aside, as a dragged icon goes (APPS-12). Nothing is saved until [`AppsIntent::Drop`].
-    /// A refresh keeps it.
-    Arrange {
-        app: AppId,
-        to: usize,
-    },
-    /// Keeps the arrangement shown, and saves the layout in that order (APPS-12, APPS-18).
+    /// In edit mode, shows `item`'s cell at place `to` in the grid, or the last place, while the
+    /// others move aside, as a dragged icon goes (APPS-12). Nothing is saved until
+    /// [`AppsIntent::Drop`].
+    Arrange { item: CellKey, to: usize },
+    /// In edit mode, shows `app` at place `to` among its folder's apps (FOLD-05). Not saved
+    /// until [`AppsIntent::Drop`].
+    ArrangeInFolder { app: AppId, to: usize },
+    /// In edit mode, takes `app` out of its folder and shows it at place `to` in the grid, as
+    /// when a dragged icon leaves the folder's panel (FOLD-05). The folder closes. Not saved
+    /// until [`AppsIntent::Drop`].
+    TakeOut { app: AppId, to: usize },
+    /// In edit mode, puts `app` into the folder `onto`, or makes a folder of it and the app
+    /// `onto` (FOLD-01, FOLD-05). Not saved until [`AppsIntent::Drop`].
+    Combine { app: AppId, onto: CellKey },
+    /// Keeps what the drag changed, tidies folders left with one app or none (FOLD-06), and
+    /// saves the layout (APPS-12, APPS-18).
     Drop,
-    /// Shows the saved order again, as when a drag ends any way but a drop.
+    /// Shows the saved layout again, as when a drag ends any way but a drop.
     CancelArrange,
-    /// In edit mode, moves `app`'s own cell to place `to` and saves it: an arrangement and a
+    /// In edit mode, moves `item` to place `to` in the grid and saves it: an arrangement and a
     /// drop at once, as a screen reader's "Move to…" actions do (A11Y-05).
-    Move {
-        app: AppId,
-        to: usize,
-    },
-    /// The ✕ on `app` was tapped, in edit mode: the system asks the user to confirm its
-    /// uninstall (APPS-13). Nothing happens for an app the user can't uninstall.
+    Move { item: CellKey, to: usize },
+    /// In edit mode, moves `app` to place `to` in its folder and saves it (A11Y-05).
+    MoveInFolder { app: AppId, to: usize },
+    /// In edit mode, puts `app` into the folder `with`, or makes a folder of it and the app
+    /// `with`, and saves it: a screen reader's "Make folder with…" and "Move into…" (A11Y-05).
+    Group { app: AppId, with: CellKey },
+    /// In edit mode, takes `app` out of its folder, just after it in the grid, and saves it: a
+    /// screen reader's "Move out of folder" (A11Y-05).
+    MoveOutOfFolder(AppId),
+    /// The ✕ on `app` was tapped, in edit mode, in the grid or the open folder: the system asks
+    /// the user to confirm its uninstall (APPS-13). Nothing happens for an app the user can't
+    /// uninstall.
     RequestUninstall(AppId),
+    /// Opens a folder as a panel over the grid (FOLD-04), in edit mode too.
     OpenFolder(FolderId),
+    /// Closes the open folder, as a tap outside it does (FOLD-04).
+    CloseFolder,
+    /// Asks the user for `folder`'s new name, as tapping its name in the open panel does
+    /// (FOLD-03).
+    StartRename(FolderId),
+    /// The user named `folder` `name`. It is trimmed and cut to [`MAX_FOLDER_NAME`]
+    /// characters; an empty name shows as "Folder" (FOLD-03).
+    RenameFolder { folder: FolderId, name: String },
+    /// The user didn't rename the folder after all.
+    CancelRename,
     /// The host scrolled the grid to this many pixels from its top, or MeeGone restores where
     /// it was (REL-05).
     Scrolled(f64),
+    /// The open folder's grid was scrolled to this many pixels from its top.
+    FolderScrolled(f64),
     /// Home on Applications with nothing open (HOME-07).
     ScrollToTop,
 }
@@ -301,9 +512,9 @@ pub struct AppsHolder {
     unsaved: bool,
     /// The apps the system listed at the last refresh, which the cells show.
     installed: Vec<App>,
-    /// In edit mode, an app's own cell shown at a place, while the others move aside, until it
-    /// is dropped (APPS-12). The place stays through a refresh: it is where the finger is.
-    arranging: Option<(AppId, usize)>,
+    /// In edit mode, the layout as the drag in progress has changed it, shown but not saved
+    /// until it is dropped (APPS-12, FOLD-05). A refresh keeps it.
+    draft: Option<Layout>,
     state: AppsState,
 }
 
@@ -315,13 +526,14 @@ impl AppsHolder {
             layout: None,
             unsaved: false,
             installed: Vec::new(),
-            arranging: None,
+            draft: None,
             state: AppsState::default(),
         }
     }
 
     /// Reconciles the layout with the installed apps, saves it if it changed, and shows it
-    /// (APPS-06, APPS-08, APPS-18). If the system can't list the apps, the grid stays as it is.
+    /// (APPS-06, APPS-08, APPS-18). A drag's draft is reconciled too, but keeps a folder it left
+    /// with one app until the drop. If the system can't list the apps, the grid stays as it is.
     fn refresh(&mut self) {
         let (installed, profiles) = match self.catalogue() {
             Ok(catalogue) => catalogue,
@@ -354,11 +566,11 @@ impl AppsHolder {
                 }
                 Err(error) => {
                     // Shown but never saved: the file may be fine, so the next refresh reads it
-                    // again instead of replacing it (REL-02). Nothing can be arranged meanwhile.
+                    // again instead of replacing it (REL-02). Nothing can be edited meanwhile.
                     let shown = reconciled(&Layout::default(), &Start::Rebuilt).0;
                     self.installed = installed;
-                    self.arranging = None;
-                    self.show(&shown);
+                    self.draft = None;
+                    self.show_layout(&shown);
                     self.state.problem = Some(error.to_string());
                     return;
                 }
@@ -367,11 +579,15 @@ impl AppsHolder {
         if changed || self.unsaved {
             self.save(&layout);
         }
+        self.draft = self
+            .draft
+            .take()
+            .map(|draft| reconcile_draft(&draft, &installed, &profiles, &Start::Saved));
         self.installed = installed;
-        self.show(&layout);
         self.layout = Some(layout);
-        // The menu of an app that was just removed closes.
-        let gone = |menu: &Arc<AppMenu>| self.app(&menu.app).is_none();
+        self.show();
+        // The menu of an app or folder that was just removed closes.
+        let gone = |menu: &Arc<AppMenu>| !self.has(&menu.item);
         if self.state.menu.as_ref().is_some_and(gone) {
             self.state.menu = None;
         }
@@ -389,27 +605,60 @@ impl AppsHolder {
         }
     }
 
-    /// Shows `layout`'s cells, with the arrangement in progress if there is one. This is the
-    /// only place the cells are made, so they never go stale. They are replaced only when they
-    /// change, so the host rebinds nothing it doesn't need to.
-    fn show(&mut self, layout: &Layout) {
-        let mut items = grid(layout, &self.installed);
-        if let Some((app, to)) = &self.arranging {
-            // An app that has gone, or now sits in a folder, ends its arrangement.
-            if !arrange(&mut items, app, *to) {
-                self.arranging = None;
-            }
-        }
+    /// Shows the drag's draft, or else the kept layout. This is the only place the cells are
+    /// made, so they never go stale. They are replaced only when they change, so the host
+    /// rebinds nothing it doesn't need to.
+    fn show(&mut self) {
+        let items = match self.draft.as_ref().or(self.layout.as_ref()) {
+            Some(shown) => grid(shown, &self.installed),
+            None => return,
+        };
+        self.show_cells(items);
+    }
+
+    fn show_layout(&mut self, layout: &Layout) {
+        let items = grid(layout, &self.installed);
+        self.show_cells(items);
+    }
+
+    /// Takes on `items`, and the open folder's apps among them. A folder that has gone closes.
+    fn show_cells(&mut self, items: Vec<GridItem>) {
         if *self.state.items != *items {
             self.state.items = items.into();
         }
+        let open = self.state.open_folder.and_then(|folder| {
+            self.state.items.iter().find_map(|item| match item {
+                GridItem::Folder { id, apps, .. } if *id == folder => Some(apps.clone()),
+                _ => None,
+            })
+        });
+        let folder_items: Vec<GridItem> = match open {
+            Some(apps) => apps
+                .into_iter()
+                .map(|app| GridItem::App { app, new: false })
+                .collect(),
+            None => {
+                self.state.open_folder = None;
+                Vec::new()
+            }
+        };
+        if *self.state.folder_items != *folder_items {
+            self.state.folder_items = folder_items.into();
+        }
+        if self
+            .state
+            .renaming
+            .is_some_and(|folder| !self.has(&CellKey::Folder(folder)))
+        {
+            self.state.renaming = None;
+        }
     }
 
-    /// Shows the kept layout again, after the arrangement changed.
-    fn show_kept(&mut self) {
-        if let Some(layout) = self.layout.take() {
-            self.show(&layout);
-            self.layout = Some(layout);
+    /// Whether the grid shows `key`, in a cell of its own or, for an app, in a folder.
+    fn has(&self, key: &CellKey) -> bool {
+        match key {
+            CellKey::App(id) => self.state.app(id).is_some(),
+            CellKey::Folder(_) => self.state.place_of(Surface::Grid, key).is_some(),
         }
     }
 
@@ -435,9 +684,12 @@ impl AppsHolder {
         };
         if layout.new.remove(app) {
             self.save(&layout);
-            self.show(&layout);
+            if let Some(draft) = &mut self.draft {
+                draft.new.remove(app);
+            }
         }
         self.layout = Some(layout);
+        self.show();
     }
 
     /// Takes on a new layout. When it changes the columns or the row height, as folding,
@@ -459,48 +711,63 @@ impl AppsHolder {
         self.state.columns = columns;
     }
 
+    /// FOLD-04: opens a folder the grid shows, in or out of edit mode. Another folder that was
+    /// open closes, and the panel starts at its top.
     fn open_folder(&mut self, folder: FolderId) {
-        let exists = self
+        if self
             .state
-            .items
-            .iter()
-            .any(|item| matches!(item, GridItem::Folder { id, .. } if *id == folder));
-        if exists {
-            self.state.open_folder = Some(folder);
+            .place_of(Surface::Grid, &CellKey::Folder(folder))
+            .is_none()
+        {
+            return;
         }
+        if self.state.open_folder != Some(folder) {
+            self.state.folder_scroll_px = 0.0;
+        }
+        self.state.open_folder = Some(folder);
+        self.show();
     }
 
-    /// The grid's app `id`, in a cell of its own or in a folder.
-    fn app(&self, id: &AppId) -> Option<&App> {
-        self.state.items.iter().find_map(|item| match item {
-            GridItem::App { app, .. } => (app.id == *id).then_some(app),
-            GridItem::Folder { apps, .. } => apps.iter().find(|app| app.id == *id),
-        })
+    fn close_folder(&mut self) -> bool {
+        let was_open = self.state.open_folder.take().is_some();
+        if was_open {
+            self.show();
+        }
+        was_open
     }
 
     /// APPS-11: App info, Uninstall when the user can uninstall the app (APPS-13), Edit
     /// applications unless edit mode is on, then the app's first shortcuts. The system offers
     /// shortcuts only while MeeGone is the default home app; otherwise, or if it can't say, the
-    /// menu has none.
-    fn open_menu(&mut self, id: AppId) {
-        let Some(app) = self.app(&id) else {
-            return;
-        };
-        let mut items = vec![AppMenuItem::AppInfo];
-        if app.can_uninstall {
-            items.push(AppMenuItem::Uninstall);
+    /// menu has none. A folder's menu offers Rename folder, then Edit applications.
+    fn open_menu(&mut self, key: CellKey) {
+        let mut items = Vec::new();
+        match &key {
+            CellKey::App(id) => {
+                let Some(app) = self.state.app(id) else {
+                    return;
+                };
+                items.push(AppMenuItem::AppInfo);
+                if app.can_uninstall {
+                    items.push(AppMenuItem::Uninstall);
+                }
+            }
+            CellKey::Folder(_) if self.has(&key) => items.push(AppMenuItem::RenameFolder),
+            CellKey::Folder(_) => return,
         }
         if !self.state.edit_mode {
             items.push(AppMenuItem::EditApplications);
         }
-        let shortcuts = self.apps.shortcuts(&id).unwrap_or_default();
-        items.extend(
-            shortcuts
-                .into_iter()
-                .take(MAX_SHORTCUTS)
-                .map(AppMenuItem::Shortcut),
-        );
-        self.state.menu = Some(Arc::new(AppMenu { app: id, items }));
+        if let CellKey::App(id) = &key {
+            let shortcuts = self.apps.shortcuts(id).unwrap_or_default();
+            items.extend(
+                shortcuts
+                    .into_iter()
+                    .take(MAX_SHORTCUTS)
+                    .map(AppMenuItem::Shortcut),
+            );
+        }
+        self.state.menu = Some(Arc::new(AppMenu { item: key, items }));
     }
 
     /// Closes the menu, then does what `item` says. Leaving MeeGone for a system screen or a
@@ -509,64 +776,103 @@ impl AppsHolder {
         let Some(menu) = self.state.menu.take_if(|menu| menu.offers(&item)) else {
             return;
         };
-        let done = match item {
-            AppMenuItem::AppInfo => self.apps.open_app_info(&menu.app),
+        let done = match (item, &menu.item) {
+            (AppMenuItem::AppInfo, CellKey::App(app)) => self.apps.open_app_info(app),
             // MeeGone never uninstalls anything itself: the system asks the user (APPS-13).
-            AppMenuItem::Uninstall => self.apps.request_uninstall(&menu.app),
-            AppMenuItem::EditApplications => {
+            (AppMenuItem::Uninstall, CellKey::App(app)) => self.apps.request_uninstall(app),
+            (AppMenuItem::Shortcut(shortcut), _) => self.apps.launch_shortcut(&shortcut),
+            (AppMenuItem::EditApplications, _) => {
                 self.state.edit_mode = true;
                 Ok(())
             }
-            AppMenuItem::Shortcut(shortcut) => self.apps.launch_shortcut(&shortcut),
+            (AppMenuItem::RenameFolder, CellKey::Folder(folder)) => {
+                self.state.renaming = Some(*folder);
+                Ok(())
+            }
+            _ => Ok(()),
         };
         self.state.problem = done.err().map(|error| error.to_string());
     }
 
-    /// Leaves edit mode, undoing an arrangement that wasn't dropped. Returns whether it was on.
+    /// Leaves edit mode, undoing a drag's draft that wasn't dropped. Returns whether it was on.
     fn exit_edit_mode(&mut self) -> bool {
-        self.cancel_arrangement();
+        self.cancel_draft();
         std::mem::take(&mut self.state.edit_mode)
     }
 
-    /// APPS-12: shows `app`'s own cell at `to` while the others move aside. Only in edit mode,
-    /// and only while the layout could be read, since nothing could be saved otherwise
-    /// (REL-02).
-    fn arrange(&mut self, app: AppId, to: usize) {
-        if !self.state.edit_mode || self.layout.is_none() || self.state.place_of(&app).is_none() {
-            return;
+    /// Applies one step of a drag to its draft (APPS-12, FOLD-05). Only in edit mode, and only
+    /// while the layout could be read, since nothing could be saved otherwise (REL-02). Returns
+    /// whether the step applied.
+    fn edit(&mut self, step: impl FnOnce(&Layout, &[App]) -> Option<Layout>) -> bool {
+        if !self.state.edit_mode {
+            return false;
         }
-        self.arranging = Some((app, to));
-        self.show_kept();
+        let Some(base) = self.draft.as_ref().or(self.layout.as_ref()) else {
+            return false;
+        };
+        let Some(next) = step(base, &self.installed) else {
+            return false;
+        };
+        self.draft = Some(next);
+        self.show();
+        true
     }
 
-    /// APPS-12, APPS-18: the arrangement shown becomes the layout, saved once. A failed save is
-    /// the problem, and the next refresh saves again (ADR 0012).
-    fn drop_arrangement(&mut self) {
-        if self.arranging.take().is_none() {
+    /// APPS-12, APPS-18: the draft becomes the layout, its folders of one or none tidied
+    /// (FOLD-06), and saved once. A failed save is the problem, and the next refresh saves again
+    /// (ADR 0012).
+    fn commit(&mut self) {
+        let Some(draft) = self.draft.take() else {
             return;
-        }
+        };
         let Some(layout) = self.layout.take() else {
             return;
         };
-        let arranged = follow_order(&layout, &self.state.items);
-        if arranged != layout {
-            self.save(&arranged);
+        let kept = folders::tidy(&draft);
+        let made = folders::folders_made(&layout, &kept);
+        self.state.folders_made = self.state.folders_made.wrapping_add(made as u32);
+        if kept != layout {
+            self.save(&kept);
         }
-        self.layout = Some(arranged);
+        self.layout = Some(kept);
+        self.show();
     }
 
-    fn cancel_arrangement(&mut self) {
-        if self.arranging.take().is_some() {
-            self.show_kept();
+    fn cancel_draft(&mut self) {
+        if self.draft.take().is_some() {
+            self.show();
         }
+    }
+
+    /// FOLD-03: the trimmed name, at most [`MAX_FOLDER_NAME`] characters, kept in the layout
+    /// and in any draft, and saved. A folder that has gone is left alone.
+    fn rename(&mut self, folder: FolderId, name: &str) {
+        self.state.renaming = None;
+        let name: String = name.trim().chars().take(MAX_FOLDER_NAME).collect();
+        let name = name.trim_end().to_owned();
+        let Some(mut layout) = self.layout.take() else {
+            return;
+        };
+        if set_name(&mut layout, folder, &name) {
+            self.save(&layout);
+        }
+        if let Some(draft) = &mut self.draft {
+            set_name(draft, folder, &name);
+        }
+        self.layout = Some(layout);
+        self.show();
     }
 
     /// APPS-13: the ✕ asks the system, which asks the user. MeeGone never uninstalls anything
-    /// itself, and apps the user can't uninstall have no ✕.
+    /// itself, and apps the user can't uninstall have no ✕. It is on an app's own cell, or on
+    /// an app in the open folder.
     fn request_uninstall(&mut self, id: &AppId) {
+        let key = CellKey::App(id.clone());
+        let shown = self.state.place_of(Surface::Grid, &key).is_some()
+            || self.state.place_of(Surface::Folder, &key).is_some();
         let can = self.state.edit_mode
-            && self.state.place_of(id).is_some()
-            && self.app(id).is_some_and(|app| app.can_uninstall);
+            && shown
+            && self.state.app(id).is_some_and(|app| app.can_uninstall);
         if can {
             self.state.problem = self
                 .apps
@@ -575,6 +881,19 @@ impl AppsHolder {
                 .map(|error| error.to_string());
         }
     }
+}
+
+/// Names `folder` `name` in `layout`. Returns whether it had that folder with another name.
+fn set_name(layout: &mut Layout, folder: FolderId, name: &str) -> bool {
+    layout.entries.iter_mut().any(|entry| match entry {
+        meegone_apps_data::LayoutEntry::Folder { id, name: old, .. }
+            if *id == folder && old != name =>
+        {
+            *old = name.to_owned();
+            true
+        }
+        _ => false,
+    })
 }
 
 impl StateHolder for AppsHolder {
@@ -590,7 +909,13 @@ impl StateHolder for AppsHolder {
             AppsIntent::Refresh => self.refresh(),
             AppsIntent::Launch { app, from } => self.launch(&app, from),
             AppsIntent::Layout(grid) => self.lay_out(grid),
-            AppsIntent::OpenMenu(app) => self.open_menu(app),
+            AppsIntent::FolderLayout { layout, bounds } => {
+                if layout.is_valid() && bounds.is_valid() {
+                    self.state.folder_layout = Some(layout);
+                    self.state.folder_bounds = Some(bounds);
+                }
+            }
+            AppsIntent::OpenMenu(key) => self.open_menu(key),
             AppsIntent::CloseMenu => self.state.menu = None,
             AppsIntent::ChooseMenuItem(item) => self.choose(item),
             AppsIntent::EnterEditMode => {
@@ -601,27 +926,75 @@ impl StateHolder for AppsHolder {
                 self.state.menu = None;
                 self.exit_edit_mode();
             }
-            AppsIntent::Arrange { app, to } => self.arrange(app, to),
-            AppsIntent::Drop => self.drop_arrangement(),
-            AppsIntent::CancelArrange => self.cancel_arrangement(),
-            AppsIntent::Move { app, to } => {
-                self.arrange(app, to);
-                self.drop_arrangement();
+            AppsIntent::Arrange { item, to } => {
+                self.edit(|layout, installed| folders::arrange(layout, installed, &item, to));
+            }
+            AppsIntent::ArrangeInFolder { app, to } => {
+                self.edit(|layout, installed| {
+                    folders::arrange_in_folder(layout, installed, &app, to)
+                });
+            }
+            AppsIntent::TakeOut { app, to } => {
+                if self.edit(|layout, installed| folders::take_out(layout, installed, &app, to)) {
+                    self.close_folder();
+                }
+            }
+            AppsIntent::Combine { app, onto } => {
+                self.edit(|layout, _| folders::combine(layout, &app, &onto));
+            }
+            AppsIntent::Drop => self.commit(),
+            AppsIntent::CancelArrange => self.cancel_draft(),
+            AppsIntent::Move { item, to } => {
+                if self.edit(|layout, installed| folders::arrange(layout, installed, &item, to)) {
+                    self.commit();
+                }
+            }
+            AppsIntent::MoveInFolder { app, to } => {
+                if self.edit(|layout, installed| {
+                    folders::arrange_in_folder(layout, installed, &app, to)
+                }) {
+                    self.commit();
+                }
+            }
+            AppsIntent::Group { app, with } => {
+                if self.edit(|layout, _| folders::combine(layout, &app, &with)) {
+                    self.commit();
+                }
+            }
+            AppsIntent::MoveOutOfFolder(app) => {
+                if self.edit(|layout, installed| folders::move_out(layout, installed, &app)) {
+                    self.commit();
+                }
             }
             AppsIntent::RequestUninstall(app) => self.request_uninstall(&app),
             AppsIntent::OpenFolder(folder) => self.open_folder(folder),
+            AppsIntent::CloseFolder => {
+                self.close_folder();
+            }
+            AppsIntent::StartRename(folder) => {
+                if self.has(&CellKey::Folder(folder)) && self.layout.is_some() {
+                    self.state.renaming = Some(folder);
+                }
+            }
+            AppsIntent::RenameFolder { folder, name } => self.rename(folder, &name),
+            AppsIntent::CancelRename => self.state.renaming = None,
             AppsIntent::Scrolled(px) => {
                 if px.is_finite() {
                     self.state.scroll_px = px.max(0.0);
+                }
+            }
+            AppsIntent::FolderScrolled(px) => {
+                if px.is_finite() {
+                    self.state.folder_scroll_px = px.max(0.0);
                 }
             }
             AppsIntent::ScrollToTop => self.state.scroll_px = 0.0,
         }
     }
 
-    /// HOME-08: the app menu, then the open folder, then edit mode.
+    /// HOME-08: the menu, then the open folder, then edit mode.
     fn on_back(&mut self) -> bool {
-        if self.state.menu.take().is_some() || self.state.open_folder.take().is_some() {
+        if self.state.menu.take().is_some() || self.close_folder() {
             return true;
         }
         self.exit_edit_mode()
@@ -897,6 +1270,10 @@ mod tests {
             top_px: 0.0,
             bottom_px: 0.0,
             height_px: 0.0,
+            left_px: 0.0,
+            view_top_px: 0.0,
+            icon_px: 0.0,
+            icon_top_px: 0.0,
         }
     }
 
@@ -1028,11 +1405,11 @@ mod tests {
         let mut holder = holder(&fakes, &layout_store());
         assert_eq!(holder.state().menu, None);
 
-        holder.handle(AppsIntent::OpenMenu(app_id("mail")));
+        holder.handle(AppsIntent::OpenMenu(CellKey::App(app_id("mail"))));
         assert_eq!(
             holder.state().menu.as_deref(),
             Some(&AppMenu {
-                app: app_id("mail"),
+                item: CellKey::App(app_id("mail")),
                 items: vec![
                     AppMenuItem::AppInfo,
                     AppMenuItem::Uninstall,
@@ -1041,7 +1418,7 @@ mod tests {
             })
         );
 
-        holder.handle(AppsIntent::OpenMenu(app_id("settings")));
+        holder.handle(AppsIntent::OpenMenu(CellKey::App(app_id("settings"))));
         assert_eq!(
             menu(&holder),
             Some(vec![AppMenuItem::AppInfo, AppMenuItem::EditApplications])
@@ -1049,7 +1426,7 @@ mod tests {
 
         // An app that isn't in the grid has no menu.
         holder.handle(AppsIntent::CloseMenu);
-        holder.handle(AppsIntent::OpenMenu(app_id("gone")));
+        holder.handle(AppsIntent::OpenMenu(CellKey::App(app_id("gone"))));
         assert_eq!(holder.state().menu, None);
     }
 
@@ -1065,11 +1442,11 @@ mod tests {
         );
         let mut holder = holder(&fakes, &layout_store());
 
-        holder.handle(AppsIntent::OpenMenu(app_id("mail")));
+        holder.handle(AppsIntent::OpenMenu(CellKey::App(app_id("mail"))));
         assert_eq!(menu(&holder).unwrap().len(), 3);
 
         *fakes.apps.shortcuts_allowed.lock().unwrap() = true;
-        holder.handle(AppsIntent::OpenMenu(app_id("mail")));
+        holder.handle(AppsIntent::OpenMenu(CellKey::App(app_id("mail"))));
         let items = menu(&holder).unwrap();
         assert_eq!(
             items[..3],
@@ -1103,7 +1480,7 @@ mod tests {
             .insert(app_id("mail"), vec![shortcut("mail", "compose")]);
         let mut holder = holder(&fakes, &layout_store());
         let choose = |holder: &mut AppsHolder, item: AppMenuItem| {
-            holder.handle(AppsIntent::OpenMenu(app_id("mail")));
+            holder.handle(AppsIntent::OpenMenu(CellKey::App(app_id("mail"))));
             holder.handle(AppsIntent::ChooseMenuItem(item));
             assert_eq!(holder.state().menu, None);
         };
@@ -1148,7 +1525,7 @@ mod tests {
         let mut holder = holder(&fakes, &layout_store());
 
         holder.handle(AppsIntent::ChooseMenuItem(AppMenuItem::AppInfo));
-        holder.handle(AppsIntent::OpenMenu(app_id("settings")));
+        holder.handle(AppsIntent::OpenMenu(CellKey::App(app_id("settings"))));
         holder.handle(AppsIntent::ChooseMenuItem(AppMenuItem::Uninstall));
         holder.handle(AppsIntent::ChooseMenuItem(AppMenuItem::Shortcut(shortcut(
             "settings", "wifi",
@@ -1165,7 +1542,7 @@ mod tests {
         let fakes = Fakes::default();
         install(&fakes, &[("mail", "Mail")]);
         let mut holder = holder(&fakes, &layout_store());
-        holder.handle(AppsIntent::OpenMenu(app_id("mail")));
+        holder.handle(AppsIntent::OpenMenu(CellKey::App(app_id("mail"))));
         *fakes.apps.error.lock().unwrap() =
             Some(DataError::Failed("App info can't open right now".into()));
 
@@ -1204,7 +1581,7 @@ mod tests {
         holder.handle(AppsIntent::EnterEditMode);
         holder.handle(AppsIntent::OpenFolder(FolderId(1)));
         // An app inside a folder has a menu too.
-        holder.handle(AppsIntent::OpenMenu(app_id("maps")));
+        holder.handle(AppsIntent::OpenMenu(CellKey::App(app_id("maps"))));
         assert!(holder.state().menu.is_some());
 
         assert!(holder.on_back());
@@ -1222,7 +1599,7 @@ mod tests {
         let fakes = Fakes::default();
         install(&fakes, &[("mail", "Mail"), ("maps", "Maps")]);
         let mut holder = holder(&fakes, &layout_store());
-        holder.handle(AppsIntent::OpenMenu(app_id("mail")));
+        holder.handle(AppsIntent::OpenMenu(CellKey::App(app_id("mail"))));
 
         install(&fakes, &[("mail", "Mail")]);
         holder.handle(AppsIntent::Refresh);
@@ -1239,12 +1616,12 @@ mod tests {
         let fakes = Fakes::default();
         install(&fakes, &[("mail", "Mail")]);
         let mut holder = holder(&fakes, &layout_store());
-        holder.handle(AppsIntent::OpenMenu(app_id("mail")));
+        holder.handle(AppsIntent::OpenMenu(CellKey::App(app_id("mail"))));
 
         holder.handle(AppsIntent::EnterEditMode);
         assert_eq!(holder.state().menu, None);
 
-        holder.handle(AppsIntent::OpenMenu(app_id("mail")));
+        holder.handle(AppsIntent::OpenMenu(CellKey::App(app_id("mail"))));
         assert_eq!(
             menu(&holder),
             Some(vec![AppMenuItem::AppInfo, AppMenuItem::Uninstall])
@@ -1615,12 +1992,12 @@ mod tests {
         let (storage, layout, mut holder) = editing(&fakes);
 
         holder.handle(AppsIntent::Arrange {
-            app: app_id("maps"),
+            item: CellKey::App(app_id("maps")),
             to: 1,
         });
         assert_eq!(labels(holder.state()), ["Camera", "Maps", "Mail", "Phone"]);
         holder.handle(AppsIntent::Arrange {
-            app: app_id("maps"),
+            item: CellKey::App(app_id("maps")),
             to: 0,
         });
         assert_eq!(labels(holder.state()), ["Maps", "Camera", "Mail", "Phone"]);
@@ -1650,7 +2027,7 @@ mod tests {
             let fakes = Fakes::default();
             let (storage, _, mut holder) = editing(&fakes);
             holder.handle(AppsIntent::Arrange {
-                app: app_id("phone"),
+                item: CellKey::App(app_id("phone")),
                 to: 0,
             });
 
@@ -1669,7 +2046,7 @@ mod tests {
         let fakes = Fakes::default();
         let (_, _, mut holder) = editing(&fakes);
         holder.handle(AppsIntent::Arrange {
-            app: app_id("phone"),
+            item: CellKey::App(app_id("phone")),
             to: 0,
         });
         assert!(holder.on_back());
@@ -1678,13 +2055,14 @@ mod tests {
     }
 
     #[test]
-    fn an_arrangement_stays_where_the_finger_is_as_apps_come_and_go() {
-        // APPS-12, APPS-08: an app above it is removed while it is dragged; it keeps its place.
-        // If the dragged app itself goes, so does its arrangement.
+    fn a_drags_draft_keeps_its_order_as_apps_come_and_go() {
+        // APPS-12, APPS-08, ADR 0015: an app before it is removed while it is dragged; it stays
+        // among its neighbours, and the shell moves it under the finger again. If the dragged
+        // app itself goes, the rest of the draft stays.
         let fakes = Fakes::default();
         let (_, layout, mut holder) = editing(&fakes);
         holder.handle(AppsIntent::Arrange {
-            app: app_id("phone"),
+            item: CellKey::App(app_id("phone")),
             to: 1,
         });
 
@@ -1693,7 +2071,7 @@ mod tests {
             &[("mail", "Mail"), ("maps", "Maps"), ("phone", "Phone")],
         );
         holder.handle(AppsIntent::Refresh);
-        assert_eq!(labels(holder.state()), ["Mail", "Phone", "Maps"]);
+        assert_eq!(labels(holder.state()), ["Phone", "Mail", "Maps"]);
 
         install(&fakes, &[("mail", "Mail"), ("maps", "Maps")]);
         holder.handle(AppsIntent::Refresh);
@@ -1709,7 +2087,7 @@ mod tests {
         let (_, layout, mut holder) = editing(&fakes);
 
         holder.handle(AppsIntent::Move {
-            app: app_id("camera"),
+            item: CellKey::App(app_id("camera")),
             to: 99,
         });
 
@@ -1724,7 +2102,7 @@ mod tests {
         let (storage, layout, mut done) = editing(&fakes);
         done.handle(AppsIntent::ExitEditMode);
         done.handle(AppsIntent::Move {
-            app: app_id("phone"),
+            item: CellKey::App(app_id("phone")),
             to: 0,
         });
         assert_eq!(labels(done.state()), ["Camera", "Mail", "Maps", "Phone"]);
@@ -1742,7 +2120,7 @@ mod tests {
         let mut holder = holder(&fakes, &layout);
         holder.handle(AppsIntent::EnterEditMode);
         holder.handle(AppsIntent::Move {
-            app: app_id("maps"),
+            item: CellKey::App(app_id("maps")),
             to: 0,
         });
         assert_eq!(labels(holder.state()), ["Mail", "Maps"]);
@@ -1805,7 +2183,7 @@ mod tests {
         // APPS-12
         let fakes = Fakes::default();
         let (_, _, mut holder) = editing(&fakes);
-        holder.handle(AppsIntent::OpenMenu(app_id("mail")));
+        holder.handle(AppsIntent::OpenMenu(CellKey::App(app_id("mail"))));
 
         holder.handle(AppsIntent::ExitEditMode);
 
@@ -1824,6 +2202,10 @@ mod tests {
             top_px: 100.0,
             bottom_px: 50.0,
             height_px: 2000.0,
+            left_px: 0.0,
+            view_top_px: 0.0,
+            icon_px: 0.0,
+            icon_top_px: 0.0,
         }
     }
 
@@ -1873,5 +2255,377 @@ mod tests {
         assert_eq!(holder.state().layout, None);
         holder.handle(AppsIntent::Layout(phone_grid()));
         assert_eq!(holder.state().layout, Some(phone_grid()));
+    }
+
+    /// In edit mode, with Camera, Mail, Maps and Phone, and the store they are saved in.
+    fn folder_of_two(fakes: &Fakes) -> (Arc<FakeStorage>, Arc<PersistentLayoutStore>, AppsHolder) {
+        let (storage, layout, mut holder) = editing(fakes);
+        holder.handle(AppsIntent::Group {
+            app: app_id("maps"),
+            with: CellKey::App(app_id("mail")),
+        });
+        storage.writes.lock().unwrap().clear();
+        (storage, layout, holder)
+    }
+
+    fn folder_id(state: &AppsState) -> FolderId {
+        state
+            .items
+            .iter()
+            .find_map(|item| match item {
+                GridItem::Folder { id, .. } => Some(*id),
+                GridItem::App { .. } => None,
+            })
+            .expect("a folder")
+    }
+
+    #[test]
+    fn grouping_two_apps_makes_a_folder_named_folder_and_saves_it() {
+        // FOLD-01, FOLD-03, A11Y-05: an unnamed folder shows as "Folder" in the user's language.
+        let fakes = Fakes::default();
+        let (_, layout, holder) = folder_of_two(&fakes);
+
+        assert_eq!(labels(holder.state()), ["Camera", "[]", "Phone"]);
+        assert_eq!(saved_order(&layout), ["camera", "[]", "phone"]);
+        assert_eq!(holder.state().folders_made, 1);
+        let GridItem::Folder { apps, .. } = &holder.state().items[1] else {
+            panic!("not a folder");
+        };
+        let apps: Vec<&str> = apps.iter().map(|app| app.label.as_str()).collect();
+        assert_eq!(apps, ["Mail", "Maps"]);
+    }
+
+    #[test]
+    fn a_folder_opens_shows_its_apps_and_closes_on_back_before_edit_mode() {
+        // FOLD-04, HOME-08
+        let fakes = Fakes::default();
+        let (_, _, mut holder) = folder_of_two(&fakes);
+        let folder = folder_id(holder.state());
+
+        holder.handle(AppsIntent::OpenFolder(folder));
+        let state = holder.state();
+        assert_eq!(state.open_folder, Some(folder));
+        assert_eq!(state.folder_rows(), 1);
+        let shown: Vec<&str> = state.folder_items.iter().map(GridItem::label).collect();
+        assert_eq!(shown, ["Mail", "Maps"]);
+        assert_eq!(
+            state.place_of(Surface::Folder, &CellKey::App(app_id("maps"))),
+            Some(1)
+        );
+
+        assert!(holder.on_back());
+        assert_eq!(holder.state().open_folder, None);
+        assert!(holder.state().folder_items.is_empty());
+        assert!(holder.state().edit_mode);
+        assert!(holder.on_back());
+        assert!(!holder.state().edit_mode);
+
+        // A folder that isn't there doesn't open.
+        holder.handle(AppsIntent::OpenFolder(FolderId(99)));
+        assert_eq!(holder.state().open_folder, None);
+    }
+
+    #[test]
+    fn dragging_an_app_out_of_a_folder_of_two_turns_it_back_into_the_other() {
+        // FOLD-05, FOLD-06, AC-08: mid-drag the folder keeps its one app; the drop tidies it.
+        let fakes = Fakes::default();
+        let (storage, layout, mut holder) = folder_of_two(&fakes);
+        holder.handle(AppsIntent::OpenFolder(folder_id(holder.state())));
+
+        holder.handle(AppsIntent::TakeOut {
+            app: app_id("maps"),
+            to: 0,
+        });
+        assert_eq!(labels(holder.state()), ["Maps", "Camera", "[]", "Phone"]);
+        assert_eq!(holder.state().open_folder, None);
+        assert!(storage.writes.lock().unwrap().is_empty());
+
+        holder.handle(AppsIntent::Drop);
+        assert_eq!(labels(holder.state()), ["Maps", "Camera", "Mail", "Phone"]);
+        assert_eq!(saved_order(&layout), ["maps", "camera", "mail", "phone"]);
+    }
+
+    #[test]
+    fn a_drag_into_a_folder_is_kept_only_when_dropped() {
+        // FOLD-05
+        let fakes = Fakes::default();
+        let (storage, layout, mut holder) = folder_of_two(&fakes);
+        let folder = folder_id(holder.state());
+
+        holder.handle(AppsIntent::Combine {
+            app: app_id("camera"),
+            onto: CellKey::Folder(folder),
+        });
+        assert_eq!(labels(holder.state()), ["[]", "Phone"]);
+        holder.handle(AppsIntent::CancelArrange);
+        assert_eq!(labels(holder.state()), ["Camera", "[]", "Phone"]);
+        assert!(storage.writes.lock().unwrap().is_empty());
+
+        holder.handle(AppsIntent::Combine {
+            app: app_id("camera"),
+            onto: CellKey::Folder(folder),
+        });
+        holder.handle(AppsIntent::Drop);
+        assert_eq!(saved_order(&layout), ["[]", "phone"]);
+        // It joined a folder: none was made.
+        assert_eq!(holder.state().folders_made, 1);
+    }
+
+    #[test]
+    fn a_drags_draft_keeps_a_folder_of_one_through_a_refresh() {
+        // ADR 0015: a refresh mid-drag mustn't collapse the folder the finger is taking an app
+        // out of.
+        let fakes = Fakes::default();
+        let (_, _, mut holder) = folder_of_two(&fakes);
+        holder.handle(AppsIntent::OpenFolder(folder_id(holder.state())));
+        holder.handle(AppsIntent::TakeOut {
+            app: app_id("maps"),
+            to: 3,
+        });
+
+        holder.handle(AppsIntent::Refresh);
+
+        assert_eq!(labels(holder.state()), ["Camera", "[]", "Phone", "Maps"]);
+    }
+
+    #[test]
+    fn apps_move_within_an_open_folder_and_out_of_it() {
+        // FOLD-05, A11Y-05
+        let fakes = Fakes::default();
+        let (_, layout, mut holder) = folder_of_two(&fakes);
+        let folder = folder_id(holder.state());
+        holder.handle(AppsIntent::OpenFolder(folder));
+
+        holder.handle(AppsIntent::MoveInFolder {
+            app: app_id("maps"),
+            to: 0,
+        });
+        let shown: Vec<&str> = holder
+            .state()
+            .folder_items
+            .iter()
+            .map(GridItem::label)
+            .collect();
+        assert_eq!(shown, ["Maps", "Mail"]);
+
+        holder.handle(AppsIntent::MoveOutOfFolder(app_id("maps")));
+        assert_eq!(labels(holder.state()), ["Camera", "Mail", "Maps", "Phone"]);
+        assert_eq!(saved_order(&layout), ["camera", "mail", "maps", "phone"]);
+    }
+
+    #[test]
+    fn folders_change_only_in_edit_mode_and_with_a_layout_that_was_read() {
+        // APPS-12, REL-02
+        let fakes = Fakes::default();
+        let (_, _, mut holder) = editing(&fakes);
+        holder.handle(AppsIntent::ExitEditMode);
+        holder.handle(AppsIntent::Group {
+            app: app_id("maps"),
+            with: CellKey::App(app_id("mail")),
+        });
+        assert_eq!(labels(holder.state()), ["Camera", "Mail", "Maps", "Phone"]);
+        assert_eq!(holder.state().folders_made, 0);
+    }
+
+    #[test]
+    fn renaming_trims_caps_and_saves_the_name() {
+        // FOLD-03
+        let fakes = Fakes::default();
+        let (_, layout, mut holder) = folder_of_two(&fakes);
+        let folder = folder_id(holder.state());
+
+        holder.handle(AppsIntent::StartRename(folder));
+        assert_eq!(holder.state().renaming, Some(folder));
+        holder.handle(AppsIntent::RenameFolder {
+            folder,
+            name: "  Mail & maps  ".into(),
+        });
+        assert_eq!(holder.state().renaming, None);
+        assert_eq!(labels(holder.state())[1], "[Mail & maps]");
+        assert_eq!(saved_order(&layout)[1], "[Mail & maps]");
+
+        holder.handle(AppsIntent::RenameFolder {
+            folder,
+            name: "é".repeat(100),
+        });
+        assert_eq!(
+            holder.state().items[1].label().chars().count(),
+            MAX_FOLDER_NAME
+        );
+
+        // Blank goes back to "Folder"; a folder that has gone is left alone.
+        holder.handle(AppsIntent::RenameFolder {
+            folder,
+            name: "   ".into(),
+        });
+        assert_eq!(labels(holder.state())[1], "[]");
+        holder.handle(AppsIntent::RenameFolder {
+            folder: FolderId(99),
+            name: "Nope".into(),
+        });
+        holder.handle(AppsIntent::StartRename(FolderId(99)));
+        assert_eq!(holder.state().renaming, None);
+        holder.handle(AppsIntent::StartRename(folder));
+        holder.handle(AppsIntent::CancelRename);
+        assert_eq!(holder.state().renaming, None);
+    }
+
+    #[test]
+    fn a_rename_during_a_drag_survives_the_drop() {
+        let fakes = Fakes::default();
+        let (_, layout, mut holder) = folder_of_two(&fakes);
+        let folder = folder_id(holder.state());
+        holder.handle(AppsIntent::Arrange {
+            item: CellKey::Folder(folder),
+            to: 0,
+        });
+
+        holder.handle(AppsIntent::RenameFolder {
+            folder,
+            name: "Post".into(),
+        });
+        holder.handle(AppsIntent::Drop);
+
+        assert_eq!(saved_order(&layout), ["[Post]", "camera", "phone"]);
+    }
+
+    #[test]
+    fn a_folders_menu_offers_rename_and_edit_applications() {
+        // ADR 0015
+        let fakes = Fakes::default();
+        let (_, _, mut holder) = folder_of_two(&fakes);
+        let folder = folder_id(holder.state());
+        holder.handle(AppsIntent::ExitEditMode);
+
+        holder.handle(AppsIntent::OpenMenu(CellKey::Folder(folder)));
+        let menu = holder.state().menu.clone().expect("a menu");
+        assert_eq!(
+            menu.items,
+            [AppMenuItem::RenameFolder, AppMenuItem::EditApplications]
+        );
+
+        holder.handle(AppsIntent::ChooseMenuItem(AppMenuItem::RenameFolder));
+        assert_eq!(holder.state().renaming, Some(folder));
+        assert_eq!(holder.state().menu, None);
+
+        // App info means nothing for a folder; a folder that isn't there has no menu.
+        holder.handle(AppsIntent::OpenMenu(CellKey::Folder(folder)));
+        holder.handle(AppsIntent::ChooseMenuItem(AppMenuItem::AppInfo));
+        assert!(holder.state().menu.is_some());
+        holder.handle(AppsIntent::CloseMenu);
+        holder.handle(AppsIntent::OpenMenu(CellKey::Folder(FolderId(99))));
+        assert_eq!(holder.state().menu, None);
+    }
+
+    #[test]
+    fn the_cross_works_on_an_app_in_the_open_folder() {
+        // APPS-13
+        let fakes = Fakes::default();
+        let (_, _, mut holder) = folder_of_two(&fakes);
+        holder.handle(AppsIntent::RequestUninstall(app_id("maps")));
+        assert!(fakes.apps.uninstall_requested.lock().unwrap().is_empty());
+
+        holder.handle(AppsIntent::OpenFolder(folder_id(holder.state())));
+        holder.handle(AppsIntent::RequestUninstall(app_id("maps")));
+        assert_eq!(
+            *fakes.apps.uninstall_requested.lock().unwrap(),
+            [app_id("maps")]
+        );
+    }
+
+    #[test]
+    fn a_folder_that_goes_closes_and_stops_being_renamed() {
+        // FOLD-06: its apps were uninstalled.
+        let fakes = Fakes::default();
+        let (_, _, mut holder) = folder_of_two(&fakes);
+        let folder = folder_id(holder.state());
+        holder.handle(AppsIntent::OpenFolder(folder));
+        holder.handle(AppsIntent::StartRename(folder));
+
+        install(
+            &fakes,
+            &[("camera", "Camera"), ("mail", "Mail"), ("phone", "Phone")],
+        );
+        holder.handle(AppsIntent::Refresh);
+
+        let state = holder.state();
+        assert_eq!(labels(state), ["Camera", "Mail", "Phone"]);
+        assert_eq!((state.open_folder, state.renaming), (None, None));
+    }
+
+    #[test]
+    fn the_folders_grid_is_reported_with_its_panel() {
+        let fakes = Fakes::default();
+        let mut holder = holder(&fakes, &layout_store());
+        let bounds = Bounds {
+            left: 10.0,
+            top: 20.0,
+            right: 30.0,
+            bottom: 40.0,
+        };
+        holder.handle(AppsIntent::FolderLayout {
+            layout: phone_grid(),
+            bounds,
+        });
+        holder.handle(AppsIntent::FolderScrolled(42.0));
+        holder.handle(AppsIntent::FolderScrolled(f64::NAN));
+        let state = holder.state();
+        assert_eq!(state.layout_of(Surface::Folder), Some(phone_grid()));
+        assert_eq!(state.folder_bounds, Some(bounds));
+        assert_eq!(state.scroll_of(Surface::Folder), 42.0);
+        assert!(bounds.contains((10.0, 39.0)) && !bounds.contains((30.0, 20.0)));
+
+        // Bounds turned inside out change nothing.
+        holder.handle(AppsIntent::FolderLayout {
+            layout: phone_grid(),
+            bounds: Bounds {
+                right: 0.0,
+                ..bounds
+            },
+        });
+        assert_eq!(holder.state().folder_bounds, Some(bounds));
+    }
+
+    #[test]
+    fn an_icon_centre_follows_edit_modes_scale_around_the_cells_centre() {
+        // ADR 0015: rows of 300 px, the icon 154 px from 22 px down.
+        let grid = GridLayout {
+            icon_px: 154.0,
+            icon_top_px: 22.0,
+            left_px: 40.0,
+            view_top_px: 5.0,
+            ..phone_grid()
+        };
+        assert_eq!(grid.icon_centre(5, false, 1.0), (375.0, 300.0 + 99.0));
+        // 150 px is the cell's middle; the icon's centre is 51 px above it, then 92 % of that.
+        let (_, y) = grid.icon_centre(5, false, 0.92);
+        assert!((y - (450.0 - 51.0 * 0.92)).abs() < 1e-9);
+        assert_eq!(grid.origin(30.0), (40.0, 5.0 + 100.0 - 30.0));
+
+        assert!(grid.over_icon(5, false, 1.0, (375.0 + 60.0, 399.0)));
+        assert!(!grid.over_icon(5, false, 1.0, (375.0 + 63.0, 399.0)));
+        // With no icon reported, nothing is over an icon; the centre is the cell's.
+        assert!(!phone_grid().over_icon(5, false, 1.0, (375.0, 450.0)));
+        assert_eq!(phone_grid().icon_centre(5, false, 0.92), (375.0, 450.0));
+    }
+
+    #[test]
+    fn preview_slots_go_in_reading_order() {
+        // FOLD-02
+        let (x0, y0, size) = preview_slot(0, false);
+        let (x3, y3, _) = preview_slot(3, false);
+        assert!(x0 < 0.5 && y0 < 0.5 && x3 > 0.5 && y3 > 0.5);
+        assert!((size - 0.33).abs() < 1e-9);
+        assert_eq!(preview_slot(0, true).0, preview_slot(1, false).0);
+    }
+
+    #[test]
+    fn a_panel_four_grid_cells_wide_always_has_four_columns() {
+        // FOLD-04: whatever the grid's columns, its cells are at most 128 dp wide.
+        for tenths in 2_000..=25_600 {
+            let width_dp = f64::from(tenths) / 10.0;
+            let cell = width_dp / columns_for(width_dp) as f64;
+            assert_eq!(columns_for(4.0 * cell), FOLDER_COLUMNS, "{width_dp} dp");
+        }
     }
 }

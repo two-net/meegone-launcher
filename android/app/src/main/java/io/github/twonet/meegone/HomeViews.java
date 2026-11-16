@@ -1,6 +1,7 @@
 package io.github.twonet.meegone;
 
 import android.annotation.TargetApi;
+import android.app.AlertDialog;
 import android.content.Context;
 import android.content.res.ColorStateList;
 import android.graphics.Color;
@@ -12,6 +13,7 @@ import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
 import android.os.Build;
 import android.os.Bundle;
+import android.text.InputFilter;
 import android.text.TextUtils;
 import android.util.TypedValue;
 import android.view.Choreographer;
@@ -24,9 +26,11 @@ import android.view.ViewConfiguration;
 import android.view.ViewGroup;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
+import android.view.WindowManager;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
 import android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction;
+import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
@@ -38,16 +42,19 @@ import java.util.List;
  * The three home views, Events, Applications and Recent, in a wrap-around carousel (HOME-02 to
  * HOME-04), drawn with Android's own views (ADR 0006). They come back from an app with a short
  * scale and fade (ANIM-09, ADR 0007). A long-press on empty space opens the home menu, or enters
- * close mode in Recent (HOME-10, ADR 0008). A long-press on an app's icon opens the app's menu,
- * and dragging on picks the icon up (APPS-11, ADR 0013).
+ * close mode in Recent (HOME-10, ADR 0008). A long-press on an app's or a folder's icon opens
+ * its menu, and dragging on picks the icon up (APPS-11, ADR 0013), which {@link DragShadow}
+ * draws above the pages. A tap on a folder opens it in a {@link FolderPanel} inside the
+ * Applications page, with its own {@link AppsGrid}; renaming it asks for the name in a dialog
+ * (FOLD-03, FOLD-04, ADR 0015).
  *
  * <p>The Rust app owns the gesture, the motion, the view indicator and the menus. This view
  * passes it every touch, frame time and layout change, says when a finger has been held on
  * empty space or on an app's icon, then reads what to draw with {@link #nativeRead} and applies
- * it. It keeps nothing
- * else. The frame slots below must stay in step with {@code frame_slots} in {@code
- * src/android.rs}. Applications is an {@link AppsGrid}, which draws the frame's Applications
- * slots (ADR 0010); Events and Recent show their names until #19 and #22.
+ * it. It keeps nothing else. The frame slots below must stay in step with {@code frame_slots}
+ * in {@code src/android.rs}. Applications is an {@link AppsGrid}, which draws the frame's
+ * Applications slots (ADR 0010), as the open folder's grid draws its own; both share one {@link
+ * AppIcons}. Events and Recent show their names until #19 and #22.
  *
  * <p>The background fills the window edge to edge, behind the system bars. Everything else stays
  * inside a safe area clear of the bars, display cut-outs and the screen's rounded corners: each
@@ -58,7 +65,7 @@ import java.util.List;
  * <p>An element inside a view that uses horizontal drags itself keeps them by calling {@link
  * #requestDisallowInterceptTouchEvent} before the carousel takes the gesture (HOME-03). An
  * element with its own long-press is clickable or long-clickable, so a long-press on it never
- * opens the home menu. An app's cell is the one such element whose long-press is timed here.
+ * opens the home menu. A cell is the one such element whose long-press is timed here.
  */
 final class HomeViews extends FrameLayout implements Choreographer.FrameCallback {
     // The slots of the frame that nativeRead fills.
@@ -94,11 +101,11 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     // An app's long-press menu (APPS-11):
     private static final int APP_MENU = 30; // the cell it is at, -1 to centre it, -2 if closed
     private static final int APP_MENU_REVISION = 31; // changes when its items change
-    // The picked-up icon (APPS-11):
-    private static final int LIFTED = 32; // its cell, or -1
-    private static final int LIFT_X = 33; // px from its place
+    // The dragged icon (APPS-11, ADR 0015):
+    private static final int LIFTED = 32; // its cell, a gap, or -1
+    private static final int LIFT_X = 33; // its centre, in px from the top left
     private static final int LIFT_Y = 34;
-    private static final int LIFT_SCALE = 35; // ten-thousandths
+    private static final int LIFT_SCALE = 35; // ten-thousandths of an icon
     // Edit mode (APPS-12, ANIM-12, ADR 0014).
     private static final int EDITING = 36; // 1 while it is on
     private static final int EDIT_SCALE = 37; // every cell's, in ten-thousandths
@@ -106,7 +113,35 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private static final int BADGE_FIRST_ROW = 39; // the grid's first visible row
     private static final int BADGES = 40; // the ✕ scale of each visible row from it
     private static final int BADGE_ROWS = 12;
-    private static final int FRAME_SIZE = BADGES + BADGE_ROWS;
+    private static final int LIFT_SURFACE = 52; // the dragged icon's cell's surface
+    private static final int LIFT_ALPHA = 53; // 0 to 255
+    private static final int LIFT_SHOWN = 54; // 1 while it is drawn
+    private static final int PRESSED_SURFACE = 55;
+    // A dragged app held over an icon, and going into a folder (ANIM-14):
+    private static final int HOVER = 56; // the grid cell, or -1
+    private static final int HOVER_SCALE = 57; // ten-thousandths
+    private static final int MERGE = 58; // the folder's grid cell, or -1
+    private static final int MERGE_SLOT = 59; // the preview slot left empty, or -1
+    private static final int MERGE_FORMED = 60; // 1 if the folder was just made
+    private static final int MERGE_PROGRESS = 61; // 0 to 10 000
+    // The open folder (FOLD-04, ANIM-15):
+    private static final int FOLDER = 62; // its id, or -1
+    private static final int FOLDER_OPEN = 63; // 1 while open, 0 while closing
+    private static final int FOLDER_CELL = 64; // its grid cell, or -1
+    private static final int FOLDER_PROGRESS = 65; // 0 to 10 000
+    private static final int FOLDER_REVISION = 66; // changes when its cells change
+    private static final int FOLDER_SCROLL = 67; // px from the top
+    private static final int FOLDER_ROWS = 68;
+    // Renaming a folder (FOLD-03):
+    private static final int RENAMING = 69; // its id, or -1
+    private static final int RENAMING_CELL = 70; // its grid cell, or -1
+    private static final int APP_MENU_SURFACE = 71;
+    private static final int SCRIM = 72; // the open folder's scrim's opacity, 0 to 255
+    private static final int FRAME_SIZE = 73;
+    /** An open folder's columns, as {@code FOLDER_COLUMNS} in the Rust app. */
+    private static final int FOLDER_COLUMNS = 4;
+    /** The longest name a folder takes, as {@code MAX_FOLDER_NAME} in the Rust app. */
+    private static final int MAX_FOLDER_NAME = 64;
 
     private static final int VIEWS = 3;
     private static final int APPLICATIONS = 1;
@@ -127,9 +162,13 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     // its kind, then a shortcut's label.
     private static final int APP_MENU_FIELDS = 2;
     private static final int APP_MENU_SHORTCUT = 3;
-    /** The text of the app menu's other kinds of item: App info, Uninstall, Edit applications. */
+    /**
+     * The text of each kind of item of a cell's menu: App info, Uninstall, Edit applications, a
+     * shortcut's own, and Rename folder.
+     */
     private static final int[] APP_MENU_ITEMS = {
-        R.string.menu_app_info, R.string.menu_uninstall, R.string.menu_edit_applications
+        R.string.menu_app_info, R.string.menu_uninstall, R.string.menu_edit_applications, 0,
+        R.string.menu_rename_folder
     };
     private static final int SETTINGS_AT_LOCK_SCREEN_IMAGE = 2;
 
@@ -138,6 +177,13 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     /** Each view's name, until its content arrives; null for Applications, which has its grid. */
     private final TextView[] titles = new TextView[VIEWS];
     private final AppsGrid apps;
+    /** The open folder's grid, in its panel (FOLD-04). */
+    private final AppsGrid folderApps;
+    private final FolderPanel folderPanel;
+    /** The dragged icon, above the pages (ADR 0015). */
+    private final DragShadow shadow;
+    /** Both grids' icons. */
+    private final AppIcons icons;
     /** Ends edit mode (APPS-12): a flat pill at the bottom of Applications. */
     private final TextView done;
     private final GradientDrawable doneShape;
@@ -163,8 +209,10 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private final GradientDrawable menuCard;
     private final List<TextView> menuItems = new ArrayList<>();
     private final List<View> menuDividers = new ArrayList<>();
-    /** Where an app's cell is, for opening its menu there. */
+    /** Where a cell is, for opening its menu there. */
     private final Rect anchor = new Rect();
+    /** Where the open folder's icon is, in the Applications page, which its panel grows from. */
+    private final Rect folderIcon = new Rect();
     private final int indicatorMargin;
     private final int menuMargin;
     private final int touchSlop;
@@ -202,6 +250,11 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private long appMenuShown = -1;
     private int settingsShown;
     private int menuOffered = -1;
+    /** Whether the open folder covers the grid for screen readers, or -1 before the first frame. */
+    private int folderCovering = -1;
+    /** The folder the rename dialog is for, or -1, and the dialog while it shows (FOLD-03). */
+    private int renameShown = -1;
+    private AlertDialog renameDialog;
     /** How far content stays from each edge, in px (HOME-11). */
     private Insets safe = Insets.NONE;
 
@@ -213,7 +266,19 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         // Carries the screen-reader actions that switch views and open the menu (A11Y-05).
         setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_YES);
 
-        apps = new AppsGrid(context, this::apply, this::announce);
+        icons = new AppIcons(context, AppCell.iconPx(context), this::refreshIcons);
+        apps = new AppsGrid(context, AppsGrid.GRID, icons, this::apply, this::announce);
+        apps.setScreen(this);
+        folderApps = new AppsGrid(context, AppsGrid.FOLDER, icons, this::apply, this::announce);
+        folderApps.setScreen(this);
+        folderPanel = new FolderPanel(context, folderApps, apps, folder -> {
+            nativeRenameRequested(folder);
+            apply();
+        }, folder -> {
+            nativeCloseFolder();
+            apply();
+        });
+        folderPanel.setScreen(this);
         doneMargin = dp(16);
         done = new TextView(context);
         done.setText(R.string.edit_done);
@@ -234,6 +299,9 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
                 // Over the grid's last row, which is always empty (HOME-14).
                 page.addView(done, new LayoutParams(LayoutParams.WRAP_CONTENT,
                         LayoutParams.WRAP_CONTENT, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL));
+                // An open folder covers both.
+                page.addView(folderPanel, new LayoutParams(
+                        LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
             } else {
                 // Until Events' and Recent's content arrives (#19, #22), each shows its name.
                 TextView title = new TextView(context);
@@ -270,6 +338,10 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
                 Gravity.TOP | Gravity.CENTER_HORIZONTAL);
         params.topMargin = indicatorMargin;
         addView(indicator, params);
+
+        shadow = new DragShadow(context);
+        addView(shadow, new LayoutParams(
+                LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT, Gravity.TOP | Gravity.LEFT));
 
         // One transparent pixel: present for screen readers, invisible on screen.
         status = new TextView(context);
@@ -360,6 +432,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         }
         // The grid scrolls under the bars, so it takes the safe area as its own padding.
         apps.setSafeArea(safe);
+        folderPanel.setSafeArea(safe);
         LayoutParams doneParams = (LayoutParams) done.getLayoutParams();
         if (doneParams.bottomMargin != safe.bottom + doneMargin) {
             doneParams.bottomMargin = safe.bottom + doneMargin;
@@ -552,7 +625,8 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
 
     /**
      * The finger has been held long enough. On empty space, the Rust app decides: the home menu
-     * or close mode (HOME-10). On an app's icon, it decides whether its menu opens (APPS-11).
+     * or close mode (HOME-10). On a cell, of the grid or of the open folder, it decides whether
+     * its menu opens (APPS-11).
      * Any other element handles touches itself. If the Rust app takes the long-press, the
      * content gets no more of the gesture, so lifting the finger taps nothing.
      */
@@ -564,7 +638,8 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         if (target == null) {
             claimed = nativeLongPress();
         } else if (target instanceof AppCell && frame[CURRENT] == APPLICATIONS) {
-            claimed = apps.longPressed((AppCell) target);
+            AppCell cell = (AppCell) target;
+            claimed = cell.grid().longPressed(cell);
         } else {
             return;
         }
@@ -625,6 +700,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     @Override
     protected void onAttachedToWindow() {
         super.onAttachedToWindow();
+        icons.watch();
         // Restarts the frame loop, and sets the system bars now that there is a window.
         background = 0;
         apply();
@@ -635,7 +711,18 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         Choreographer.getInstance().removeFrameCallback(this);
         framePosted = false;
         removeCallbacks(longPress);
+        icons.stopWatching();
+        // The activity is going: its dialog goes with it, and the Rust app keeps the rename
+        // open for the next one.
+        closeRenameDialog();
         super.onDetachedFromWindow();
+    }
+
+    /** The icons arrived or changed: both grids, and the dragged icon, draw them again. */
+    private void refreshIcons() {
+        apps.refreshIcons();
+        folderApps.refreshIcons();
+        shadow.invalidate();
     }
 
     /** Draws what the Rust app says, and asks for another frame while anything moves. */
@@ -686,15 +773,25 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             }
         }
         int current = frame[CURRENT];
+        boolean applications = current == APPLICATIONS;
+        int pressedSurface = frame[PRESSED_SURFACE];
         apps.apply(frame[APPS_REVISION], frame[APPS_SCROLL], frame[APPS_COLUMNS],
-                frame[APPS_ROWS], current == APPLICATIONS ? frame[PRESSED] : -1,
+                frame[APPS_ROWS],
+                applications && pressedSurface == AppsGrid.GRID ? frame[PRESSED] : -1,
+                frame[PRESS_SCALE], foreground, dim, frame[ACCENT], surface);
+        folderApps.apply(frame[FOLDER_REVISION], frame[FOLDER_SCROLL], FOLDER_COLUMNS,
+                frame[FOLDER_ROWS],
+                applications && pressedSurface == AppsGrid.FOLDER ? frame[PRESSED] : -1,
                 frame[PRESS_SCALE], foreground, dim, frame[ACCENT], surface);
         apps.move(frame[APPEAR_SCALE], frame[APPEAR_ALPHA], frame[LEAVE_SCALE],
                 frame[LEAVE_ALPHA], frame[SHIFT]);
-        apps.lift(current == APPLICATIONS ? frame[LIFTED] : -1, frame[LIFT_X], frame[LIFT_Y],
-                frame[LIFT_SCALE]);
+        folderApps.move(frame[APPEAR_SCALE], frame[APPEAR_ALPHA], frame[LEAVE_SCALE],
+                frame[LEAVE_ALPHA], frame[SHIFT]);
+        applyDrag(applications);
         apps.edit(frame[EDITING] != 0, frame[EDIT_SCALE], frame[BADGE_FIRST_ROW], frame, BADGES,
                 BADGE_ROWS);
+        folderApps.edit(frame[EDITING] != 0, frame[EDIT_SCALE], 0, frame, BADGES, BADGE_ROWS);
+        applyFolder();
         applyDone();
         if (current != announced) {
             announced = current;
@@ -712,6 +809,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         }
         applySettings();
         applyMenu();
+        applyRename();
         if (frame[MENU_OFFERED] != menuOffered) {
             // Screen readers ask again which actions the home views offer.
             menuOffered = frame[MENU_OFFERED];
@@ -721,6 +819,117 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             framePosted = true;
             Choreographer.getInstance().postFrameCallback(this);
         }
+    }
+
+    /**
+     * Draws the dragged icon above the pages, its cell as a gap, the icon it is held over and a
+     * folder taking it in (APPS-11, ANIM-13, ANIM-14).
+     */
+    private void applyDrag(boolean applications) {
+        boolean shown = applications && frame[LIFT_SHOWN] != 0;
+        int surfaceOfLift = frame[LIFT_SURFACE];
+        int lifted = shown ? frame[LIFTED] : -1;
+        apps.hide(surfaceOfLift == AppsGrid.GRID ? lifted : -1);
+        folderApps.hide(surfaceOfLift == AppsGrid.FOLDER ? lifted : -1);
+        AppsGrid from = surfaceOfLift == AppsGrid.FOLDER ? folderApps : apps;
+        shadow.show(shown, from.cellAt(lifted), frame[LIFT_X], frame[LIFT_Y], frame[LIFT_SCALE],
+                frame[LIFT_ALPHA]);
+        apps.hover(applications ? frame[HOVER] : -1, frame[HOVER_SCALE]);
+        apps.merge(applications ? frame[MERGE] : -1, frame[MERGE_SLOT],
+                frame[MERGE_FORMED] != 0, frame[MERGE_PROGRESS]);
+    }
+
+    /**
+     * Draws the open or closing folder, growing from its icon (FOLD-04, ANIM-15). While it is
+     * open, screen readers read only its panel.
+     */
+    private void applyFolder() {
+        int folder = frame[FOLDER];
+        AppCell cell = apps.cellAt(frame[FOLDER_CELL]);
+        folderIcon.setEmpty();
+        if (cell != null && cell.isLaidOut()) {
+            int iconPx = AppCell.iconPx(getContext());
+            int iconTop = AppCell.iconTopPx(getContext());
+            folderIcon.set(0, 0, cell.getWidth(), cell.getHeight());
+            pages[APPLICATIONS].offsetDescendantRectToMyCoords(cell, folderIcon);
+            int left = folderIcon.centerX() - iconPx / 2;
+            int top = folderIcon.top + iconTop;
+            folderIcon.set(left, top, left + iconPx, top + iconPx);
+        }
+        folderPanel.apply(folder, frame[FOLDER_OPEN] != 0, frame[FOLDER_PROGRESS], folderIcon,
+                cell == null ? null : cell.name(), frame[SCRIM], foreground, surface);
+        int covering = folder >= 0 && frame[FOLDER_OPEN] != 0 ? 1 : 0;
+        if (covering != folderCovering) {
+            folderCovering = covering;
+            apps.setImportantForAccessibility(covering != 0
+                    ? IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+                    : IMPORTANT_FOR_ACCESSIBILITY_AUTO);
+        }
+    }
+
+    /**
+     * Asks for a folder's new name while the Rust app says it is being renamed (FOLD-03): a
+     * dialog with the name as it is, at most {@link #MAX_FOLDER_NAME} characters. OK names it,
+     * and Cancel, Back or a touch outside leaves it. In its own window, the dialog has the
+     * keyboard and Back to itself. It follows MeeGone's theme, not the system's.
+     */
+    private void applyRename() {
+        int folder = frame[RENAMING];
+        if (folder == renameShown) {
+            return;
+        }
+        closeRenameDialog();
+        renameShown = folder;
+        if (folder < 0 || !isAttachedToWindow()) {
+            return;
+        }
+        AppCell cell = apps.cellAt(frame[RENAMING_CELL]);
+        String name = cell == null ? "" : cell.label();
+        EditText field = new EditText(getContext());
+        field.setSingleLine(true);
+        field.setHint(R.string.folder_name);
+        field.setFilters(new InputFilter[] {new InputFilter.LengthFilter(MAX_FOLDER_NAME)});
+        field.setText(name);
+        field.setSelectAllOnFocus(true);
+        FrameLayout box = new FrameLayout(getContext());
+        box.setPaddingRelative(dp(24), dp(8), dp(24), 0);
+        box.addView(field);
+        boolean light = Color.luminance(background) > 0.5f;
+        AlertDialog dialog = new AlertDialog.Builder(getContext(), light
+                        ? android.R.style.Theme_DeviceDefault_Light_Dialog_Alert
+                        : android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                .setTitle(R.string.menu_rename_folder)
+                .setView(box)
+                .setPositiveButton(android.R.string.ok, (shown, which) -> {
+                    renameDialog = null;
+                    nativeFolderRenamed(folder, field.getText().toString());
+                    apply();
+                })
+                .setNegativeButton(android.R.string.cancel, null)
+                .create();
+        dialog.setOnDismissListener(shown -> {
+            // Dismissed by the user, not by OK or by the Rust app.
+            if (renameDialog == dialog) {
+                renameDialog = null;
+                nativeRenameCancelled();
+                apply();
+            }
+        });
+        renameDialog = dialog;
+        dialog.getWindow().setSoftInputMode(
+                WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE);
+        dialog.show();
+        field.requestFocus();
+    }
+
+    /** Closes the rename dialog without telling the Rust app. */
+    private void closeRenameDialog() {
+        AlertDialog dialog = renameDialog;
+        renameDialog = null;
+        if (dialog != null) {
+            dialog.dismiss();
+        }
+        renameShown = -1;
     }
 
     /** The view's name and place for screen readers, e.g. "Applications, 2 of 3" (A11Y-08). */
@@ -745,8 +954,11 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         done.setAlpha(alpha);
         boolean on = frame[EDITING] != 0;
         done.setEnabled(on);
-        done.setImportantForAccessibility(
-                on ? IMPORTANT_FOR_ACCESSIBILITY_YES : IMPORTANT_FOR_ACCESSIBILITY_NO);
+        // Under an open folder's scrim, screen readers skip it, as they skip the grid.
+        boolean covered = frame[FOLDER] >= 0 && frame[FOLDER_OPEN] != 0;
+        done.setImportantForAccessibility(on && !covered
+                ? IMPORTANT_FOR_ACCESSIBILITY_YES
+                : IMPORTANT_FOR_ACCESSIBILITY_NO);
         if (frame[ACCENT] != doneAccent || background != doneText) {
             doneAccent = frame[ACCENT];
             doneText = background;
@@ -827,12 +1039,13 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     }
 
     /**
-     * An app's menu at {@code revision} (APPS-11): App info, Uninstall and Edit applications as
-     * it offers them, then its shortcuts below a divider. Its pane title names the app.
+     * A cell's menu at {@code revision} (APPS-11): App info, Uninstall and Edit applications as
+     * an app's offers them, then its shortcuts below a divider, or a folder's Rename folder and
+     * Edit applications. Its pane title names the app or the folder.
      */
     private void fillAppMenu(int revision) {
         clearMenu();
-        String app = apps.label(frame[APP_MENU]);
+        String app = menuGrid().label(frame[APP_MENU]);
         menu.setAccessibilityPaneTitle(app != null
                 ? getResources().getString(R.string.app_menu, app)
                 : getResources().getString(R.string.action_app_menu));
@@ -848,7 +1061,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
                     addMenuDivider();
                 }
                 divided = true;
-            } else if (kind >= 0 && kind < APP_MENU_ITEMS.length) {
+            } else if (kind >= 0 && kind < APP_MENU_ITEMS.length && APP_MENU_ITEMS[kind] != 0) {
                 text = getResources().getText(APP_MENU_ITEMS[kind]);
             } else {
                 continue;
@@ -962,12 +1175,17 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         menu.setTranslationY(within(y, top, bottom - menuHeight));
     }
 
+    /** The grid of the cell the menu is open at: the Applications grid's or the folder's. */
+    private AppsGrid menuGrid() {
+        return frame[APP_MENU_SURFACE] == AppsGrid.FOLDER ? folderApps : apps;
+    }
+
     /**
-     * Fills {@code bounds} with where cell {@code index} of the grid is, in this view's
+     * Fills {@code bounds} with where cell {@code index} of the menu's grid is, in this view's
      * coordinates. Returns false if it has no laid-out view.
      */
     private boolean appCellBounds(int index, Rect bounds) {
-        View cell = apps.cellView(index);
+        View cell = menuGrid().cellAt(index);
         if (cell == null || !cell.isLaidOut()) {
             return false;
         }
@@ -1101,6 +1319,18 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
 
     /** Opens the home menu without a gesture. Returns false if the current view has none. */
     private native boolean nativeOpenMenu();
+
+    /** A tap outside the open folder: it closes. */
+    private native void nativeCloseFolder();
+
+    /** The user tapped the open folder's name, or chose Rename folder: {@code folder}'s. */
+    private native void nativeRenameRequested(int folder);
+
+    /** The user named {@code folder} {@code name}. */
+    private native void nativeFolderRenamed(int folder, String name);
+
+    /** The user left the folder's name as it was. */
+    private native void nativeRenameCancelled();
 
     /**
      * An item of the home menu was chosen, 0 to 2, or {@link #CLOSE_MENU} for a touch outside

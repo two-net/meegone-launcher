@@ -132,6 +132,13 @@ pub const DRAG_LIFT_SCALE: f64 = 1.10;
 /// APPS-12: a dragged icon takes a new place once its centre has stayed over it this long, so
 /// a quick drag across the grid doesn't shuffle every cell it passes.
 pub const REORDER_DWELL: Duration = ms(150);
+/// FOLD-01: a dragged app held over another's icon this long makes a folder when dropped.
+pub const FOLDER_HOVER: Duration = ms(400);
+/// ANIM-14: the icon an app is held over grows to this scale while it waits…
+pub const FOLDER_HOVER_SCALE: f64 = 1.1;
+/// …then pulses down to this one and back, once every [`FOLDER_PULSE`], until the drop.
+pub const FOLDER_PULSE_SCALE: f64 = 1.05;
+pub const FOLDER_PULSE: Duration = ms(600);
 /// APPS-12: a dragged icon whose centre is this close to the top or bottom of the visible grid,
 /// in dp, scrolls it…
 pub const AUTO_SCROLL_ZONE_DP: f64 = 64.0;

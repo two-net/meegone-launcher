@@ -11,6 +11,7 @@ use meegone_apps_data::{FolderId, Layout, LayoutEntry};
 use meegone_core_data::{App, AppId, Profile, ProfileId};
 
 use crate::GridItem;
+use crate::folders::tidy;
 
 /// How the layout being reconciled came about.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,6 +39,17 @@ pub enum Start {
 ///   gone, and one not placed yet, with the same profile and package (APPS-08).
 /// - Apps not placed yet join the end, as `start` says.
 pub fn reconcile(saved: &Layout, installed: &[App], profiles: &[Profile], start: &Start) -> Layout {
+    tidy(&reconcile_draft(saved, installed, profiles, start))
+}
+
+/// [`reconcile`], except that a folder left with one app stays a folder: a drag in progress may
+/// have left it so, and the drop tidies it (FOLD-05, ADR 0015). An empty folder still goes.
+pub fn reconcile_draft(
+    saved: &Layout,
+    installed: &[App],
+    profiles: &[Profile],
+    start: &Start,
+) -> Layout {
     let present: HashMap<&AppId, &App> = installed.iter().map(|app| (&app.id, app)).collect();
     let waiting = waiting_profiles(installed, profiles);
     let renamed = renamed(saved, &present, &waiting);
@@ -58,15 +70,13 @@ pub fn reconcile(saved: &Layout, installed: &[App], profiles: &[Profile], start:
         match entry {
             LayoutEntry::App(id) => entries.extend(place(id).map(LayoutEntry::App)),
             LayoutEntry::Folder { id, name, apps } => {
-                let mut kept: Vec<AppId> = apps.iter().filter_map(&mut place).collect();
-                if kept.len() > 1 {
+                let kept: Vec<AppId> = apps.iter().filter_map(&mut place).collect();
+                if !kept.is_empty() {
                     entries.push(LayoutEntry::Folder {
                         id: folder_ids.unique(*id),
                         name: name.clone(),
                         apps: kept,
                     });
-                } else if let Some(only) = kept.pop() {
-                    entries.push(LayoutEntry::App(only));
                 }
             }
         }
@@ -131,14 +141,37 @@ pub fn grid(layout: &Layout, installed: &[App]) -> Vec<GridItem> {
 
 /// Where each cell of `after` was in `before`, matched by the app or folder it shows, or `None`
 /// for a cell that just joined the grid. The host moves each cell from its old place (ANIM-21).
+///
+/// A cell that changed what it is keeps its place, so the host reuses its view (ADR 0015): a
+/// folder that just formed was the cell of its first app, and an app a folder turned back into
+/// was that folder's cell (FOLD-06).
 pub fn previous_places(before: &[GridItem], after: &[GridItem]) -> Vec<Option<usize>> {
     let mut places: HashMap<Key<'_>, usize> = HashMap::new();
     for (index, item) in before.iter().enumerate() {
         places.entry(Key::of(item)).or_insert(index);
     }
+    let still: HashSet<Key<'_>> = after.iter().map(Key::of).collect();
+    // The apps of each folder that has gone, and where that folder was.
+    let mut gone_folders: HashMap<&AppId, usize> = HashMap::new();
+    for (index, item) in before.iter().enumerate() {
+        if let GridItem::Folder { apps, .. } = item {
+            if !still.contains(&Key::of(item)) {
+                for app in apps {
+                    gone_folders.entry(&app.id).or_insert(index);
+                }
+            }
+        }
+    }
     after
         .iter()
-        .map(|item| places.get(&Key::of(item)).copied())
+        .map(|item| {
+            places.get(&Key::of(item)).copied().or_else(|| match item {
+                GridItem::Folder { apps, .. } => apps
+                    .first()
+                    .and_then(|first| places.get(&Key::App(&first.id)).copied()),
+                GridItem::App { app, .. } => gone_folders.get(&app.id).copied(),
+            })
+        })
         .collect()
 }
 
@@ -150,21 +183,6 @@ pub fn cells_moved(before: &[GridItem], after: &[GridItem]) -> bool {
             .iter()
             .enumerate()
             .any(|(place, from)| *from != Some(place))
-}
-
-/// `cells` with `app`'s own cell moved to place `to`, or as far as it goes, and the cells
-/// between moved aside (APPS-12). Returns false, changing nothing, if `app` has no cell of its
-/// own.
-pub fn arrange(cells: &mut Vec<GridItem>, app: &AppId, to: usize) -> bool {
-    let Some(from) = cells
-        .iter()
-        .position(|item| matches!(item, GridItem::App { app: shown, .. } if shown.id == *app))
-    else {
-        return false;
-    };
-    let cell = cells.remove(from);
-    cells.insert(to.min(cells.len()), cell);
-    true
 }
 
 /// `layout` in the order of the cells `shown` (APPS-12, APPS-18). Entries that show no cell,
@@ -296,13 +314,13 @@ fn defaults_first<'a>(joining: Vec<&'a App>, defaults: &[String]) -> Vec<&'a App
 }
 
 /// Gives each folder an id no other folder has: recovery can bring back two with the same id.
-struct FolderIds {
+pub(crate) struct FolderIds {
     used: HashSet<FolderId>,
     next: u32,
 }
 
 impl FolderIds {
-    fn new(saved: &Layout) -> Self {
+    pub(crate) fn new(saved: &Layout) -> Self {
         let highest = saved
             .entries
             .iter()
@@ -317,7 +335,7 @@ impl FolderIds {
         }
     }
 
-    fn unique(&mut self, id: FolderId) -> FolderId {
+    pub(crate) fn unique(&mut self, id: FolderId) -> FolderId {
         if self.used.insert(id) {
             return id;
         }
@@ -822,36 +840,6 @@ mod tests {
         assert!(!cells_moved(&[], &[]));
     }
 
-    fn shown(cells: &[GridItem]) -> Vec<&str> {
-        cells
-            .iter()
-            .map(|item| match item {
-                GridItem::App { app, .. } => app.id.package.as_str(),
-                GridItem::Folder { name, .. } => name.as_str(),
-            })
-            .collect()
-    }
-
-    #[test]
-    fn arranging_moves_an_apps_cell_and_the_others_aside() {
-        // APPS-12
-        let mut grid = cells(&["camera", "mail", "maps", "phone"]);
-
-        assert!(arrange(&mut grid, &app_id("maps"), 0));
-        assert_eq!(shown(&grid), ["maps", "camera", "mail", "phone"]);
-
-        assert!(arrange(&mut grid, &app_id("maps"), 2));
-        assert_eq!(shown(&grid), ["camera", "mail", "maps", "phone"]);
-
-        // Past the end is the last place.
-        assert!(arrange(&mut grid, &app_id("camera"), 99));
-        assert_eq!(shown(&grid), ["mail", "maps", "phone", "camera"]);
-
-        // An app with no cell of its own changes nothing.
-        assert!(!arrange(&mut grid, &app_id("atlas"), 0));
-        assert_eq!(shown(&grid), ["mail", "maps", "phone", "camera"]);
-    }
-
     #[test]
     fn following_the_shown_order_keeps_hidden_entries_in_their_slots() {
         // APPS-12, APPS-18, ADR 0012: the work apps of a locked profile show no cell, and keep
@@ -874,7 +862,8 @@ mod tests {
                 apps: vec![app("chess", "Chess"), app("go", "Go")],
             },
         );
-        assert!(arrange(&mut grid, &app_id("phone"), 0));
+        let phone = grid.remove(3);
+        grid.insert(0, phone);
 
         let kept = follow_order(&saved, &grid);
 
@@ -888,5 +877,26 @@ mod tests {
         assert_eq!(kept.new, saved.new);
         // The order shown already is the layout's.
         assert_eq!(follow_order(&kept, &grid), kept);
+    }
+
+    #[test]
+    fn a_folder_that_forms_or_collapses_keeps_its_cells_place() {
+        // ADR 0015: Maps was dropped onto Mail; later the folder turned back into Mail.
+        let folder = |apps: &[&str]| GridItem::Folder {
+            id: FolderId(1),
+            name: String::new(),
+            apps: apps.iter().map(|package| app(package, package)).collect(),
+        };
+        let before = cells(&["camera", "mail", "maps"]);
+        let formed = vec![cell("camera"), folder(&["mail", "maps"])];
+        assert_eq!(previous_places(&before, &formed), [Some(0), Some(1)]);
+
+        let collapsed = cells(&["camera", "mail", "maps"]);
+        let before = vec![cell("camera"), folder(&["mail"]), cell("maps")];
+        assert_eq!(
+            previous_places(&before, &collapsed),
+            [Some(0), Some(1), Some(2)]
+        );
+        assert!(!cells_moved(&before, &collapsed));
     }
 }

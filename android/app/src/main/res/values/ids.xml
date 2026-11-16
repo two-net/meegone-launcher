@@ -10,4 +10,7 @@
     <item name="action_move_earlier" type="id" />
     <item name="action_move_later" type="id" />
     <item name="action_move_last" type="id" />
+    <!-- Folders' screen-reader actions in edit mode (A11Y-05). -->
+    <item name="action_group" type="id" />
+    <item name="action_move_out" type="id" />
 </resources>

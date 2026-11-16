@@ -4,7 +4,6 @@ import android.content.Context;
 import android.graphics.Canvas;
 import android.graphics.ColorMatrix;
 import android.graphics.ColorMatrixColorFilter;
-import android.graphics.Outline;
 import android.graphics.Paint;
 import android.graphics.Rect;
 import android.graphics.RectF;
@@ -18,15 +17,15 @@ import android.text.TextUtils;
 import android.util.TypedValue;
 import android.view.MotionEvent;
 import android.view.View;
-import android.view.ViewOutlineProvider;
 import android.view.accessibility.AccessibilityNodeInfo;
 import android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction;
+import java.util.Arrays;
 import java.util.Objects;
 
 /**
- * One cell of the Applications grid: an app's icon with its label below (APPS-01, ADR 0010).
- * It is a single view that draws both, so a grid of a few hundred apps lays out quickly
- * (PERF-04).
+ * One cell of the Applications grid or of an open folder: an app's icon with its label below
+ * (APPS-01, ADR 0010), or a folder's (FOLD-02, ADR 0015). It is a single view that draws both,
+ * so a grid of a few hundred apps lays out quickly (PERF-04).
  *
  * <p>The icon is 56 dp, with a placeholder plate in the icons' shape until it loads (APPS-15).
  * The label sits 4 dp below it, at 12 sp in the theme's text colour, on one line and ellipsised
@@ -34,19 +33,27 @@ import java.util.Objects;
  * of overlapping, and its 8 dp above and below leave 16 dp between rows. A pressed icon shrinks
  * (ANIM-10). An unavailable app is drawn greyed and at half opacity (APPS-09). A new app has a
  * small dot in the accent colour before its label (APPS-07). As apps come and go, the grid
- * scales, fades and slides the whole cell (ANIM-21). A picked-up icon lifts above the other
- * cells and follows the finger (APPS-11); the two never undo each other.
+ * scales, fades and slides the whole cell (ANIM-21). While its icon is dragged, {@link
+ * DragShadow} draws it, and the cell is a gap (APPS-11).
+ *
+ * <p>A folder's icon is a plate in the icons' shape, in the surface colour, with its first four
+ * apps in a 2×2 preview whose slots match {@code preview_slot} in the Rust app. Its label is its
+ * name, or "Folder" until it has one (FOLD-03). The icon a dragged app is held over grows and
+ * pulses, and a folder taking in a dropped app leaves the app's slot empty until it lands; a
+ * folder just made shows its first app shrinking into its slot (ANIM-14).
  *
  * <p>In edit mode (APPS-12, ADR 0014) the whole cell is drawn at 92 %, and an app the user can
  * uninstall has a ✕ over its icon's top-start corner, which pops in and out as the frame says
  * (ANIM-12). A tap within the cell's top-start 48 dp square taps the ✕ (A11Y-02, APPS-13); any
- * other tap does nothing. A lifted or settling icon takes the lift's scale instead.
+ * other tap on an app does nothing, and one on a folder opens it (FOLD-04).
  *
  * <p>Screen readers read its label, "work" for a work-profile app (A11Y-01), and "new" for a
- * new one. An app's cell offers "Open menu", which opens its long-press menu (A11Y-05). In edit
- * mode it also offers "Uninstall ‹label›" for its ✕ (A11Y-01), and "Move to start", "Move
- * earlier", "Move later" and "Move to end" instead of dragging (A11Y-05). The view itself isn't
- * long-clickable: {@link HomeViews} times long-presses.
+ * new one; a folder is "Folder: ‹name›, N apps". Each cell offers "Open menu", which opens its
+ * long-press menu (A11Y-05). In edit mode it also offers "Uninstall ‹label›" for an app's ✕
+ * (A11Y-01), and "Move to start", "Move earlier", "Move later" and "Move to end" instead of
+ * dragging (A11Y-05). An app in the grid offers "Make folder with ‹next›", or "Move into
+ * ‹folder›" when the next cell is a folder, and an app in an open folder "Move out of folder".
+ * The view itself isn't long-clickable: {@link HomeViews} times long-presses.
  */
 final class AppCell extends View {
     private static final float ICON_DP = 56f;
@@ -58,8 +65,11 @@ final class AppCell extends View {
     private static final float DOT_DP = 6f;
     private static final float DOT_GAP_DP = 4f;
     private static final float DIMMED_ALPHA = 0.5f;
-    /** How far a picked-up icon rises above the other cells. */
-    private static final float LIFT_DP = 8f;
+    /** A folder's preview, as {@code PREVIEW_INSET} and {@code PREVIEW_GAP} in the Rust app. */
+    private static final int PREVIEW_APPS = 4;
+    private static final float PREVIEW_INSET = 0.14f;
+    private static final float PREVIEW_GAP = 0.06f;
+    private static final int NONE = -1;
     /** The ✕: a disc this wide, its centre this far inside the icon's top-start corner. */
     private static final float BADGE_DP = 24f;
     private static final float BADGE_INSET_DP = 4f;
@@ -79,6 +89,9 @@ final class AppCell extends View {
     private final AppsGrid grid;
     private final TextPaint text = new TextPaint(Paint.ANTI_ALIAS_FLAG);
     private final Paint plate = new Paint(Paint.ANTI_ALIAS_FLAG);
+    /** A folder's plate, in the surface colour with a faint ring (FOLD-02). */
+    private final Paint folderFill = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint folderRing = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint dot = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint badgeFill = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint badgeRing = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -92,7 +105,6 @@ final class AppCell extends View {
     private final int sidePaddingPx;
     private final int dotPx;
     private final int dotGapPx;
-    private final int liftPx;
     private final int badgePx;
     private final int badgeInsetPx;
     private final int badgeArmPx;
@@ -101,7 +113,7 @@ final class AppCell extends View {
     /** Its place in the grid's cells. */
     private int index;
     private String label = "";
-    /** The app it launches, or null for a folder, which #14 draws. */
+    /** The app it launches, or null for a folder. */
     private String packageName;
     private String activity;
     private long profile;
@@ -110,6 +122,21 @@ final class AppCell extends View {
     private boolean isNew;
     /** The user can uninstall it, so in edit mode it has a ✕ (APPS-12). */
     private boolean uninstallable;
+    /** A folder's apps, and the keys of its first ones: profile, package and activity. */
+    private int count;
+    private String[][] preview = new String[0][];
+    private final Drawable[] previewIcons = new Drawable[PREVIEW_APPS];
+    /** Its icon is dragged: {@link DragShadow} draws it, and the cell is a gap. */
+    private boolean hidden;
+    /** Its icon's scale while a dragged app is held over it (ANIM-14). */
+    private float hoverScale = 1f;
+    /**
+     * A folder taking in a dropped app (ANIM-14): the preview slot left empty until it lands,
+     * or -1, whether the folder was just made, and how far the app has gone in.
+     */
+    private int mergeSlot = NONE;
+    private boolean mergeFormed;
+    private float mergeProgress = 1f;
     /** Edit mode is on: only the ✕ acts on a tap (APPS-12). */
     private boolean editing;
     /** The whole cell's scale in edit mode, and its ✕'s (ANIM-12). */
@@ -117,8 +144,6 @@ final class AppCell extends View {
     private float badgeScale;
     /** A finger went down on the ✕ and hasn't left it. */
     private boolean badgeDown;
-    /** It is lifted or settling: the lift's scale takes the place of edit mode's. */
-    private boolean raised;
     /** Its cell left the grid: it only shrinks away, and can't be tapped (ANIM-21). */
     private boolean leaving;
     /** Its opacity as the grid changes, on top of the dimming of an unavailable app. */
@@ -127,10 +152,6 @@ final class AppCell extends View {
     private float motionScale = 1f;
     private float motionDx;
     private float motionDy;
-    /** Its scale and distance from its place while it is picked up (APPS-11). */
-    private float liftScale = 1f;
-    private float liftDx;
-    private float liftDy;
     private Drawable icon;
     private StaticLayout labelLayout;
     private float iconScale = 1f;
@@ -145,13 +166,14 @@ final class AppCell extends View {
         sidePaddingPx = Math.round(SIDE_PADDING_DP * density);
         dotPx = Math.round(DOT_DP * density);
         dotGapPx = Math.round(DOT_GAP_DP * density);
-        liftPx = Math.round(LIFT_DP * density);
         badgePx = Math.round(BADGE_DP * density);
         badgeInsetPx = Math.round(BADGE_INSET_DP * density);
         badgeArmPx = Math.round(BADGE_ARM_DP * density);
         badgeTargetPx = Math.round(BADGE_TARGET_DP * density);
         badgeRing.setStyle(Paint.Style.STROKE);
         badgeRing.setStrokeWidth(Math.max(1f, density));
+        folderRing.setStyle(Paint.Style.STROKE);
+        folderRing.setStrokeWidth(Math.max(1f, density));
         badgeCross.setStyle(Paint.Style.STROKE);
         badgeCross.setStrokeWidth(BADGE_STROKE_DP * density);
         badgeCross.setStrokeCap(Paint.Cap.ROUND);
@@ -159,15 +181,6 @@ final class AppCell extends View {
                 TypedValue.COMPLEX_UNIT_SP, LABEL_SP, getResources().getDisplayMetrics()));
         heightPx = heightPx(context);
         setOnClickListener(view -> grid.tapped(this));
-        // A picked-up icon's shadow takes the icons' shape (APPS-15).
-        setOutlineProvider(new ViewOutlineProvider() {
-            @Override
-            public void getOutline(View view, Outline outline) {
-                int left = Math.round(view.getWidth() / 2f - iconPx / 2f);
-                outline.setRoundRect(left, verticalPaddingPx, left + iconPx,
-                        verticalPaddingPx + iconPx, iconPx * AppIcons.CORNER);
-            }
-        });
     }
 
     /** The height of every cell: the same for every label, so rows line up. */
@@ -186,20 +199,42 @@ final class AppCell extends View {
         return Math.round(ICON_DP * context.getResources().getDisplayMetrics().density);
     }
 
+    /** How far below the cell's top its icon starts, in px. */
+    static int iconTopPx(Context context) {
+        return Math.round(
+                VERTICAL_PADDING_DP * context.getResources().getDisplayMetrics().density);
+    }
+
     /**
-     * Shows cell {@code index}: an app, or a folder when {@code packageName} is null. Its icon
-     * is asked for again.
+     * Shows cell {@code index}: an app, or a folder of {@code count} apps when {@code
+     * packageName} is null, whose first apps {@code preview} names. Its icons are asked for
+     * again.
      */
     void bind(int index, String label, String packageName, String activity, long profile,
-            boolean available, boolean work, boolean isNew, boolean uninstallable) {
+            boolean available, boolean work, boolean isNew, boolean uninstallable, int count,
+            String[][] preview) {
         this.index = index;
-        boolean labelChanged = !label.equals(this.label) || isNew != this.isNew;
+        boolean labelChanged = !label.equals(this.label) || isNew != this.isNew
+                || (packageName == null) != (this.packageName == null);
         boolean otherApp = profile != this.profile
                 || !Objects.equals(packageName, this.packageName)
                 || !Objects.equals(activity, this.activity);
         if (otherApp) {
             icon = null;
         }
+        if (!Arrays.deepEquals(preview, this.preview)) {
+            // Each slot keeps its icon only while it shows the same app.
+            for (int i = 0; i < PREVIEW_APPS; i++) {
+                boolean same = i < preview.length && i < this.preview.length
+                        && Arrays.equals(preview[i], this.preview[i]);
+                if (!same) {
+                    previewIcons[i] = null;
+                }
+            }
+            this.preview = preview;
+            invalidate();
+        }
+        this.count = count;
         this.label = label;
         this.packageName = packageName;
         this.activity = activity;
@@ -210,13 +245,18 @@ final class AppCell extends View {
             this.uninstallable = uninstallable;
             invalidate();
         }
-        boolean app = packageName != null;
-        setClickable(app);
+        setClickable(true);
         setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_YES);
-        String description = work ? getResources().getString(R.string.app_work, label) : label;
-        setContentDescription(isNew
-                ? getResources().getString(R.string.app_new, description)
-                : description);
+        if (isFolder()) {
+            setContentDescription(getResources().getQuantityString(
+                    R.plurals.folder_description, count, name(), count));
+        } else {
+            String description =
+                    work ? getResources().getString(R.string.app_work, label) : label;
+            setContentDescription(isNew
+                    ? getResources().getString(R.string.app_new, description)
+                    : description);
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             setStateDescription(available
                     ? null
@@ -241,14 +281,36 @@ final class AppCell extends View {
             icon = found;
             invalidate();
         }
+        for (int i = 0; i < Math.min(PREVIEW_APPS, preview.length); i++) {
+            String[] key = preview[i];
+            Drawable slot = grid.icon(AppsGrid.parseLong(key[0]), key[1], key[2]);
+            if (slot != null && slot != previewIcons[i]) {
+                previewIcons[i] = slot;
+                invalidate();
+            }
+        }
     }
 
     int index() {
         return index;
     }
 
+    AppsGrid grid() {
+        return grid;
+    }
+
+    /** Its label as it is stored: a folder's is "" until the user names it (FOLD-03). */
     String label() {
         return label;
+    }
+
+    /** Its name as it shows: its label, or "Folder" for a folder with none (FOLD-03). */
+    String name() {
+        return isFolder() && label.isEmpty() ? getResources().getString(R.string.folder) : label;
+    }
+
+    boolean isFolder() {
+        return packageName == null;
     }
 
     /**
@@ -257,6 +319,8 @@ final class AppCell extends View {
      */
     void setColours(int foreground, int dim, int accent, int surface) {
         text.setColor(foreground);
+        folderFill.setColor(surface);
+        folderRing.setColor((dim & 0x00FFFFFF) | 0x40000000);
         // A faint plate in the secondary text colour.
         plate.setColor((dim & 0x00FFFFFF) | 0x33000000);
         dot.setColor(accent);
@@ -310,30 +374,43 @@ final class AppCell extends View {
         }
     }
 
-    /**
-     * How the cell is drawn while it is picked up (APPS-11): its scale, and how far it is from
-     * its place, in px. {@code lifted} raises it above the other cells, with a shadow.
-     */
-    void setLift(float dx, float dy, float scale, boolean lifted) {
-        liftScale = scale;
-        liftDx = dx;
-        liftDy = dy;
-        raised = lifted;
-        applyTransform();
-        setTranslationZ(lifted ? liftPx : 0f);
+    /** Leaves the cell as a gap while {@link DragShadow} draws its icon (ADR 0015). */
+    void setHidden(boolean hidden) {
+        if (hidden != this.hidden) {
+            this.hidden = hidden;
+            invalidate();
+        }
+    }
+
+    /** Its icon's scale while a dragged app is held over it (ANIM-14). */
+    void setHoverScale(float scale) {
+        if (scale != hoverScale) {
+            hoverScale = scale;
+            invalidate();
+        }
     }
 
     /**
-     * Combines the grid's motion, edit mode's scale and the lift. A lifted or settling icon is
-     * drawn where the lift says, from its cell's place, at the lift's scale instead of edit
-     * mode's, so the grid's motion never moves it away from the finger.
+     * A folder taking in a dropped app (ANIM-14): preview slot {@code slot} stays empty until
+     * {@code progress} reaches 1, or none at -1, and if it was just {@code formed}, its first
+     * app shrinks into slot 0 from the whole icon as the plate fades in.
      */
+    void setMerge(int slot, boolean formed, float progress) {
+        if (slot != mergeSlot || formed != mergeFormed || progress != mergeProgress) {
+            mergeSlot = slot;
+            mergeFormed = formed;
+            mergeProgress = progress;
+            invalidate();
+        }
+    }
+
+    /** Combines the grid's motion and edit mode's scale. */
     private void applyTransform() {
-        float scale = motionScale * (raised ? liftScale : editScale);
+        float scale = motionScale * editScale;
         setScaleX(scale);
         setScaleY(scale);
-        setTranslationX((raised ? 0f : motionDx) + liftDx);
-        setTranslationY((raised ? 0f : motionDy) + liftDy);
+        setTranslationX(motionDx);
+        setTranslationY(motionDy);
     }
 
     /** Its cell left the grid: it shrinks away where it was, and can't be used (ANIM-21). */
@@ -364,14 +441,14 @@ final class AppCell extends View {
         return new Rect(left, top, left + iconPx, top + iconPx);
     }
 
-    /** Whether it is an app's cell that can be used: not a folder, and not leaving. */
+    /** Whether it is a cell that can be used, with a menu: not leaving. */
     private boolean hasMenu() {
-        return packageName != null && !leaving;
+        return !leaving;
     }
 
-    /** Whether it has a ✕ in edit mode (APPS-12, APPS-13). */
+    /** Whether it has a ✕ in edit mode (APPS-12, APPS-13): an app the user can uninstall. */
     private boolean hasBadge() {
-        return hasMenu() && uninstallable;
+        return hasMenu() && !isFolder() && uninstallable;
     }
 
     /** Whether ({@code x}, {@code y}) is in the ✕'s target: the cell's top-start square. */
@@ -381,11 +458,12 @@ final class AppCell extends View {
         return across && y >= 0 && y < badgeTargetPx;
     }
 
-    // In edit mode only the ✕ acts: a tap on it asks the system to uninstall the app (APPS-13),
-    // and any other tap launches nothing (APPS-12). The long-press is still HomeViews'.
+    // In edit mode only the ✕ acts on an app: a tap on it asks the system to uninstall the app
+    // (APPS-13), and any other tap launches nothing (APPS-12). A folder still opens. The
+    // long-press is still HomeViews'.
     @Override
     public boolean onTouchEvent(MotionEvent event) {
-        if (!editing || !hasMenu()) {
+        if (!editing || !hasMenu() || isFolder()) {
             return super.onTouchEvent(event);
         }
         float x = event.getX();
@@ -409,9 +487,9 @@ final class AppCell extends View {
         return true;
     }
 
-    // Screen readers open the app's menu with "double-tap and hold", or from their actions
+    // Screen readers open the cell's menu with "double-tap and hold", or from their actions
     // (A11Y-05). Only the accessibility node is long-clickable. In edit mode, they uninstall and
-    // move the app with actions too (A11Y-01, A11Y-05).
+    // move it, and put apps into folders and take them out, with actions too (A11Y-01, A11Y-05).
     @Override
     public void onInitializeAccessibilityNodeInfo(AccessibilityNodeInfo info) {
         super.onInitializeAccessibilityNodeInfo(info);
@@ -436,6 +514,17 @@ final class AppCell extends View {
             addAction(info, R.id.action_move_later, R.string.action_move_later);
             addAction(info, R.id.action_move_last, R.string.action_move_last);
         }
+        if (isFolder()) {
+            return;
+        }
+        AppCell next = grid.cellAt(index + 1);
+        if (grid.surface() == AppsGrid.GRID && next != null) {
+            int text = next.isFolder() ? R.string.action_move_into : R.string.action_make_folder;
+            info.addAction(new AccessibilityAction(
+                    R.id.action_group, getResources().getString(text, next.name())));
+        } else if (grid.surface() == AppsGrid.FOLDER) {
+            addAction(info, R.id.action_move_out, R.string.action_move_out);
+        }
     }
 
     private void addAction(AccessibilityNodeInfo info, int id, int text) {
@@ -451,6 +540,12 @@ final class AppCell extends View {
             if (action == R.id.action_uninstall && hasBadge()) {
                 grid.badgeTapped(this);
                 return true;
+            }
+            if (action == R.id.action_group && !isFolder()) {
+                return grid.grouped(this);
+            }
+            if (action == R.id.action_move_out && !isFolder()) {
+                return grid.movedOut(this);
             }
             int to = moveTo(action);
             if (to >= 0) {
@@ -478,7 +573,7 @@ final class AppCell extends View {
     public void setPressed(boolean pressed) {
         boolean changed = pressed != isPressed();
         super.setPressed(pressed);
-        if (changed && packageName != null && !leaving) {
+        if (changed && !leaving) {
             grid.pressChanged(this, pressed);
         }
     }
@@ -502,20 +597,16 @@ final class AppCell extends View {
 
     @Override
     protected void onDraw(Canvas canvas) {
+        if (hidden) {
+            return;
+        }
         float centreX = getWidth() / 2f;
         int iconTop = verticalPaddingPx;
         canvas.save();
-        canvas.scale(iconScale, iconScale, centreX, iconTop + iconPx / 2f);
+        float scale = iconScale * hoverScale;
+        canvas.scale(scale, scale, centreX, iconTop + iconPx / 2f);
         int iconLeft = Math.round(centreX - iconPx / 2f);
-        if (icon != null) {
-            icon.setBounds(iconLeft, iconTop, iconLeft + iconPx, iconTop + iconPx);
-            icon.setColorFilter(available ? null : GREYED);
-            icon.draw(canvas);
-        } else {
-            plateBounds.set(iconLeft, iconTop, iconLeft + iconPx, iconTop + iconPx);
-            float corner = iconPx * AppIcons.CORNER;
-            canvas.drawRoundRect(plateBounds, corner, corner, plate);
-        }
+        drawIcon(canvas, iconLeft, iconTop, iconPx);
         canvas.restore();
 
         StaticLayout layout = labelLayout();
@@ -530,6 +621,78 @@ final class AppCell extends View {
         }
         if (badgeScale > 0f) {
             drawBadge(canvas, iconLeft, iconTop);
+        }
+    }
+
+    /**
+     * Draws its icon in the square at ({@code left}, {@code top}), {@code size} px wide: the
+     * app's, or a folder's plate and preview. {@link DragShadow} draws a dragged icon with it.
+     */
+    void drawIcon(Canvas canvas, float left, float top, float size) {
+        float corner = size * AppIcons.CORNER;
+        plateBounds.set(left, top, left + size, top + size);
+        if (isFolder()) {
+            drawFolder(canvas, corner, size);
+        } else if (icon != null) {
+            icon.setBounds(Math.round(left), Math.round(top), Math.round(left + size),
+                    Math.round(top + size));
+            icon.setColorFilter(available ? null : GREYED);
+            icon.draw(canvas);
+        } else {
+            canvas.drawRoundRect(plateBounds, corner, corner, plate);
+        }
+    }
+
+    /**
+     * A folder's icon in {@link #plateBounds} (FOLD-02): the plate, then its first apps in the
+     * preview's slots, in reading order and mirrored right to left. A slot an app is going into
+     * stays empty until it lands, and the first app of a folder just made shrinks into its slot
+     * from the whole icon as the plate fades in (ANIM-14).
+     */
+    private void drawFolder(Canvas canvas, float corner, float size) {
+        float left = plateBounds.left;
+        float top = plateBounds.top;
+        boolean forming = mergeFormed && mergeProgress < 1f;
+        int fillAlpha = folderFill.getAlpha();
+        int ringAlpha = folderRing.getAlpha();
+        if (forming) {
+            folderFill.setAlpha(Math.round(fillAlpha * mergeProgress));
+            folderRing.setAlpha(Math.round(ringAlpha * mergeProgress));
+        }
+        canvas.drawRoundRect(plateBounds, corner, corner, folderFill);
+        float ring = folderRing.getStrokeWidth() / 2f;
+        canvas.drawRoundRect(left + ring, top + ring, left + size - ring, top + size - ring,
+                corner, corner, folderRing);
+        folderFill.setAlpha(fillAlpha);
+        folderRing.setAlpha(ringAlpha);
+        boolean rtl = getLayoutDirection() == LAYOUT_DIRECTION_RTL;
+        float slotSize = (1f - 2f * PREVIEW_INSET - PREVIEW_GAP) / 2f;
+        for (int i = 0; i < Math.min(PREVIEW_APPS, preview.length); i++) {
+            if (i == mergeSlot && mergeProgress < 1f) {
+                continue;
+            }
+            int column = rtl ? 1 - i % 2 : i % 2;
+            int row = i / 2;
+            float x = left + size * (PREVIEW_INSET + column * (slotSize + PREVIEW_GAP));
+            float y = top + size * (PREVIEW_INSET + row * (slotSize + PREVIEW_GAP));
+            float width = size * slotSize;
+            if (forming && i == 0) {
+                // From the whole icon into the slot.
+                float t = mergeProgress;
+                x = left + (x - left) * t;
+                y = top + (y - top) * t;
+                width = size + (width - size) * t;
+            }
+            Drawable slot = previewIcons[i];
+            if (slot != null) {
+                slot.setBounds(Math.round(x), Math.round(y), Math.round(x + width),
+                        Math.round(y + width));
+                slot.setColorFilter(null);
+                slot.draw(canvas);
+            } else {
+                float slotCorner = width * AppIcons.CORNER;
+                canvas.drawRoundRect(x, y, x + width, y + width, slotCorner, slotCorner, plate);
+            }
         }
     }
 
@@ -572,7 +735,8 @@ final class AppCell extends View {
     private StaticLayout labelLayout() {
         int width = getWidth() - 2 * (sidePaddingPx + dotRoom());
         if (labelLayout == null && width > 0) {
-            labelLayout = StaticLayout.Builder.obtain(label, 0, label.length(), text, width)
+            String shown = name();
+            labelLayout = StaticLayout.Builder.obtain(shown, 0, shown.length(), text, width)
                     .setAlignment(Layout.Alignment.ALIGN_CENTER)
                     .setMaxLines(1)
                     .setEllipsize(TextUtils.TruncateAt.END)

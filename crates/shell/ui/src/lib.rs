@@ -5,8 +5,8 @@
 //! It also tells the host what to draw for the home views in each frame, as a [`HomeFrame`]:
 //! where the carousel's views are, how the view indicator looks, how the content comes back
 //! from an app, the home menu, the Applications grid, the pressed icon, the grid's cells as
-//! apps come, go and move, an app's long-press menu, the dragged icon and edit mode (ADR 0006
-//! to ADR 0008, ADR 0010, ADR 0012 to ADR 0014).
+//! apps come, go and move, a cell's long-press menu, the dragged icon, edit mode and the open
+//! folder (ADR 0006 to ADR 0008, ADR 0010, ADR 0012 to ADR 0015).
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -14,7 +14,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use meegone_apps_ui::AppsView;
-pub use meegone_apps_ui::{AppMenuFrame, AppMenuItem, AppsFrame, Cell, GridLayout};
+pub use meegone_apps_ui::{
+    AppMenuFrame, AppMenuItem, AppsFrame, Bounds, Cell, CellKey, FolderCellsFrame, FolderId,
+    GridLayout, Surface,
+};
 use meegone_core_ui::{Dispatch, Latest, Rgb, Slot, View, tokens};
 use meegone_events_ui::EventsView;
 use meegone_lockimage_ui::{ImageCard, ImageSettingsSection};
@@ -53,20 +56,71 @@ pub struct GridChangeFrame {
     pub shift: u16,
 }
 
-/// The app icon a drag after a long-press picked up, as the host draws it (APPS-11, APPS-12).
+/// The dragged icon, as the host draws it above everything (APPS-11, APPS-12, ADR 0015).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LiftFrame {
-    /// Its cell's place in the Applications grid's cells now.
-    pub cell: usize,
-    /// How far it is drawn from its cell's place, in whole pixels, so it stays under the
-    /// finger.
-    pub dx: i32,
-    pub dy: i32,
-    /// Its scale in ten-thousandths: 11 000 while lifted (ANIM-13), springing to edit mode's
-    /// 9 200 as it settles. It takes the place of edit mode's scale for this cell.
+    /// Where its cell is: the grid, or the open folder.
+    pub surface: Surface,
+    /// Its cell's place there now, which the host leaves as a gap; `None` once it has gone
+    /// into a folder.
+    pub cell: Option<usize>,
+    /// Where its icon's centre is on screen, in whole pixels from the home views' top left.
+    pub x: i32,
+    pub y: i32,
+    /// Its scale in ten-thousandths of the icon's size: 11 000 while lifted (ANIM-13), springing
+    /// to edit mode's 9 200 as it settles, or shrinking into a folder's preview (ANIM-14).
     pub scale: u16,
+    /// Its opacity, from 0 to 255: it fades into a folder whose preview is full.
+    pub alpha: u8,
     /// The finger has lifted, and it is settling into its cell (ANIM-13).
     pub settling: bool,
+    /// The finger has lifted over a folder or an app, and it is going into the folder
+    /// (ANIM-14).
+    pub merging: bool,
+}
+
+/// The icon a dragged app is held over, growing and pulsing (ANIM-14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HoverFrame {
+    /// Its place in the grid's cells.
+    pub cell: usize,
+    /// Its icon's scale in ten-thousandths.
+    pub scale: u16,
+}
+
+/// A folder taking in a dropped app (ANIM-14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MergeFrame {
+    /// The folder's place in the grid's cells.
+    pub cell: usize,
+    /// The preview slot the app goes into, left empty until it lands, if the preview has room.
+    pub slot: Option<usize>,
+    /// The folder was just made: its first app shrinks into slot 0 from full size as well.
+    pub formed: bool,
+    /// How far it has come, from 0 to 10 000.
+    pub progress: u16,
+}
+
+/// The open folder's panel (FOLD-04, ANIM-15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FolderFrame {
+    /// The folder it shows, while it is open or closing.
+    pub folder: FolderId,
+    /// It is open, rather than closing: it takes touches.
+    pub open: bool,
+    /// The folder's place in the grid's cells, which it grows from and shrinks back into, or
+    /// `None` if it has none.
+    pub cell: Option<usize>,
+    /// How far it has grown from the folder's icon, from 0 to 10 000.
+    pub progress: u16,
+}
+
+/// The folder whose new name the host asks the user for (FOLD-03).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenameFrame {
+    pub folder: FolderId,
+    /// Its place in the grid's cells, whose name the dialog starts with.
+    pub cell: Option<usize>,
 }
 
 /// Edit mode as the host draws it (APPS-12, ANIM-12).
@@ -107,15 +161,25 @@ pub struct HomeFrame {
     pub content_alpha: u8,
     /// The Applications grid (APPS-01, APPS-02), with an app's long-press menu (APPS-11).
     pub apps: AppsFrame,
-    /// The item of the current view under the finger, by its place in the view's cells
-    /// (ANIM-10).
+    /// The item of the current view under the finger, by its place in the view's cells or the
+    /// open folder's (ANIM-10).
     pub pressed: Option<usize>,
+    pub pressed_surface: Surface,
     /// The pressed item's icon scale in ten-thousandths: 10 000 at rest, 9 200 held (ANIM-10).
     pub press_scale: u16,
     /// The grid's cells as apps come and go (ANIM-21).
     pub grid_change: GridChangeFrame,
-    /// The picked-up icon, while one is, or settles into its cell (APPS-11, APPS-12).
+    /// The dragged icon, while one is lifted, settles into its cell or goes into a folder
+    /// (APPS-11, APPS-12, ANIM-14).
     pub lifted: Option<LiftFrame>,
+    /// The icon a dragged app is held over (ANIM-14).
+    pub hover: Option<HoverFrame>,
+    /// A folder taking in a dropped app (ANIM-14).
+    pub merge: Option<MergeFrame>,
+    /// The open folder's panel, while it is open or closing (FOLD-04, ANIM-15).
+    pub folder: Option<FolderFrame>,
+    /// The folder being renamed (FOLD-03).
+    pub renaming: Option<RenameFrame>,
     /// Edit mode and its motion (APPS-12, ANIM-12).
     pub edit: EditFrame,
     /// Something is still moving or fading, so the host should draw another frame.
@@ -139,6 +203,8 @@ pub struct HomeFrame {
     pub dim: Rgb,
     /// The dot on a newly installed app (APPS-07).
     pub accent: Rgb,
+    /// The opacity of the black scrim behind an open folder, 0 to 255 (FOLD-04).
+    pub scrim: u8,
 }
 
 pub struct ShellView {
@@ -200,15 +266,48 @@ impl ShellView {
     pub fn frame(&mut self, shell: &HomeShell) -> HomeFrame {
         let tokens = tokens(shell.theme().state().theme);
         let state = shell.state();
-        let apps = self.apps.frame(&shell.apps().state());
-        let lifted = state.lift.app.as_ref().and_then(|app| {
-            Some(LiftFrame {
-                cell: self.apps.place_of(app)?,
-                dx: state.lift.dx.round() as i32,
-                dy: state.lift.dy.round() as i32,
-                scale: scale(state.lift.scale),
-                settling: state.lift.settling,
+        let apps_state = shell.apps().state();
+        let mut apps = self.apps.frame(&apps_state);
+        // A failed Applications can't close its menu, so the home is never left covered by it
+        // (ARCH-09).
+        if !state.app_menu_open {
+            apps.menu = None;
+        }
+        let in_grid = |key: &CellKey| self.apps.place_of(Surface::Grid, key);
+        let lift = &state.lift;
+        let lifted = lift.key.as_ref().map(|key| LiftFrame {
+            surface: lift.surface,
+            cell: self.apps.place_of(lift.surface, key),
+            x: lift.x.round() as i32,
+            y: lift.y.round() as i32,
+            scale: scale(lift.scale),
+            alpha: (lift.alpha.clamp(0.0, 1.0) * 255.0).round() as u8,
+            settling: lift.settling,
+            merging: lift.merging,
+        });
+        let hover = state.hover.key.as_ref().and_then(|key| {
+            Some(HoverFrame {
+                cell: in_grid(key)?,
+                scale: scale(state.hover.scale),
             })
+        });
+        let merge = state.merge.folder.and_then(|folder| {
+            Some(MergeFrame {
+                cell: in_grid(&CellKey::Folder(folder))?,
+                slot: state.merge.slot,
+                formed: state.merge.formed,
+                progress: ten_thousandths(state.merge.progress),
+            })
+        });
+        let folder = state.folder.folder.map(|folder| FolderFrame {
+            folder,
+            open: state.folder.open && state.folder_open,
+            cell: in_grid(&CellKey::Folder(folder)),
+            progress: ten_thousandths(state.folder.progress),
+        });
+        let renaming = state.renaming.map(|folder| RenameFrame {
+            folder,
+            cell: in_grid(&CellKey::Folder(folder)),
         });
         let mode = &state.mode;
         HomeFrame {
@@ -220,6 +319,7 @@ impl ShellView {
             content_alpha: (state.return_home.alpha.clamp(0.0, 1.0) * 255.0).round() as u8,
             apps,
             pressed: state.press.item,
+            pressed_surface: state.press.surface,
             // A spring back overshoots full size a little.
             press_scale: scale(state.press.scale),
             grid_change: GridChangeFrame {
@@ -230,6 +330,10 @@ impl ShellView {
                 shift: ten_thousandths(state.grid_change.shift),
             },
             lifted,
+            hover,
+            merge,
+            folder,
+            renaming,
             edit: EditFrame {
                 on: mode.on,
                 scale: scale(mode.scale),
@@ -242,7 +346,8 @@ impl ShellView {
                 || state.press.animating
                 || state.grid_change.animating
                 || state.lift.animating
-                || mode.animating,
+                || mode.animating
+                || state.folder.animating,
             menu: state.menu.map(|menu| MenuFrame {
                 items: menu.items,
                 anchor: menu
@@ -257,6 +362,7 @@ impl ShellView {
             foreground: tokens.text_primary,
             dim: tokens.text_secondary,
             accent: tokens.accent,
+            scrim: (u16::from(tokens.scrim_percent.min(100)) * 255 / 100) as u8,
         }
     }
 

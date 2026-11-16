@@ -7,6 +7,7 @@
 
 use std::time::Duration;
 
+use meegone_apps_state::Surface;
 use meegone_core_state::motion::{
     ICON_PRESS, ICON_PRESS_SCALE, ICON_RELEASE, SpringMotion, decelerate, scaled,
 };
@@ -19,8 +20,11 @@ const REST_SPEED: f64 = 0.05;
 /// The pressed item as it is drawn now: an immutable snapshot inside `ShellState`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PressState {
-    /// The item that is pressed or springing back, by its place in the current view's cells.
+    /// The item that is pressed or springing back, by its place in the current view's cells,
+    /// or the open folder's.
     pub item: Option<usize>,
+    /// Whether it is in the open folder's panel, rather than the view's own cells (FOLD-04).
+    pub surface: Surface,
     /// Its icon's scale, from 0.92 to 1, and briefly a little over 1 as it springs back.
     pub scale: f64,
     /// It is still moving, so the host should draw another frame.
@@ -32,6 +36,7 @@ impl Default for PressState {
     fn default() -> Self {
         Self {
             item: None,
+            surface: Surface::Grid,
             scale: 1.0,
             animating: false,
         }
@@ -59,6 +64,7 @@ pub(crate) struct Press {
     pressed: Option<(usize, Phase)>,
     /// Its icon's scale now.
     scale: f64,
+    surface: Surface,
 }
 
 impl Default for Press {
@@ -66,17 +72,20 @@ impl Default for Press {
         Self {
             pressed: None,
             scale: 1.0,
+            surface: Surface::Grid,
         }
     }
 }
 
 impl Press {
-    /// A finger went down on `item` at `at`. Any other item that was pressed lets go at once.
-    pub fn press(&mut self, item: usize, at: Duration, animation_scale: f64) {
+    /// A finger went down on `item` on `surface` at `at`. Any other item that was pressed lets
+    /// go at once.
+    pub fn press(&mut self, surface: Surface, item: usize, at: Duration, animation_scale: f64) {
         let from = match self.pressed {
-            Some((pressed, _)) if pressed == item => self.scale,
+            Some((pressed, _)) if pressed == item && surface == self.surface => self.scale,
             _ => 1.0,
         };
+        self.surface = surface;
         let length = scaled(ICON_PRESS, animation_scale);
         let phase = if length.is_zero() {
             self.scale = ICON_PRESS_SCALE;
@@ -152,6 +161,7 @@ impl Press {
             None => PressState::default(),
             Some((item, phase)) => PressState {
                 item: Some(item),
+                surface: self.surface,
                 scale: self.scale,
                 animating: phase != Phase::Held,
             },
@@ -173,7 +183,7 @@ mod tests {
         let mut press = Press::default();
         assert_eq!(press.state(), PressState::default());
 
-        press.press(3, ms(1_000), 1.0);
+        press.press(Surface::Grid, 3, ms(1_000), 1.0);
         let first = press.state();
         assert_eq!(
             (first.item, first.scale, first.animating),
@@ -189,6 +199,7 @@ mod tests {
         assert_eq!(
             press.state(),
             PressState {
+                surface: Surface::Grid,
                 item: Some(3),
                 scale: ICON_PRESS_SCALE,
                 animating: false,
@@ -200,7 +211,7 @@ mod tests {
     fn a_frame_from_before_the_touch_doesnt_move_it() {
         // The display's frame time can come just before the touch's time.
         let mut press = Press::default();
-        press.press(0, ms(1_000), 1.0);
+        press.press(Surface::Grid, 0, ms(1_000), 1.0);
 
         press.frame(ms(995));
 
@@ -211,7 +222,7 @@ mod tests {
     fn released_it_springs_back_with_little_overshoot() {
         // ANIM-10, ANIM-02
         let mut press = Press::default();
-        press.press(3, ms(0), 1.0);
+        press.press(Surface::Grid, 3, ms(0), 1.0);
         press.frame(ms(90));
         press.release(ms(500), 1.0);
         assert!(press.state().animating);
@@ -238,7 +249,7 @@ mod tests {
     fn a_quick_tap_springs_back_from_where_it_got_to() {
         // ANIM-03: the release catches the shrink where it is.
         let mut press = Press::default();
-        press.press(1, ms(0), 1.0);
+        press.press(Surface::Grid, 1, ms(0), 1.0);
         press.frame(ms(30));
         let reached = press.state().scale;
 
@@ -253,10 +264,10 @@ mod tests {
     #[test]
     fn pressing_another_item_lets_the_first_go() {
         let mut press = Press::default();
-        press.press(1, ms(0), 1.0);
+        press.press(Surface::Grid, 1, ms(0), 1.0);
         press.frame(ms(90));
 
-        press.press(2, ms(100), 1.0);
+        press.press(Surface::Grid, 2, ms(100), 1.0);
 
         let state = press.state();
         assert_eq!((state.item, state.scale), (Some(2), 1.0));
@@ -266,17 +277,18 @@ mod tests {
     fn it_follows_the_system_animation_speed() {
         // ANIM-05
         let mut slow = Press::default();
-        slow.press(0, ms(0), 2.0);
+        slow.press(Surface::Grid, 0, ms(0), 2.0);
         slow.frame(ms(90));
         assert!(slow.state().scale > ICON_PRESS_SCALE);
         slow.frame(ms(180));
         assert_eq!(slow.state().scale, ICON_PRESS_SCALE);
 
         let mut removed = Press::default();
-        removed.press(0, ms(0), 0.0);
+        removed.press(Surface::Grid, 0, ms(0), 0.0);
         assert_eq!(
             removed.state(),
             PressState {
+                surface: Surface::Grid,
                 item: Some(0),
                 scale: ICON_PRESS_SCALE,
                 animating: false,
@@ -289,7 +301,7 @@ mod tests {
     #[test]
     fn finishing_shows_it_at_full_size_at_once() {
         let mut press = Press::default();
-        press.press(0, ms(0), 1.0);
+        press.press(Surface::Grid, 0, ms(0), 1.0);
         press.frame(ms(50));
         assert_eq!(press.state().item, Some(0));
 

@@ -1,11 +1,12 @@
 //! Home shell state (SRS 4.1): the carousel of views, the home menu, which long-press counts,
 //! Home and Back, coming back to the home, the icon press, the dragged icon, the grid's motion
-//! as apps come, go and move, edit mode's motion, and the theme.
+//! as apps come, go and move, edit mode's motion, the open folder's motion, and the theme.
 //!
 //! [`HomeShell::compose`] is the only place features are put together (ARCH-03). Each feature
 //! runs in its own [`Store`], so a failing feature never takes down the shell (ARCH-09).
 
 mod carousel;
+mod folder;
 mod grid_change;
 mod home_menu;
 mod lift;
@@ -17,12 +18,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use meegone_apps_data::PersistentLayoutStore;
-use meegone_apps_state::{AppsHolder, AppsIntent, GridItem, cells_moved};
+use meegone_apps_state::{AppsHolder, AppsIntent, CellKey, FolderId, Surface, cells_moved};
 use meegone_core_data::{
     HomeTarget, PersistentSettingsStore, Platform, SettingsStore, SystemConfigAdapter,
 };
 use meegone_core_state::motion::MODE_SCALE;
-use meegone_core_state::{AppId, Health, Store, ThemeHolder, ThemeIntent};
+use meegone_core_state::{Health, Store, ThemeHolder, ThemeIntent};
 use meegone_events_state::{EventsHolder, EventsIntent};
 use meegone_lockimage_data::PersistentImageCache;
 use meegone_lockimage_state::{LockImageHolder, LockImageIntent, LockImageState};
@@ -31,11 +32,14 @@ use meegone_settings_state::{SettingsHolder, SettingsIntent, SettingsState};
 
 use carousel::{Carousel, Release};
 pub use carousel::{CarouselState, Layout, PointerEvent, PointerKind};
+use folder::FolderMotion;
+pub use folder::FolderState;
 use grid_change::GridChange;
 pub use grid_change::GridChangeState;
 pub use home_menu::{HomeMenu, MenuItem};
-pub use lift::LiftState;
-use lift::{DragGrid, Lift, LiftEvent};
+use lift::{DragSurfaces, DropAt, Lift, LiftEvent, SurfaceView};
+pub use lift::{HoverState, LiftState, MergeState};
+pub use meegone_apps_state::{FOLDER_COLUMNS, GridItem, PREVIEW_APPS, preview_slot};
 pub use meegone_settings_state::SettingsGroup;
 use mode::Mode;
 pub use mode::{BADGE_ROWS, ModeState};
@@ -109,9 +113,13 @@ pub struct ShellState {
     /// The home menu, open over the current view (HOME-10). It covers the home views: they get
     /// no touches while it is open.
     pub menu: Option<HomeMenu>,
-    /// An app's long-press menu is open over Applications (APPS-11). Its content is
-    /// Applications' own. It covers the home views as the home menu does.
+    /// An app's or a folder's long-press menu is open over Applications (APPS-11). Its content
+    /// is Applications' own. It covers the home views as the home menu does. A failed
+    /// Applications never counts (ARCH-09).
     pub app_menu_open: bool,
+    /// A folder is open over Applications (FOLD-04): the carousel stays put, and only the
+    /// folder's panel takes touches. A failed Applications never counts (ARCH-09).
+    pub folder_open: bool,
     pub carousel: CarouselState,
     /// The home content's scale and opacity while it comes back from an app (ANIM-09).
     pub return_home: ReturnHomeState,
@@ -125,6 +133,15 @@ pub struct ShellState {
     /// Edit mode as Applications shows it, with its motion: the cells' size, the ✕ badges and
     /// Done (APPS-12, ANIM-12).
     pub mode: ModeState,
+    /// The icon a dragged app is held over, growing and pulsing (ANIM-14).
+    pub hover: HoverState,
+    /// A folder taking in a dropped app (ANIM-14).
+    pub merge: MergeState,
+    /// The open folder's panel, growing from its icon or shrinking back (ANIM-15).
+    pub folder: FolderState,
+    /// The folder whose new name the host asks the user for (FOLD-03). A failed Applications
+    /// never asks (ARCH-09).
+    pub renaming: Option<FolderId>,
 }
 
 impl ShellState {
@@ -145,6 +162,7 @@ impl ShellState {
         !self.settings_open
             && self.menu.is_none()
             && !self.app_menu_open
+            && !self.folder_open
             && HomeMenu::items_for(self.current, false).is_some()
     }
 }
@@ -170,9 +188,10 @@ pub enum ShellIntent {
     /// The display is about to draw a frame at this time on the host's monotonic clock.
     Frame(Duration),
     /// A finger went down on an item of the current view, such as an app icon, at this time on
-    /// the host's monotonic clock. `item` is its place in the view's cells. Its icon shrinks
-    /// (ANIM-10).
+    /// the host's monotonic clock. `item` is its place in the view's cells, or in the open
+    /// folder's on that `surface`. Its icon shrinks (ANIM-10).
     Press {
+        surface: Surface,
         item: usize,
         at: Duration,
     },
@@ -188,16 +207,21 @@ pub enum ShellIntent {
     /// Events and Applications it opens the home menu, and in Recent it enters close mode
     /// (REC-07).
     LongPress,
-    /// The finger that is down has stayed on `app`'s icon in Applications for the platform's
-    /// long-press time (APPS-11). The shell takes it only if the finger hasn't moved past the
-    /// touch slop and nothing covers the views: the app's menu opens and ticks (ANIM-24), and
-    /// the rest of the gesture is the shell's. Lifting the finger then taps nothing, and
-    /// dragging on picks the icon up and enters edit mode.
-    LongPressApp(AppId),
+    /// The finger that is down has stayed on an app's or a folder's icon in Applications, or on
+    /// an app's in the open folder, for the platform's long-press time (APPS-11, ADR 0015). The
+    /// shell takes it only if the finger hasn't moved past the touch slop and nothing covers
+    /// that surface: the menu opens and ticks (ANIM-24), and the rest of the gesture is the
+    /// shell's. Lifting the finger then taps nothing, and dragging on picks the icon up and
+    /// enters edit mode.
+    LongPressCell {
+        surface: Surface,
+        key: CellKey,
+    },
     /// Opens the home menu without a gesture, from a screen-reader action (A11Y-05).
     OpenMenu,
-    /// Opens `app`'s menu without a gesture, from a screen-reader action (A11Y-05).
-    OpenAppMenu(AppId),
+    /// Opens an app's or a folder's menu without a gesture, from a screen-reader action
+    /// (A11Y-05).
+    OpenCellMenu(CellKey),
     /// A touch outside the home menu or an app's menu closes it.
     CloseMenu,
     /// An item of the home menu was chosen (HOME-10).
@@ -252,6 +276,11 @@ pub struct HomeShell {
     was_lifted: bool,
     /// Edit mode was just entered by picking an icon up, whose long-press already ticked.
     picked_up: bool,
+    folder: FolderMotion,
+    /// The open folder's cells as of the last intent, and which folder they were.
+    seen_folder: (Option<FolderId>, Arc<[GridItem]>),
+    /// How many folders Applications had made as of the last intent (ANIM-24).
+    seen_folders_made: u32,
     theme: Store<ThemeHolder>,
     apps: Store<AppsHolder>,
     events: Store<EventsHolder>,
@@ -278,6 +307,9 @@ impl HomeShell {
             seen_cells: Arc::new([]),
             was_lifted: false,
             picked_up: false,
+            folder: FolderMotion::default(),
+            seen_folder: (None, Arc::new([])),
+            seen_folders_made: 0,
             theme: Store::new(ThemeHolder::new(
                 settings_store.clone(),
                 platform.system.clone(),
@@ -391,12 +423,14 @@ impl HomeShell {
                     // A touch never waits for the return motion (ANIM-03).
                     self.return_home.finish();
                 }
-                // A long-press on an app's icon keeps the rest of its gesture, even under the
-                // app's menu: dragging on picks the icon up and enters edit mode, which closes
-                // the menu (APPS-11). Lifting the finger drops it (APPS-12).
+                // A long-press on an icon keeps the rest of its gesture, even under its menu:
+                // dragging on picks the icon up and enters edit mode, which closes the menu
+                // (APPS-11). Lifting the finger drops it (APPS-12, FOLD-01, FOLD-05).
                 self.drag(&event);
                 // Settings and the menus cover the home views, but a finger that was already
-                // down may still lift.
+                // down may still lift. An open folder takes touches itself: the row stays put,
+                // but a press there can still become a long-press (FOLD-04).
+                self.carousel.lock(self.folder_shown());
                 if !self.covered() || matches!(event.kind, PointerKind::Up | PointerKind::Cancel) {
                     let release = self.carousel.pointer(event, self.state.current);
                     self.settle(release);
@@ -413,18 +447,19 @@ impl HomeShell {
                 self.press.frame(at);
                 self.grid_change.frame(at);
                 self.mode.frame(at);
+                self.folder.frame(at);
                 self.drag_frame(at);
             }
-            ShellIntent::Press { item, at } => self.press_item(item, at),
+            ShellIntent::Press { surface, item, at } => self.press_item(surface, item, at),
             ShellIntent::Release(at) => {
                 self.press.release(at, self.carousel.animation_scale());
             }
             ShellIntent::Home => self.home(),
             ShellIntent::Back => self.back(),
             ShellIntent::LongPress => self.long_press(),
-            ShellIntent::LongPressApp(app) => self.long_press_app(app),
+            ShellIntent::LongPressCell { surface, key } => self.long_press_cell(surface, key),
             ShellIntent::OpenMenu => self.open_menu(None),
-            ShellIntent::OpenAppMenu(app) => self.open_app_menu(app),
+            ShellIntent::OpenCellMenu(key) => self.open_cell_menu(key),
             ShellIntent::CloseMenu => {
                 self.state.menu = None;
                 self.close_app_menu();
@@ -453,17 +488,25 @@ impl HomeShell {
                 self.configure_carousel();
             }
         }
+        self.keep_folder_in_step();
         self.keep_lift_in_step();
         self.keep_mode_in_step();
         self.keep_cells_in_step();
-        self.lift.sync(&self.drag_grid());
+        self.lift.sync(&self.drag_surfaces());
         self.state.carousel = self.carousel.state();
         self.state.return_home = self.return_home.state();
         self.state.press = self.press.state();
         self.state.lift = self.lift.state();
+        self.state.hover = self.lift.hover();
+        self.state.merge = self.lift.merge_state();
         self.state.grid_change = self.grid_change.state();
         self.state.mode = self.mode_state();
         self.state.app_menu_open = self.app_menu_shown();
+        self.state.folder_open = self.folder_shown();
+        self.state.folder = self.folder.state();
+        self.state.renaming = (*self.apps.health() == Health::Ready)
+            .then(|| self.apps.state().renaming)
+            .flatten();
     }
 
     /// Whether Settings or a menu covers the home views, so they get no new touches.
@@ -483,24 +526,54 @@ impl HomeShell {
         }
     }
 
+    fn close_folder(&mut self) {
+        if self.folder_shown() {
+            self.apps.dispatch(AppsIntent::CloseFolder);
+        }
+    }
+
     /// Whether Applications shows edit mode. A failed Applications can't leave it, so it never
     /// counts: no badge, Done or drag is left on screen for good (ARCH-09).
     fn editing_shown(&self) -> bool {
         *self.apps.health() == Health::Ready && self.apps.state().edit_mode
     }
 
-    /// A long-press can pick its icon up only while the app's menu it opened is still open, and
-    /// an icon stays lifted or settling only in edit mode, while its app has a cell of its own.
-    /// Otherwise, such as after Back, the icon is back in its cell at once. A drag that ends any
-    /// way but a drop puts the grid back as it was (APPS-12).
+    /// Whether a folder is open over Applications. A failed Applications can't close it, so it
+    /// never counts (ARCH-09).
+    fn folder_shown(&self) -> bool {
+        *self.apps.health() == Health::Ready && self.apps.state().open_folder.is_some()
+    }
+
+    /// The panel follows the open folder (ANIM-15), and a folder made ticks (ANIM-24).
+    fn keep_folder_in_step(&mut self) {
+        let open = self
+            .folder_shown()
+            .then(|| self.apps.state().open_folder)
+            .flatten();
+        self.folder.set(open, self.carousel.animation_scale());
+        let made = self.apps.state().folders_made;
+        if made != std::mem::replace(&mut self.seen_folders_made, made) {
+            self.system.haptic_tick();
+        }
+    }
+
+    /// A long-press can pick its icon up only while the menu it opened is still open, and an
+    /// icon stays lifted or settling only in edit mode, while it has a cell on its surface: the
+    /// grid, or a folder that is still open. A merging icon needs only edit mode. Otherwise,
+    /// such as after Back, the icon is back in its cell at once. A drag that ends any way but a
+    /// drop puts the grid back as it was (APPS-12).
     fn keep_lift_in_step(&mut self) {
         let apps = self.apps.state();
-        let in_step = match (self.lift.armed(), self.lift.app()) {
-            (Some(app), _) => {
-                self.app_menu_shown() && apps.menu.as_ref().is_some_and(|menu| menu.app == *app)
+        let in_step = match (self.lift.armed(), self.lift.held()) {
+            (Some((key, _)), _) => {
+                self.app_menu_shown() && apps.menu.as_ref().is_some_and(|menu| menu.item == *key)
             }
-            (None, Some(app)) => self.editing_shown() && apps.place_of(app).is_some(),
-            (None, None) => true,
+            (None, Some((key, surface))) => {
+                self.editing_shown()
+                    && (surface == Surface::Grid || self.folder_shown())
+                    && apps.place_of(surface, key).is_some()
+            }
+            (None, None) => !self.lift.is_merging() || self.editing_shown(),
         };
         if !in_step {
             self.lift.cancel();
@@ -527,72 +600,133 @@ impl HomeShell {
 
     /// When Applications' cells came, went or moved, the grid moves to its new cells (ANIM-21,
     /// ANIM-13), and a pressed icon lets go: it is named by its place, which may now hold
-    /// another cell (ANIM-10).
+    /// another cell (ANIM-10). The open folder's cells moving moves them too (FOLD-05), but a
+    /// folder opening or closing doesn't.
     fn keep_cells_in_step(&mut self) {
-        let cells = self.apps.state().items.clone();
-        if Arc::ptr_eq(&cells, &self.seen_cells) {
-            return;
+        let apps = self.apps.state();
+        let mut moved = false;
+        if !Arc::ptr_eq(&apps.items, &self.seen_cells) {
+            moved |= cells_moved(&self.seen_cells, &apps.items);
+            self.seen_cells = apps.items.clone();
         }
-        if cells_moved(&self.seen_cells, &cells) {
+        let (folder, cells) = &self.seen_folder;
+        if !Arc::ptr_eq(&apps.folder_items, cells) {
+            moved |= *folder == apps.open_folder && cells_moved(cells, &apps.folder_items);
+            self.seen_folder = (apps.open_folder, apps.folder_items.clone());
+        }
+        if moved {
             self.press.finish();
             self.grid_change.start(self.carousel.animation_scale());
         }
-        self.seen_cells = cells;
     }
 
-    /// The Applications grid as a drag needs it now.
-    fn drag_grid(&self) -> DragGrid {
+    /// The grid and the open folder as a drag needs them now. The folder counts once its panel
+    /// is all the way open, since until then its cells aren't where the host laid them out.
+    fn drag_surfaces(&self) -> DragSurfaces {
         let apps = self.apps.state();
-        DragGrid {
-            layout: apps.layout,
-            rtl: self.carousel.state().layout.rtl,
+        let view = |surface: Surface| SurfaceView {
+            layout: apps.layout_of(surface),
             // As the host draws it, in whole pixels.
-            scroll_px: apps.scroll_px.round(),
-            count: apps.items.len(),
-            rows: apps.rows(),
-            // While armed, it is the cell the icon is about to be picked up from.
-            place: (self.lift.armed())
-                .or(self.lift.app())
-                .and_then(|app| apps.place_of(app)),
+            scroll_px: apps.scroll_of(surface).round(),
+            cells: apps.cells(surface).clone(),
+            rows: apps.rows_of(surface),
+        };
+        let mode = self.mode_state();
+        DragSurfaces {
+            grid: view(Surface::Grid),
+            folder: (self.folder_shown() && self.folder.fully_open())
+                .then(|| view(Surface::Folder)),
+            folder_bounds: apps.folder_bounds,
+            rtl: self.carousel.state().layout.rtl,
+            scale: mode.scale,
+            rest_scale: if mode.on { MODE_SCALE } else { 1.0 },
         }
     }
 
     /// Follows the finger that made a long-press on an icon: dragging picks the icon up and
-    /// enters edit mode (APPS-11), and lifting it drops the icon where it is (APPS-12).
+    /// enters edit mode (APPS-11), dragging it out of the open folder takes it out (FOLD-05),
+    /// and lifting the finger drops the icon where it is (APPS-12, FOLD-01).
     fn drag(&mut self, event: &PointerEvent) {
         let slop = self.carousel.state().layout.touch_slop_px;
-        let grid = self.drag_grid();
-        match self
-            .lift
-            .pointer(event, slop, &grid, self.mode_state().scale)
-        {
+        let surfaces = self.drag_surfaces();
+        let scale = self.carousel.animation_scale();
+        match self.lift.pointer(event, slop, &surfaces, scale) {
             Some(LiftEvent::PickedUp) => {
                 self.picked_up = true;
                 self.apps.dispatch(AppsIntent::EnterEditMode);
             }
-            Some(LiftEvent::Dropped { app, to }) => {
-                match to {
-                    Some(to) => self.apps.dispatch(AppsIntent::Move { app, to }),
-                    None => self.apps.dispatch(AppsIntent::Drop),
-                }
-                let grid = self.drag_grid();
-                self.lift
-                    .settle(&grid, MODE_SCALE, self.carousel.animation_scale());
+            Some(LiftEvent::LeftFolder { app, to }) => {
+                self.apps.dispatch(AppsIntent::TakeOut { app, to });
             }
+            Some(LiftEvent::Dropped(at)) => self.drop(at),
             None => {}
         }
     }
 
-    /// While an icon is lifted, it takes the place it waited over, and scrolls the grid near
-    /// its edges (APPS-12).
-    fn drag_frame(&mut self, at: Duration) {
-        let grid = self.drag_grid();
-        let step = self.lift.frame(at, &grid, self.carousel.animation_scale());
-        if let Some(px) = step.scroll_to {
-            self.apps.dispatch(AppsIntent::Scrolled(px));
+    /// The finger lifted: the drag's changes are kept, then the icon settles into its cell, or
+    /// shrinks into the folder it went into (ANIM-13, ANIM-14).
+    fn drop(&mut self, at: DropAt) {
+        let scale = self.carousel.animation_scale();
+        let into = match at {
+            DropAt::Grid { key, to } => {
+                self.apps.dispatch(AppsIntent::Arrange { item: key, to });
+                None
+            }
+            DropAt::Folder { app, to } => {
+                self.apps.dispatch(AppsIntent::ArrangeInFolder { app, to });
+                None
+            }
+            DropAt::Combine { app, onto } => {
+                self.apps.dispatch(AppsIntent::Combine {
+                    app: app.clone(),
+                    onto: onto.clone(),
+                });
+                Some((app, onto))
+            }
+            DropAt::Back => None,
+        };
+        self.apps.dispatch(AppsIntent::Drop);
+        let surfaces = self.drag_surfaces();
+        let merged = into.and_then(|(app, onto)| {
+            // The folder it is in now, which was made from the app it was dropped on.
+            let apps = self.apps.state();
+            apps.items.iter().find_map(|item| match item {
+                GridItem::Folder { id, apps, .. } => {
+                    let slot = apps.iter().position(|shown| shown.id == app)?;
+                    Some((*id, slot, matches!(onto, CellKey::App(_))))
+                }
+                GridItem::App { .. } => None,
+            })
+        });
+        match merged {
+            Some((folder, slot, formed)) => {
+                self.lift.merge(&surfaces, folder, slot, formed, scale);
+            }
+            // Refused, or not a folder drop: it settles into its cell.
+            None => self.lift.settle(&surfaces, scale),
         }
-        if let Some((app, to)) = step.arrange {
-            self.apps.dispatch(AppsIntent::Arrange { app, to });
+    }
+
+    /// While an icon is lifted, it takes the place it waited over, and scrolls its surface near
+    /// the edges (APPS-12, FOLD-05).
+    fn drag_frame(&mut self, at: Duration) {
+        let surfaces = self.drag_surfaces();
+        let step = self
+            .lift
+            .frame(at, &surfaces, self.carousel.animation_scale());
+        match step.scroll_to {
+            Some((Surface::Grid, px)) => self.apps.dispatch(AppsIntent::Scrolled(px)),
+            Some((Surface::Folder, px)) => self.apps.dispatch(AppsIntent::FolderScrolled(px)),
+            None => {}
+        }
+        match step.arrange {
+            Some(DropAt::Grid { key, to }) => {
+                self.apps.dispatch(AppsIntent::Arrange { item: key, to });
+            }
+            Some(DropAt::Folder { app, to }) => {
+                self.apps.dispatch(AppsIntent::ArrangeInFolder { app, to });
+            }
+            Some(DropAt::Combine { .. } | DropAt::Back) | None => {}
         }
     }
 
@@ -632,14 +766,25 @@ impl HomeShell {
         }
     }
 
-    /// ANIM-10: an item of the current view shrinks under the finger, unless the views are
-    /// moving or something covers them.
-    fn press_item(&mut self, item: usize, at: Duration) {
+    /// ANIM-10: an item of the current view, or of the open folder, shrinks under the finger,
+    /// unless the views are moving or something covers that surface.
+    fn press_item(&mut self, surface: Surface, item: usize, at: Duration) {
         // In edit mode a tap launches nothing, so nothing shrinks to say it would (APPS-12).
-        if self.covered() || self.carousel.state().dragging || self.editing_shown() {
+        if self.covered()
+            || !self.touchable(surface)
+            || self.carousel.state().dragging
+            || self.editing_shown()
+        {
             return;
         }
-        self.press.press(item, at, self.carousel.animation_scale());
+        self.press
+            .press(surface, item, at, self.carousel.animation_scale());
+    }
+
+    /// Whether `surface` takes touches: the open folder's panel while it is open, and the grid
+    /// only while it isn't (FOLD-04).
+    fn touchable(&self, surface: Surface) -> bool {
+        (surface == Surface::Folder) == self.folder_shown()
     }
 
     /// A drag ended: settle on the view it chose.
@@ -665,7 +810,7 @@ impl HomeShell {
     /// HOME-10: a long-press on empty space opens the home menu where the finger is, or, in
     /// Recent, enters close mode (REC-07). Either way it ticks (ANIM-24).
     fn long_press(&mut self) {
-        if self.covered() {
+        if self.covered() || self.folder_shown() {
             return;
         }
         let Some(at) = self.carousel.long_press() else {
@@ -678,18 +823,22 @@ impl HomeShell {
         self.system.haptic_tick();
     }
 
-    /// APPS-11: a long-press on an app's icon opens its menu and ticks (ANIM-24). It counts only
-    /// on Applications, while the gesture is still a press and nothing covers the views, and
-    /// only if the app has a menu. Then the rest of the gesture is the shell's, so lifting the
-    /// finger launches nothing, and dragging on picks the icon up.
-    fn long_press_app(&mut self, app: AppId) {
+    /// APPS-11: a long-press on an app's or a folder's icon opens its menu and ticks (ANIM-24).
+    /// It counts only on Applications, while the gesture is still a press, nothing covers the
+    /// views, and the icon's surface takes touches: in the open folder only once its panel is
+    /// all the way open. Then the rest of the gesture is the shell's, so lifting the finger
+    /// launches nothing, and dragging on picks the icon up.
+    fn long_press_cell(&mut self, surface: Surface, key: CellKey) {
+        let opening = surface == Surface::Folder && !self.folder.fully_open();
         if self.covered()
+            || !self.touchable(surface)
+            || opening
             || self.state.current != HomeView::Applications
             || self.carousel.pressed_at().is_none()
         {
             return;
         }
-        self.apps.dispatch(AppsIntent::OpenMenu(app.clone()));
+        self.apps.dispatch(AppsIntent::OpenMenu(key.clone()));
         if !self.app_menu_shown() {
             return;
         }
@@ -698,19 +847,20 @@ impl HomeShell {
         };
         // The menu covers the views, so the pressed icon lets go.
         self.press.finish();
-        self.lift.arm(app, origin);
+        self.lift.arm(key, surface, origin);
         self.system.haptic_tick();
     }
 
-    /// A11Y-05: opens `app`'s menu without a gesture, so with no tick, and nothing to pick up.
-    fn open_app_menu(&mut self, app: AppId) {
+    /// A11Y-05: opens an app's or a folder's menu without a gesture, so with no tick, and
+    /// nothing to pick up.
+    fn open_cell_menu(&mut self, key: CellKey) {
         if self.covered() || self.state.current != HomeView::Applications {
             return;
         }
         let release = self.carousel.end_gesture(self.state.current);
         self.settle(release);
         self.press.finish();
-        self.apps.dispatch(AppsIntent::OpenMenu(app));
+        self.apps.dispatch(AppsIntent::OpenMenu(key));
     }
 
     /// Opens the current view's home menu at `anchor`, or centred, if it has one (HOME-10).
@@ -752,6 +902,7 @@ impl HomeShell {
         self.lift.cancel();
         self.state.menu = None;
         self.close_app_menu();
+        self.close_folder();
         self.settings.dispatch(SettingsIntent::Refresh);
         self.state.settings_open = true;
         self.state.settings_group = group;
@@ -856,8 +1007,11 @@ impl HomeShell {
         self.close_app_menu();
         self.press.finish();
         self.lift.cancel();
-        if view != HomeView::Applications && self.editing_shown() {
-            self.apps.dispatch(AppsIntent::ExitEditMode);
+        if view != HomeView::Applications {
+            self.close_folder();
+            if self.editing_shown() {
+                self.apps.dispatch(AppsIntent::ExitEditMode);
+            }
         }
         // Recent refreshes whenever it becomes visible (REC-09); Events does too, to stay live.
         match view {
@@ -1051,6 +1205,7 @@ mod tests {
         assert!(!shell.state().grid_change.animating);
 
         shell.dispatch(ShellIntent::Press {
+            surface: Surface::Grid,
             item: 1,
             at: ms(1_000),
         });
@@ -1779,6 +1934,7 @@ mod tests {
         let mut shell = laid_out(&Fakes::default());
 
         shell.dispatch(ShellIntent::Press {
+            surface: Surface::Grid,
             item: 5,
             at: ms(1_000),
         });
@@ -1807,7 +1963,11 @@ mod tests {
             y: 900.0,
             at: ms(0),
         }));
-        shell.dispatch(ShellIntent::Press { item: 2, at: ms(0) });
+        shell.dispatch(ShellIntent::Press {
+            surface: Surface::Grid,
+            item: 2,
+            at: ms(0),
+        });
         shell.dispatch(ShellIntent::Frame(ms(90)));
         assert_eq!(shell.state().press.scale, ICON_PRESS_SCALE);
 
@@ -1823,6 +1983,7 @@ mod tests {
         assert!(shell.state().press.scale > ICON_PRESS_SCALE);
         // While the views move, nothing else is pressed.
         shell.dispatch(ShellIntent::Press {
+            surface: Surface::Grid,
             item: 3,
             at: ms(120),
         });
@@ -1833,7 +1994,11 @@ mod tests {
     fn the_menu_settings_or_another_view_let_the_pressed_icon_go_at_once() {
         let mut shell = laid_out(&Fakes::default());
         let press = |shell: &mut HomeShell| {
-            shell.dispatch(ShellIntent::Press { item: 1, at: ms(0) });
+            shell.dispatch(ShellIntent::Press {
+                surface: Surface::Grid,
+                item: 1,
+                at: ms(0),
+            });
             assert_eq!(shell.state().press.item, Some(1));
         };
 
@@ -1842,7 +2007,11 @@ mod tests {
         assert_eq!(shell.state().press, PressState::default());
 
         // Under the menu or Settings, nothing is pressed.
-        shell.dispatch(ShellIntent::Press { item: 1, at: ms(0) });
+        shell.dispatch(ShellIntent::Press {
+            surface: Surface::Grid,
+            item: 1,
+            at: ms(0),
+        });
         assert_eq!(shell.state().press, PressState::default());
         shell.dispatch(ShellIntent::CloseMenu);
 
@@ -1871,7 +2040,10 @@ mod tests {
             y,
             at: ms(10_000),
         }));
-        shell.dispatch(ShellIntent::LongPressApp(app_id(package)));
+        shell.dispatch(ShellIntent::LongPressCell {
+            surface: Surface::Grid,
+            key: CellKey::App(app_id(package)),
+        });
     }
 
     fn finger(shell: &mut HomeShell, kind: PointerKind, x: f64, y: f64) {
@@ -1889,7 +2061,10 @@ mod tests {
             .state()
             .menu
             .as_ref()
-            .map(|menu| menu.app.clone())
+            .and_then(|menu| match &menu.item {
+                CellKey::App(app) => Some(app.clone()),
+                CellKey::Folder(_) => None,
+            })
     }
 
     #[test]
@@ -1898,6 +2073,7 @@ mod tests {
         let fakes = Fakes::default();
         let mut shell = with_mail(&fakes);
         shell.dispatch(ShellIntent::Press {
+            surface: Surface::Grid,
             item: 0,
             at: ms(10_000),
         });
@@ -1933,7 +2109,10 @@ mod tests {
         // The finger moved past the touch slop: a scroll that stopped.
         finger(&mut shell, PointerKind::Down, 300.0, 400.0);
         finger(&mut shell, PointerKind::Move, 300.0, 480.0);
-        shell.dispatch(ShellIntent::LongPressApp(app_id("mail")));
+        shell.dispatch(ShellIntent::LongPressCell {
+            surface: Surface::Grid,
+            key: CellKey::App(app_id("mail")),
+        });
         not_taken(&shell, &fakes);
         lift(&mut shell);
 
@@ -1977,10 +2156,11 @@ mod tests {
         let state = shell.state();
         assert!(!state.app_menu_open);
         assert!(shell.apps().state().edit_mode);
+        // The grid isn't laid out, so the icon's centre is the finger.
         let lifted = &state.lift;
         assert_eq!(
-            (&lifted.app, lifted.dx, lifted.dy, lifted.settling),
-            (&Some(app_id("mail")), 220.0, -20.0, false)
+            (&lifted.key, lifted.x, lifted.y, lifted.settling),
+            (&Some(CellKey::App(app_id("mail"))), 520.0, 380.0, false)
         );
         assert_eq!(state.carousel.offset, 0.0);
         assert!(!state.carousel.dragging);
@@ -1991,16 +2171,11 @@ mod tests {
         assert!((shell.state().lift.scale - DRAG_LIFT_SCALE).abs() < 0.001);
 
         finger(&mut shell, PointerKind::Move, 700.0, 900.0);
-        assert_eq!(
-            (shell.state().lift.dx, shell.state().lift.dy),
-            (400.0, 500.0)
-        );
+        assert_eq!((shell.state().lift.x, shell.state().lift.y), (700.0, 900.0));
 
-        // Lifting the finger drops it: with no grid laid out, it settles back into its cell.
-        // Edit mode stays.
+        // Lifting the finger drops it: with no grid laid out, there is no cell to settle into,
+        // so it is back at once. Edit mode stays.
         lift(&mut shell);
-        assert!(shell.state().lift.settling);
-        come_to_rest(&mut shell, 10_500);
         assert_eq!(shell.state().lift, LiftState::default());
         assert!(shell.apps().state().edit_mode);
         assert!(!shell.state().carousel.held);
@@ -2026,7 +2201,7 @@ mod tests {
         let pick_up = |shell: &mut HomeShell| {
             hold_app(shell, "mail", 300.0, 400.0);
             finger(shell, PointerKind::Move, 300.0, 600.0);
-            assert!(shell.state().lift.app.is_some());
+            assert!(shell.state().lift.key.is_some());
         };
 
         let mut shell = with_mail(&fakes);
@@ -2050,7 +2225,7 @@ mod tests {
         pick_up(&mut shell);
         fakes.apps.apps.lock().unwrap().push(app("atlas", "Atlas"));
         shell.dispatch(ShellIntent::AppsChanged);
-        assert!(shell.state().lift.app.is_some());
+        assert!(shell.state().lift.key.is_some());
         fakes
             .apps
             .apps
@@ -2089,7 +2264,7 @@ mod tests {
     fn a_touch_outside_another_view_or_settings_close_the_app_menu() {
         let mut shell = with_mail(&Fakes::default());
         let open = |shell: &mut HomeShell| {
-            shell.dispatch(ShellIntent::OpenAppMenu(app_id("maps")));
+            shell.dispatch(ShellIntent::OpenCellMenu(CellKey::App(app_id("maps"))));
             assert!(shell.state().app_menu_open);
         };
 
@@ -2115,17 +2290,17 @@ mod tests {
         let fakes = Fakes::default();
         let mut shell = with_mail(&fakes);
 
-        shell.dispatch(ShellIntent::OpenAppMenu(app_id("mail")));
+        shell.dispatch(ShellIntent::OpenCellMenu(CellKey::App(app_id("mail"))));
         assert_eq!(app_menu_of(&shell), Some(app_id("mail")));
         assert_eq!(ticks(&fakes), 0);
         assert!(!shell.state().carousel.held);
         // Another app's menu doesn't replace an open one.
-        shell.dispatch(ShellIntent::OpenAppMenu(app_id("maps")));
+        shell.dispatch(ShellIntent::OpenCellMenu(CellKey::App(app_id("maps"))));
         assert_eq!(app_menu_of(&shell), Some(app_id("mail")));
         shell.dispatch(ShellIntent::CloseMenu);
 
         go(&mut shell, Direction::Next);
-        shell.dispatch(ShellIntent::OpenAppMenu(app_id("mail")));
+        shell.dispatch(ShellIntent::OpenCellMenu(CellKey::App(app_id("mail"))));
         assert_eq!(app_menu_of(&shell), None);
     }
 
@@ -2134,13 +2309,17 @@ mod tests {
         // It covers the home views, as the home menu does.
         let fakes = Fakes::default();
         let mut shell = with_mail(&fakes);
-        shell.dispatch(ShellIntent::OpenAppMenu(app_id("mail")));
+        shell.dispatch(ShellIntent::OpenCellMenu(CellKey::App(app_id("mail"))));
 
         finger(&mut shell, PointerKind::Down, 800.0, 900.0);
         finger(&mut shell, PointerKind::Move, 300.0, 900.0);
         assert!(!shell.state().carousel.dragging);
         assert_eq!(shell.state().carousel.offset, 0.0);
-        shell.dispatch(ShellIntent::Press { item: 1, at: ms(0) });
+        shell.dispatch(ShellIntent::Press {
+            surface: Surface::Grid,
+            item: 1,
+            at: ms(0),
+        });
         assert_eq!(shell.state().press, PressState::default());
         shell.dispatch(ShellIntent::LongPress);
         shell.dispatch(ShellIntent::OpenMenu);
@@ -2173,7 +2352,7 @@ mod tests {
         broken.apps.lock().unwrap().push(app("mail", "Mail"));
         platform.apps = Arc::new(BrokenLauncher(broken));
         let mut shell = HomeShell::compose(platform);
-        shell.dispatch(ShellIntent::OpenAppMenu(app_id("mail")));
+        shell.dispatch(ShellIntent::OpenCellMenu(CellKey::App(app_id("mail"))));
         assert!(shell.state().app_menu_open);
 
         shell.dispatch(ShellIntent::Apps(AppsIntent::Launch {
@@ -2207,6 +2386,10 @@ mod tests {
         top_px: 100.0,
         bottom_px: 100.0,
         height_px: 1600.0,
+        left_px: 0.0,
+        view_top_px: 0.0,
+        icon_px: 0.0,
+        icon_top_px: 0.0,
     };
 
     /// `fakes`' apps in [`GRID`].
@@ -2276,16 +2459,14 @@ mod tests {
         // still under the finger.
         let state = shell.state();
         assert!(state.grid_change.animating);
-        assert_eq!((state.lift.dx, state.lift.dy), (0.0, 0.0));
+        // Picked up 100 px below its cell's middle, at (500, 200).
+        assert_eq!((state.lift.x, state.lift.y), (100.0, 200.0));
         assert!(fakes.storage.writes.lock().unwrap().is_empty());
 
         pointer_at(&mut shell, PointerKind::Up, 110.0, 290.0, 10_300);
 
         assert!(shell.state().lift.settling);
-        assert_eq!(
-            (shell.state().lift.dx, shell.state().lift.dy),
-            (10.0, -10.0)
-        );
+        assert_eq!((shell.state().lift.x, shell.state().lift.y), (110.0, 190.0));
         assert_eq!(saved_first(&fakes), Some(LayoutEntry::App(app_id("maps"))));
         come_to_rest(&mut shell, 10_300);
         assert_eq!(shell.state().lift, LiftState::default());
@@ -2353,7 +2534,7 @@ mod tests {
         assert!(scrolled > 0.0, "{scrolled}");
         assert!(shell.state().lift.animating);
         // The icon stays under the finger.
-        assert_eq!(shell.state().lift.dy, 1200.0 + scrolled.round());
+        assert_eq!(shell.state().lift.y, 1400.0);
     }
 
     #[test]
@@ -2413,7 +2594,11 @@ mod tests {
         let mut shell = with_mail(&Fakes::default());
         shell.dispatch(ShellIntent::Apps(AppsIntent::EnterEditMode));
 
-        shell.dispatch(ShellIntent::Press { item: 0, at: ms(0) });
+        shell.dispatch(ShellIntent::Press {
+            surface: Surface::Grid,
+            item: 0,
+            at: ms(0),
+        });
 
         assert_eq!(shell.state().press, PressState::default());
     }
@@ -2439,7 +2624,7 @@ mod tests {
         come_to_rest(&mut shell, 0);
 
         shell.dispatch(ShellIntent::Apps(AppsIntent::Move {
-            app: app_id("phone"),
+            item: CellKey::App(app_id("phone")),
             to: 0,
         }));
         assert!(shell.state().grid_change.animating);
@@ -2466,7 +2651,7 @@ mod tests {
         }));
         hold_app(&mut shell, "mail", 300.0, 400.0);
         finger(&mut shell, PointerKind::Move, 300.0, 600.0);
-        assert!(shell.state().lift.app.is_some() && shell.state().mode.on);
+        assert!(shell.state().lift.key.is_some() && shell.state().mode.on);
 
         shell.dispatch(ShellIntent::Apps(AppsIntent::RequestUninstall(app_id(
             "mail",
@@ -2476,7 +2661,194 @@ mod tests {
         let state = shell.state();
         assert_eq!(state.lift, LiftState::default());
         assert!(!state.mode.on);
-        shell.dispatch(ShellIntent::Press { item: 0, at: ms(0) });
+        shell.dispatch(ShellIntent::Press {
+            surface: Surface::Grid,
+            item: 0,
+            at: ms(0),
+        });
         assert!(shell.state().press.item.is_some());
+    }
+
+    /// [`GRID`] with each icon 112 px from 16 px down its cell, so a dragged app's centre within
+    /// 44.8 px of an icon's centre is over it.
+    const GRID_ICONS: GridLayout = GridLayout {
+        icon_px: 112.0,
+        icon_top_px: 16.0,
+        ..GRID
+    };
+
+    /// Where cell `place`'s icon centre is on screen in [`GRID_ICONS`], unscrolled.
+    fn icon_at(place: usize) -> (f64, f64) {
+        let (column, row) = ((place % 4) as f64, (place / 4) as f64);
+        (column * 200.0 + 100.0, 100.0 + row * 200.0 + 72.0)
+    }
+
+    #[test]
+    fn holding_an_app_over_another_and_dropping_it_makes_a_folder_and_ticks() {
+        // FOLD-01, FOLD-03, ANIM-14, ANIM-24, AC-08
+        let fakes = Fakes::default();
+        let mut shell = with_four(&fakes);
+        shell.dispatch(ShellIntent::Apps(AppsIntent::Layout(GRID_ICONS)));
+        let (mx, my) = icon_at(2);
+        hold_app(&mut shell, "maps", mx, my);
+        assert_eq!(ticks(&fakes), 1);
+        let (x, y) = icon_at(1);
+        pointer_at(&mut shell, PointerKind::Move, x + 10.0, y, 10_050);
+        shell.dispatch(ShellIntent::Frame(ms(10_060)));
+        let hover = &shell.state().hover;
+        assert_eq!(hover.key, Some(CellKey::App(app_id("mail"))));
+        assert!(!hover.armed);
+        // It stays a hover: Mail never moves aside.
+        shell.dispatch(ShellIntent::Frame(ms(10_300)));
+        assert_eq!(grid_labels(&shell), ["Camera", "Mail", "Maps", "Phone"]);
+        shell.dispatch(ShellIntent::Frame(ms(10_460)));
+        assert!(shell.state().hover.armed);
+
+        pointer_at(&mut shell, PointerKind::Up, x + 10.0, y, 10_470);
+
+        // A folder named "Folder" holds both, Mail first, where Mail was.
+        assert_eq!(grid_labels(&shell), ["Camera", "", "Phone"]);
+        let GridItem::Folder { id, apps, .. } = &shell.apps().state().items[1] else {
+            panic!("not a folder");
+        };
+        let held: Vec<&str> = apps.iter().map(|app| app.label.as_str()).collect();
+        assert_eq!(held, ["Mail", "Maps"]);
+        assert_eq!(ticks(&fakes), 2);
+        let state = shell.state();
+        assert!(state.lift.merging);
+        assert_eq!(
+            state.merge,
+            MergeState {
+                folder: Some(*id),
+                slot: Some(1),
+                formed: true,
+                progress: 0.0
+            }
+        );
+        assert_eq!(state.hover, HoverState::default());
+        come_to_rest(&mut shell, 10_470);
+        assert_eq!(shell.state().lift, LiftState::default());
+        assert_eq!(
+            saved_first(&fakes),
+            Some(LayoutEntry::App(app_id("camera")))
+        );
+    }
+
+    #[test]
+    fn an_open_folder_keeps_the_views_still_and_takes_its_own_long_presses() {
+        // FOLD-04, H1: a sideways drag on the panel never swipes the views.
+        let (fakes, mut shell) = with_a_folder();
+        shell.dispatch(ShellIntent::Layout(Layout {
+            width_px: 1000.0,
+            density: 2.0,
+            touch_slop_px: 16.0,
+            rtl: false,
+        }));
+        shell.dispatch(ShellIntent::Apps(AppsIntent::OpenFolder(FolderId(1))));
+        assert!(shell.state().folder_open);
+        assert!(!shell.state().menu_offered());
+        assert_eq!(shell.state().folder.folder, Some(FolderId(1)));
+
+        pointer_at(&mut shell, PointerKind::Down, 300.0, 400.0, 0);
+        pointer_at(&mut shell, PointerKind::Move, 700.0, 400.0, 50);
+        assert!(!shell.state().carousel.dragging);
+        assert_eq!(shell.state().carousel.offset, 0.0);
+        pointer_at(&mut shell, PointerKind::Up, 700.0, 400.0, 100);
+
+        // A long-press in the panel waits for it to finish opening; one on the grid behind it
+        // never counts.
+        let maps = CellKey::App(app_id("maps"));
+        let long_press = |shell: &mut HomeShell, surface: Surface| {
+            pointer_at(shell, PointerKind::Down, 300.0, 400.0, 1_000);
+            shell.dispatch(ShellIntent::LongPressCell {
+                surface,
+                key: maps.clone(),
+            });
+        };
+        long_press(&mut shell, Surface::Folder);
+        assert!(!shell.state().app_menu_open);
+        pointer_at(&mut shell, PointerKind::Up, 300.0, 400.0, 1_100);
+        come_to_rest(&mut shell, 2_000);
+        long_press(&mut shell, Surface::Grid);
+        assert!(!shell.state().app_menu_open);
+        pointer_at(&mut shell, PointerKind::Up, 300.0, 400.0, 1_100);
+        long_press(&mut shell, Surface::Folder);
+        assert!(shell.state().app_menu_open);
+        assert_eq!(ticks(&fakes), 1);
+
+        // Presses count only in the panel.
+        shell.dispatch(ShellIntent::CloseMenu);
+        shell.dispatch(ShellIntent::Press {
+            surface: Surface::Grid,
+            item: 0,
+            at: ms(3_000),
+        });
+        assert_eq!(shell.state().press.item, None);
+        shell.dispatch(ShellIntent::Press {
+            surface: Surface::Folder,
+            item: 1,
+            at: ms(3_000),
+        });
+        assert_eq!(
+            (shell.state().press.item, shell.state().press.surface),
+            (Some(1), Surface::Folder)
+        );
+    }
+
+    #[test]
+    fn a_folder_closes_with_back_another_view_or_settings_and_shrinks_away() {
+        // FOLD-04, ANIM-15
+        let ends: [fn(&mut HomeShell); 3] = [
+            |shell| shell.dispatch(ShellIntent::Back),
+            |shell| shell.dispatch(ShellIntent::Swipe(Direction::Next)),
+            |shell| shell.dispatch(ShellIntent::OpenSettings),
+        ];
+        for end in ends {
+            let (_, mut shell) = with_a_folder();
+            shell.dispatch(ShellIntent::Apps(AppsIntent::OpenFolder(FolderId(1))));
+            come_to_rest(&mut shell, 0);
+            assert_eq!(shell.state().folder.progress, 1.0);
+
+            end(&mut shell);
+
+            let state = shell.state();
+            assert!(!state.folder_open);
+            assert_eq!(state.folder.folder, Some(FolderId(1)));
+            assert!(!state.folder.open && state.folder.animating);
+            come_to_rest(&mut shell, 2_000);
+            assert_eq!(shell.state().folder, FolderState::default());
+        }
+    }
+
+    #[test]
+    fn a_failing_applications_never_leaves_a_folder_open() {
+        // ARCH-09
+        let fakes = Fakes::default();
+        let mut platform = fakes.platform();
+        let broken = FakeApps::default();
+        *broken.apps.lock().unwrap() = vec![app("maps", "Maps"), app("mail", "Mail")];
+        platform.apps = Arc::new(BrokenLauncher(broken));
+        PersistentLayoutStore::new(fakes.storage.clone())
+            .save(&SavedLayout {
+                entries: vec![LayoutEntry::Folder {
+                    id: FolderId(1),
+                    name: String::new(),
+                    apps: vec![app_id("maps"), app_id("mail")],
+                }],
+                ..SavedLayout::default()
+            })
+            .unwrap();
+        let mut shell = HomeShell::compose(platform);
+        shell.dispatch(ShellIntent::Apps(AppsIntent::OpenFolder(FolderId(1))));
+        assert!(shell.state().folder_open);
+
+        shell.dispatch(ShellIntent::Apps(AppsIntent::Launch {
+            app: app_id("mail"),
+            from: None,
+        }));
+
+        assert!(matches!(shell.apps().health(), Health::Failed(_)));
+        assert!(!shell.state().folder_open);
+        assert!(shell.state().menu_offered());
     }
 }

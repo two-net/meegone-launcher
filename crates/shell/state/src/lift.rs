@@ -1,35 +1,48 @@
-//! The picked-up icon (APPS-11, APPS-12, ANIM-13; ADR 0013, ADR 0014). A long-press on an app's
-//! icon opens its menu and keeps the rest of the gesture. If the finger then moves past the
-//! touch slop, the icon is picked up: edit mode starts, and the icon lifts to 110 % and follows
-//! the finger.
+//! The dragged icon (APPS-11, APPS-12, FOLD-01, FOLD-05, ANIM-13, ANIM-14; ADR 0013 to
+//! ADR 0015). A long-press on an app's or a folder's icon, in the grid or in the open folder,
+//! opens its menu and keeps the rest of the gesture. If the finger then moves past the touch
+//! slop, the icon is picked up: edit mode starts, and the icon lifts to 110 % and follows the
+//! finger, drawn above everything by the host, while its cell stays as a gap.
 //!
-//! - **Taking a place.** The place under the icon's centre becomes its own once the centre has
-//!   stayed there for [`REORDER_DWELL`], and the others move aside. A little hysteresis keeps a
-//!   finger resting on the line between two cells from flipping between them.
-//! - **Auto-scroll.** Near the top or bottom of the visible grid, the grid scrolls, faster the
-//!   deeper the icon is, until it can go no further. An icon picked up near an edge scrolls only
-//!   once it has been away from that edge.
-//! - **Dropping.** When the finger lifts, the icon takes the place under it and settles into its
-//!   cell on the [`DROP`] spring, to the size edit mode draws icons at.
+//! - **Where the icon's centre is.** Over another cell's icon, an app *hovers* over it: the icon
+//!   grows and, after [`FOLDER_HOVER`], pulses, armed. Anywhere else in a cell, the place becomes
+//!   the icon's own once the centre has stayed there for [`REORDER_DWELL`], and the others move
+//!   aside. Each change of place or zone starts its wait again. Folders, and apps in the open
+//!   folder, only take places: a folder never goes into anything.
+//! - **Leaving the folder.** An app dragged out of the open folder's panel comes out of the
+//!   folder, at the grid's place under it, and the drag goes on in the grid.
+//! - **Auto-scroll.** Near the top or bottom of the visible grid or panel, it scrolls, faster
+//!   the deeper the icon is, until it can go no further.
+//! - **Dropping.** Over an armed icon, the app goes into that folder, or makes one with that
+//!   app, and shrinks into the folder's preview (ANIM-14). Over a place, the icon takes it and
+//!   settles into its cell on the [`DROP`] spring. Over an icon not yet armed, it settles back
+//!   into its own gap.
 //!
 //! Like the icon press, it is pure: the host passes each touch and frame, with its time
-//! (ADR 0006), and the shell passes the grid as it is now ([`DragGrid`]). The icon is drawn from
-//! its cell's *current* place, which moves as it takes new ones, so it stays under the finger.
+//! (ADR 0006), and the shell passes the grid and the open folder as they are now
+//! ([`DragSurfaces`]). The icon is tracked by its centre on screen, so it stays under the
+//! finger as cells move, the grid scrolls, or it changes surface.
 
+use std::f64::consts::TAU;
+use std::sync::Arc;
 use std::time::Duration;
 
-use meegone_apps_state::GridLayout;
+use meegone_apps_state::{
+    Bounds, CellKey, FolderId, GridItem, GridLayout, PREVIEW_APPS, Surface, preview_slot,
+};
 use meegone_core_state::AppId;
 use meegone_core_state::motion::{
-    AUTO_SCROLL_MAX_DP, AUTO_SCROLL_ZONE_DP, DRAG_LIFT_SCALE, DROP, REORDER_DWELL, SpringMotion,
+    AUTO_SCROLL_MAX_DP, AUTO_SCROLL_ZONE_DP, DRAG_LIFT_SCALE, DROP, FOLDER, FOLDER_HOVER,
+    FOLDER_HOVER_SCALE, FOLDER_PULSE, FOLDER_PULSE_SCALE, REORDER_DWELL, SpringMotion, decelerate,
+    scaled,
 };
 
 use crate::carousel::{PointerEvent, PointerKind};
 use crate::grid_change::MAX_FRAME_STEP;
 
 /// A place stays the icon's target while its centre is this far, as a fraction of a cell, past
-/// the place's edges.
-const HYSTERESIS: f64 = 0.15;
+/// the place's edges. Small, so the gaps beside an icon still take its place.
+const HYSTERESIS: f64 = 0.05;
 /// Closer than this to where it is going, in px, and slower than [`REST_SPEED_PX`] per second, a
 /// settling icon has landed.
 const REST_DISTANCE_PX: f64 = 0.5;
@@ -37,22 +50,31 @@ const REST_SPEED_PX: f64 = 30.0;
 /// The same for its scale, which is about 1.
 const REST_DISTANCE_SCALE: f64 = 0.001;
 const REST_SPEED_SCALE: f64 = 0.05;
+/// An app dropped into a folder whose preview is full shrinks to this fraction of its size as it
+/// fades into the folder's icon.
+const MERGE_AWAY_SCALE: f64 = 0.3;
 
-/// The lifted icon as it is drawn now: an immutable snapshot inside `ShellState`.
+/// The dragged icon as it is drawn now: an immutable snapshot inside `ShellState`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LiftState {
-    /// The app whose icon is lifted or settling, or `None` while no icon is.
-    pub app: Option<AppId>,
-    /// How far the icon is drawn from its cell's place now, in pixels.
-    pub dx: f64,
-    pub dy: f64,
-    /// The icon's scale: 1.1 while it is lifted (ANIM-13), springing to the size edit mode
-    /// draws icons at as it settles. It takes the place of edit mode's scale.
+    /// The app or folder whose icon is lifted, settling or merging, or `None` while none is.
+    pub key: Option<CellKey>,
+    /// Where its cell is: the grid, or the open folder's panel.
+    pub surface: Surface,
+    /// Where the icon's centre is on screen, in px from the home views' top left.
+    pub x: f64,
+    pub y: f64,
+    /// Its scale: 1.1 while lifted (ANIM-13), springing to the size edit mode draws icons at as
+    /// it settles, and shrinking into a folder's preview as it merges (ANIM-14).
     pub scale: f64,
+    /// Its opacity, from 0 to 1: it fades into a folder whose preview is full.
+    pub alpha: f64,
     /// The finger has lifted, and the icon is settling into its cell (ANIM-13).
     pub settling: bool,
-    /// It is moving, waiting to take a place, or scrolling the grid, so the host should draw
-    /// another frame.
+    /// The finger has lifted over a folder or an app, and the icon is going into the folder
+    /// (ANIM-14).
+    pub merging: bool,
+    /// It is moving, waiting, pulsing, or scrolling, so the host should draw another frame.
     pub animating: bool,
 }
 
@@ -60,31 +82,106 @@ impl Default for LiftState {
     /// No icon lifted.
     fn default() -> Self {
         Self {
-            app: None,
-            dx: 0.0,
-            dy: 0.0,
+            key: None,
+            surface: Surface::Grid,
+            x: 0.0,
+            y: 0.0,
             scale: 1.0,
+            alpha: 1.0,
             settling: false,
+            merging: false,
             animating: false,
         }
     }
 }
 
-/// The Applications grid as a drag needs it, as it is now.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct DragGrid {
-    /// How the host laid the grid out, or `None` until it has: then the icon only follows the
-    /// finger.
+/// The icon a dragged app is held over, which grows and pulses (ANIM-14).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HoverState {
+    /// The app's or folder's cell in the grid, or `None` while no icon is held over.
+    pub key: Option<CellKey>,
+    /// Its icon's scale: from 1 to 1.1 while the drop would only put the app back, then
+    /// pulsing, armed, while the drop would make a folder or add to one (FOLD-01).
+    pub scale: f64,
+    /// Dropping now would make a folder or add to one.
+    pub armed: bool,
+}
+
+impl Default for HoverState {
+    fn default() -> Self {
+        Self {
+            key: None,
+            scale: 1.0,
+            armed: false,
+        }
+    }
+}
+
+/// A folder taking in a dropped app (ANIM-14).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct MergeState {
+    /// The folder, while an app is shrinking into it.
+    pub folder: Option<FolderId>,
+    /// The preview slot the app shrinks into, which stays empty until it lands, or `None` if
+    /// the preview is full.
+    pub slot: Option<usize>,
+    /// The folder was just made: its first app shrinks into its slot from full size as well.
+    pub formed: bool,
+    /// How far it has come, eased, from 0 to 1.
+    pub progress: f64,
+}
+
+/// One surface as a drag needs it, as it is now.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SurfaceView {
+    /// How the host laid it out, or `None` until it has: then the icon only follows the finger.
     pub layout: Option<GridLayout>,
+    /// How far it is scrolled, in whole pixels, as the host draws it.
+    pub scroll_px: f64,
+    pub cells: Arc<[GridItem]>,
+    /// How many rows it lays out.
+    pub rows: usize,
+}
+
+/// The grid and the open folder as a drag needs them, as they are now.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DragSurfaces {
+    pub grid: SurfaceView,
+    /// The open folder's panel, once it is all the way open.
+    pub folder: Option<SurfaceView>,
+    /// Where the open folder's panel is on screen.
+    pub folder_bounds: Option<Bounds>,
     /// Right to left mirrors the columns (L10N-02).
     pub rtl: bool,
-    /// How far the grid is scrolled, in whole pixels, as the host draws it.
-    pub scroll_px: f64,
-    /// How many cells it has, and rows, the last one empty.
-    pub count: usize,
-    pub rows: usize,
-    /// The place of the dragged app's own cell now, if it has one.
-    pub place: Option<usize>,
+    /// The scale cells are drawn at now, and the one edit mode draws them at.
+    pub scale: f64,
+    pub rest_scale: f64,
+}
+
+impl DragSurfaces {
+    fn view(&self, surface: Surface) -> Option<&SurfaceView> {
+        match surface {
+            Surface::Grid => Some(&self.grid),
+            Surface::Folder => self.folder.as_ref(),
+        }
+    }
+
+    /// The place of `key`'s cell on `surface`.
+    fn place(&self, surface: Surface, key: &CellKey) -> Option<usize> {
+        self.view(surface)?
+            .cells
+            .iter()
+            .position(|item| item.is(key))
+    }
+
+    /// Where cell `place`'s icon centre is on screen, its cell drawn at `scale`.
+    fn icon_centre(&self, surface: Surface, place: usize, scale: f64) -> Option<(f64, f64)> {
+        let view = self.view(surface)?;
+        let layout = view.layout?;
+        let (x, y) = layout.icon_centre(place, self.rtl, scale);
+        let (left, top) = layout.origin(view.scroll_px);
+        Some((left + x, top + y))
+    }
 }
 
 /// What a touch did to the lift.
@@ -92,18 +189,33 @@ pub(crate) struct DragGrid {
 pub(crate) enum LiftEvent {
     /// The icon was picked up: edit mode starts.
     PickedUp,
-    /// The finger lifted: `app` takes place `to`, if the grid is laid out, and then the shell
-    /// lets it [`Lift::settle`].
-    Dropped { app: AppId, to: Option<usize> },
+    /// An app was dragged out of the open folder's panel: it comes out of the folder, at grid
+    /// place `to`, and the drag goes on in the grid (FOLD-05).
+    LeftFolder { app: AppId, to: usize },
+    /// The finger lifted. The shell applies the drop, then lets the icon settle or merge.
+    Dropped(DropAt),
 }
 
-/// What a frame asks of the grid while an icon is lifted.
+/// Where a dragged icon was dropped.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum DropAt {
+    /// At place `to` in the grid.
+    Grid { key: CellKey, to: usize },
+    /// At place `to` in the open folder.
+    Folder { app: AppId, to: usize },
+    /// Into the folder `onto`, or with the app `onto` into a new one (FOLD-01, FOLD-05).
+    Combine { app: AppId, onto: CellKey },
+    /// Back into its own gap.
+    Back,
+}
+
+/// What a frame asks of the surfaces while an icon is lifted.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct LiftStep {
     /// The icon has stayed over this place long enough to take it.
-    pub arrange: Option<(AppId, usize)>,
-    /// Auto-scroll moved the grid here, in px from its top.
-    pub scroll_to: Option<f64>,
+    pub arrange: Option<DropAt>,
+    /// Auto-scroll moved this surface here, in px from its top.
+    pub scroll_to: Option<(Surface, f64)>,
 }
 
 /// A value springing to `target` on the [`DROP`] spring.
@@ -155,124 +267,165 @@ impl Toward {
     }
 }
 
+/// What the icon's centre is over.
+#[derive(Debug, Clone, PartialEq)]
+enum Over {
+    /// A place on a surface, which it takes after a wait.
+    Place(Surface, usize),
+    /// Another cell's icon in the grid, which it goes into after a wait.
+    Icon(CellKey),
+}
+
 /// An icon being dragged.
 #[derive(Debug, Clone, PartialEq)]
 struct Drag {
-    app: AppId,
-    /// Where the finger went down, and where it is now.
-    origin: (f64, f64),
+    key: CellKey,
+    surface: Surface,
+    /// From the finger to the icon's centre, as it was picked up.
+    grab: (f64, f64),
     finger: (f64, f64),
-    /// The place it was picked up from, and how far the grid was scrolled then.
-    picked: Option<usize>,
-    scroll: f64,
-    /// The place under its centre, and since when.
-    over: Option<(usize, Duration)>,
-    /// How fast it scrolls the grid, in px per second, down positive.
+    /// What its centre is over, and since when.
+    over: Option<(Over, Duration)>,
+    /// How fast it scrolls its surface, in px per second, down positive.
     speed: f64,
     /// Whether it has been away from the top and from the bottom edge since it was picked up,
     /// so it may scroll that way.
     may_scroll: (bool, bool),
-    /// Its scale, from the cell's to 110 %.
+    /// Its scale, from its cell's to 110 %.
     scale: Toward,
-    /// How far it is drawn from its cell's place now.
-    offset: (f64, f64),
-    /// It is waiting to take a place, or still lifting.
+    /// It is waiting to take a place, hovering, or still lifting.
     waiting: bool,
     /// The last frame's time, for auto-scroll.
     last_frame: Option<Duration>,
     /// The latest time seen.
     now: Duration,
+    animation_scale: f64,
+}
+
+/// An icon shrinking into a folder (ANIM-14).
+#[derive(Debug, Clone, PartialEq)]
+struct Merging {
+    key: CellKey,
+    merge: MergeState,
+    /// Where it starts and ends: centre, scale and opacity.
+    from: (f64, f64, f64, f64),
+    to: (f64, f64, f64, f64),
+    length: Duration,
+    /// The last frame's time, or `None` until the first frame.
+    last: Option<Duration>,
+    played: Duration,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
 enum Phase {
     #[default]
     Idle,
-    /// A long-press on `app`'s icon opened its menu. The finger went down at `origin` and is
-    /// still down.
-    Armed { app: AppId, origin: (f64, f64) },
+    /// A long-press on `key`'s icon on `surface` opened its menu. The finger went down at
+    /// `origin` and is still down.
+    Armed {
+        key: CellKey,
+        surface: Surface,
+        origin: (f64, f64),
+    },
     /// The icon follows the finger.
     Lifted(Box<Drag>),
     /// The finger lifted, and the icon springs into its cell.
     Settling {
-        app: AppId,
+        key: CellKey,
+        surface: Surface,
         x: Toward,
         y: Toward,
         scale: Toward,
     },
+    /// The finger lifted over a folder or an app, and the icon shrinks into the folder.
+    Merging(Box<Merging>),
 }
 
 /// Picks an icon up after a long-press, and drags it. `HomeShell` owns it and publishes its
-/// [`LiftState`].
+/// [`LiftState`], [`HoverState`] and [`MergeState`].
 #[derive(Debug, Default)]
 pub(crate) struct Lift {
     phase: Phase,
 }
 
 impl Lift {
-    /// A long-press that went down at `origin` opened `app`'s menu, and the finger is still down.
-    pub fn arm(&mut self, app: AppId, origin: (f64, f64)) {
-        self.phase = Phase::Armed { app, origin };
+    /// A long-press on `key`'s icon on `surface`, which went down at `origin`, opened its menu,
+    /// and the finger is still down.
+    pub fn arm(&mut self, key: CellKey, surface: Surface, origin: (f64, f64)) {
+        self.phase = Phase::Armed {
+            key,
+            surface,
+            origin,
+        };
     }
 
     /// Follows the finger that made the long-press. A move past `slop` from where it went down,
-    /// either way, picks the icon up from its cell, drawn at `scale`. Lifting the finger drops
-    /// it; the system cancelling the gesture puts it back. A new finger lands a settling icon at
-    /// once.
+    /// either way, picks the icon up. A move out of the open folder's panel takes an app out of
+    /// the folder. Lifting the finger drops it; the system cancelling the gesture puts it back.
+    /// A new finger lands a settling or merging icon at once.
     pub fn pointer(
         &mut self,
         event: &PointerEvent,
         slop: f64,
-        grid: &DragGrid,
-        scale: f64,
+        surfaces: &DragSurfaces,
+        animation_scale: f64,
     ) -> Option<LiftEvent> {
         let finger = (event.x, event.y);
         match (event.kind, &mut self.phase) {
-            (PointerKind::Move, Phase::Armed { app, origin }) => {
+            (
+                PointerKind::Move,
+                Phase::Armed {
+                    key,
+                    surface,
+                    origin,
+                },
+            ) => {
                 let (dx, dy) = (finger.0 - origin.0, finger.1 - origin.1);
                 if dx.abs() <= slop && dy.abs() <= slop {
                     return None;
                 }
+                let place = surfaces.place(*surface, key);
+                let grab = place
+                    .and_then(|place| surfaces.icon_centre(*surface, place, surfaces.scale))
+                    .map_or((0.0, 0.0), |(x, y)| (x - origin.0, y - origin.1));
                 let mut drag = Drag {
-                    app: app.clone(),
-                    origin: *origin,
+                    key: key.clone(),
+                    surface: *surface,
+                    grab,
                     finger: *origin,
-                    picked: grid.place,
-                    scroll: grid.scroll_px,
                     over: None,
                     speed: 0.0,
                     may_scroll: (false, false),
-                    scale: Toward::new(scale, DRAG_LIFT_SCALE),
-                    offset: (dx, dy),
+                    scale: Toward::new(surfaces.scale, DRAG_LIFT_SCALE),
                     waiting: true,
                     last_frame: None,
                     now: event.at,
+                    animation_scale,
                 };
                 // Where it was picked up decides which edges it may scroll towards at once.
-                drag.track(grid);
+                drag.track(surfaces);
+                drag.over = None;
                 drag.finger = finger;
-                drag.track(grid);
+                drag.track(surfaces);
                 self.phase = Phase::Lifted(Box::new(drag));
                 Some(LiftEvent::PickedUp)
             }
             (PointerKind::Move, Phase::Lifted(drag)) => {
                 drag.finger = finger;
                 drag.now = drag.now.max(event.at);
-                drag.track(grid);
+                if let Some(left) = drag.leave_folder(surfaces) {
+                    return Some(left);
+                }
+                drag.track(surfaces);
                 None
             }
             (PointerKind::Up, Phase::Lifted(drag)) => {
                 drag.finger = finger;
                 drag.now = drag.now.max(event.at);
-                drag.track(grid);
-                // It takes the place under it now, whether or not it has waited there.
-                let to = drag.over.map(|(place, _)| place).or(grid.place);
-                Some(LiftEvent::Dropped {
-                    app: drag.app.clone(),
-                    to: grid.layout.and(to),
-                })
+                drag.track(surfaces);
+                Some(LiftEvent::Dropped(drag.drop_at()))
             }
-            (PointerKind::Move, Phase::Idle | Phase::Settling { .. }) => None,
+            (PointerKind::Move, _) => None,
             (PointerKind::Down | PointerKind::Up | PointerKind::Cancel, _) => {
                 self.phase = Phase::Idle;
                 None
@@ -280,32 +433,98 @@ impl Lift {
         }
     }
 
-    /// The dropped icon settles into its cell's place in `grid`, from where it is drawn now, to
-    /// `rest_scale`, the size edit mode draws icons at (ANIM-13). With animations removed, it is
-    /// there at once.
-    pub fn settle(&mut self, grid: &DragGrid, rest_scale: f64, animation_scale: f64) {
+    /// The dropped icon settles into its cell on `surfaces`, from where it is drawn now, to the
+    /// size edit mode draws icons at (ANIM-13). With animations removed, or if its cell can't
+    /// be found on screen, it is there at once.
+    pub fn settle(&mut self, surfaces: &DragSurfaces, animation_scale: f64) {
         let Phase::Lifted(drag) = &mut self.phase else {
             return;
         };
-        drag.track(grid);
-        if animation_scale <= 0.0 {
+        let target = surfaces
+            .place(drag.surface, &drag.key)
+            .and_then(|place| surfaces.icon_centre(drag.surface, place, surfaces.rest_scale));
+        let (Some((x, y)), true) = (target, animation_scale > 0.0) else {
             self.phase = Phase::Idle;
             return;
-        }
-        let (dx, dy) = drag.offset;
+        };
+        let (from_x, from_y) = drag.centre();
         self.phase = Phase::Settling {
-            app: drag.app.clone(),
-            x: Toward::new(dx, 0.0),
-            y: Toward::new(dy, 0.0),
-            scale: Toward::new(drag.scale.value(), rest_scale),
+            key: drag.key.clone(),
+            surface: drag.surface,
+            x: Toward::new(from_x, x),
+            y: Toward::new(from_y, y),
+            scale: Toward::new(drag.scale.value(), surfaces.rest_scale),
         };
     }
 
-    /// Advances to the display's frame time (ANIM-04): the lift and the drop's springs, the
-    /// wait before a new place is taken, and auto-scroll.
-    pub fn frame(&mut self, at: Duration, grid: &DragGrid, animation_scale: f64) -> LiftStep {
+    /// The dropped app went into `folder`, at preview slot `slot`, and the folder was just made
+    /// if `formed`: the icon shrinks into the folder's preview over 250 ms (ANIM-14), or into
+    /// its icon, fading, when the preview is full. With animations removed, or if the folder
+    /// can't be found, it is there at once.
+    pub fn merge(
+        &mut self,
+        surfaces: &DragSurfaces,
+        folder: FolderId,
+        slot: usize,
+        formed: bool,
+        animation_scale: f64,
+    ) {
+        let Phase::Lifted(drag) = &self.phase else {
+            return;
+        };
+        let length = scaled(FOLDER, animation_scale);
+        let folder_key = CellKey::Folder(folder);
+        let at = surfaces
+            .place(Surface::Grid, &folder_key)
+            .and_then(|place| {
+                let layout = surfaces.grid.layout?;
+                let centre = surfaces.icon_centre(Surface::Grid, place, surfaces.rest_scale)?;
+                Some((centre, layout.icon_px * surfaces.rest_scale))
+            });
+        let (Some(((x, y), icon)), false) = (at, length.is_zero()) else {
+            self.phase = Phase::Idle;
+            return;
+        };
+        let slot = (slot < PREVIEW_APPS).then_some(slot);
+        let to = match slot {
+            Some(slot) => {
+                let (fx, fy, size) = preview_slot(slot, surfaces.rtl);
+                (
+                    x + (fx - 0.5) * icon,
+                    y + (fy - 0.5) * icon,
+                    size * surfaces.rest_scale,
+                    1.0,
+                )
+            }
+            None => (x, y, MERGE_AWAY_SCALE * surfaces.rest_scale, 0.0),
+        };
+        let (from_x, from_y) = drag.centre();
+        self.phase = Phase::Merging(Box::new(Merging {
+            key: drag.key.clone(),
+            merge: MergeState {
+                folder: Some(folder),
+                slot,
+                formed,
+                progress: 0.0,
+            },
+            from: (from_x, from_y, drag.scale.value(), 1.0),
+            to,
+            length,
+            last: None,
+            played: Duration::ZERO,
+        }));
+    }
+
+    /// Advances to the display's frame time (ANIM-04): the lift's, the drop's and the merge's
+    /// motion, the waits before a place is taken or an icon armed, and auto-scroll.
+    pub fn frame(
+        &mut self,
+        at: Duration,
+        surfaces: &DragSurfaces,
+        animation_scale: f64,
+    ) -> LiftStep {
         match &mut self.phase {
-            Phase::Lifted(drag) => drag.frame(at, grid, animation_scale),
+            Phase::Lifted(drag) => drag.frame(at, surfaces, animation_scale),
             Phase::Settling { x, y, scale, .. } => {
                 for motion in [&mut *x, &mut *y] {
                     motion.advance(at, animation_scale);
@@ -319,39 +538,56 @@ impl Lift {
                 }
                 LiftStep::default()
             }
+            Phase::Merging(merging) => {
+                let last = *merging.last.get_or_insert(at);
+                merging.played += at.saturating_sub(last).min(MAX_FRAME_STEP);
+                merging.last = Some(at.max(last));
+                let progress = merging.played.as_secs_f64() / merging.length.as_secs_f64();
+                if progress >= 1.0 {
+                    self.phase = Phase::Idle;
+                } else {
+                    merging.merge.progress = decelerate(progress);
+                }
+                LiftStep::default()
+            }
             Phase::Idle | Phase::Armed { .. } => LiftStep::default(),
         }
     }
 
-    /// Takes on the grid as it is now, after anything else changed it, such as a new place or a
-    /// scroll.
-    pub fn sync(&mut self, grid: &DragGrid) {
+    /// Takes on the surfaces as they are now, after anything else changed them, such as a new
+    /// place or a scroll.
+    pub fn sync(&mut self, surfaces: &DragSurfaces) {
         if let Phase::Lifted(drag) = &mut self.phase {
-            drag.track(grid);
+            drag.track(surfaces);
         }
     }
 
-    /// The app whose menu a long-press opened, while its finger is still down and the icon
-    /// isn't lifted yet.
-    pub fn armed(&self) -> Option<&AppId> {
+    /// The app or folder whose menu a long-press opened, and its surface, while its finger is
+    /// still down and the icon isn't lifted yet.
+    pub fn armed(&self) -> Option<(&CellKey, Surface)> {
         match &self.phase {
-            Phase::Armed { app, .. } => Some(app),
-            Phase::Idle | Phase::Lifted(_) | Phase::Settling { .. } => None,
+            Phase::Armed { key, surface, .. } => Some((key, *surface)),
+            _ => None,
         }
     }
 
-    /// The app whose icon is lifted or settling.
-    pub fn app(&self) -> Option<&AppId> {
+    /// The app or folder whose icon is lifted or settling, and its surface.
+    pub fn held(&self) -> Option<(&CellKey, Surface)> {
         match &self.phase {
-            Phase::Lifted(drag) => Some(&drag.app),
-            Phase::Settling { app, .. } => Some(app),
-            Phase::Idle | Phase::Armed { .. } => None,
+            Phase::Lifted(drag) => Some((&drag.key, drag.surface)),
+            Phase::Settling { key, surface, .. } => Some((key, *surface)),
+            _ => None,
         }
     }
 
     /// Whether an icon follows the finger.
     pub fn is_lifted(&self) -> bool {
         matches!(self.phase, Phase::Lifted(_))
+    }
+
+    /// Whether a dropped icon is shrinking into a folder.
+    pub fn is_merging(&self) -> bool {
+        matches!(self.phase, Phase::Merging(_))
     }
 
     /// Puts the icon back in its cell at once, or forgets the long-press, such as when the
@@ -363,29 +599,99 @@ impl Lift {
     pub fn state(&self) -> LiftState {
         match &self.phase {
             Phase::Idle | Phase::Armed { .. } => LiftState::default(),
-            Phase::Lifted(drag) => LiftState {
-                app: Some(drag.app.clone()),
-                dx: drag.offset.0,
-                dy: drag.offset.1,
-                scale: drag.scale.value(),
-                settling: false,
-                animating: drag.waiting || drag.speed != 0.0,
-            },
-            Phase::Settling { app, x, y, scale } => LiftState {
-                app: Some(app.clone()),
-                dx: x.value(),
-                dy: y.value(),
+            Phase::Lifted(drag) => {
+                let (x, y) = drag.centre();
+                LiftState {
+                    key: Some(drag.key.clone()),
+                    surface: drag.surface,
+                    x,
+                    y,
+                    scale: drag.scale.value(),
+                    alpha: 1.0,
+                    settling: false,
+                    merging: false,
+                    animating: drag.waiting || drag.speed != 0.0,
+                }
+            }
+            Phase::Settling {
+                key,
+                surface,
+                x,
+                y,
+                scale,
+            } => LiftState {
+                key: Some(key.clone()),
+                surface: *surface,
+                x: x.value(),
+                y: y.value(),
                 scale: scale.value(),
+                alpha: 1.0,
                 settling: true,
+                merging: false,
                 animating: true,
             },
+            Phase::Merging(merging) => {
+                let t = merging.merge.progress;
+                let between = |from: f64, to: f64| from + (to - from) * t;
+                LiftState {
+                    key: Some(merging.key.clone()),
+                    surface: Surface::Grid,
+                    x: between(merging.from.0, merging.to.0),
+                    y: between(merging.from.1, merging.to.1),
+                    scale: between(merging.from.2, merging.to.2),
+                    alpha: between(merging.from.3, merging.to.3),
+                    settling: false,
+                    merging: true,
+                    animating: true,
+                }
+            }
+        }
+    }
+
+    /// The icon a dragged app is held over, growing and then pulsing (ANIM-14).
+    pub fn hover(&self) -> HoverState {
+        let Phase::Lifted(drag) = &self.phase else {
+            return HoverState::default();
+        };
+        let Some((Over::Icon(key), since)) = &drag.over else {
+            return HoverState::default();
+        };
+        let held = drag.now.saturating_sub(*since);
+        let armed = held >= FOLDER_HOVER;
+        let grow = FOLDER_HOVER_SCALE - 1.0;
+        let scale = if drag.animation_scale <= 0.0 {
+            if armed { FOLDER_HOVER_SCALE } else { 1.0 }
+        } else if !armed {
+            1.0 + grow * decelerate(held.as_secs_f64() / FOLDER_HOVER.as_secs_f64())
+        } else {
+            let pulse = (held - FOLDER_HOVER).as_secs_f64() / FOLDER_PULSE.as_secs_f64();
+            let dip = (1.0 - (pulse * TAU).cos()) / 2.0;
+            FOLDER_HOVER_SCALE - (FOLDER_HOVER_SCALE - FOLDER_PULSE_SCALE) * dip
+        };
+        HoverState {
+            key: Some(key.clone()),
+            scale,
+            armed,
+        }
+    }
+
+    /// The folder a dropped app is shrinking into (ANIM-14).
+    pub fn merge_state(&self) -> MergeState {
+        match &self.phase {
+            Phase::Merging(merging) => merging.merge,
+            _ => MergeState::default(),
         }
     }
 }
 
 impl Drag {
-    fn frame(&mut self, at: Duration, grid: &DragGrid, animation_scale: f64) -> LiftStep {
+    fn centre(&self) -> (f64, f64) {
+        (self.finger.0 + self.grab.0, self.finger.1 + self.grab.1)
+    }
+
+    fn frame(&mut self, at: Duration, surfaces: &DragSurfaces, animation_scale: f64) -> LiftStep {
         self.now = self.now.max(at);
+        self.animation_scale = animation_scale;
         self.scale.advance(at, animation_scale);
         self.scale.land(REST_DISTANCE_SCALE, REST_SPEED_SCALE);
         let mut step = LiftStep::default();
@@ -395,83 +701,157 @@ impl Drag {
             .map_or(Duration::ZERO, |last| at.saturating_sub(last))
             .min(MAX_FRAME_STEP);
         self.last_frame = Some(self.last_frame.map_or(at, |last| last.max(at)));
-        if let Some(layout) = grid.layout.filter(|_| self.speed != 0.0) {
-            let max = layout.max_scroll(grid.rows);
-            let to = (grid.scroll_px + self.speed * elapsed.as_secs_f64()).clamp(0.0, max);
-            if to != grid.scroll_px {
-                step.scroll_to = Some(to);
+        if let Some(view) = surfaces.view(self.surface).filter(|_| self.speed != 0.0) {
+            if let Some(layout) = view.layout {
+                let max = layout.max_scroll(view.rows);
+                let to = (view.scroll_px + self.speed * elapsed.as_secs_f64()).clamp(0.0, max);
+                if to != view.scroll_px {
+                    step.scroll_to = Some((self.surface, to));
+                }
             }
         }
-        self.track(grid);
-        if let Some((place, since)) = self.over {
-            if grid.place != Some(place) && at.saturating_sub(since) >= REORDER_DWELL {
-                step.arrange = Some((self.app.clone(), place));
+        self.track(surfaces);
+        if let Some((Over::Place(surface, place), since)) = &self.over {
+            let own = surfaces.place(self.surface, &self.key);
+            if *surface == self.surface
+                && own != Some(*place)
+                && at.saturating_sub(*since) >= REORDER_DWELL
+            {
+                step.arrange = self.place_at(*place);
             }
         }
         step
     }
 
-    /// Works out, from the finger and the grid now, where the icon is drawn, the place under
-    /// its centre, and how fast it scrolls the grid.
-    fn track(&mut self, grid: &DragGrid) {
-        let moved = (
-            self.finger.0 - self.origin.0,
-            self.finger.1 - self.origin.1 + grid.scroll_px - self.scroll,
-        );
-        self.offset = moved;
+    /// Taking place `to` on its own surface.
+    fn place_at(&self, to: usize) -> Option<DropAt> {
+        match (self.surface, &self.key) {
+            (Surface::Grid, key) => Some(DropAt::Grid {
+                key: key.clone(),
+                to,
+            }),
+            (Surface::Folder, CellKey::App(app)) => Some(DropAt::Folder {
+                app: app.clone(),
+                to,
+            }),
+            (Surface::Folder, CellKey::Folder(_)) => None,
+        }
+    }
+
+    /// Where the finger lifting now drops the icon.
+    fn drop_at(&self) -> DropAt {
+        match (&self.over, &self.key) {
+            (Some((Over::Icon(onto), since)), CellKey::App(app))
+                if self.now.saturating_sub(*since) >= FOLDER_HOVER =>
+            {
+                DropAt::Combine {
+                    app: app.clone(),
+                    onto: onto.clone(),
+                }
+            }
+            (Some((Over::Place(surface, place), _)), _) if *surface == self.surface => {
+                self.place_at(*place).unwrap_or(DropAt::Back)
+            }
+            _ => DropAt::Back,
+        }
+    }
+
+    /// An app dragged out of the open folder's panel comes out of the folder, at the grid place
+    /// under its centre, and the drag goes on in the grid (FOLD-05).
+    fn leave_folder(&mut self, surfaces: &DragSurfaces) -> Option<LiftEvent> {
+        let (Surface::Folder, CellKey::App(app)) = (self.surface, &self.key) else {
+            return None;
+        };
+        let bounds = surfaces.folder_bounds?;
+        let centre = self.centre();
+        if bounds.contains(centre) {
+            return None;
+        }
+        let layout = surfaces.grid.layout?;
+        let (left, top) = layout.origin(surfaces.grid.scroll_px);
+        // One place past the last cell is the end.
+        let count = surfaces.grid.cells.len() + 1;
+        let to = layout.place_at(centre.0 - left, centre.1 - top, count, surfaces.rtl)?;
+        let app = app.clone();
+        self.surface = Surface::Grid;
+        self.over = None;
+        self.may_scroll = (false, false);
+        Some(LiftEvent::LeftFolder { app, to })
+    }
+
+    /// Works out, from the finger and the surface now, what the icon's centre is over, and how
+    /// fast it scrolls its surface.
+    fn track(&mut self, surfaces: &DragSurfaces) {
         self.speed = 0.0;
         let lifting = !self.scale.at_rest(REST_DISTANCE_SCALE, REST_SPEED_SCALE);
-        let (Some(layout), Some(picked)) = (grid.layout, self.picked) else {
+        let found = surfaces
+            .view(self.surface)
+            .and_then(|view| Some((view, view.layout?)));
+        let Some((view, layout)) = found else {
             self.over = None;
             self.waiting = lifting;
             return;
         };
-        // Drawn from its cell's place now, which moves as it takes new ones.
-        if let Some(place) = grid.place {
-            self.offset.0 -= layout.cell_left(place, grid.rtl) - layout.cell_left(picked, grid.rtl);
-            self.offset.1 -= layout.cell_top(place) - layout.cell_top(picked);
-        }
-        // Its centre, in px from the cells' top left.
-        let row = layout.row_height_px.round();
-        let centre = (
-            layout.cell_left(picked, grid.rtl)
-                + layout.cell_width(picked, grid.rtl) / 2.0
-                + moved.0,
-            layout.cell_top(picked) + row / 2.0 + moved.1,
-        );
-        self.over_place(&layout, grid, centre);
-        self.speed = self.scroll_speed(&layout, grid, centre.1);
-        let waiting = self
-            .over
-            .is_some_and(|(place, _)| grid.place != Some(place));
-        self.waiting = lifting || waiting;
-    }
-
-    /// The place under `centre`. The place it is over now stays while the centre is within
-    /// [`HYSTERESIS`] of it; a new one starts its wait now.
-    fn over_place(&mut self, layout: &GridLayout, grid: &DragGrid, centre: (f64, f64)) {
-        let Some(under) = layout.place_at(centre.0, centre.1, grid.count, grid.rtl) else {
-            self.over = None;
-            return;
-        };
-        if let Some((place, _)) = self.over {
-            if place == under || near(layout, grid.rtl, place, centre) {
-                return;
+        let (left, top) = layout.origin(view.scroll_px);
+        let centre = self.centre();
+        let content = (centre.0 - left, centre.1 - top);
+        let own = surfaces.place(self.surface, &self.key);
+        if let Some(place) = layout.place_at(content.0, content.1, view.cells.len(), surfaces.rtl) {
+            let over = self.over_now(surfaces, &layout, view, place, own, content);
+            if self.over.as_ref().map(|(over, _)| over) != Some(&over) {
+                self.over = Some((over, self.now));
             }
         }
-        self.over = Some((under, self.now));
+        self.speed = self.scroll_speed(&layout, view, content.1);
+        self.waiting = lifting
+            || match &self.over {
+                Some((Over::Place(_, place), _)) => own != Some(*place),
+                Some((Over::Icon(_), _)) => true,
+                None => false,
+            };
     }
 
-    /// How fast the grid scrolls, in px per second, with the icon's centre `y` px below the
-    /// cells' top: 0 outside the zones at the visible grid's top and bottom, up to
-    /// [`AUTO_SCROLL_MAX_DP`] at its very edge, and 0 once the grid can go no further.
-    fn scroll_speed(&mut self, layout: &GridLayout, grid: &DragGrid, y: f64) -> f64 {
+    /// What the icon's centre at `content` px from the cells' top left, in place `place`, is
+    /// over: another app's or folder's icon in the grid, for a dragged app, or else the place.
+    /// The place it is over now stays while the centre is within [`HYSTERESIS`] of it.
+    fn over_now(
+        &self,
+        surfaces: &DragSurfaces,
+        layout: &GridLayout,
+        view: &SurfaceView,
+        place: usize,
+        own: Option<usize>,
+        content: (f64, f64),
+    ) -> Over {
+        let mergeable = self.surface == Surface::Grid
+            && matches!(self.key, CellKey::App(_))
+            && own != Some(place);
+        if mergeable && layout.over_icon(place, surfaces.rtl, surfaces.scale, content) {
+            if let Some(item) = view.cells.get(place) {
+                return Over::Icon(item.key());
+            }
+        }
+        if let Some((Over::Place(surface, kept), _)) = &self.over {
+            if *surface == self.surface
+                && *kept != place
+                && near(layout, surfaces.rtl, *kept, content)
+            {
+                return Over::Place(*surface, *kept);
+            }
+        }
+        Over::Place(self.surface, place)
+    }
+
+    /// How fast the surface scrolls, in px per second, with the icon's centre `y` px below its
+    /// cells' top: 0 outside the zones at the visible top and bottom, up to
+    /// [`AUTO_SCROLL_MAX_DP`] at its very edge, and 0 once it can go no further.
+    fn scroll_speed(&mut self, layout: &GridLayout, view: &SurfaceView, y: f64) -> f64 {
         if layout.height_px <= 0.0 {
             return 0.0;
         }
         let zone = AUTO_SCROLL_ZONE_DP * layout.density;
-        // From the top of the visible grid, below the safe area.
-        let on_screen = y - grid.scroll_px;
+        // From the top of the visible cells, below the safe area.
+        let on_screen = y - view.scroll_px;
         let visible = layout.height_px - layout.top_px - layout.bottom_px;
         let up = ((zone - on_screen) / zone).min(1.0);
         let down = ((on_screen - (visible - zone)) / zone).min(1.0);
@@ -486,8 +866,8 @@ impl Drag {
         } else {
             0.0
         };
-        let stuck = (speed < 0.0 && grid.scroll_px <= 0.0)
-            || (speed > 0.0 && grid.scroll_px >= layout.max_scroll(grid.rows));
+        let stuck = (speed < 0.0 && view.scroll_px <= 0.0)
+            || (speed > 0.0 && view.scroll_px >= layout.max_scroll(view.rows));
         if stuck { 0.0 } else { speed }
     }
 }
@@ -502,385 +882,4 @@ fn near(layout: &GridLayout, rtl: bool, place: usize, point: (f64, f64)) -> bool
 }
 
 #[cfg(test)]
-mod tests {
-    use meegone_core_state::ProfileId;
-    use meegone_core_state::motion::MAX_OVERSHOOT;
-
-    use super::*;
-
-    fn mail() -> AppId {
-        AppId {
-            profile: ProfileId(0),
-            package: "mail".into(),
-            activity: "mail.Main".into(),
-        }
-    }
-
-    fn ms(millis: u64) -> Duration {
-        Duration::from_millis(millis)
-    }
-
-    fn event(kind: PointerKind, x: f64, y: f64) -> PointerEvent {
-        at(kind, x, y, 0)
-    }
-
-    fn at(kind: PointerKind, x: f64, y: f64, millis: u64) -> PointerEvent {
-        PointerEvent {
-            kind,
-            x,
-            y,
-            at: ms(millis),
-        }
-    }
-
-    const SLOP: f64 = 16.0;
-
-    /// Not laid out yet: the icon only follows the finger.
-    fn unlaid() -> DragGrid {
-        DragGrid {
-            layout: None,
-            rtl: false,
-            scroll_px: 0.0,
-            count: 8,
-            rows: 3,
-            place: Some(5),
-        }
-    }
-
-    /// 4 columns of 250 px, rows of 300 px, 100 px of safe area above and below, 1000 px tall:
-    /// 800 px of grid show. 40 cells, so 11 rows, scroll up to 2500 px. 2.5 px per dp, so the
-    /// auto-scroll zones are 160 px deep, and it scrolls up to 1600 px a second.
-    fn laid_out(place: usize, scroll_px: f64) -> DragGrid {
-        DragGrid {
-            layout: Some(GridLayout {
-                width_px: 1000.0,
-                row_height_px: 300.0,
-                density: 2.5,
-                top_px: 100.0,
-                bottom_px: 100.0,
-                height_px: 1000.0,
-            }),
-            rtl: false,
-            scroll_px,
-            count: 40,
-            rows: 11,
-            place: Some(place),
-        }
-    }
-
-    /// Mail picked up from place 5 (row 1, column 1) by a finger that went down at (300, 400)
-    /// and moved to (`x`, `y`).
-    fn picked_up(grid: &DragGrid, x: f64, y: f64) -> Lift {
-        let mut lift = Lift::default();
-        lift.arm(mail(), (300.0, 400.0));
-        assert_eq!(
-            lift.pointer(&event(PointerKind::Move, x, y), SLOP, grid, 1.0),
-            Some(LiftEvent::PickedUp)
-        );
-        lift
-    }
-
-    #[test]
-    fn moving_past_the_slop_picks_the_icon_up_and_it_follows_the_finger() {
-        // APPS-11, ANIM-13
-        let grid = unlaid();
-        let mut lift = Lift::default();
-        lift.arm(mail(), (100.0, 200.0));
-        assert_eq!(lift.armed(), Some(&mail()));
-        assert_eq!(lift.state(), LiftState::default());
-
-        // Within the slop, either way, it stays a long-press.
-        let within = event(PointerKind::Move, 116.0, 184.0);
-        assert_eq!(lift.pointer(&within, SLOP, &grid, 1.0), None);
-        assert!(!lift.is_lifted());
-
-        let past = event(PointerKind::Move, 100.0, 217.0);
-        assert_eq!(
-            lift.pointer(&past, SLOP, &grid, 1.0),
-            Some(LiftEvent::PickedUp)
-        );
-        assert!(lift.is_lifted());
-        assert_eq!(lift.armed(), None);
-        let state = lift.state();
-        assert_eq!((state.app, state.dx, state.dy), (Some(mail()), 0.0, 17.0));
-        // It lifts from its cell's size to 110 %.
-        assert_eq!(state.scale, 1.0);
-        assert!(state.animating);
-
-        // Picked up once: later moves only follow.
-        let far = event(PointerKind::Move, 40.0, 500.0);
-        assert_eq!(lift.pointer(&far, SLOP, &grid, 1.0), None);
-        let state = lift.state();
-        assert_eq!((state.dx, state.dy), (-60.0, 300.0));
-    }
-
-    #[test]
-    fn the_icon_lifts_to_110_percent_on_a_spring() {
-        // ANIM-13: from edit mode's 92 %.
-        let grid = unlaid();
-        let mut lift = Lift::default();
-        lift.arm(mail(), (0.0, 0.0));
-        lift.pointer(&event(PointerKind::Move, 0.0, 50.0), SLOP, &grid, 0.92);
-        assert_eq!(lift.state().scale, 0.92);
-
-        lift.frame(ms(0), &grid, 1.0);
-        lift.frame(ms(60), &grid, 1.0);
-        let midway = lift.state().scale;
-        assert!(midway > 0.92 && midway < DRAG_LIFT_SCALE, "{midway}");
-        for t in (60..=400).step_by(8) {
-            lift.frame(ms(t), &grid, 1.0);
-        }
-        let state = lift.state();
-        assert!(
-            (state.scale - DRAG_LIFT_SCALE).abs() < 0.001,
-            "{}",
-            state.scale
-        );
-        // Lifted and still, with nothing to wait for: no more frames.
-        assert!(!state.animating);
-    }
-
-    #[test]
-    fn the_cancel_or_a_new_finger_puts_the_icon_back() {
-        for end in [PointerKind::Cancel, PointerKind::Down] {
-            let grid = unlaid();
-            let mut lift = picked_up(&grid, 500.0, 400.0);
-
-            assert_eq!(
-                lift.pointer(&event(end, 300.0, 200.0), SLOP, &grid, 1.0),
-                None
-            );
-
-            assert_eq!(lift.state(), LiftState::default());
-            assert!(!lift.is_lifted());
-            // A later move picks nothing up.
-            let later = event(PointerKind::Move, 0.0, 0.0);
-            assert_eq!(lift.pointer(&later, SLOP, &grid, 1.0), None);
-        }
-    }
-
-    #[test]
-    fn a_long_press_that_ends_without_a_drag_picks_nothing_up() {
-        let grid = unlaid();
-        let mut lift = Lift::default();
-        lift.arm(mail(), (100.0, 200.0));
-
-        lift.pointer(&event(PointerKind::Up, 100.0, 200.0), SLOP, &grid, 1.0);
-
-        assert_eq!(lift.armed(), None);
-        let later = event(PointerKind::Move, 300.0, 200.0);
-        assert_eq!(lift.pointer(&later, SLOP, &grid, 1.0), None);
-    }
-
-    #[test]
-    fn cancelling_puts_it_back_at_once() {
-        let grid = unlaid();
-        let mut lift = picked_up(&grid, 350.0, 400.0);
-
-        lift.cancel();
-
-        assert_eq!(lift.state(), LiftState::default());
-    }
-
-    #[test]
-    fn a_place_the_icon_stays_over_becomes_its_own() {
-        // APPS-12: from place 5 to place 1, a row up, after REORDER_DWELL.
-        let grid = laid_out(5, 0.0);
-        let mut lift = picked_up(&grid, 300.0, 100.0);
-        let step = lift.frame(ms(0), &grid, 1.0);
-        assert_eq!(step.arrange, None);
-        assert!(lift.state().animating);
-
-        let step = lift.frame(REORDER_DWELL - ms(1), &grid, 1.0);
-        assert_eq!(step.arrange, None);
-        let step = lift.frame(REORDER_DWELL, &grid, 1.0);
-        assert_eq!(step.arrange, Some((mail(), 1)));
-
-        // Once the cell is there, it is drawn from its new place, still under the finger.
-        let moved = laid_out(1, 0.0);
-        lift.sync(&moved);
-        let state = lift.state();
-        assert_eq!((state.dx, state.dy), (0.0, 0.0));
-        assert_eq!(lift.frame(REORDER_DWELL + ms(8), &moved, 1.0).arrange, None);
-    }
-
-    #[test]
-    fn crossing_cells_quickly_takes_no_place_on_the_way() {
-        // APPS-12: each new place starts its wait again.
-        let grid = laid_out(5, 0.0);
-        let mut lift = picked_up(&grid, 600.0, 400.0);
-        let mut taken = Vec::new();
-        for (i, x) in [600.0, 850.0, 600.0, 350.0].into_iter().enumerate() {
-            let t = 100 * i as u64;
-            lift.pointer(&at(PointerKind::Move, x, 400.0, t), SLOP, &grid, 1.0);
-            taken.extend(lift.frame(ms(t + 99), &grid, 1.0).arrange);
-        }
-        assert!(taken.is_empty(), "{taken:?}");
-    }
-
-    #[test]
-    fn a_finger_resting_on_a_line_between_cells_keeps_its_place() {
-        // The line between places 6 and 7 is at x = 750; the centre is 75 px right of the
-        // finger. A little either side of it stays over 6, which keeps its wait.
-        let grid = laid_out(5, 0.0);
-        let mut lift = picked_up(&grid, 670.0, 400.0);
-        lift.frame(ms(0), &grid, 1.0);
-        for (i, x) in [680.0, 672.0, 700.0, 690.0].into_iter().enumerate() {
-            let t = 40 * (i as u64 + 1);
-            lift.pointer(&at(PointerKind::Move, x, 400.0, t), SLOP, &grid, 1.0);
-        }
-        assert_eq!(lift.frame(ms(200), &grid, 1.0).arrange, Some((mail(), 6)));
-    }
-
-    #[test]
-    fn near_an_edge_the_grid_scrolls_faster_the_deeper_and_stops_at_its_end() {
-        // APPS-12: the bottom zone is the last 160 px of the 800 px that show.
-        let grid = laid_out(5, 0.0);
-        // The centre at y = 450 + 200 = 650 from the cells' top: 10 px into the zone.
-        let mut lift = picked_up(&grid, 300.0, 600.0);
-        lift.frame(ms(0), &grid, 1.0);
-        let slow = lift.frame(ms(16), &grid, 1.0).scroll_to.unwrap();
-        assert!((slow - 100.0 * 0.016).abs() < 0.01, "{slow}");
-
-        lift.pointer(&at(PointerKind::Move, 300.0, 900.0, 16), SLOP, &grid, 1.0);
-        let fast = lift.frame(ms(32), &grid, 1.0).scroll_to.unwrap();
-        // At the edge itself, and past it: 640 dp a second.
-        assert!((fast - 1600.0 * 0.016).abs() < 0.01, "{fast}");
-        assert!(lift.state().animating);
-
-        // A late frame scrolls no further than two would.
-        let late = lift.frame(ms(500), &grid, 1.0).scroll_to.unwrap();
-        assert!((late - 1600.0 * 0.034).abs() < 0.01, "{late}");
-
-        // At the end it scrolls no further, and the icon stays under the finger.
-        let end = laid_out(5, 2500.0);
-        lift.sync(&end);
-        assert_eq!(lift.frame(ms(516), &end, 1.0).scroll_to, None);
-        let state = lift.state();
-        assert_eq!((state.dx, state.dy), (0.0, 500.0 + 2500.0));
-
-        // Over the last cell, it takes its place, and then asks for no more frames.
-        let step = lift.frame(ms(650), &end, 1.0);
-        assert_eq!(step.arrange, Some((mail(), 39)));
-        let last = laid_out(39, 2500.0);
-        lift.sync(&last);
-        let state = lift.state();
-        assert!(!state.animating, "{state:?}");
-        assert_eq!((state.dx, state.dy), (-500.0, 600.0));
-    }
-
-    #[test]
-    fn the_grid_scrolls_up_near_the_top_but_not_past_it() {
-        let grid = laid_out(5, 200.0);
-        // Place 5 shows 250 px down the visible grid; the finger moves up 1000 px.
-        let mut lift = picked_up(&grid, 300.0, -600.0);
-        lift.frame(ms(0), &grid, 1.0);
-        let up = lift.frame(ms(16), &grid, 1.0).scroll_to.unwrap();
-        assert!((up - (200.0 - 1600.0 * 0.016)).abs() < 0.01, "{up}");
-        let top = laid_out(5, 0.0);
-        lift.sync(&top);
-        assert_eq!(lift.frame(ms(32), &top, 1.0).scroll_to, None);
-    }
-
-    #[test]
-    fn an_icon_picked_up_near_an_edge_scrolls_only_once_it_has_been_away() {
-        // Place 9, in the third row, its centre 750 px down: inside the bottom zone already.
-        let mut grid = laid_out(9, 0.0);
-        grid.place = Some(9);
-        let mut lift = Lift::default();
-        lift.arm(mail(), (300.0, 800.0));
-        lift.pointer(&event(PointerKind::Move, 300.0, 820.0), SLOP, &grid, 1.0);
-        lift.frame(ms(0), &grid, 1.0);
-        assert_eq!(lift.frame(ms(16), &grid, 1.0).scroll_to, None);
-
-        // Up and out of the zone, then back in.
-        lift.pointer(&at(PointerKind::Move, 300.0, 600.0, 20), SLOP, &grid, 1.0);
-        lift.pointer(&at(PointerKind::Move, 300.0, 840.0, 30), SLOP, &grid, 1.0);
-        assert!(lift.frame(ms(48), &grid, 1.0).scroll_to.is_some());
-    }
-
-    #[test]
-    fn lifting_the_finger_takes_the_place_under_it_and_settles_there() {
-        // ANIM-13: dropped over place 1 before its wait was over.
-        let grid = laid_out(5, 0.0);
-        let mut lift = picked_up(&grid, 300.0, 100.0);
-        lift.frame(ms(0), &grid, 1.0);
-
-        let dropped = lift.pointer(&at(PointerKind::Up, 320.0, 90.0, 50), SLOP, &grid, 1.0);
-        assert_eq!(
-            dropped,
-            Some(LiftEvent::Dropped {
-                app: mail(),
-                to: Some(1)
-            })
-        );
-
-        // The shell moved it there; it springs from where it is drawn to its new cell.
-        let moved = laid_out(1, 0.0);
-        lift.settle(&moved, 0.92, 1.0);
-        let state = lift.state();
-        assert!(state.settling && state.animating);
-        assert_eq!((state.dx, state.dy), (20.0, -10.0));
-        assert!(!lift.is_lifted());
-
-        let mut overshoot: f64 = 0.0;
-        let mut t = 50;
-        while lift.state().app.is_some() {
-            t += 8;
-            lift.frame(ms(t), &moved, 1.0);
-            overshoot = overshoot.max(-lift.state().dx);
-            assert!(t < 600, "still settling");
-        }
-        // A short drop lands within half a pixel sooner than the spring's 220 ms, and
-        // overshoots by about 1.5 % (ANIM-13, ANIM-02).
-        assert!((120..=300).contains(&(t - 50)), "{t}");
-        assert!(overshoot <= 20.0 * MAX_OVERSHOOT, "{overshoot}");
-        assert_eq!(lift.state(), LiftState::default());
-    }
-
-    #[test]
-    fn with_animations_removed_a_dropped_icon_is_in_its_cell_at_once() {
-        // ANIM-05
-        let grid = laid_out(5, 0.0);
-        let mut lift = picked_up(&grid, 300.0, 100.0);
-        lift.pointer(&event(PointerKind::Up, 300.0, 100.0), SLOP, &grid, 1.0);
-
-        lift.settle(&laid_out(1, 0.0), 0.92, 0.0);
-
-        assert_eq!(lift.state(), LiftState::default());
-    }
-
-    #[test]
-    fn a_new_finger_lands_a_settling_icon_at_once() {
-        let grid = unlaid();
-        let mut lift = picked_up(&grid, 500.0, 400.0);
-        let dropped = lift.pointer(&event(PointerKind::Up, 500.0, 400.0), SLOP, &grid, 1.0);
-        // Not laid out: it takes no place, and settles back.
-        assert_eq!(
-            dropped,
-            Some(LiftEvent::Dropped {
-                app: mail(),
-                to: None
-            })
-        );
-        lift.settle(&grid, 1.0, 1.0);
-        assert!(lift.state().settling);
-
-        lift.pointer(&event(PointerKind::Down, 0.0, 0.0), SLOP, &grid, 1.0);
-
-        assert_eq!(lift.state(), LiftState::default());
-    }
-
-    #[test]
-    fn right_to_left_mirrors_the_places() {
-        // L10N-02: moving left from place 5 is moving to a later place.
-        let mut grid = laid_out(5, 0.0);
-        grid.rtl = true;
-        let mut lift = picked_up(&grid, 50.0, 400.0);
-        lift.frame(ms(0), &grid, 1.0);
-        assert_eq!(
-            lift.frame(REORDER_DWELL, &grid, 1.0).arrange,
-            Some((mail(), 6))
-        );
-    }
-}
+mod tests;

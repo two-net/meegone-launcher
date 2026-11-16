@@ -30,7 +30,7 @@ Each crate is `crates/<area>/<layer>`, with the package name `meegone-<area>-<la
 | **recent** | – | Filtering, ordering, close mode | `RecentView` | Removed-apps list (in the settings store) |
 | **lockimage** | Image cache, image-feed interface | On/off, availability, current image | `ImageCard`, `ImageSettingsSection` | Image cache |
 | **settings** | – | Settings, access status, the home-app banner (ONB-04) | `SettingsView`, `HomeBanner` | The settings screens |
-| **shell** | – | `HomeShell`: the carousel of views, the home menu, which long-press counts, Home and Back, coming back to the home, the icon press, the dragged icon, the grid's motion as apps come, go and move, edit mode's motion, composes every feature | `ShellView`, `HomeFrame` | Nothing persistent |
+| **shell** | – | `HomeShell`: the carousel of views, the home menu, which long-press counts, Home and Back, coming back to the home, the icon press, the dragged icon across the grid and the open folder, the grid's motion as apps come, go and move, edit mode's motion, a folder's opening and closing, composes every feature | `ShellView`, `HomeFrame` | Nothing persistent |
 
 The root package `meegone-launcher` is the app. `Launcher::start(platform)` hands the platform adapters to the shell. On Android it is also a native library, which the Java host in `android/` loads ([ADR 0005](docs/adr/0005-android-host-and-home-role.md)) and asks what to draw ([ADR 0006](docs/adr/0006-android-views-and-the-carousel.md)). `tools/arch-check` is a development tool that is never part of the app.
 
@@ -70,15 +70,19 @@ AppsView.cell_tapped(revision, 4, icon)          ui     sends AppsIntent::Launch
   - Coming back from an app (`Returned`) shows the view the user left. With "Home button opens: Always Applications", Home from an app shows Applications with nothing open (HOME-06).
   - After the system ends the process, the activity's saved state brings back the view and the Applications scroll position (`Restore`, REL-05).
 - **The home menu** ([ADR 0008](docs/adr/0008-the-home-menu.md)). A long-press on empty space opens it in Events and Applications, and enters close mode in Recent (HOME-10, REC-07). It lives in `ShellState.menu`, and its items route to Settings and to Applications' edit mode.
-- **An app's menu** ([ADR 0013](docs/adr/0013-the-app-long-press-menu.md)). A long-press on an app's icon opens it: App info, Uninstall when the app allows it, Edit applications and, while MeeGone is the default home app, the app's shortcuts (APPS-11, APPS-13).
+- **An app's menu** ([ADR 0013](docs/adr/0013-the-app-long-press-menu.md)). A long-press on an app's icon opens it: App info, Uninstall when the app allows it, Edit applications and, while MeeGone is the default home app, the app's shortcuts (APPS-11, APPS-13). A folder's menu has Rename folder and Edit applications (ADR 0015).
   - It lives in `AppsState.menu`, and each item's side effect goes through `AppsAdapter`. Back closes it before a folder or edit mode.
   - The shell decides whether the long-press counts and treats the menu as covering the views, but only while Applications works (ARCH-09).
   - Dragging on picks the icon up (`lift.rs`): edit mode starts, and the icon follows the finger until it lifts.
 - **Edit mode** ([ADR 0014](docs/adr/0014-edit-mode.md)). The app menu, the home menu or a drag enters it; Done, Home, Back or leaving Applications ends it (APPS-12).
-  - Applications owns the arrangement. A dragged icon is shown at the place it waits over (`Arrange`) without saving, and the drop saves that order once (`Drop`). Entries that show no cell keep their slots.
-  - The shell owns the drag: the place under the icon, the wait before it is taken, auto-scroll near the grid's edges, and the drop's spring. It works places out from the grid's geometry, which `AppsGrid` reports.
+  - Applications owns the arrangement. A drag edits a draft layout (`Arrange`, `Combine`, `TakeOut`, `ArrangeInFolder`) without saving, and the drop tidies the draft and saves it once (`Drop`). Entries that show no cell keep their slots. The pure edits are in `folders.rs` (ADR 0015).
+  - The shell owns the drag: the place or icon under the dragged icon, the waits before a place is taken or a merge is armed, auto-scroll near the edges, leaving the open folder, and the drop's spring or merge. It works places out from each surface's geometry, which its `AppsGrid` reports.
   - A drag that ends any way but a drop puts the grid back: one rule in the shell's dispatch epilogue.
   - The ✕ asks `AppsAdapter::request_uninstall`; a tap on an icon launches nothing. Edit mode counts only while Applications works (ARCH-09).
+- **Folders** ([ADR 0015](docs/adr/0015-folders.md)). An app dropped on another, after a 400 ms hover, makes a folder named "Folder" until the user renames it; one dropped on a folder joins it (FOLD-01, FOLD-03). A folder left with one app turns back into it when the drop is saved (FOLD-06).
+  - Applications keeps the open folder and its cells as a second surface, `Surface::Folder`, beside the grid. Cells, presses, menus and the drag name their surface and a `CellKey`.
+  - A tap opens a folder. Back, Home, a tap outside, a new view or Settings closes it. While it is open it locks the carousel, and only its panel takes long-presses and presses (FOLD-04).
+  - The shell runs the panel's motion (`folder.rs`), the hover and the merge, and ticks when a folder is made (ANIM-14, ANIM-15, ANIM-24). The open folder, its rename and the app menu count only while Applications works (ARCH-09).
 
 ## Drawing (ADR 0006)
 
@@ -88,12 +92,13 @@ Android's own views draw MeeGone, and the Rust app decides what they show. The d
 HomeViews (Java)                                            Rust
   dispatchTouchEvent ── nativePointer        ──▶ ShellIntent::Pointer      ─┐
   long-press timer   ── nativeLongPress      ──▶ ShellIntent::LongPress    ─┤
-    (on an app icon) ── nativeAppLongPressed ──▶ ShellIntent::LongPressApp ─┤
+    (on a cell)      ── nativeAppLongPressed ──▶ ShellIntent::LongPressCell ┤
   Choreographer      ── nativeFrame          ──▶ ShellIntent::Frame        ─┼▶ HomeShell: carousel
   onSizeChanged      ── nativeLayout         ──▶ ShellIntent::Layout       ─┘   (gesture, spring,
                                                                          indicator), menus, the
-                                                                         picked-up icon and
-                                                                         return-home motion
+                                                                         dragged icon, the open
+                                                                         folder and return-home
+                                                                         motion
   translationX, scale, alpha, menu ◀── nativeRead(int[]) ◀── ShellView::frame ◀── ShellState
 ```
 
@@ -102,15 +107,16 @@ HomeViews (Java)                                            Rust
 - **Touches.** Every touch reaches the carousel first. The content below keeps a gesture until the carousel takes it: sideways, past the platform's touch slop, from anywhere in the view (HOME-03, HOME-13). An element that uses horizontal drags itself calls `requestDisallowInterceptTouchEvent(true)` first.
 - **Edge to edge** ([ADR 0009](docs/adr/0009-edge-to-edge-screens-and-navigation-modes.md)). On every Android version the solid background fills the window behind the system bars, which stay visible (HOME-11). Content stays inside a safe area clear of the bars, cut-outs and rounded corners: each page and Settings get it as padding, so a view's content needs no inset code of its own. Phones stay in portrait; screens 600 dp or more across their smallest width turn freely (HOME-12).
 - **Size changes keep state** (COMP-03). Rotating, folding and resizing send a new `Layout`. It ends a drag but keeps the view, Settings, the home menu (now centred) and everything open in the views. Other configuration changes recreate the activity, and the shared launcher keeps everything.
-- **Applications** ([ADR 0010](docs/adr/0010-the-applications-grid.md)). `AppsGrid`, a `ScrollView`, draws the frame's Applications slots: the columns and rows (the last one empty, HOME-14), the scroll position and the pressed icon. It reads the cells with `nativeAppsCells` only when their revision changes, and names a tapped cell by revision and index. It reports its width and row height, and the Rust app picks the columns (APPS-02) and keeps the same first visible item when they change. It also reports the room above and below its cells and its height, so the Rust app knows which place is under a dragged icon (ADR 0014). Icons stay in Java: `AppIcons` loads them off the main thread.
+- **Applications** ([ADR 0010](docs/adr/0010-the-applications-grid.md)). `AppsGrid`, a `ScrollView`, draws the frame's Applications slots: the columns and rows (the last one empty, HOME-14), the scroll position and the pressed icon. It reads the cells with `nativeAppsCells` only when their revision changes, and names a tapped cell by revision and index. It reports its width and row height, and the Rust app picks the columns (APPS-02) and keeps the same first visible item when they change. It also reports the room above and below its cells, its height, where it is on screen and where its icons are, so the Rust app knows which place or icon is under a dragged icon (ADR 0014, ADR 0015). Icons stay in Java: `AppIcons` loads them off the main thread, once for both grids.
 - **Apps coming, going and moving** ([ADR 0012](docs/adr/0012-keeping-the-layout-in-step.md), [ADR 0014](docs/adr/0014-edit-mode.md)). Each cell says where it was in the cells the host last read, so `AppsGrid` moves the same view, icon and all, to its new place. When cells come, go or move, the shell's grid-change motion runs for 200 ms: new cells grow and fade in, cells that left shrink away where they were, and the rest slide to their new places from where they are drawn (ANIM-21). A revision that only refreshes cells, such as a new accent, keeps a change playing. A new app has a dot in the accent colour before its label until it is opened from MeeGone (APPS-07).
-- **Edit mode** ([ADR 0014](docs/adr/0014-edit-mode.md)). The cells shrink to 92 % and the ✕ badges pop in row by row, from frame slots per visible row (ANIM-12). A dragged icon lifts to 110 % with a shadow, stays under the finger as cells move and the grid scrolls, and settles into its cell on a spring (ANIM-13). Done is a flat pill at the bottom of Applications. Screen readers get "Uninstall ‹app›" and "Move to…" actions on each cell, and hear "Edit mode" (A11Y-01, A11Y-05, A11Y-08).
+- **Edit mode** ([ADR 0014](docs/adr/0014-edit-mode.md)). The cells shrink to 92 % and the ✕ badges pop in row by row, from frame slots per visible row (ANIM-12). A dragged icon lifts to 110 % with a shadow, stays under the finger as cells move and the grid scrolls, and settles into its cell on a spring (ANIM-13). `DragShadow` draws it above the pages, so it can leave an open folder, and its cell stays as a gap (ADR 0015). Done is a flat pill at the bottom of Applications. Screen readers get "Uninstall ‹app›" and "Move to…" actions on each cell, and hear "Edit mode" (A11Y-01, A11Y-05, A11Y-08).
+- **Folders** ([ADR 0015](docs/adr/0015-folders.md)). `AppCell` draws a folder as a plate in the icons' shape with a 2×2 preview of its first apps, and the icon held over grows and pulses (FOLD-02, ANIM-14). `FolderPanel`, inside the Applications page, draws the scrim and a panel four cells wide, with the folder's name over its own `AppsGrid`, growing from the folder's icon (ANIM-15). A tap on the name opens a rename dialog (FOLD-03). Screen readers hear "Folder: ‹name›, N apps", and make and empty folders with actions (A11Y-01, A11Y-05).
 - **Icons and accents** ([ADR 0011](docs/adr/0011-icon-shape-and-app-accents.md)). Every icon is one rounded square: adaptive icons are masked to it, and legacy ones sit on a white plate of that shape (APPS-15). Each app's accent comes from its icon once per process: `AppAccents` samples the icon on a background thread, and the Rust app's pure `nativeAccent` picks the colour (APPS-17). It reaches Rust in the app catalogue, and a theme draws it with `Tokens::app_accent`, at 3:1 or more against its background (THEME-07).
 - **Long-press** (ADR 0008, ADR 0013).
-  - The host times a finger held still. On empty space it sends `LongPress`; on an app's icon, `LongPressApp`, named by the cells' revision and the cell's place.
+  - The host times a finger held still. On empty space it sends `LongPress`; on a cell's icon, `LongPressCell`, named by the surface, the cells' revision and the cell's place.
   - Empty space is where no clickable or long-clickable element is under the finger, so any other element with its own long-press only needs to be clickable.
   - The shell takes a long-press only while the finger is within the touch slop. Once taken, the rest of the gesture is the shell's, so lifting the finger taps nothing.
-  - The menus and Settings cover the home views: while any is open, the carousel gets no new touches. The one card shows the home menu at the finger, or an app's menu at its icon.
+  - The menus and Settings cover the home views: while any is open, the carousel gets no new touches. The one card shows the home menu at the finger, or a cell's menu at its icon. An open folder locks the carousel instead, so long-presses in its panel still count.
 - **Text** is in Android string resources (L10N-01). **Accessibility** comes from Android's views: the home views offer scroll, page and named actions, including "Home menu", and each app's cell offers "Open menu" as its long-click action (A11Y-05).
 
 ## Platform adapters (ARCH-04)
@@ -210,21 +216,21 @@ MeeGone keeps three persistent stores, each in its own file under one private fo
 
 ## Not built yet
 
-The skeleton is from issue #1; the Android host and the home-app role from #4; the carousel of home views from #5; Home, Back and coming back to the home from #6; the home menu from #7; edge to edge, screen sizes and navigation modes from #8; the Applications grid and the app catalogue from #9; one icon shape and each app's accent from #10; the layout kept in step with the installed apps from #11; the app long-press menu from #12; edit mode from #13. The following arrive with later requirements:
+The skeleton is from issue #1; the Android host and the home-app role from #4; the carousel of home views from #5; Home, Back and coming back to the home from #6; the home menu from #7; edge to edge, screen sizes and navigation modes from #8; the Applications grid and the app catalogue from #9; one icon shape and each app's accent from #10; the layout kept in step with the installed apps from #11; the app long-press menu from #12; edit mode from #13; folders from #14. The following arrive with later requirements:
 
 - **Android adapters.**
   - Built:
     - The home-app role, the clock and storage (ADR 0005).
-    - The navigation-mode check for the return-home motion (ADR 0007) and the haptic tick (ADR 0008).
+    - The navigation-mode check for the return-home motion (ADR 0007) and the haptic tick (ADR 0008), which also marks a folder made (ADR 0015).
     - The app catalogue (ADR 0010), with its shortcuts, App info and uninstall requests (ADR 0013).
   - Stubs until their issues: notifications, usage, wallpaper, network, scheduling and the remaining device settings.
-  - The tick on creating a folder (ANIM-24) comes with #14.
 - **The daily image.** The Bing implementation of `ImageFeed` (#26) and the updater (SRS 7.5) come with the WALL requirements.
-- **Drawing.** The home views, their carousel, the view indicator, the return-home motion, the home menu, the Applications grid and its edit mode are drawn (ADR 0006 to ADR 0008, ADR 0010, ADR 0014). Events and Recent show only their names until their content arrives (#19, #22).
+- **Drawing.** The home views, their carousel, the view indicator, the return-home motion, the home menu, the Applications grid, its edit mode and its folders are drawn (ADR 0006 to ADR 0008, ADR 0010, ADR 0014, ADR 0015). Events and Recent show only their names until their content arrives (#19, #22).
   - Recent's cards adapt to large screens when #22 builds them. Today the pages, the carousel, the safe area, the menu, Settings and the Applications columns adapt (HOME-12, APPS-02).
-  - Events' group marker and Recent's card fill draw each app's accent with `Tokens::app_accent` when #19 and #22 draw them. Folders show as a plain cell with their name until #14 draws them.
+  - Events' group marker and Recent's card fill draw each app's accent with `Tokens::app_accent` when #19 and #22 draw them.
   - Settings covers the home views with only its name, and its group's, until #34 draws it. "Home button opens", the home-app banner and first-run setup send intents but aren't drawn yet.
-  - Close mode changes state but isn't drawn yet (#24). Edit mode's "Sort A–Z" (APPS-14, Could) comes with a later issue.
+  - Close mode changes state but isn't drawn yet (#24). Edit mode's "Sort A–Z" (APPS-14, Could) and folders' category names (FOLD-07, Could) come with later issues.
+  - The Android host doesn't yet follow the system's dark mode (#32); the Rust app already does, open folders included.
 - **First-run setup** comes with the ONB requirements. The lock-screen image step is provided as a `Slot`, like its Settings section.
 
 ## Adding a crate

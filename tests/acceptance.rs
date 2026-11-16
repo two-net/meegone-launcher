@@ -3,14 +3,14 @@
 //!
 //! Not automated yet, because the behaviour isn't built:
 //! - AC-01: first-run setup (#35)
-//! - AC-05's open folder, AC-08: folders (#14)
 //! - AC-12: Clear in Events (#20)
 //! - AC-13, AC-14: Recent density and close mode (#23, #24)
 //! - AC-15 to AC-17: the daily image (#27 to #30)
 //!
 //! AC-18 to AC-20 (animation scale, screen reader, timing) need a device; they belong to the
 //! device matrix (#43). Their core logic is tested without one: the carousel with animations
-//! removed and its screen-reader actions in `meegone-shell-state`.
+//! removed and its screen-reader actions in `meegone-shell-state`, and the folders'
+//! screen-reader actions here (A11Y-05).
 
 use std::time::Duration;
 
@@ -23,8 +23,8 @@ use meegone_core_data::{
 use meegone_core_state::{Access, Health, Theme};
 use meegone_core_ui::tokens;
 use meegone_launcher::{
-    AppMenuItem, BADGE_ROWS, Direction, GridLayout, HomeView, Launcher, Layout, LiftFrame,
-    MenuItem, PointerEvent, PointerKind, SettingsGroup, ShellIntent,
+    AppMenuItem, BADGE_ROWS, Bounds, CellKey, Direction, FolderId, GridLayout, HomeView, Launcher,
+    Layout, LiftFrame, MenuItem, PointerEvent, PointerKind, SettingsGroup, ShellIntent, Surface,
 };
 
 /// A phone 1080 × 2400 px at 2.75 px per dp.
@@ -211,7 +211,7 @@ fn ac03_home_from_an_app_opened_from_recent_shows_recent_with_it_at_the_top_left
 #[test]
 fn ac04_home_on_events_shows_applications_and_home_again_scrolls_it_to_the_top() {
     let (mut launcher, mut clock) = on_a_phone(&Fakes::default());
-    launcher.view().apps().grid_scrolled(600.0);
+    launcher.view().apps().scrolled(Surface::Grid, 600.0);
     launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
     launcher.frame();
     assert_eq!(launcher.shell().state().current, HomeView::Events);
@@ -273,7 +273,7 @@ fn home10_long_pressing_the_empty_row_below_a_long_grid_opens_the_home_menu() {
     assert!(rows as f64 * row_px > HEIGHT);
     // when the user scrolls to the bottom and long-presses the empty row,
     let bottom = rows as f64 * row_px - HEIGHT;
-    launcher.view().apps().grid_scrolled(bottom);
+    launcher.view().apps().scrolled(Surface::Grid, bottom);
     launcher.frame();
     let empty_row = (rows - 1) as f64 * row_px - bottom + row_px / 2.0;
     long_press(&mut launcher, &mut clock, WIDTH / 2.0, empty_row);
@@ -339,7 +339,7 @@ fn comp03_folding_or_unfolding_keeps_the_view_scroll_position_and_edit_mode() {
     // another density. Folders arrive with #14; `meegone-shell-state` checks that an open one
     // is kept too.
     let (mut launcher, mut clock) = on_a_phone(&Fakes::default());
-    launcher.view().apps().grid_scrolled(600.0);
+    launcher.view().apps().scrolled(Surface::Grid, 600.0);
     long_press(&mut launcher, &mut clock, 540.0, 1800.0);
     launcher.dispatch(ShellIntent::ChooseMenuItem(MenuItem::EditApplications));
     launcher.frame();
@@ -405,7 +405,7 @@ fn comp02_home_and_back_behave_the_same_in_every_navigation_mode() {
         let fakes = Fakes::default();
         *fakes.system.animates_return_home.lock().unwrap() = gestures;
         let (mut launcher, mut clock) = on_a_phone(&fakes);
-        launcher.view().apps().grid_scrolled(600.0);
+        launcher.view().apps().scrolled(Surface::Grid, 600.0);
         let mut steps = Vec::new();
         let mut step = |launcher: &mut Launcher, intent| {
             launcher.dispatch(intent);
@@ -504,7 +504,7 @@ fn dots(launcher: &mut Launcher) -> Vec<bool> {
     launcher
         .view()
         .apps()
-        .cells()
+        .cells(Surface::Grid)
         .map(|cell| cell.new)
         .collect()
 }
@@ -515,7 +515,7 @@ fn froms(launcher: &mut Launcher) -> Vec<Option<usize>> {
     launcher
         .view()
         .apps()
-        .cells()
+        .cells(Surface::Grid)
         .map(|cell| cell.from)
         .collect()
 }
@@ -574,7 +574,7 @@ fn apps06_given_an_app_installed_while_meegone_wasnt_running_it_is_at_the_end() 
         launcher
             .view()
             .apps()
-            .cell_tapped(revision, 2, Rect::default())
+            .cell_tapped(Surface::Grid, revision, 2, Rect::default())
     );
     launcher.frame();
     assert_eq!(*fakes.apps.launched.lock().unwrap(), [app_id("atlas")]);
@@ -676,8 +676,9 @@ fn apps08_an_uninstalled_app_leaves_its_folder_and_the_grid_closes_up() {
     launcher.dispatch(ShellIntent::AppsChanged);
 
     assert_eq!(grid(&launcher), ["Chess", "Phone"]);
-    // Games and Maps leave, shrinking; Chess joins; Phone moves up from the third cell.
-    assert_eq!(froms(&mut launcher), [None, Some(2)]);
+    // Games turns back into Chess in its own cell (ADR 0015); Maps leaves, shrinking; Phone
+    // moves up from the third cell.
+    assert_eq!(froms(&mut launcher), [Some(0), Some(2)]);
     let change = launcher.frame().grid_change;
     assert_eq!(
         (change.leave_scale, change.leave_alpha, change.shift),
@@ -855,7 +856,7 @@ fn cells(launcher: &mut Launcher) -> Vec<(String, bool, bool)> {
     launcher
         .view()
         .apps()
-        .cells()
+        .cells(Surface::Grid)
         .map(|cell| (cell.label.to_owned(), cell.work, cell.available))
         .collect()
 }
@@ -919,9 +920,7 @@ fn apps02_given_a_screen_600_dp_wide_or_more_every_cell_is_96_to_128_dp_wide() {
             width_px: grid_dp * density,
             row_height_px: 112.0 * density,
             density,
-            top_px: 0.0,
-            bottom_px: 0.0,
-            height_px: 0.0,
+            ..PHONE_GRID
         });
         let columns = f64::from(launcher.frame().apps.columns);
         (grid_dp, columns)
@@ -977,14 +976,24 @@ fn apps09_given_a_paused_work_profile_its_apps_are_dimmed_and_a_tap_defers_to_th
         bottom: 454,
     };
     let revision = launcher.frame().apps.revision;
-    assert!(launcher.view().apps().cell_tapped(revision, 0, icon));
+    assert!(
+        launcher
+            .view()
+            .apps()
+            .cell_tapped(Surface::Grid, revision, 0, icon)
+    );
     launcher.frame();
     assert_eq!(*fakes.apps.launched.lock().unwrap(), [paused.id.clone()]);
     assert_eq!(*fakes.apps.launched_from.lock().unwrap(), [Some(icon)]);
     assert_eq!(launcher.shell().apps().state().problem, None);
 
     *fakes.apps.error.lock().unwrap() = Some(DataError::Unsupported("App isn't available".into()));
-    assert!(launcher.view().apps().cell_tapped(revision, 0, icon));
+    assert!(
+        launcher
+            .view()
+            .apps()
+            .cell_tapped(Surface::Grid, revision, 0, icon)
+    );
     launcher.frame();
     assert_eq!(
         launcher.shell().apps().state().problem.as_deref(),
@@ -1105,10 +1114,18 @@ fn long_press_cell(launcher: &mut Launcher, clock: &mut u64, index: usize, x: f6
     finger(launcher, clock, PointerKind::Down, x, y);
     *clock += 400;
     let revision = launcher.frame().apps.revision;
-    let Some(app) = launcher.view().apps().app_at(revision, index).cloned() else {
+    let Some(app) = launcher
+        .view()
+        .apps()
+        .app_at(Surface::Grid, revision, index)
+        .cloned()
+    else {
         return false;
     };
-    launcher.dispatch(ShellIntent::LongPressApp(app));
+    launcher.dispatch(ShellIntent::LongPressCell {
+        surface: Surface::Grid,
+        key: CellKey::App(app),
+    });
     launcher.frame().apps.menu.is_some() && launcher.shell().state().carousel.held
 }
 
@@ -1223,8 +1240,8 @@ fn apps11_given_meegone_isnt_the_default_home_app_then_no_shortcuts_appear() {
 
 #[test]
 fn apps11_given_a_long_press_followed_by_a_drag_then_the_icon_lifts_and_edit_mode_starts() {
-    // Issues #12 and #13. With the grid not laid out yet, it takes no new place: dropped, it
-    // settles back into its cell.
+    // Issues #12 to #14. With the grid not laid out yet, the icon's centre is the finger, and
+    // it takes no new place: dropped, it is back in its cell at once.
     let fakes = Fakes::default();
     mail_and_settings(&fakes);
     let (mut launcher, mut clock) = on_a_phone(&fakes);
@@ -1236,7 +1253,7 @@ fn apps11_given_a_long_press_followed_by_a_drag_then_the_icon_lifts_and_edit_mod
     assert_eq!(frame.apps.menu, None);
     assert!(launcher.shell().apps().state().edit_mode);
     let lifted = frame.lifted.expect("lifted");
-    assert_eq!((lifted.cell, lifted.dx, lifted.dy), (1, 120, 150));
+    assert_eq!((lifted.cell, lifted.x, lifted.y), (Some(1), 520, 450));
     // The views stay put, so the drag moves only the icon.
     assert_eq!(frame.pages[HomeView::Applications.index()], 0);
     // ANIM-13: it lifts to 110 %.
@@ -1244,17 +1261,18 @@ fn apps11_given_a_long_press_followed_by_a_drag_then_the_icon_lifts_and_edit_mod
     assert_eq!(
         launcher.frame().lifted,
         Some(LiftFrame {
-            cell: 1,
-            dx: 120,
-            dy: 150,
+            surface: Surface::Grid,
+            cell: Some(1),
+            x: 520,
+            y: 450,
             scale: 11_000,
+            alpha: 255,
             settling: false,
+            merging: false,
         })
     );
 
     finger(&mut launcher, &mut clock, PointerKind::Up, 520.0, 450.0);
-    assert!(launcher.frame().lifted.unwrap().settling);
-    come_to_rest(&mut launcher, &mut clock);
     assert_eq!(launcher.frame().lifted, None);
     assert!(launcher.shell().apps().state().edit_mode);
     assert!(fakes.apps.launched.lock().unwrap().is_empty());
@@ -1296,7 +1314,7 @@ fn home07_home08_back_or_home_closes_an_apps_menu() {
     let fakes = Fakes::default();
     mail_and_settings(&fakes);
     let (mut launcher, mut clock) = on_a_phone(&fakes);
-    launcher.view().apps().grid_scrolled(120.0);
+    launcher.view().apps().scrolled(Surface::Grid, 120.0);
 
     long_press_cell(&mut launcher, &mut clock, 0, 150.0, 300.0);
     finger(&mut launcher, &mut clock, PointerKind::Up, 150.0, 300.0);
@@ -1321,8 +1339,13 @@ fn a11y05_a_screen_reader_opens_an_apps_menu_without_a_gesture() {
     let (mut launcher, _) = on_a_phone(&fakes);
     let revision = launcher.frame().apps.revision;
 
-    let app = launcher.view().apps().app_at(revision, 1).cloned().unwrap();
-    launcher.dispatch(ShellIntent::OpenAppMenu(app));
+    let app = launcher
+        .view()
+        .apps()
+        .app_at(Surface::Grid, revision, 1)
+        .cloned()
+        .unwrap();
+    launcher.dispatch(ShellIntent::OpenCellMenu(CellKey::App(app)));
 
     let frame = launcher.frame();
     assert_eq!(frame.apps.menu.map(|menu| menu.cell), Some(Some(1)));
@@ -1330,18 +1353,24 @@ fn a11y05_a_screen_reader_opens_an_apps_menu_without_a_gesture() {
     assert_eq!(*fakes.system.haptic_ticks.lock().unwrap(), 0);
 }
 
-/// The phone's grid as `AppsGrid` reports it: 992 px wide inside its 16 dp margins, four
-/// columns of 248 px, rows 308 px apart, the status bar's 82 px above and the navigation bar's
-/// 132 px below.
+/// The phone's grid as `AppsGrid` reports it: 992 px wide inside its 16 dp margins, so 44 px
+/// in, four columns of 248 px, rows 308 px apart, the status bar's 82 px above and the
+/// navigation bar's 132 px below. Each icon is 154 px from 22 px down its cell.
+const PHONE_GRID: GridLayout = GridLayout {
+    width_px: 992.0,
+    row_height_px: 308.0,
+    density: 2.75,
+    top_px: 82.0,
+    bottom_px: 132.0,
+    height_px: HEIGHT,
+    left_px: 44.0,
+    view_top_px: 0.0,
+    icon_px: 154.0,
+    icon_top_px: 22.0,
+};
+
 fn grid_on_a_phone(launcher: &mut Launcher) {
-    launcher.view().apps().grid_laid_out(GridLayout {
-        width_px: 992.0,
-        row_height_px: 308.0,
-        density: 2.75,
-        top_px: 82.0,
-        bottom_px: 132.0,
-        height_px: HEIGHT,
-    });
+    launcher.view().apps().grid_laid_out(PHONE_GRID);
     // The host reads the cells it draws.
     let _ = froms(launcher);
 }
@@ -1380,7 +1409,8 @@ fn ac07_given_edit_mode_when_maps_is_dragged_to_the_first_cell_then_the_others_m
     assert_eq!(frame.edit.badges, [10_000; BADGE_ROWS]);
 
     assert!(long_press_cell(&mut launcher, &mut clock, 2, 620.0, 300.0));
-    finger(&mut launcher, &mut clock, PointerKind::Move, 124.0, 300.0);
+    // Over the first cell's label: its icon would make a folder.
+    finger(&mut launcher, &mut clock, PointerKind::Move, 124.0, 451.0);
     // It waits over the first cell for a moment, then takes it.
     for _ in 0..12 {
         clock += 16;
@@ -1394,9 +1424,10 @@ fn ac07_given_edit_mode_when_maps_is_dragged_to_the_first_cell_then_the_others_m
     let frame = launcher.frame();
     assert!(frame.animating);
     let lifted = frame.lifted.expect("still lifted");
-    assert_eq!((lifted.cell, lifted.dx, lifted.dy), (0, 0, 0));
+    // Held 44 px left of its icon's centre and 115 px below it.
+    assert_eq!((lifted.cell, lifted.x, lifted.y), (Some(0), 168, 336));
 
-    finger(&mut launcher, &mut clock, PointerKind::Up, 124.0, 300.0);
+    finger(&mut launcher, &mut clock, PointerKind::Up, 124.0, 451.0);
     come_to_rest(&mut launcher, &mut clock);
     assert_eq!(launcher.frame().lifted, None);
     assert_eq!(grid(&launcher), ["Maps", "Camera", "Mail", "Phone"]);
@@ -1443,13 +1474,18 @@ fn ac09_given_edit_mode_when_the_user_taps_the_cross_and_confirms_then_the_icon_
     let crosses: Vec<bool> = launcher
         .view()
         .apps()
-        .cells()
+        .cells(Surface::Grid)
         .map(|cell| cell.uninstallable)
         .collect();
     assert_eq!(crosses, [false, true, true, true]);
 
     let revision = launcher.frame().apps.revision;
-    assert!(launcher.view().apps().badge_tapped(revision, 1));
+    assert!(
+        launcher
+            .view()
+            .apps()
+            .badge_tapped(Surface::Grid, revision, 1)
+    );
     launcher.frame();
     // MeeGone only asks: the system shows its confirmation.
     assert_eq!(
@@ -1485,7 +1521,7 @@ fn apps12_done_home_or_back_ends_edit_mode() {
             launcher
                 .view()
                 .apps()
-                .cell_tapped(revision, 2, Rect::default())
+                .cell_tapped(Surface::Grid, revision, 2, Rect::default())
         );
         launcher.frame();
         assert!(fakes.apps.launched.lock().unwrap().is_empty());
@@ -1516,7 +1552,7 @@ fn a11y05_a_screen_reader_moves_an_icon_without_a_gesture() {
     let (mut launcher, _) = editing_four(&fakes);
     let revision = launcher.frame().apps.revision;
 
-    assert!(launcher.view().apps().moved(revision, 3, 0));
+    assert!(launcher.view().apps().moved(Surface::Grid, revision, 3, 0));
     launcher.frame();
 
     assert_eq!(grid(&launcher), ["Phone", "Camera", "Mail", "Maps"]);
@@ -1525,4 +1561,254 @@ fn a11y05_a_screen_reader_moves_an_icon_without_a_gesture() {
         grid(&Launcher::start(fakes.platform())),
         ["Phone", "Camera", "Mail", "Maps"]
     );
+}
+
+/// Where `place`'s icon centre is on screen in [`PHONE_GRID`], out of edit mode.
+fn phone_icon(place: usize) -> (f64, f64) {
+    let (column, row) = ((place % 4) as f64, (place / 4) as f64);
+    (44.0 + column * 248.0 + 124.0, 82.0 + row * 308.0 + 99.0)
+}
+
+/// Frames every 16 ms for `ms` ms.
+fn wait(launcher: &mut Launcher, clock: &mut u64, ms: u64) {
+    for _ in 0..ms / 16 {
+        *clock += 16;
+        launcher.dispatch(ShellIntent::Frame(Duration::from_millis(*clock)));
+        launcher.frame();
+    }
+}
+
+/// The open folder's grid as its panel reports it: four columns of 248 px from 44 px in, its
+/// top 600 px down, one row tall, inside a panel from (30, 500) to (1050, 1000).
+fn folder_on_a_phone(launcher: &mut Launcher) {
+    launcher.view().apps().folder_laid_out(
+        GridLayout {
+            top_px: 0.0,
+            bottom_px: 0.0,
+            height_px: 308.0,
+            view_top_px: 600.0,
+            ..PHONE_GRID
+        },
+        Bounds {
+            left: 30.0,
+            top: 500.0,
+            right: 1050.0,
+            bottom: 1000.0,
+        },
+    );
+    let _ = launcher.view().apps().cells(Surface::Folder).count();
+}
+
+#[test]
+fn ac08_given_two_apps_when_one_is_dropped_on_the_other_then_a_folder_holds_both_and_moving_one_out_undoes_it()
+ {
+    // Issue #14: FOLD-01, FOLD-03, FOLD-05, FOLD-06, ANIM-14.
+    let fakes = Fakes::default();
+    *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail"), app("maps", "Maps")];
+    let (mut launcher, mut clock) = on_a_phone(&fakes);
+    grid_on_a_phone(&mut launcher);
+
+    // Maps is held over Mail's icon until it pulses, then dropped.
+    let (x, y) = phone_icon(1);
+    assert!(long_press_cell(&mut launcher, &mut clock, 1, x, y));
+    let (x, y) = phone_icon(0);
+    finger(&mut launcher, &mut clock, PointerKind::Move, x, y);
+    wait(&mut launcher, &mut clock, 480);
+    let hover = launcher.frame().hover.expect("held over Mail");
+    assert_eq!(hover.cell, 0);
+    finger(&mut launcher, &mut clock, PointerKind::Up, x, y);
+
+    // A folder named "Folder", the host's name for "", holds both, where Mail was.
+    assert_eq!(grid(&launcher), [""]);
+    let frame = launcher.frame();
+    let merge = frame.merge.expect("Maps goes into the folder");
+    assert_eq!((merge.cell, merge.slot, merge.formed), (0, Some(1), true));
+    come_to_rest(&mut launcher, &mut clock);
+    let cell = launcher.view().apps().cells(Surface::Grid).next().unwrap();
+    let held: Vec<&str> = cell.apps.iter().map(|app| app.label.as_str()).collect();
+    assert_eq!((cell.label, held), ("", vec!["Mail", "Maps"]));
+
+    // Opened, then Maps dragged out of its panel to the grid's second place.
+    open_folder(&mut launcher, 0);
+    folder_on_a_phone(&mut launcher);
+    come_to_rest(&mut launcher, &mut clock);
+    assert!(launcher.frame().folder.expect("open").open);
+    let (fx, fy) = (44.0 + 248.0 + 124.0, 600.0 + 99.0);
+    finger(&mut launcher, &mut clock, PointerKind::Down, fx, fy);
+    clock += 400;
+    launcher.dispatch(ShellIntent::LongPressCell {
+        surface: Surface::Folder,
+        key: CellKey::App(app_id("maps")),
+    });
+    assert!(launcher.frame().apps.menu.is_some());
+    finger(&mut launcher, &mut clock, PointerKind::Move, fx, fy - 40.0);
+    assert_eq!(
+        launcher.frame().lifted.map(|lift| lift.surface),
+        Some(Surface::Folder)
+    );
+    finger(&mut launcher, &mut clock, PointerKind::Move, fx, 300.0);
+    assert_eq!(launcher.shell().apps().state().open_folder, None);
+    finger(&mut launcher, &mut clock, PointerKind::Up, fx, 300.0);
+    come_to_rest(&mut launcher, &mut clock);
+
+    // The folder of one is Mail again.
+    assert_eq!(grid(&launcher), ["Mail", "Maps"]);
+    drop(launcher);
+    assert_eq!(grid(&Launcher::start(fakes.platform())), ["Mail", "Maps"]);
+}
+
+#[test]
+fn a11y05_a_screen_reader_makes_a_folder_and_takes_an_app_out_of_it() {
+    // Issue #14: A11Y-05. "Make folder with Maps", then "Move out of folder". Each step ticks:
+    // the long-press, entering edit mode, and the folder made (ANIM-24).
+    let fakes = Fakes::default();
+    let (mut launcher, _) = editing_four(&fakes);
+    let revision = launcher.frame().apps.revision;
+
+    assert!(launcher.view().apps().grouped(revision, 1));
+    launcher.frame();
+    assert_eq!(grid(&launcher), ["Camera", "", "Phone"]);
+    assert_eq!(*fakes.system.haptic_ticks.lock().unwrap(), 3);
+
+    // Mail went onto Maps: the folder holds Maps first. Taking Maps out leaves Mail alone,
+    // which the folder turns back into, with Maps just after it.
+    open_folder(&mut launcher, 1);
+    assert_eq!(in_folder(&launcher), ["Maps", "Mail"]);
+    let open = launcher.frame().apps.folder.revision;
+    assert!(launcher.view().apps().moved_out(open, 0));
+    launcher.frame();
+    assert_eq!(grid(&launcher), ["Camera", "Mail", "Maps", "Phone"]);
+}
+
+/// Games, a folder of Chess and Go, then Maps, on a phone.
+fn games_and_maps(fakes: &Fakes) -> (Launcher, u64) {
+    *fakes.apps.apps.lock().unwrap() =
+        vec![app("chess", "Chess"), app("go", "Go"), app("maps", "Maps")];
+    saved_layout(
+        fakes,
+        "folder 1 Games 2 0 chess chess.Main 0 go go.Main\napp 0 maps maps.Main\n",
+    );
+    on_a_phone(fakes)
+}
+
+/// The folder at grid cell `index` is tapped.
+fn open_folder(launcher: &mut Launcher, index: usize) {
+    let revision = launcher.frame().apps.revision;
+    assert!(
+        launcher
+            .view()
+            .apps()
+            .cell_tapped(Surface::Grid, revision, index, Rect::default())
+    );
+    launcher.frame();
+}
+
+fn in_folder(launcher: &Launcher) -> Vec<String> {
+    launcher
+        .view()
+        .apps()
+        .cells(Surface::Folder)
+        .map(|cell| cell.label.to_owned())
+        .collect()
+}
+
+#[test]
+fn fold04_a_tap_opens_a_folder_and_back_home_or_a_tap_outside_closes_it() {
+    // Issue #14: FOLD-04, HOME-07, HOME-08, ANIM-15.
+    for end in 0..3 {
+        let fakes = Fakes::default();
+        let (mut launcher, mut clock) = games_and_maps(&fakes);
+
+        open_folder(&mut launcher, 0);
+
+        let frame = launcher.frame();
+        let folder = frame.folder.expect("opening");
+        assert_eq!(
+            (folder.folder, folder.open, folder.cell),
+            (FolderId(1), true, Some(0))
+        );
+        assert!(frame.animating && !frame.menu_offered);
+        come_to_rest(&mut launcher, &mut clock);
+        assert_eq!(launcher.frame().folder.unwrap().progress, 10_000);
+        assert_eq!(in_folder(&launcher), ["Chess", "Go"]);
+
+        match end {
+            0 => launcher.dispatch(ShellIntent::Back),
+            1 => launcher.dispatch(ShellIntent::Home),
+            _ => launcher.view().apps().close_folder(),
+        }
+
+        let closing = launcher.frame().folder.expect("closing");
+        assert!(!closing.open);
+        come_to_rest(&mut launcher, &mut clock);
+        let frame = launcher.frame();
+        assert_eq!(frame.folder, None);
+        assert_eq!(frame.current, HomeView::Applications);
+    }
+}
+
+#[test]
+fn fold03_a_folders_new_name_survives_a_restart() {
+    // Issue #14: FOLD-03. The host asks for the name in a dialog.
+    let fakes = Fakes::default();
+    let (mut launcher, _) = games_and_maps(&fakes);
+    open_folder(&mut launcher, 0);
+
+    launcher.view().apps().rename_requested(FolderId(1));
+    let renaming = launcher.frame().renaming.expect("asked for a name");
+    assert_eq!((renaming.folder, renaming.cell), (FolderId(1), Some(0)));
+    launcher
+        .view()
+        .apps()
+        .folder_renamed(FolderId(1), "  Board games ".into());
+
+    assert_eq!(launcher.frame().renaming, None);
+    assert_eq!(grid(&launcher), ["Board games", "Maps"]);
+    drop(launcher);
+    assert_eq!(
+        grid(&Launcher::start(fakes.platform())),
+        ["Board games", "Maps"]
+    );
+}
+
+#[test]
+fn fold05_apps_move_within_a_folder_and_the_order_is_kept() {
+    // Issue #14: FOLD-05, in edit mode, with a screen reader's "Move earlier".
+    let fakes = Fakes::default();
+    let (mut launcher, mut clock) = games_and_maps(&fakes);
+    long_press(&mut launcher, &mut clock, 500.0, 1500.0);
+    launcher.dispatch(ShellIntent::ChooseMenuItem(MenuItem::EditApplications));
+    open_folder(&mut launcher, 0);
+    let open = launcher.frame().apps.folder.revision;
+
+    assert!(launcher.view().apps().moved(Surface::Folder, open, 1, 0));
+    launcher.frame();
+
+    assert_eq!(in_folder(&launcher), ["Go", "Chess"]);
+    drop(launcher);
+    let mut restarted = Launcher::start(fakes.platform());
+    open_folder(&mut restarted, 0);
+    assert_eq!(in_folder(&restarted), ["Go", "Chess"]);
+}
+
+#[test]
+fn ac05_given_theme_system_and_an_open_folder_the_app_turns_dark_with_the_folder_still_open() {
+    // Issue #14: THEME-02, THEME-06.
+    let fakes = Fakes::default();
+    let (mut launcher, mut clock) = games_and_maps(&fakes);
+    launcher.view().apps().scrolled(Surface::Grid, 120.0);
+    open_folder(&mut launcher, 0);
+    come_to_rest(&mut launcher, &mut clock);
+    // The black scrim behind it is 40 % opaque in Light (SRS 5.3)…
+    assert_eq!(launcher.frame().scrim, 102);
+
+    *fakes.system.dark.lock().unwrap() = true;
+    launcher.dispatch(ShellIntent::SystemThemeChanged);
+
+    let frame = launcher.frame();
+    assert_eq!(launcher.shell().theme().state().theme, Theme::Dark);
+    assert!(frame.folder.expect("still open").open);
+    assert_eq!(frame.apps.scroll_px, 120);
+    // …and 60 % in Dark.
+    assert_eq!(frame.scrim, 153);
 }

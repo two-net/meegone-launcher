@@ -245,6 +245,9 @@ pub(crate) struct Carousel {
     animation_scale: f64,
     /// The latest time the host reported.
     now: Duration,
+    /// Something over the views, such as an open folder, takes touches itself: a finger still
+    /// counts as a press, so a long-press can count, but it never drags the row (FOLD-04).
+    locked: bool,
 }
 
 impl Carousel {
@@ -256,6 +259,7 @@ impl Carousel {
             indicator: Indicator::default(),
             animation_scale: 1.0,
             now: Duration::ZERO,
+            locked: false,
         };
         carousel.configure(wrap, animation_scale);
         carousel
@@ -325,6 +329,11 @@ impl Carousel {
         };
         self.publish();
         release
+    }
+
+    /// Locks the row in place, or lets it move again (FOLD-04): see `locked`.
+    pub fn lock(&mut self, locked: bool) {
+        self.locked = locked;
     }
 
     /// Where the finger went down, while the gesture is still a press: down, not past the touch
@@ -472,7 +481,7 @@ impl Carousel {
         if dx.abs() <= slop && dy.abs() <= slop {
             return;
         }
-        if dx.abs() > dy.abs() {
+        if dx.abs() > dy.abs() && !self.locked {
             // Measured from where the finger crossed the slop, so the row doesn't jump.
             self.start_drag(x + slop.copysign(dx), 0.0, event.at);
             self.drag(event, current);

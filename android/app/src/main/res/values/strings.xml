@@ -65,6 +65,31 @@
          app's name, %2$d its place from the start and %3$d how many places there are. -->
     <string name="app_moved">%1$s, place %2$d of %3$d</string>
 
+    <!-- Folders in Applications (FOLD-01 to FOLD-06). A folder's name until the user gives it
+         one (FOLD-03). -->
+    <string name="folder">Folder</string>
+    <!-- What screen readers read for a folder's icon, e.g. "Folder: Games, 3 apps" (A11Y-01).
+         %1$s is its name and %2$d how many apps it holds. -->
+    <plurals name="folder_description">
+        <item quantity="one">Folder: %1$s, %2$d app</item>
+        <item quantity="other">Folder: %1$s, %2$d apps</item>
+    </plurals>
+    <!-- The open folder's title for screen readers, e.g. "Folder: Games" (A11Y-08). %1$s is its
+         name. -->
+    <string name="folder_pane">Folder: %1$s</string>
+    <!-- An item of a folder's long-press menu, and the dialog it opens (FOLD-03). -->
+    <string name="menu_rename_folder">Rename folder</string>
+    <string name="folder_name">Folder name</string>
+    <!-- Screen-reader actions in edit mode that make a folder of an app and the next one, or put
+         it into the next folder, instead of dragging (A11Y-05). %1$s is the next cell's name. -->
+    <string name="action_make_folder">Make folder with %1$s</string>
+    <string name="action_move_into">Move into %1$s</string>
+    <!-- A screen-reader action on an app in an open folder in edit mode (A11Y-05). -->
+    <string name="action_move_out">Move out of folder</string>
+    <!-- Read by screen readers after those actions (A11Y-08). %1$s is the app's name. -->
+    <string name="app_grouped">%1$s moved into a folder</string>
+    <string name="app_moved_out">%1$s moved out of the folder</string>
+
     <!-- Settings' title (SET-01). -->
     <string name="settings_title">Launcher settings</string>
 </resources>
