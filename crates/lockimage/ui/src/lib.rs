@@ -26,8 +26,8 @@ impl ImageCard {
 
 impl Slot for ImageCard {
     fn render(&mut self, _tokens: &Tokens) {
-        // Drawing the thumbnail, title and attribution when `is_visible` arrives with the UI
-        // toolkit (ADR 0002).
+        // Drawing the thumbnail, title and attribution when `is_visible` arrives with #21
+        // (ADR 0006).
     }
 }
 
@@ -55,6 +55,6 @@ impl ImageSettingsSection {
 
 impl Slot for ImageSettingsSection {
     fn render(&mut self, _tokens: &Tokens) {
-        // Drawing arrives with the UI toolkit (ADR 0002).
+        // Drawing arrives with the Settings screen, #34 (ADR 0006).
     }
 }

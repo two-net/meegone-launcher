@@ -47,7 +47,7 @@ impl View for SettingsView {
     type State = SettingsState;
 
     fn render(&mut self, _state: &SettingsState, tokens: &Tokens) {
-        // Drawing Settings' own groups arrives with the UI toolkit (ADR 0002).
+        // Drawing Settings' own groups arrives with #34, in Android's views (ADR 0006).
         for section in &mut self.sections {
             section.render(tokens);
         }
@@ -85,6 +85,6 @@ impl HomeBanner {
 
 impl Slot for HomeBanner {
     fn render(&mut self, _tokens: &Tokens) {
-        // Drawing the banner when `is_visible` arrives with the UI toolkit (ADR 0002).
+        // Drawing the banner when `is_visible` isn't built yet (ADR 0006).
     }
 }

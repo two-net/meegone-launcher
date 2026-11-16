@@ -9,7 +9,10 @@
 mod android;
 
 pub use meegone_core_data::Platform;
-pub use meegone_shell_state::{Direction, HomeShell, HomeView, ShellIntent};
+pub use meegone_shell_state::{
+    Direction, HomeShell, HomeView, Layout, PointerEvent, PointerKind, ShellIntent,
+};
+pub use meegone_shell_ui::HomeFrame;
 use meegone_shell_ui::ShellView;
 
 pub struct Launcher {
@@ -29,12 +32,14 @@ impl Launcher {
         self.shell.dispatch(intent);
     }
 
-    /// One UI turn: applies the intents the views sent, then draws.
-    pub fn frame(&mut self) {
+    /// One UI turn: applies the intents the views sent, then draws. Returns what the host
+    /// draws for the home views (ADR 0006).
+    pub fn frame(&mut self) -> HomeFrame {
         for intent in self.view.take_intents() {
             self.shell.dispatch(intent);
         }
         self.view.render(&self.shell);
+        self.view.frame(&self.shell)
     }
 
     pub fn shell(&self) -> &HomeShell {

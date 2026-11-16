@@ -44,6 +44,7 @@ mod env_slot {
     pub const GET_STRING_LENGTH: usize = 164;
     pub const GET_STRING_CHARS: usize = 165;
     pub const RELEASE_STRING_CHARS: usize = 166;
+    pub const SET_INT_ARRAY_REGION: usize = 211;
     pub const GET_JAVA_VM: usize = 219;
     pub const EXCEPTION_CHECK: usize = 228;
 }
@@ -365,6 +366,28 @@ impl Env {
             );
             Ok(text)
         }
+    }
+
+    /// Copies `values` into the start of `array`, a Java `int[]` passed to the running native
+    /// method. Fails if the array is shorter: Java then throws instead of writing past its end.
+    pub fn set_int_array(&self, array: &LocalRef, values: &[i32]) -> Result<(), DataError> {
+        type SetIntArrayRegion =
+            unsafe extern "system" fn(RawEnv, JObject, JInt, JInt, *const JInt);
+        let length = JInt::try_from(values.len())
+            .map_err(|_| DataError::Failed("The system couldn't do that".into()))?;
+        // SAFETY: the signature matches `jni.h`; `array` is a live `int[]` reference and
+        // `values` holds `length` ints. A region past the array's end raises a Java exception
+        // instead of writing, which `check` reports.
+        unsafe {
+            self.function::<SetIntArrayRegion>(env_slot::SET_INT_ARRAY_REGION)(
+                self.0,
+                array.0,
+                0,
+                length,
+                values.as_ptr(),
+            );
+        }
+        self.check()
     }
 
     /// Throws a `java.lang.RuntimeException` with `message` when the native call returns, so a

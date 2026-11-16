@@ -33,7 +33,7 @@ impl View for EventsView {
     type State = EventsState;
 
     fn render(&mut self, _state: &EventsState, tokens: &Tokens) {
-        // Drawing the header and notifications arrives with the UI toolkit (ADR 0002).
+        // Drawing the header and notifications arrives with #18 and #19 (ADR 0006).
         for card in &mut self.cards {
             card.render(tokens);
         }

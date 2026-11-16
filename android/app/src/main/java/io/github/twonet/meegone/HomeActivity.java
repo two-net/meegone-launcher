@@ -7,7 +7,7 @@ import android.os.Bundle;
 /**
  * MeeGone's one activity: the home screen (HOME-01), which also opens from the app drawer as a
  * normal app. It hands Android's lifecycle to the Rust app (ADR 0005), which shares one
- * launcher between every instance of this activity and draws nothing yet.
+ * launcher between every instance of this activity, and shows the home views (ADR 0006).
  */
 public final class HomeActivity extends Activity {
     static {
@@ -15,6 +15,7 @@ public final class HomeActivity extends Activity {
     }
 
     private Bridge bridge;
+    private HomeViews views;
     private boolean debugRequestHome;
 
     @Override
@@ -22,6 +23,8 @@ public final class HomeActivity extends Activity {
         super.onCreate(savedInstanceState);
         bridge = Bridge.get(this);
         nativeStart(bridge, getFilesDir().getPath());
+        views = new HomeViews(this);
+        setContentView(views);
         readDebugExtras(getIntent());
     }
 
@@ -37,6 +40,7 @@ public final class HomeActivity extends Activity {
         super.onResume();
         bridge.setActivity(this);
         nativeResumed();
+        views.onResumed();
         if (debugRequestHome) {
             debugRequestHome = false;
             nativeRequestDefaultHome();

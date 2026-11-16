@@ -7,8 +7,8 @@ use crate::tokens::Tokens;
 /// A screen, or a part of one, belonging to one feature.
 ///
 /// It draws the latest immutable state with the theme's tokens and turns input into intents
-/// through a [`Dispatch`] (ARCH-05). It keeps no other copy of the state (ARCH-06). Drawing
-/// arrives with the UI toolkit (ADR 0002).
+/// through a [`Dispatch`] (ARCH-05). It keeps no other copy of the state (ARCH-06). Android's
+/// views draw it, asking the Rust app what to show (ADR 0006).
 pub trait View {
     type State;
 

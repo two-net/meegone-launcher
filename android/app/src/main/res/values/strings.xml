@@ -1,4 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name" translatable="false">MeeGone</string>
+
+    <!-- The three home views (HOME-02). -->
+    <string name="view_events">Events</string>
+    <string name="view_applications">Applications</string>
+    <string name="view_recent">Recent</string>
+    <!-- Read by screen readers when the home view changes, e.g. "Applications, 2 of 3"
+         (A11Y-08). %1$s is the view, %2$d its place from the left, %3$d how many there are. -->
+    <string name="view_position">%1$s, %2$d of %3$d</string>
+    <!-- Screen-reader actions that switch home views without a gesture (A11Y-05). -->
+    <string name="action_next_view">Next view</string>
+    <string name="action_previous_view">Previous view</string>
 </resources>

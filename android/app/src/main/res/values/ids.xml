@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The home views' screen-reader actions (A11Y-05). -->
+    <item name="action_next_view" type="id" />
+    <item name="action_previous_view" type="id" />
+</resources>

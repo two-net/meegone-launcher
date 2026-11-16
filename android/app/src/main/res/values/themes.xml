@@ -1,13 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Follows the device's dark theme. Nothing is drawn until the UI toolkit arrives
-         (ADR 0002), so the home screen shows the wallpaper through a transparent window. -->
+    <!-- Follows the device's dark theme. The home views draw the theme's solid background, so
+         the wallpaper isn't shown behind them (HOME-11, ADR 0006). -->
     <style name="Theme.MeeGone" parent="@android:style/Theme.DeviceDefault.DayNight">
         <item name="android:windowNoTitle">true</item>
         <item name="android:windowActionBar">false</item>
-        <item name="android:windowShowWallpaper">true</item>
-        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowShowWallpaper">false</item>
+        <item name="android:windowBackground">@color/home_background</item>
         <item name="android:statusBarColor">@android:color/transparent</item>
         <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">@bool/light_system_bars</item>
+        <item name="android:windowLightNavigationBar">@bool/light_system_bars</item>
     </style>
 </resources>

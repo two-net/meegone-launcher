@@ -24,15 +24,15 @@ Each crate is `crates/<area>/<layer>`, with the package name `meegone-<area>-<la
 
 | Area | data | state | ui | Owns |
 |---|---|---|---|---|
-| **core** | Models, platform adapter traits and fakes, storage and the saved-file format, the settings store | `StateHolder`, `Store`, theme resolution | Colour tokens, motion specs, `View`, `Slot`, `Dispatch` | Nothing persistent |
+| **core** | Models, platform adapter traits and fakes, storage and the saved-file format, the settings store | `StateHolder`, `Store`, theme resolution, motion specs and spring physics | Colour tokens, `View`, `Slot`, `Dispatch` | Nothing persistent |
 | **apps** | Layout store | Grid, edit mode, folders | `AppsView` | Layout store |
 | **events** | – | Notifications grouped by app | `EventsView` | Nothing (memory only) |
 | **recent** | – | Filtering, ordering, close mode | `RecentView` | Removed-apps list (in the settings store) |
 | **lockimage** | Image cache, image-feed interface | On/off, availability, current image | `ImageCard`, `ImageSettingsSection` | Image cache |
 | **settings** | – | Settings, access status, the home-app banner (ONB-04) | `SettingsView`, `HomeBanner` | The settings screens |
-| **shell** | – | `HomeShell`: carousel, Home and Back, composes every feature | `ShellView` | Nothing persistent |
+| **shell** | – | `HomeShell`: the carousel of views, Home and Back, composes every feature | `ShellView`, `HomeFrame` | Nothing persistent |
 
-The root package `meegone-launcher` is the app. `Launcher::start(platform)` hands the platform adapters to the shell. On Android it is also a native library, which the Java host in `android/` loads ([ADR 0005](docs/adr/0005-android-host-and-home-role.md)). `tools/arch-check` is a development tool that is never part of the app.
+The root package `meegone-launcher` is the app. `Launcher::start(platform)` hands the platform adapters to the shell. On Android it is also a native library, which the Java host in `android/` loads ([ADR 0005](docs/adr/0005-android-host-and-home-role.md)) and asks what to draw ([ADR 0006](docs/adr/0006-android-views-and-the-carousel.md)). `tools/arch-check` is a development tool that is never part of the app.
 
 ## Dependency rules
 
@@ -65,6 +65,23 @@ AppsView.icon_tapped(mail)                       ui     sends AppsIntent::Launch
 - **State holders** implement `StateHolder`: `state()`, `handle(intent)` and `on_back()`. They take their adapters and stores as `Arc<dyn …>` traits, so tests drive them with the fakes in `meegone-core-data` (feature `fakes`), without any UI (MAINT-01).
 - **Constructors do no I/O.** Each feature loads on its first `Refresh` intent, which runs inside its store.
 - **Home and Back.** The shell sends them to the current view's `on_back`, which closes that feature's topmost open element (HOME-07, HOME-08).
+
+## Drawing (ADR 0006)
+
+Android's own views draw MeeGone, and the Rust app decides what they show. The decisions are in [ADR 0006](docs/adr/0006-android-views-and-the-carousel.md).
+
+```
+HomeViews (Java)                                    Rust
+  dispatchTouchEvent ── nativePointer ──▶ ShellIntent::Pointer ─┐
+  Choreographer      ── nativeFrame   ──▶ ShellIntent::Frame   ─┼▶ HomeShell: carousel
+  onSizeChanged      ── nativeLayout  ──▶ ShellIntent::Layout  ─┘   (gesture, spring, indicator)
+  translationX, alpha ◀── nativeRead(int[]) ◀── ShellView::frame ◀── ShellState.carousel
+```
+
+- **Java pulls.** After every touch, frame or layout change, `HomeViews` reads the frame and applies it. It asks `Choreographer` for another frame only while the frame says something moves. Rust never calls Java to draw.
+- **Motion is state.** A moving element's position and velocity live in the state layer, and the motion specs and spring physics in `meegone-core-state::motion`. Time comes in with each event, on the host's monotonic clock, so tests pass explicit times.
+- **Touches.** Every touch reaches the carousel first. The content below keeps a gesture until the carousel takes it: sideways, past the platform's touch slop, from anywhere in the view (HOME-03, HOME-13). An element that uses horizontal drags itself calls `requestDisallowInterceptTouchEvent(true)` first.
+- **Text** is in Android string resources (L10N-01). **Accessibility** comes from Android's views: the home views offer scroll, page and named actions (A11Y-05).
 
 ## Platform adapters (ARCH-04)
 
@@ -156,11 +173,11 @@ MeeGone keeps three persistent stores, each in its own file under one private fo
 
 ## Not built yet
 
-The skeleton is from issue #1; the Android host and the home-app role from #4. The following arrive with later requirements:
+The skeleton is from issue #1; the Android host and the home-app role from #4; the carousel of home views from #5. The following arrive with later requirements:
 
 - **Android adapters.** The home-app role, the clock and storage are built (ADR 0005). The app catalogue, notifications, usage, wallpaper, network, scheduling and the remaining device settings are stubs until their issues.
 - **The daily image.** The Bing implementation of `ImageFeed` (#26) and the updater (SRS 7.5) come with the WALL requirements.
-- **The UI toolkit** is still to be chosen (ADR 0002). Views compile and send intents, but nothing is drawn yet.
+- **Drawing.** The home views, their carousel and the view indicator are drawn (ADR 0006). Each view shows only its name until its content arrives (#9, #19, #22). Settings, the home-app banner and first-run setup send intents but aren't drawn yet.
 - **First-run setup** comes with the ONB requirements. The lock-screen image step is provided as a `Slot`, like its Settings section.
 
 ## Adding a crate

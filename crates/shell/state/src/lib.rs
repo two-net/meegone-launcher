@@ -3,17 +3,23 @@
 //! [`HomeShell::compose`] is the only place features are put together (ARCH-03). Each feature
 //! runs in its own [`Store`], so a failing feature never takes down the shell (ARCH-09).
 
+mod carousel;
+
 use std::sync::Arc;
+use std::time::Duration;
 
 use meegone_apps_data::PersistentLayoutStore;
 use meegone_apps_state::{AppsHolder, AppsIntent};
-use meegone_core_data::{PersistentSettingsStore, Platform, SettingsStore};
+use meegone_core_data::{PersistentSettingsStore, Platform, SettingsStore, SystemConfigAdapter};
 use meegone_core_state::{Store, ThemeHolder, ThemeIntent};
 use meegone_events_state::{EventsHolder, EventsIntent};
 use meegone_lockimage_data::PersistentImageCache;
 use meegone_lockimage_state::{LockImageHolder, LockImageIntent, LockImageState};
 use meegone_recent_state::{RecentHolder, RecentIntent};
 use meegone_settings_state::{SettingsHolder, SettingsIntent, SettingsState};
+
+use carousel::{Carousel, Release};
+pub use carousel::{CarouselState, Layout, PointerEvent, PointerKind};
 
 /// The three home views, left to right (HOME-02).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -36,6 +42,18 @@ pub enum Direction {
 }
 
 impl HomeView {
+    /// Every view, left to right in a left-to-right layout (HOME-02).
+    pub const ALL: [HomeView; 3] = [HomeView::Events, HomeView::Applications, HomeView::Recent];
+
+    /// The view's place in [`HomeView::ALL`], from 0.
+    pub fn index(self) -> usize {
+        match self {
+            HomeView::Events => 0,
+            HomeView::Applications => 1,
+            HomeView::Recent => 2,
+        }
+    }
+
     /// The view a swipe shows. Past either end it wraps around when `wrap` is on, and otherwise
     /// stays put (HOME-04).
     pub fn neighbour(self, direction: Direction, wrap: bool) -> Option<HomeView> {
@@ -52,15 +70,37 @@ impl HomeView {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct ShellState {
+    /// The view on screen, or the one the carousel is settling on.
     pub current: HomeView,
     pub settings_open: bool,
+    pub carousel: CarouselState,
+}
+
+impl ShellState {
+    /// How far `view` is drawn from where it fills the screen, in pixels.
+    pub fn page_offset_px(&self, view: HomeView) -> f64 {
+        self.carousel.page_offset_px(self.current, view)
+    }
+
+    /// The view nearest to the carousel's position, which the view indicator highlights
+    /// (HOME-09).
+    pub fn nearest_view(&self) -> HomeView {
+        self.carousel.nearest(self.current)
+    }
 }
 
 #[derive(Debug)]
 pub enum ShellIntent {
+    /// Shows the neighbouring view without a gesture, such as from a screen reader (A11Y-05).
     Swipe(Direction),
+    /// The host laid the home views out, at start or after a size or direction change.
+    Layout(Layout),
+    /// A finger on the home views, which may drag the carousel (HOME-03).
+    Pointer(PointerEvent),
+    /// The display is about to draw a frame at this time on the host's monotonic clock.
+    Frame(Duration),
     /// The system Home action (HOME-07).
     Home,
     /// The system Back action (HOME-08).
@@ -92,6 +132,8 @@ const MAX_OPEN_ELEMENTS: usize = 8;
 pub struct HomeShell {
     state: ShellState,
     settings_store: Arc<dyn SettingsStore>,
+    system: Arc<dyn SystemConfigAdapter>,
+    carousel: Carousel,
     theme: Store<ThemeHolder>,
     apps: Store<AppsHolder>,
     events: Store<EventsHolder>,
@@ -108,6 +150,8 @@ impl HomeShell {
             Arc::new(PersistentSettingsStore::new(platform.storage.clone()));
         let mut shell = Self {
             state: ShellState::default(),
+            system: platform.system.clone(),
+            carousel: Carousel::new(true, 1.0),
             theme: Store::new(ThemeHolder::new(
                 settings_store.clone(),
                 platform.system.clone(),
@@ -145,6 +189,7 @@ impl HomeShell {
         shell.recent.dispatch(RecentIntent::Refresh);
         shell.lockimage.dispatch(LockImageIntent::Refresh);
         shell.settings.dispatch(SettingsIntent::Refresh);
+        shell.configure_carousel();
         shell
     }
 
@@ -191,13 +236,32 @@ impl HomeShell {
     pub fn dispatch(&mut self, intent: ShellIntent) {
         match intent {
             ShellIntent::Swipe(direction) => self.swipe(direction),
+            ShellIntent::Layout(layout) => {
+                let release = self.carousel.layout(layout, self.state.current);
+                self.settle(release);
+            }
+            ShellIntent::Pointer(event) => {
+                // Settings covers the home views.
+                if !self.state.settings_open {
+                    let release = self.carousel.pointer(event, self.state.current);
+                    self.settle(release);
+                }
+            }
+            ShellIntent::Frame(at) => self.carousel.frame(at),
             ShellIntent::Home => self.home(),
             ShellIntent::Back => self.back(),
             ShellIntent::OpenSettings => {
+                // Settings covers the home views, so a drag on them ends.
+                let release = self.carousel.end_gesture(self.state.current);
+                self.settle(release);
                 self.settings.dispatch(SettingsIntent::Refresh);
                 self.state.settings_open = true;
             }
-            ShellIntent::Resumed => self.settings.dispatch(SettingsIntent::Refresh),
+            ShellIntent::Resumed => {
+                self.settings.dispatch(SettingsIntent::Refresh);
+                // The animation speed may have changed in system settings (ANIM-05).
+                self.configure_carousel();
+            }
             ShellIntent::SystemThemeChanged => self.theme.dispatch(ThemeIntent::Refresh),
             ShellIntent::AppsChanged => {
                 self.apps.dispatch(AppsIntent::Refresh);
@@ -210,15 +274,46 @@ impl HomeShell {
             ShellIntent::LockImage(intent) => self.lockimage.dispatch(intent),
             ShellIntent::Settings(intent) => {
                 self.settings.dispatch(intent);
-                // The theme choice lives in the settings store; re-resolve it (THEME-06).
+                // The theme choice and wrap-around live in the settings store; take them on
+                // (THEME-06, HOME-04).
                 self.theme.dispatch(ThemeIntent::Refresh);
+                self.configure_carousel();
             }
         }
+        self.state.carousel = self.carousel.state();
+    }
+
+    /// Takes on the wrap-around setting and the system animation speed, which the carousel
+    /// keeps rather than reading them on every touch.
+    fn configure_carousel(&mut self) {
+        let wrap = self.settings_store.get().wrap_around;
+        self.carousel.configure(wrap, self.system.animation_scale());
+        self.state.carousel = self.carousel.state();
     }
 
     fn swipe(&mut self, direction: Direction) {
-        let wrap = self.settings_store.get().wrap_around;
+        let wrap = self.state.carousel.wrap;
         if let Some(view) = self.state.current.neighbour(direction, wrap) {
+            self.move_to(view, 0.0, None);
+        }
+    }
+
+    /// A drag ended: settle on the view it chose.
+    fn settle(&mut self, release: Option<Release>) {
+        if let Some(Release {
+            target,
+            velocity,
+            at,
+        }) = release
+        {
+            self.move_to(target, velocity, Some(at));
+        }
+    }
+
+    /// Moves the carousel to `view` from wherever it is, and shows it.
+    fn move_to(&mut self, view: HomeView, velocity: f64, at: Option<Duration>) {
+        self.carousel.settle(self.state.current, view, velocity, at);
+        if view != self.state.current {
             self.show(view);
         }
     }
@@ -235,11 +330,14 @@ impl HomeShell {
             }
             closed_any = true;
         }
-        if !closed_any && self.state.current != HomeView::Applications {
-            self.show(HomeView::Applications);
+        // A drag in progress ends too.
+        let carousel = self.carousel.state();
+        let moving = carousel.dragging || carousel.offset != 0.0;
+        if !closed_any && (self.state.current != HomeView::Applications || moving) {
+            self.move_to(HomeView::Applications, 0.0, None);
         }
         // On Applications with nothing open, Home scrolls to the top; scrolling arrives with
-        // the UI toolkit.
+        // the grid (#6, #9).
     }
 
     /// HOME-08: close the topmost open element; otherwise do nothing.

@@ -1,6 +1,9 @@
 //! Home shell UI (SRS 4.1). It puts the feature views together, connects each to its state
 //! holder through the shell and places content one feature shows inside another (ADR 0002).
 //! Only the shell depends on other features (ARCH-03).
+//!
+//! It also tells the host what to draw for the home views in each frame, as a [`HomeFrame`]:
+//! where the carousel's views are and how the view indicator looks (ADR 0006).
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -8,7 +11,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use meegone_apps_ui::AppsView;
-use meegone_core_ui::{Dispatch, Latest, Slot, View, tokens};
+use meegone_core_ui::{Dispatch, Latest, Rgb, Slot, View, tokens};
 use meegone_events_ui::EventsView;
 use meegone_lockimage_ui::{ImageCard, ImageSettingsSection};
 use meegone_recent_ui::RecentView;
@@ -16,6 +19,29 @@ use meegone_settings_ui::{HomeBanner, SettingsView};
 use meegone_shell_state::{HomeShell, HomeView, ShellIntent};
 
 type Outbox = Rc<RefCell<VecDeque<ShellIntent>>>;
+
+/// What the host draws for the home views in one frame (ADR 0006).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HomeFrame {
+    /// How far each view, in [`HomeView::ALL`] order, is drawn from where it fills the screen,
+    /// in whole pixels. A view a full width or more away is off screen (HOME-02 to HOME-04).
+    pub pages: [i32; 3],
+    /// The view indicator's opacity, from 0 to 255 (HOME-09).
+    pub indicator_alpha: u8,
+    /// The segment the indicator highlights: the view nearest the carousel's position.
+    pub indicator_selected: HomeView,
+    /// The view on screen, or the one the carousel is settling on, which screen readers
+    /// announce (A11Y-08).
+    pub current: HomeView,
+    /// Something is still moving or fading, so the host should draw another frame.
+    pub animating: bool,
+    /// The home views' solid background (HOME-11, THEME-04).
+    pub background: Rgb,
+    /// Text, and the indicator's highlighted segment.
+    pub foreground: Rgb,
+    /// The indicator's other segments.
+    pub dim: Rgb,
+}
 
 pub struct ShellView {
     outbox: Outbox,
@@ -69,6 +95,22 @@ impl ShellView {
     /// The intents the views sent since the last call, in order, for the shell to apply.
     pub fn take_intents(&self) -> Vec<ShellIntent> {
         self.outbox.borrow_mut().drain(..).collect()
+    }
+
+    /// What the host draws for the home views now, in the current theme (THEME-03).
+    pub fn frame(&self, shell: &HomeShell) -> HomeFrame {
+        let tokens = tokens(shell.theme().state().theme);
+        let state = shell.state();
+        HomeFrame {
+            pages: HomeView::ALL.map(|view| state.page_offset_px(view).round() as i32),
+            indicator_alpha: (state.carousel.indicator.clamp(0.0, 1.0) * 255.0).round() as u8,
+            indicator_selected: state.nearest_view(),
+            current: state.current,
+            animating: state.carousel.animating,
+            background: tokens.background,
+            foreground: tokens.text_primary,
+            dim: tokens.text_secondary,
+        }
     }
 
     /// Draws what is on screen in the current theme (THEME-03).

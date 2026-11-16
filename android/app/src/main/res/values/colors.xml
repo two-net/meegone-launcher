@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The Light theme's home background, shown until the first frame. The Rust app's colour
+         tokens decide it from then on (SRS 5.3). -->
+    <color name="home_background">#F2F2F2</color>
+    <!-- Dark system-bar icons on the light background. -->
+    <bool name="light_system_bars">true</bool>
+</resources>

@@ -33,6 +33,6 @@ impl View for AppsView {
     type State = AppsState;
 
     fn render(&mut self, _state: &AppsState, _tokens: &Tokens) {
-        // Drawing arrives with the UI toolkit (ADR 0002).
+        // Drawing the grid arrives with #9, in Android's views (ADR 0006).
     }
 }

@@ -33,6 +33,6 @@ impl View for RecentView {
     type State = RecentState;
 
     fn render(&mut self, _state: &RecentState, _tokens: &Tokens) {
-        // Drawing arrives with the UI toolkit (ADR 0002).
+        // Drawing the cards arrives with #22, in Android's views (ADR 0006).
     }
 }

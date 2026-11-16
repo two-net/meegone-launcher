@@ -11,12 +11,20 @@
 //! - AC-15 to AC-17: the daily image (#27 to #30)
 //!
 //! AC-18 to AC-20 (animation scale, screen reader, timing) need a device; they belong to the
-//! device matrix (#43).
+//! device matrix (#43). Their core logic is tested without one: the carousel with animations
+//! removed and its screen-reader actions in `meegone-shell-state`.
+
+use std::time::Duration;
 
 use meegone_core_data::fakes::{Fakes, app, app_id};
 use meegone_core_data::{Notification, ThemeChoice};
 use meegone_core_state::{Access, Health, Theme};
-use meegone_launcher::{Direction, HomeView, Launcher, ShellIntent};
+use meegone_launcher::{
+    Direction, HomeView, Launcher, Layout, PointerEvent, PointerKind, ShellIntent,
+};
+
+/// A phone 1080 px wide at 2.75 px per dp.
+const WIDTH: f64 = 1080.0;
 
 fn notification(key: &str, package: &str) -> Notification {
     Notification {
@@ -28,6 +36,48 @@ fn notification(key: &str, package: &str) -> Notification {
         clearable: true,
         ongoing: false,
     }
+}
+
+/// A launcher laid out on a phone, with the time at 0 ms.
+fn on_a_phone(fakes: &Fakes) -> (Launcher, u64) {
+    let mut launcher = Launcher::start(fakes.platform());
+    launcher.dispatch(ShellIntent::Layout(Layout {
+        width_px: WIDTH,
+        density: 2.75,
+        touch_slop_px: 22.0,
+        rtl: false,
+    }));
+    (launcher, 0)
+}
+
+/// A finger drags from `from` to `to` over `length` ms, rests for `pause` ms and lifts; then the
+/// display draws frames until nothing moves. `clock` is the time in ms.
+fn swipe(launcher: &mut Launcher, clock: &mut u64, from: f64, to: f64, length: u64, pause: u64) {
+    let mut touch = |kind, x, at| {
+        launcher.dispatch(ShellIntent::Pointer(PointerEvent {
+            kind,
+            x,
+            y: 1200.0,
+            at: Duration::from_millis(at),
+        }));
+        launcher.frame();
+    };
+    let steps = length / 8;
+    touch(PointerKind::Down, from, *clock);
+    for step in 1..=steps {
+        let x = from + (to - from) * step as f64 / steps as f64;
+        touch(PointerKind::Move, x, *clock + step * 8);
+    }
+    *clock += steps * 8 + pause;
+    touch(PointerKind::Up, to, *clock);
+    for _ in 0..500 {
+        *clock += 8;
+        launcher.dispatch(ShellIntent::Frame(Duration::from_millis(*clock)));
+        if !launcher.frame().animating {
+            return;
+        }
+    }
+    panic!("still moving");
 }
 
 fn grid(launcher: &Launcher) -> Vec<String> {
@@ -56,6 +106,42 @@ fn ac02_swiping_right_to_left_three_times_goes_recent_events_applications() {
         seen,
         [HomeView::Recent, HomeView::Events, HomeView::Applications]
     );
+}
+
+#[test]
+fn ac02_dragging_right_to_left_three_times_goes_recent_events_applications() {
+    // HOME-03: the same scenario with the finger, each view settling in full view.
+    let (mut launcher, mut clock) = on_a_phone(&Fakes::default());
+
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        swipe(&mut launcher, &mut clock, 900.0, 300.0, 400, 100);
+        let frame = launcher.frame();
+        assert_eq!(frame.pages[frame.current.index()], 0);
+        seen.push(frame.current);
+    }
+
+    assert_eq!(
+        seen,
+        [HomeView::Recent, HomeView::Events, HomeView::Applications]
+    );
+}
+
+#[test]
+fn anim07_a_drag_past_35_percent_or_a_fling_settles_and_a_short_slow_drag_returns() {
+    // Issue #5: 35 % of 1080 px is 378 px, after the 22 px touch slop.
+    let (mut launcher, mut clock) = on_a_phone(&Fakes::default());
+    let current = |launcher: &Launcher| launcher.shell().state().current;
+
+    swipe(&mut launcher, &mut clock, 900.0, 900.0 - 410.0, 400, 100);
+    assert_eq!(current(&launcher), HomeView::Recent);
+
+    swipe(&mut launcher, &mut clock, 500.0, 650.0, 64, 0);
+    assert_eq!(current(&launcher), HomeView::Applications);
+
+    swipe(&mut launcher, &mut clock, 900.0, 900.0 - 380.0, 400, 100);
+    assert_eq!(current(&launcher), HomeView::Applications);
+    assert_eq!(launcher.frame().pages, [-1080, 0, 1080]);
 }
 
 #[test]
