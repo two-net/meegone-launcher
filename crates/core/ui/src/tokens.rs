@@ -99,6 +99,16 @@ mod tests {
     }
 
     #[test]
+    fn text_on_an_accent_button_meets_4_5_to_1() {
+        // A11Y-03: edit mode's Done is the background colour on the accent (APPS-12).
+        for theme in THEMES {
+            let t = tokens(theme);
+            let ratio = t.background.contrast_ratio(t.accent);
+            assert!(ratio >= 4.5, "{theme:?}: Done's text is {ratio:.2}");
+        }
+    }
+
+    #[test]
     fn dark_home_views_are_true_black() {
         // THEME-04
         assert_eq!(DARK.background, Rgb::hex(0x000000));

@@ -11,7 +11,9 @@
 //! [`frame_slots`] and mirrored in `HomeViews.java`. Its Applications grid, `AppsGrid`, reads
 //! its cells with `nativeAppsCells` whenever their revision changes, in the fields of
 //! [`cell_fields`] (ADR 0010). An app's long-press menu is read the same way, with
-//! `nativeAppMenu`, in the fields of [`menu_item_fields`] (ADR 0013).
+//! `nativeAppMenu`, in the fields of [`menu_item_fields`] (ADR 0013). In edit mode, the grid
+//! names a cell by revision and place when its ✕ is tapped or a screen reader moves it
+//! (ADR 0014).
 //!
 //! A bug in MeeGone becomes a Java `RuntimeException` instead of an abort, so its message
 //! reaches logcat. Containing it keeps `panic = "unwind"`, as ARCH-09 already requires.
@@ -27,8 +29,8 @@ use meegone_core_data::android::{self, Env, JObject, LocalRef, RawEnv};
 use meegone_core_data::{AppId, Rect, Rgb, accent};
 
 use crate::{
-    AppMenuItem, Cell, Direction, HomeFrame, HomeView, Launcher, Layout, MenuItem, PointerEvent,
-    PointerKind, SavedHome, SettingsGroup, ShellIntent,
+    AppMenuItem, BADGE_ROWS, Cell, Direction, GridLayout, HomeFrame, HomeView, Launcher, Layout,
+    MenuItem, PointerEvent, PointerKind, SavedHome, SettingsGroup, ShellIntent,
 };
 
 /// JNI's `jboolean`.
@@ -569,12 +571,14 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_AppsGrid_nativeAppsC
 /// The fields of one cell in `nativeAppsCells`, mirrored in `AppsGrid.java`: its label, then
 /// the package, activity and profile serial number of the app it launches (empty for a
 /// folder), then its flags: 1 an app, 2 available (APPS-09), 4 in a work profile (APPS-20),
-/// 8 new (APPS-07). Last, its place in the cells before, or -1 if it just joined (ANIM-21).
+/// 8 new (APPS-07), 16 the user can uninstall it, so it has a ✕ in edit mode (APPS-12). Last,
+/// its place in the cells the grid last read, or -1 if it joined since (ANIM-21).
 fn cell_fields(cell: Cell<'_>) -> [String; 6] {
     let flags = u8::from(cell.app.is_some())
         | u8::from(cell.available) << 1
         | u8::from(cell.work) << 2
-        | u8::from(cell.new) << 3;
+        | u8::from(cell.new) << 3
+        | u8::from(cell.uninstallable) << 4;
     let from = cell
         .from
         .and_then(|from| i32::try_from(from).ok())
@@ -597,21 +601,27 @@ fn cell_fields(cell: Cell<'_>) -> [String; 6] {
     ]
 }
 
-/// `void nativeAppsLayout(int widthPx, int rowHeightPx, float density, int[] grid)`: the grid
-/// was laid out this wide inside its margins, with rows this far apart: at start, or after a
-/// size, density or font-size change (APPS-02, APPS-16). Fills `grid` with the columns and rows
-/// it now has, so the grid lays them out in the same pass.
+/// `void nativeAppsLayout(int widthPx, int rowHeightPx, float density, int topPx,
+/// int bottomPx, int heightPx, int[] grid)`: the grid was laid out this wide inside its
+/// margins, with rows this far apart, the safe area's room above and below its cells, and this
+/// tall on screen: at start, or after a size, density, font-size or safe-area change (APPS-02,
+/// APPS-16, ADR 0014). Fills `grid` with the columns and rows it now has, so the grid lays them
+/// out in the same pass.
 ///
 /// # Safety
 ///
 /// Called only by the JVM, with the arguments of that native method.
 #[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)] // The JNI calling convention.
 pub unsafe extern "system" fn Java_io_github_twonet_meegone_AppsGrid_nativeAppsLayout(
     env: RawEnv,
     _grid: JObject,
     width_px: i32,
     row_height_px: i32,
     density: f32,
+    top_px: i32,
+    bottom_px: i32,
+    height_px: i32,
     grid: JObject,
 ) {
     // SAFETY: the JVM passes this thread's environment and a live local reference to an
@@ -620,11 +630,14 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_AppsGrid_nativeAppsL
     guarded(env, || {
         LAUNCHER.with_borrow_mut(|launcher| {
             let launcher = launcher.as_mut().ok_or("MeeGone hasn't started")?;
-            launcher.view().apps().grid_laid_out(
-                f64::from(width_px),
-                f64::from(row_height_px),
-                f64::from(density),
-            );
+            launcher.view().apps().grid_laid_out(GridLayout {
+                width_px: f64::from(width_px),
+                row_height_px: f64::from(row_height_px),
+                density: f64::from(density),
+                top_px: f64::from(top_px),
+                bottom_px: f64::from(bottom_px),
+                height_px: f64::from(height_px),
+            });
             let apps = launcher.frame().apps;
             env.set_int_array(&grid, &[i32::from(apps.columns), i32::from(apps.rows)])
                 .map_err(|error| format!("Couldn't pass the grid: {error}"))
@@ -755,6 +768,95 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_AppsGrid_nativeAppMe
     JBoolean::from(opened)
 }
 
+/// `String nativeAppBadgeTapped(int revision, int index)`: the ✕ of cell `index` of the cells
+/// at `revision` was tapped, in edit mode (APPS-13). The system asks the user to confirm the
+/// uninstall; MeeGone never uninstalls anything itself. Returns `null`, or a short message to
+/// show when the system refused.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_AppsGrid_nativeAppBadgeTapped(
+    env: RawEnv,
+    _grid: JObject,
+    revision: i32,
+    index: i32,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    let Ok(index) = usize::try_from(index) else {
+        return std::ptr::null_mut();
+    };
+    let mut message = std::ptr::null_mut();
+    guarded(env, || {
+        LAUNCHER.with_borrow_mut(|launcher| {
+            let launcher = launcher.as_mut().ok_or("MeeGone hasn't started")?;
+            // The revision travels as Java's `int`.
+            if !launcher.view().apps().badge_tapped(revision as u32, index) {
+                return Ok(());
+            }
+            launcher.frame();
+            message = problem(env, launcher)?;
+            Ok(())
+        })
+    });
+    message
+}
+
+/// `int nativeAppMoved(int revision, int index, int to)`: a screen reader moved cell `index` of
+/// the cells at `revision` to place `to`, in edit mode (A11Y-05). Returns the place its app's
+/// cell is at now, or -1 if nothing moved.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_AppsGrid_nativeAppMoved(
+    env: RawEnv,
+    _grid: JObject,
+    revision: i32,
+    index: i32,
+    to: i32,
+) -> i32 {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    let (Ok(cell), Ok(to)) = (usize::try_from(index), usize::try_from(to)) else {
+        return -1;
+    };
+    let mut place = -1;
+    with_launcher(env, |launcher| {
+        let Some(app) = app_at(launcher, revision, index) else {
+            return;
+        };
+        // The revision travels as Java's `int`.
+        if launcher.view().apps().moved(revision as u32, cell, to) {
+            launcher.frame();
+            let now = launcher.shell().apps().state().place_of(&app);
+            place = now.and_then(|now| i32::try_from(now).ok()).unwrap_or(-1);
+        }
+    });
+    place
+}
+
+/// `void nativeEditDone()`: Done was tapped, so edit mode ends (APPS-12).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_AppsGrid_nativeEditDone(
+    env: RawEnv,
+    _grid: JObject,
+) {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_launcher(env, |launcher| {
+        launcher.view().apps().done();
+        launcher.frame();
+    });
+}
+
 /// The app of cell `index` of the cells at `revision`, if it is still that cell's.
 fn app_at(launcher: &Launcher, revision: i32, index: i32) -> Option<AppId> {
     let index = usize::try_from(index).ok()?;
@@ -872,9 +974,14 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRead
 /// | 30 | The cell the app menu is open at, or -1: centred, or -2 while it is closed (APPS-11) |
 /// | 31 | The app menu's revision: when it changes, `HomeViews` reads its items again |
 /// | 32 | The picked-up icon's cell, or -1 (APPS-11) |
-/// | 33–34 | How far the picked-up icon is from its cell, in px |
-/// | 35 | The picked-up icon's scale in ten-thousandths, 11 000 while lifted (ANIM-13) |
-fn frame_slots(frame: &HomeFrame) -> [i32; 36] {
+/// | 33–34 | How far the picked-up icon is from its cell's place now, in px |
+/// | 35 | The picked-up icon's scale in ten-thousandths, 11 000 while lifted (ANIM-13); it takes the place of edit mode's scale |
+/// | 36 | 1 while edit mode is on (APPS-12); otherwise 0 |
+/// | 37 | Every cell's scale in ten-thousandths: 10 000, or 9 200 in edit mode (ANIM-12) |
+/// | 38 | How far into edit mode the cells are, 0 to 10 000: Done's opacity |
+/// | 39 | The grid's first visible row, which slot 40 is for |
+/// | 40–51 | The ✕ scale of each visible row from slot 39's, in ten-thousandths; rows further down take slot 51's (ANIM-12) |
+fn frame_slots(frame: &HomeFrame) -> [i32; 40 + BADGE_ROWS] {
     let [events, applications, recent] = frame.pages;
     let menu_items = frame.menu.map_or(0, |menu| {
         menu.items
@@ -895,7 +1002,8 @@ fn frame_slots(frame: &HomeFrame) -> [i32; 36] {
     let (lifted, lift_dx, lift_dy, lift_scale) = frame.lifted.map_or((-1, 0, 0, 10_000), |lift| {
         (place(lift.cell), lift.dx, lift.dy, i32::from(lift.scale))
     });
-    [
+    let edit = frame.edit;
+    let fixed = [
         events,
         applications,
         recent,
@@ -936,7 +1044,17 @@ fn frame_slots(frame: &HomeFrame) -> [i32; 36] {
         lift_dx,
         lift_dy,
         lift_scale,
-    ]
+        i32::from(edit.on),
+        i32::from(edit.scale),
+        i32::from(edit.progress),
+        i32::from(edit.first_row),
+    ];
+    let mut slots = [0; 40 + BADGE_ROWS];
+    slots[..40].copy_from_slice(&fixed);
+    for (slot, badge) in slots[40..].iter_mut().zip(edit.badges) {
+        *slot = i32::from(badge);
+    }
+    slots
 }
 
 /// An opaque colour as Android's `int` ARGB.

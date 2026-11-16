@@ -7,12 +7,15 @@ import android.graphics.Rect;
 import android.graphics.drawable.Drawable;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.accessibility.AccessibilityEvent;
 import android.widget.ScrollView;
 import android.widget.Toast;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.function.Consumer;
 
 /**
  * The Applications view: every app in one grid that scrolls vertically, with no pages and no
@@ -38,7 +41,13 @@ import java.util.Set;
  * <p>Each cell says where it was in the cells before, so its view, icon and all, moves to its
  * new place instead of another app being drawn there (ADR 0012). As apps come and go, new cells
  * grow and fade in, the views no cell took shrink away at their old places, and the others slide
- * to their new ones, as far as the frame says (ANIM-21).
+ * to their new ones, as far as the frame says (ANIM-21). Each slides from where it is drawn when
+ * the change comes, so a change that comes while another plays never makes a cell jump.
+ *
+ * <p>In edit mode (APPS-12, ADR 0014) the cells shrink and the ✕ badges pop in row by row, as
+ * the frame says (ANIM-12). A dropped icon moves the cells the same way, and the dragged one
+ * stays under the finger, even as auto-scroll moves the grid. A tap on a ✕ asks the system to
+ * uninstall the app (APPS-13), and screen readers move icons with actions (A11Y-05).
  */
 final class AppsGrid extends ScrollView {
     // The fields of one cell in nativeAppsCells, mirrored in cell_fields in src/android.rs.
@@ -54,6 +63,7 @@ final class AppsGrid extends ScrollView {
     private static final int AVAILABLE = 2;
     private static final int WORK = 4;
     private static final int NEW = 8;
+    private static final int UNINSTALLABLE = 16; // has a ✕ in edit mode
     private static final float WHOLE = 10_000f; // ten-thousandths
 
     private static final float MARGIN_DP = 16f;
@@ -62,8 +72,12 @@ final class AppsGrid extends ScrollView {
     private final Cells cells;
     /** The cells' views, in order. They are the first of the grid's children. */
     private final List<AppCell> shown = new ArrayList<>();
-    /** Each shown cell's place in the cells before, or {@link #NONE} if it just joined. */
-    private int[] from = new int[0];
+    /**
+     * Where each shown cell was drawn when the cells last changed, from the cells' top left, in
+     * px; NaN for a cell that just joined, which grows in where it is.
+     */
+    private float[] fromX = new float[0];
+    private float[] fromY = new float[0];
     /** Views of cells that left the grid, shrinking away after the shown ones (ANIM-21). */
     private final List<AppCell> leaving = new ArrayList<>();
     /** Each leaving view's place in the cells before. */
@@ -73,6 +87,8 @@ final class AppsGrid extends ScrollView {
     private final AppIcons icons;
     /** Reads the frame again and draws it, after a native call: {@code HomeViews.apply}. */
     private final Runnable redraw;
+    /** Tells screen readers of a change, such as a move (A11Y-08). */
+    private final Consumer<String> announce;
     private final int margin;
     private final int rowPx;
     private final int[] laidOut = new int[2];
@@ -85,18 +101,27 @@ final class AppsGrid extends ScrollView {
     private int agreedScroll;
     /** A position from the Rust app to take once the grid is laid out, or {@link #NONE}. */
     private int pendingScroll = NONE;
-    /** The width last reported to the Rust app, or {@link #NONE}. */
-    private int reportedWidth = NONE;
+    /** The cells' width, and what was last reported to the Rust app; {@link #NONE} for none. */
+    private int cellsWidth = NONE;
+    private final int[] reported = {NONE, NONE, NONE, NONE};
     private int pressed = NONE;
     /** The picked-up icon's view, or null (APPS-11). */
     private AppCell lifted;
     private int foreground;
     private int dim;
     private int accent;
+    private int surface;
+    /** Edit mode as the frame says, and every cell's scale (APPS-12, ANIM-12). */
+    private boolean editing;
+    private float editScale = 1f;
+    /** The grid's first visible row, and the ✕ scale of each visible row from it. */
+    private int badgeFirstRow;
+    private float[] badgeScales = new float[0];
 
-    AppsGrid(Context context, Runnable redraw) {
+    AppsGrid(Context context, Runnable redraw, Consumer<String> announce) {
         super(context);
         this.redraw = redraw;
+        this.announce = announce;
         margin = Math.round(MARGIN_DP * getResources().getDisplayMetrics().density);
         rowPx = AppCell.heightPx(context);
         setClipToPadding(false);
@@ -112,21 +137,57 @@ final class AppsGrid extends ScrollView {
     /** Keeps the cells inside the safe area, with 16 dp at each side; they scroll under the bars. */
     void setSafeArea(Insets safe) {
         setPadding(safe.left + margin, safe.top, safe.right + margin, safe.bottom);
+        reportAgain();
+    }
+
+    @Override
+    protected void onSizeChanged(int width, int height, int oldWidth, int oldHeight) {
+        super.onSizeChanged(width, height, oldWidth, oldHeight);
+        reportAgain();
+    }
+
+    /**
+     * Tells the Rust app how the grid is laid out now (APPS-02), if anything changed: the cells'
+     * width, the room above and below them, and the grid's height, which the drag's places and
+     * auto-scroll need (ADR 0014). Returns whether it did. The answer, the columns and rows,
+     * takes effect at once.
+     */
+    private boolean report(int width) {
+        int[] now = {width, getPaddingTop(), getPaddingBottom(), getHeight()};
+        if (Arrays.equals(now, reported)) {
+            return false;
+        }
+        System.arraycopy(now, 0, reported, 0, now.length);
+        nativeAppsLayout(width, rowPx, getResources().getDisplayMetrics().density, now[1], now[2],
+                now[3], laidOut);
+        columns = Math.max(1, laidOut[0]);
+        rows = laidOut[1];
+        return true;
+    }
+
+    /** Reports a new padding or height, once the cells' width is known. */
+    private void reportAgain() {
+        if (cellsWidth > 0 && report(cellsWidth)) {
+            cells.requestLayout();
+            post(redraw);
+        }
     }
 
     /**
      * Draws the frame's Applications slots. {@code pressedCell} is -1 unless a cell of this
      * view is pressed, and {@code pressScale} its icon scale in ten-thousandths. {@code accent}
-     * colours the dot of a new app (APPS-07).
+     * colours the dot of a new app (APPS-07), and {@code surface} the ✕ badges (APPS-12).
      */
     void apply(int cellsRevision, int scrollPx, int columns, int rows, int pressedCell,
-            int pressScale, int foreground, int dim, int accent) {
-        if (foreground != this.foreground || dim != this.dim || accent != this.accent) {
+            int pressScale, int foreground, int dim, int accent, int surface) {
+        if (foreground != this.foreground || dim != this.dim || accent != this.accent
+                || surface != this.surface) {
             this.foreground = foreground;
             this.dim = dim;
             this.accent = accent;
+            this.surface = surface;
             for (int i = 0; i < cells.getChildCount(); i++) {
-                ((AppCell) cells.getChildAt(i)).setColours(foreground, dim, accent);
+                ((AppCell) cells.getChildAt(i)).setColours(foreground, dim, accent, surface);
             }
         }
         if (!loaded || cellsRevision != revision) {
@@ -173,7 +234,8 @@ final class AppsGrid extends ScrollView {
                     parseLong(fields[at + PROFILE]),
                     (flags & AVAILABLE) != 0,
                     (flags & WORK) != 0,
-                    (flags & NEW) != 0);
+                    (flags & NEW) != 0,
+                    (flags & UNINSTALLABLE) != 0);
         }
         // The new cells start at full size; the next frame says what is pressed.
         pressed = NONE;
@@ -183,25 +245,32 @@ final class AppsGrid extends ScrollView {
 
     /**
      * Puts the views in the cells' new order: the view of the cell each was before, or a new one
-     * for a cell that just joined. The views no cell took leave after them.
+     * for a cell that just joined. The views no cell took leave after them. Each view it keeps
+     * slides from where it is drawn now, part-way through an earlier change or not.
      */
     private void rearrange(int[] places) {
         List<AppCell> before = new ArrayList<>(shown);
         boolean[] taken = new boolean[before.size()];
         shown.clear();
+        fromX = new float[places.length];
+        fromY = new float[places.length];
         for (int i = 0; i < places.length; i++) {
             int place = places[i];
             if (place >= 0 && place < before.size() && !taken[place]) {
                 taken[place] = true;
-                shown.add(before.get(place));
-            } else {
-                places[i] = NONE;
-                AppCell cell = new AppCell(getContext(), this);
-                cell.setColours(foreground, dim, accent);
+                AppCell cell = before.get(place);
                 shown.add(cell);
+                boolean drawn = cell.isLaidOut();
+                fromX[i] = drawn ? cell.getLeft() + cell.motionX() : Float.NaN;
+                fromY[i] = drawn ? cell.getTop() + cell.motionY() : Float.NaN;
+            } else {
+                AppCell cell = new AppCell(getContext(), this);
+                cell.setColours(foreground, dim, accent, surface);
+                shown.add(cell);
+                fromX[i] = Float.NaN;
+                fromY[i] = Float.NaN;
             }
         }
-        from = places;
         int left = 0;
         leftFrom = new int[before.size()];
         for (int place = 0; place < before.size(); place++) {
@@ -224,10 +293,10 @@ final class AppsGrid extends ScrollView {
     }
 
     /**
-     * Draws the cells as apps come and go, from the frame's values in ten-thousandths (ANIM-21).
-     * Cells that just joined take the appearing scale and opacity, and those that left the
-     * leaving ones, at their old places. Every other cell is {@code shift} of the way from its
-     * old place to its new one. Leaving views go once they have faded out.
+     * Draws the cells as apps come, go and move, from the frame's values in ten-thousandths
+     * (ANIM-21, ANIM-13). Cells that just joined take the appearing scale and opacity, and those
+     * that left the leaving ones, at their old places. Every other cell is {@code shift} of the
+     * way from where it was drawn to its new place. Leaving views go once they have faded out.
      */
     void move(int appearScale, int appearAlpha, int leaveScale, int leaveAlpha, int shift) {
         boolean atRest = appearScale == WHOLE && appearAlpha == WHOLE && leaveAlpha <= 0
@@ -238,12 +307,15 @@ final class AppsGrid extends ScrollView {
         float still = 1f - shift / WHOLE;
         for (int i = 0; i < shown.size(); i++) {
             AppCell cell = shown.get(i);
-            int place = i < from.length ? from[i] : i;
-            if (place == NONE) {
+            float x = i < fromX.length ? fromX[i] : cells.left(i);
+            float y = i < fromY.length ? fromY[i] : cells.top(i);
+            if (cell == lifted) {
+                // The dragged icon follows the finger, wherever its cell moves (ANIM-13).
+                cell.setMotion(1f, 1f, 0f, 0f);
+            } else if (Float.isNaN(x) || Float.isNaN(y)) {
                 cell.setMotion(appearScale / WHOLE, appearAlpha / WHOLE, 0f, 0f);
             } else {
-                cell.setMotion(1f, 1f, still * (cells.left(place) - cells.left(i)),
-                        still * (cells.top(place) - cells.top(i)));
+                cell.setMotion(1f, 1f, still * (x - cells.left(i)), still * (y - cells.top(i)));
             }
         }
         if (leaveAlpha <= 0) {
@@ -264,8 +336,10 @@ final class AppsGrid extends ScrollView {
         agreedScroll = scrollPx;
         if (!isLaidOut() || cells.getHeight() == 0) {
             pendingScroll = scrollPx;
-        } else if (scrollPx == 0 && isShown() && ValueAnimator.areAnimatorsEnabled()) {
-            // Home scrolls back to the top (HOME-07).
+        } else if (scrollPx == 0 && lifted == null && isShown()
+                && ValueAnimator.areAnimatorsEnabled()) {
+            // Home scrolls back to the top (HOME-07). A dragged icon's auto-scroll reaching it
+            // follows the frame exactly instead.
             smoothScrollTo(0, 0);
         } else {
             scrollTo(0, scrollPx);
@@ -273,8 +347,44 @@ final class AppsGrid extends ScrollView {
     }
 
     /**
+     * Draws edit mode (APPS-12, ANIM-12): whether it is on, every cell's scale in ten-thousandths,
+     * and the ✕ scale of each visible row from {@code firstRow}, in {@code frame} from {@code
+     * badgesAt} on, {@code badgeRows} of them. Rows further down take the last one. When it
+     * turns on or off, screen readers read the cells' actions again.
+     */
+    void edit(boolean on, int scale, int firstRow, int[] frame, int badgesAt, int badgeRows) {
+        boolean changed = on != editing;
+        editing = on;
+        editScale = scale / WHOLE;
+        badgeFirstRow = firstRow;
+        if (badgeScales.length != badgeRows) {
+            badgeScales = new float[badgeRows];
+        }
+        for (int i = 0; i < badgeRows; i++) {
+            badgeScales[i] = frame[badgesAt + i] / WHOLE;
+        }
+        for (int i = 0; i < shown.size(); i++) {
+            AppCell cell = shown.get(i);
+            cell.setEdit(editing, editScale, badgeScale(i));
+            if (changed) {
+                cell.sendAccessibilityEvent(AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED);
+            }
+        }
+    }
+
+    /** The ✕ scale of cell {@code index}, from its row's place among the visible ones. */
+    private float badgeScale(int index) {
+        if (badgeScales.length == 0) {
+            return 0f;
+        }
+        int rank = index / columns - badgeFirstRow;
+        return badgeScales[Math.max(0, Math.min(rank, badgeScales.length - 1))];
+    }
+
+    /**
      * Draws the picked-up icon: cell {@code index}, {@code dx} and {@code dy} px from its place,
-     * at {@code scale} ten-thousandths (APPS-11). -1 puts every icon back in its cell.
+     * at {@code scale} ten-thousandths (APPS-11). It stays raised until it has settled into its
+     * cell (ANIM-13). -1 puts every icon back in its cell.
      */
     void lift(int index, int dx, int dy, int scale) {
         AppCell cell = index >= 0 && index < shown.size() ? shown.get(index) : null;
@@ -347,6 +457,45 @@ final class AppsGrid extends ScrollView {
      */
     boolean longPressed(AppCell cell) {
         return nativeAppLongPressed(revision, cell.index());
+    }
+
+    /**
+     * The ✕ of a cell was tapped, or its screen-reader action used (APPS-13): the system asks
+     * the user to confirm. If it refuses, its message shows briefly.
+     */
+    void badgeTapped(AppCell cell) {
+        String message = nativeAppBadgeTapped(revision, cell.index());
+        redraw.run();
+        if (message != null) {
+            Toast.makeText(getContext(), message, Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    /**
+     * A screen reader moved a cell to place {@code to} (A11Y-05). Its new place is announced, as
+     * "Mail, place 3 of 40" (A11Y-08). Returns whether it moved.
+     */
+    boolean moveTo(AppCell cell, int to) {
+        String label = cell.label();
+        int place = nativeAppMoved(revision, cell.index(), to);
+        redraw.run();
+        if (place < 0) {
+            return false;
+        }
+        announce.accept(getResources().getString(
+                R.string.app_moved, label, place + 1, shown.size()));
+        return true;
+    }
+
+    /** Done: edit mode ends (APPS-12). */
+    void done() {
+        nativeEditDone();
+        redraw.run();
+    }
+
+    /** How many cells the grid shows. */
+    int cellCount() {
+        return shown.size();
     }
 
     /** A screen reader asked for an app's menu (A11Y-05). Returns whether it opened. */
@@ -464,15 +613,13 @@ final class AppsGrid extends ScrollView {
         @Override
         protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
             int width = MeasureSpec.getSize(widthMeasureSpec);
-            if (width > 0 && width != reportedWidth) {
+            if (width > 0) {
+                cellsWidth = width;
                 // The Rust app picks the columns for this width (APPS-02). Asked here, the
                 // answer lays out in this pass; a new scroll position follows in the next frame.
-                reportedWidth = width;
-                nativeAppsLayout(
-                        width, rowPx, getResources().getDisplayMetrics().density, laidOut);
-                columns = Math.max(1, laidOut[0]);
-                rows = laidOut[1];
-                post(redraw);
+                if (report(width)) {
+                    post(redraw);
+                }
             }
             int cellWidth = MeasureSpec.makeMeasureSpec(width / columns, MeasureSpec.EXACTLY);
             int cellHeight = MeasureSpec.makeMeasureSpec(rowPx, MeasureSpec.EXACTLY);
@@ -505,10 +652,12 @@ final class AppsGrid extends ScrollView {
     private native String[] nativeAppsCells();
 
     /**
-     * The grid is {@code widthPx} wide inside its margins, with rows {@code rowHeightPx} apart.
-     * Fills {@code grid} with the columns and rows it now has.
+     * The grid is {@code widthPx} wide inside its margins, with rows {@code rowHeightPx} apart,
+     * {@code topPx} and {@code bottomPx} of room above and below its cells, and {@code heightPx}
+     * tall. Fills {@code grid} with the columns and rows it now has.
      */
-    private native void nativeAppsLayout(int widthPx, int rowHeightPx, float density, int[] grid);
+    private native void nativeAppsLayout(int widthPx, int rowHeightPx, float density, int topPx,
+            int bottomPx, int heightPx, int[] grid);
 
     /** The user scrolled the grid this far from its top. */
     private native void nativeAppsScrolled(int px);
@@ -537,4 +686,19 @@ final class AppsGrid extends ScrollView {
      * Returns whether it opened.
      */
     private native boolean nativeAppMenuRequested(int revision, int index);
+
+    /**
+     * The ✕ of cell {@code index} of the cells at {@code revision} was tapped. Returns null, or
+     * a short message to show.
+     */
+    private native String nativeAppBadgeTapped(int revision, int index);
+
+    /**
+     * Moves cell {@code index} of the cells at {@code revision} to place {@code to}. Returns its
+     * place now, or -1 if nothing moved.
+     */
+    private native int nativeAppMoved(int revision, int index, int to);
+
+    /** Done was tapped: edit mode ends. */
+    private native void nativeEditDone();
 }

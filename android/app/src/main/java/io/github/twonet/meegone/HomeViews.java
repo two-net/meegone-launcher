@@ -99,7 +99,14 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private static final int LIFT_X = 33; // px from its place
     private static final int LIFT_Y = 34;
     private static final int LIFT_SCALE = 35; // ten-thousandths
-    private static final int FRAME_SIZE = 36;
+    // Edit mode (APPS-12, ANIM-12, ADR 0014).
+    private static final int EDITING = 36; // 1 while it is on
+    private static final int EDIT_SCALE = 37; // every cell's, in ten-thousandths
+    private static final int EDIT_PROGRESS = 38; // 0 to 10 000: Done's opacity
+    private static final int BADGE_FIRST_ROW = 39; // the grid's first visible row
+    private static final int BADGES = 40; // the ✕ scale of each visible row from it
+    private static final int BADGE_ROWS = 12;
+    private static final int FRAME_SIZE = BADGES + BADGE_ROWS;
 
     private static final int VIEWS = 3;
     private static final int APPLICATIONS = 1;
@@ -131,6 +138,10 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     /** Each view's name, until its content arrives; null for Applications, which has its grid. */
     private final TextView[] titles = new TextView[VIEWS];
     private final AppsGrid apps;
+    /** Ends edit mode (APPS-12): a flat pill at the bottom of Applications. */
+    private final TextView done;
+    private final GradientDrawable doneShape;
+    private final int doneMargin;
     private final View[] segments = new View[VIEWS];
     /** The view indicator (HOME-09). Screen readers skip it; {@link #status} speaks instead. */
     private final LinearLayout indicator;
@@ -175,6 +186,11 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private float downY;
     private boolean framePosted;
     private int announced = -1;
+    /** Edit mode as last drawn, or -1 before the first frame. */
+    private int editingShown = -1;
+    /** Done's colours as drawn: the accent behind, and the background's for its text. */
+    private int doneAccent;
+    private int doneText;
     private int selected = -1;
     private int background;
     private int surface;
@@ -197,12 +213,27 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         // Carries the screen-reader actions that switch views and open the menu (A11Y-05).
         setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_YES);
 
-        apps = new AppsGrid(context, this::apply);
+        apps = new AppsGrid(context, this::apply, this::announce);
+        doneMargin = dp(16);
+        done = new TextView(context);
+        done.setText(R.string.edit_done);
+        done.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
+        done.setGravity(Gravity.CENTER);
+        done.setMinHeight(dp(48));
+        done.setMinWidth(dp(120));
+        done.setPadding(dp(24), 0, dp(24), 0);
+        doneShape = new GradientDrawable();
+        doneShape.setCornerRadius(dp(24));
+        done.setOnClickListener(view -> apps.done());
+        done.setVisibility(GONE);
         for (int i = 0; i < VIEWS; i++) {
             FrameLayout page = new FrameLayout(context);
             if (i == APPLICATIONS) {
                 page.addView(apps, new LayoutParams(
                         LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
+                // Over the grid's last row, which is always empty (HOME-14).
+                page.addView(done, new LayoutParams(LayoutParams.WRAP_CONTENT,
+                        LayoutParams.WRAP_CONTENT, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL));
             } else {
                 // Until Events' and Recent's content arrives (#19, #22), each shows its name.
                 TextView title = new TextView(context);
@@ -329,6 +360,11 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         }
         // The grid scrolls under the bars, so it takes the safe area as its own padding.
         apps.setSafeArea(safe);
+        LayoutParams doneParams = (LayoutParams) done.getLayoutParams();
+        if (doneParams.bottomMargin != safe.bottom + doneMargin) {
+            doneParams.bottomMargin = safe.bottom + doneMargin;
+            done.setLayoutParams(doneParams);
+        }
         settings.setPadding(safe.left, safe.top, safe.right, safe.bottom);
         LayoutParams params = (LayoutParams) indicator.getLayoutParams();
         if (params.topMargin != safe.top + indicatorMargin) {
@@ -652,15 +688,27 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         int current = frame[CURRENT];
         apps.apply(frame[APPS_REVISION], frame[APPS_SCROLL], frame[APPS_COLUMNS],
                 frame[APPS_ROWS], current == APPLICATIONS ? frame[PRESSED] : -1,
-                frame[PRESS_SCALE], foreground, dim, frame[ACCENT]);
+                frame[PRESS_SCALE], foreground, dim, frame[ACCENT], surface);
         apps.move(frame[APPEAR_SCALE], frame[APPEAR_ALPHA], frame[LEAVE_SCALE],
                 frame[LEAVE_ALPHA], frame[SHIFT]);
         apps.lift(current == APPLICATIONS ? frame[LIFTED] : -1, frame[LIFT_X], frame[LIFT_Y],
                 frame[LIFT_SCALE]);
+        apps.edit(frame[EDITING] != 0, frame[EDIT_SCALE], frame[BADGE_FIRST_ROW], frame, BADGES,
+                BADGE_ROWS);
+        applyDone();
         if (current != announced) {
             announced = current;
-            status.setText(getResources().getString(R.string.view_position,
-                    getResources().getString(NAMES[current]), current + 1, VIEWS));
+            status.setText(viewPosition(current));
+        }
+        if (frame[EDITING] != editingShown) {
+            // A11Y-08: "Edit mode". Leaving it sets the view's position again, so the next time
+            // edit mode starts, the text changes and is read.
+            if (editingShown >= 0) {
+                status.setText(frame[EDITING] != 0
+                        ? getResources().getString(R.string.edit_mode)
+                        : viewPosition(current));
+            }
+            editingShown = frame[EDITING];
         }
         applySettings();
         applyMenu();
@@ -672,6 +720,41 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         if (frame[ANIMATING] != 0 && !framePosted && isAttachedToWindow()) {
             framePosted = true;
             Choreographer.getInstance().postFrameCallback(this);
+        }
+    }
+
+    /** The view's name and place for screen readers, e.g. "Applications, 2 of 3" (A11Y-08). */
+    private String viewPosition(int view) {
+        return getResources().getString(R.string.view_position,
+                getResources().getString(NAMES[view]), view + 1, VIEWS);
+    }
+
+    /** Tells screen readers of a change, through the polite live region (A11Y-08). */
+    private void announce(String text) {
+        status.setText(text);
+    }
+
+    /**
+     * Done fades in and out with edit mode (ANIM-12). It is in the accent colour with the
+     * background colour's text, and can be tapped, or found by screen readers, only while edit
+     * mode is on.
+     */
+    private void applyDone() {
+        float alpha = frame[EDIT_PROGRESS] / 10_000f;
+        done.setVisibility(alpha > 0f ? VISIBLE : GONE);
+        done.setAlpha(alpha);
+        boolean on = frame[EDITING] != 0;
+        done.setEnabled(on);
+        done.setImportantForAccessibility(
+                on ? IMPORTANT_FOR_ACCESSIBILITY_YES : IMPORTANT_FOR_ACCESSIBILITY_NO);
+        if (frame[ACCENT] != doneAccent || background != doneText) {
+            doneAccent = frame[ACCENT];
+            doneText = background;
+            doneShape.setColor(doneAccent);
+            ColorStateList pressed =
+                    ColorStateList.valueOf((background & 0x00FFFFFF) | 0x3D000000);
+            done.setBackground(new RippleDrawable(pressed, doneShape, null));
+            done.setTextColor(background);
         }
     }
 

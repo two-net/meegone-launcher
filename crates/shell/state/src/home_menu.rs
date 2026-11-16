@@ -50,11 +50,13 @@ pub struct HomeMenu {
 }
 
 impl HomeMenu {
-    /// The items `view`'s menu offers, or `None` for Recent, which has no menu (HOME-10).
-    pub fn items_for(view: HomeView) -> Option<&'static [MenuItem]> {
+    /// The items `view`'s menu offers, or `None` for Recent, which has no menu (HOME-10). While
+    /// edit mode is on, Applications' leaves out Edit applications, as an app's menu does.
+    pub fn items_for(view: HomeView, editing: bool) -> Option<&'static [MenuItem]> {
+        const WITHOUT_EDIT: [MenuItem; 2] = [MenuItem::LauncherSettings, MenuItem::LockScreenImage];
         match view {
-            HomeView::Applications => Some(&MenuItem::ALL),
-            HomeView::Events => Some(&[MenuItem::LauncherSettings, MenuItem::LockScreenImage]),
+            HomeView::Applications if !editing => Some(&MenuItem::ALL),
+            HomeView::Applications | HomeView::Events => Some(&WITHOUT_EDIT),
             HomeView::Recent => None,
         }
     }
@@ -72,15 +74,18 @@ mod tests {
     #[test]
     fn edit_applications_is_offered_only_in_applications() {
         // HOME-10
+        let without_edit = Some(&[MenuItem::LauncherSettings, MenuItem::LockScreenImage][..]);
         assert_eq!(
-            HomeMenu::items_for(HomeView::Applications),
+            HomeMenu::items_for(HomeView::Applications, false),
             Some(&MenuItem::ALL[..])
         );
+        assert_eq!(HomeMenu::items_for(HomeView::Events, false), without_edit);
+        assert_eq!(HomeMenu::items_for(HomeView::Recent, false), None);
+        // In edit mode, Edit applications has nothing to do (APPS-12).
         assert_eq!(
-            HomeMenu::items_for(HomeView::Events),
-            Some(&[MenuItem::LauncherSettings, MenuItem::LockScreenImage][..])
+            HomeMenu::items_for(HomeView::Applications, true),
+            without_edit
         );
-        assert_eq!(HomeMenu::items_for(HomeView::Recent), None);
     }
 
     #[test]

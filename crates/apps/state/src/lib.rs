@@ -1,6 +1,6 @@
 //! Applications state (SRS 4.2): the grid, its layout and scroll position, an app's long-press
-//! menu, edit mode and the open folder. [`reconcile`] keeps the layout in step with the
-//! installed apps (ADR 0012).
+//! menu, edit mode with its arrangement and the open folder. [`reconcile`] keeps the layout in
+//! step with the installed apps (ADR 0012).
 
 mod reconcile;
 
@@ -11,8 +11,8 @@ use meegone_core_data::{AppsAdapter, DataError, Profile};
 use meegone_core_state::{App, AppId, Rect, Shortcut, StateHolder};
 
 pub use meegone_apps_data::FolderId;
-use reconcile::{Start, grid, reconcile};
-pub use reconcile::{cells_came_or_went, previous_places};
+use reconcile::{Start, arrange, follow_order, grid, reconcile};
+pub use reconcile::{cells_moved, previous_places};
 
 /// Columns on a phone (APPS-02).
 pub const PHONE_COLUMNS: usize = 4;
@@ -96,6 +96,10 @@ impl GridItem {
 }
 
 /// How the host laid the grid out, in physical pixels.
+///
+/// The cells start `top_px` below the grid's top, which is the home views' top, and scroll under
+/// the system bars (ADR 0010). Cell places are worked out exactly as the host lays them out, in
+/// whole pixels, so the shell can tell which place is under a dragged icon (ADR 0014).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GridLayout {
     /// The grid's width inside its margins and the safe area.
@@ -105,17 +109,79 @@ pub struct GridLayout {
     pub row_height_px: f64,
     /// Physical pixels per dp.
     pub density: f64,
+    /// Room above the first row and below the last, inside the grid: the safe area.
+    pub top_px: f64,
+    pub bottom_px: f64,
+    /// The grid's height on screen, that room included, or 0 before it has one.
+    pub height_px: f64,
 }
 
 impl GridLayout {
     fn is_valid(&self) -> bool {
-        [self.width_px, self.row_height_px, self.density]
-            .iter()
-            .all(|value| value.is_finite() && *value > 0.0)
+        let sizes = [self.width_px, self.row_height_px, self.density];
+        let room = [self.top_px, self.bottom_px, self.height_px];
+        sizes.iter().all(|value| value.is_finite() && *value > 0.0)
+            && room.iter().all(|value| value.is_finite() && *value >= 0.0)
     }
 
-    fn columns(&self) -> usize {
+    /// How many columns it lays out (APPS-02).
+    pub fn columns(&self) -> usize {
         columns_for(self.width_px / self.density)
+    }
+
+    /// The column `place` is drawn in, from the left: mirrored right to left (L10N-02).
+    fn column(&self, place: usize, rtl: bool) -> usize {
+        let columns = self.columns();
+        let column = place % columns;
+        if rtl { columns - 1 - column } else { column }
+    }
+
+    /// Where the `column`th column from the left starts, in px from the cells' left. The
+    /// leftover pixels are spread, as `AppsGrid` does, so the cells fill the width exactly.
+    fn column_left(&self, column: usize) -> f64 {
+        let width = self.width_px.round() as i64;
+        (width * column as i64 / self.columns() as i64) as f64
+    }
+
+    /// Where cell `place` starts, in px from the cells' left.
+    pub fn cell_left(&self, place: usize, rtl: bool) -> f64 {
+        self.column_left(self.column(place, rtl))
+    }
+
+    /// How wide cell `place` is, in px.
+    pub fn cell_width(&self, place: usize, rtl: bool) -> f64 {
+        let column = self.column(place, rtl);
+        self.column_left(column + 1) - self.column_left(column)
+    }
+
+    /// Where cell `place` starts, in px from the cells' top.
+    pub fn cell_top(&self, place: usize) -> f64 {
+        (place / self.columns()) as f64 * self.row_height_px.round()
+    }
+
+    /// The place of the cell at (`x`, `y`) px from the cells' top left, among `count` cells:
+    /// the nearest one, so a point past the last cell, or outside the grid, is still a place.
+    /// `None` when there are no cells.
+    pub fn place_at(&self, x: f64, y: f64, count: usize, rtl: bool) -> Option<usize> {
+        let last = count.checked_sub(1)?;
+        let columns = self.columns();
+        let on_screen = (0..columns)
+            .rev()
+            .find(|&column| x >= self.column_left(column))
+            .unwrap_or(0);
+        let column = if rtl {
+            columns - 1 - on_screen
+        } else {
+            on_screen
+        };
+        let row = (y / self.row_height_px.round()).floor().max(0.0) as usize;
+        Some((row * columns + column).min(last))
+    }
+
+    /// How far a grid of `rows` rows scrolls at most, in px.
+    pub fn max_scroll(&self, rows: usize) -> f64 {
+        let content = rows as f64 * self.row_height_px.round() + self.top_px + self.bottom_px;
+        (content - self.height_px).max(0.0)
     }
 }
 
@@ -130,9 +196,13 @@ pub struct AppsState {
     /// it back to 0 (HOME-07), and it is kept when the system ends MeeGone's process (REL-05).
     /// The host scrolls its grid to this position whenever it differs from its own (ADR 0007).
     pub scroll_px: f64,
+    /// How the host last laid the grid out, if it has yet.
+    pub layout: Option<GridLayout>,
     /// An app's long-press menu, while it is open (APPS-11). Shared, so the UI can tell when it
     /// changed.
     pub menu: Option<Arc<AppMenu>>,
+    /// Edit mode (APPS-12): ✕ badges on the apps the user can uninstall, icons that can be
+    /// dragged, and a Done button. A tap on an icon launches nothing.
     pub edit_mode: bool,
     pub open_folder: Option<FolderId>,
     /// The last problem, in plain words. The grid keeps working (REL-01).
@@ -145,6 +215,7 @@ impl Default for AppsState {
             items: Arc::new([]),
             columns: PHONE_COLUMNS,
             scroll_px: 0.0,
+            layout: None,
             menu: None,
             edit_mode: false,
             open_folder: None,
@@ -159,6 +230,13 @@ impl AppsState {
     pub fn rows(&self) -> usize {
         self.items.len().div_ceil(self.columns.max(1)) + 1
     }
+
+    /// The place of `app`'s own cell, if it has one: an app in a folder has none.
+    pub fn place_of(&self, app: &AppId) -> Option<usize> {
+        self.items
+            .iter()
+            .position(|item| matches!(item, GridItem::App { app: shown, .. } if shown.id == *app))
+    }
 }
 
 #[derive(Debug)]
@@ -166,7 +244,8 @@ pub enum AppsIntent {
     /// Rebuilds the grid from the installed apps and the saved layout.
     Refresh,
     /// Launches an app, growing its window from `from`, the tapped icon (APPS-10, ANIM-08). An
-    /// unavailable app is launched too, so the system explains why it can't open (APPS-09).
+    /// unavailable app is launched too, so the system explains why it can't open (APPS-09). In
+    /// edit mode, nothing launches.
     Launch {
         app: AppId,
         from: Option<Rect>,
@@ -182,6 +261,28 @@ pub enum AppsIntent {
     ChooseMenuItem(AppMenuItem),
     /// Enters edit mode (APPS-12). An open app menu closes.
     EnterEditMode,
+    /// Done: leaves edit mode (APPS-12). An arrangement not dropped yet is undone.
+    ExitEditMode,
+    /// In edit mode, shows `app`'s own cell at place `to`, or the last place, while the others
+    /// move aside, as a dragged icon goes (APPS-12). Nothing is saved until [`AppsIntent::Drop`].
+    /// A refresh keeps it.
+    Arrange {
+        app: AppId,
+        to: usize,
+    },
+    /// Keeps the arrangement shown, and saves the layout in that order (APPS-12, APPS-18).
+    Drop,
+    /// Shows the saved order again, as when a drag ends any way but a drop.
+    CancelArrange,
+    /// In edit mode, moves `app`'s own cell to place `to` and saves it: an arrangement and a
+    /// drop at once, as a screen reader's "Move to…" actions do (A11Y-05).
+    Move {
+        app: AppId,
+        to: usize,
+    },
+    /// The ✕ on `app` was tapped, in edit mode: the system asks the user to confirm its
+    /// uninstall (APPS-13). Nothing happens for an app the user can't uninstall.
+    RequestUninstall(AppId),
     OpenFolder(FolderId),
     /// The host scrolled the grid to this many pixels from its top, or MeeGone restores where
     /// it was (REL-05).
@@ -198,8 +299,11 @@ pub struct AppsHolder {
     layout: Option<Layout>,
     /// The kept layout's last save failed, so the next refresh saves it again.
     unsaved: bool,
-    /// The grid's last layout, if the host has laid it out yet.
-    grid: Option<GridLayout>,
+    /// The apps the system listed at the last refresh, which the cells show.
+    installed: Vec<App>,
+    /// In edit mode, an app's own cell shown at a place, while the others move aside, until it
+    /// is dropped (APPS-12). The place stays through a refresh: it is where the finger is.
+    arranging: Option<(AppId, usize)>,
     state: AppsState,
 }
 
@@ -210,7 +314,8 @@ impl AppsHolder {
             store: layout,
             layout: None,
             unsaved: false,
-            grid: None,
+            installed: Vec::new(),
+            arranging: None,
             state: AppsState::default(),
         }
     }
@@ -249,9 +354,11 @@ impl AppsHolder {
                 }
                 Err(error) => {
                     // Shown but never saved: the file may be fine, so the next refresh reads it
-                    // again instead of replacing it (REL-02).
+                    // again instead of replacing it (REL-02). Nothing can be arranged meanwhile.
                     let shown = reconciled(&Layout::default(), &Start::Rebuilt).0;
-                    self.show(&shown, &installed);
+                    self.installed = installed;
+                    self.arranging = None;
+                    self.show(&shown);
                     self.state.problem = Some(error.to_string());
                     return;
                 }
@@ -260,7 +367,8 @@ impl AppsHolder {
         if changed || self.unsaved {
             self.save(&layout);
         }
-        self.show(&layout, &installed);
+        self.installed = installed;
+        self.show(&layout);
         self.layout = Some(layout);
         // The menu of an app that was just removed closes.
         let gone = |menu: &Arc<AppMenu>| self.app(&menu.app).is_none();
@@ -281,14 +389,35 @@ impl AppsHolder {
         }
     }
 
-    fn show(&mut self, layout: &Layout, installed: &[App]) {
-        let items = grid(layout, installed);
+    /// Shows `layout`'s cells, with the arrangement in progress if there is one. This is the
+    /// only place the cells are made, so they never go stale. They are replaced only when they
+    /// change, so the host rebinds nothing it doesn't need to.
+    fn show(&mut self, layout: &Layout) {
+        let mut items = grid(layout, &self.installed);
+        if let Some((app, to)) = &self.arranging {
+            // An app that has gone, or now sits in a folder, ends its arrangement.
+            if !arrange(&mut items, app, *to) {
+                self.arranging = None;
+            }
+        }
         if *self.state.items != *items {
             self.state.items = items.into();
         }
     }
 
+    /// Shows the kept layout again, after the arrangement changed.
+    fn show_kept(&mut self) {
+        if let Some(layout) = self.layout.take() {
+            self.show(&layout);
+            self.layout = Some(layout);
+        }
+    }
+
     fn launch(&mut self, app: &AppId, from: Option<Rect>) {
+        // In edit mode a tap arranges; it never leaves MeeGone (APPS-12).
+        if self.state.edit_mode {
+            return;
+        }
         self.state.problem = self
             .apps
             .launch(app, from)
@@ -306,19 +435,7 @@ impl AppsHolder {
         };
         if layout.new.remove(app) {
             self.save(&layout);
-            let items: Vec<GridItem> = self
-                .state
-                .items
-                .iter()
-                .map(|item| match item {
-                    GridItem::App { app: shown, .. } if shown.id == *app => GridItem::App {
-                        app: shown.clone(),
-                        new: false,
-                    },
-                    other => other.clone(),
-                })
-                .collect();
-            self.state.items = items.into();
+            self.show(&layout);
         }
         self.layout = Some(layout);
     }
@@ -331,14 +448,14 @@ impl AppsHolder {
             return;
         }
         let columns = grid.columns();
-        if let Some(before) = self.grid {
+        if let Some(before) = self.state.layout {
             if before.row_height_px != grid.row_height_px || self.state.columns != columns {
                 let row = (self.state.scroll_px / before.row_height_px).floor() as usize;
                 let first = row * self.state.columns;
                 self.state.scroll_px = (first / columns) as f64 * grid.row_height_px;
             }
         }
-        self.grid = Some(grid);
+        self.state.layout = Some(grid);
         self.state.columns = columns;
     }
 
@@ -404,6 +521,60 @@ impl AppsHolder {
         };
         self.state.problem = done.err().map(|error| error.to_string());
     }
+
+    /// Leaves edit mode, undoing an arrangement that wasn't dropped. Returns whether it was on.
+    fn exit_edit_mode(&mut self) -> bool {
+        self.cancel_arrangement();
+        std::mem::take(&mut self.state.edit_mode)
+    }
+
+    /// APPS-12: shows `app`'s own cell at `to` while the others move aside. Only in edit mode,
+    /// and only while the layout could be read, since nothing could be saved otherwise
+    /// (REL-02).
+    fn arrange(&mut self, app: AppId, to: usize) {
+        if !self.state.edit_mode || self.layout.is_none() || self.state.place_of(&app).is_none() {
+            return;
+        }
+        self.arranging = Some((app, to));
+        self.show_kept();
+    }
+
+    /// APPS-12, APPS-18: the arrangement shown becomes the layout, saved once. A failed save is
+    /// the problem, and the next refresh saves again (ADR 0012).
+    fn drop_arrangement(&mut self) {
+        if self.arranging.take().is_none() {
+            return;
+        }
+        let Some(layout) = self.layout.take() else {
+            return;
+        };
+        let arranged = follow_order(&layout, &self.state.items);
+        if arranged != layout {
+            self.save(&arranged);
+        }
+        self.layout = Some(arranged);
+    }
+
+    fn cancel_arrangement(&mut self) {
+        if self.arranging.take().is_some() {
+            self.show_kept();
+        }
+    }
+
+    /// APPS-13: the ✕ asks the system, which asks the user. MeeGone never uninstalls anything
+    /// itself, and apps the user can't uninstall have no ✕.
+    fn request_uninstall(&mut self, id: &AppId) {
+        let can = self.state.edit_mode
+            && self.state.place_of(id).is_some()
+            && self.app(id).is_some_and(|app| app.can_uninstall);
+        if can {
+            self.state.problem = self
+                .apps
+                .request_uninstall(id)
+                .err()
+                .map(|error| error.to_string());
+        }
+    }
 }
 
 impl StateHolder for AppsHolder {
@@ -426,6 +597,18 @@ impl StateHolder for AppsHolder {
                 self.state.menu = None;
                 self.state.edit_mode = true;
             }
+            AppsIntent::ExitEditMode => {
+                self.state.menu = None;
+                self.exit_edit_mode();
+            }
+            AppsIntent::Arrange { app, to } => self.arrange(app, to),
+            AppsIntent::Drop => self.drop_arrangement(),
+            AppsIntent::CancelArrange => self.cancel_arrangement(),
+            AppsIntent::Move { app, to } => {
+                self.arrange(app, to);
+                self.drop_arrangement();
+            }
+            AppsIntent::RequestUninstall(app) => self.request_uninstall(&app),
             AppsIntent::OpenFolder(folder) => self.open_folder(folder),
             AppsIntent::Scrolled(px) => {
                 if px.is_finite() {
@@ -441,7 +624,7 @@ impl StateHolder for AppsHolder {
         if self.state.menu.take().is_some() || self.state.open_folder.take().is_some() {
             return true;
         }
-        std::mem::take(&mut self.state.edit_mode)
+        self.exit_edit_mode()
     }
 }
 
@@ -711,6 +894,9 @@ mod tests {
             width_px: width_dp * density,
             row_height_px: row_dp * density,
             density,
+            top_px: 0.0,
+            bottom_px: 0.0,
+            height_px: 0.0,
         }
     }
 
@@ -1391,5 +1577,301 @@ mod tests {
                 "{damaged:?}"
             );
         }
+    }
+
+    /// A holder in edit mode, with Camera, Mail, Maps and Phone in that order.
+    fn editing(fakes: &Fakes) -> (Arc<FakeStorage>, Arc<PersistentLayoutStore>, AppsHolder) {
+        install(
+            fakes,
+            &[
+                ("camera", "Camera"),
+                ("mail", "Mail"),
+                ("maps", "Maps"),
+                ("phone", "Phone"),
+            ],
+        );
+        let (storage, layout) = storage_and_store();
+        let mut holder = holder(fakes, &layout);
+        holder.handle(AppsIntent::EnterEditMode);
+        storage.writes.lock().unwrap().clear();
+        (storage, layout, holder)
+    }
+
+    fn saved_order(layout: &PersistentLayoutStore) -> Vec<String> {
+        saved(layout)
+            .entries
+            .iter()
+            .map(|entry| match entry {
+                LayoutEntry::App(id) => id.package.clone(),
+                LayoutEntry::Folder { name, .. } => format!("[{name}]"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_dragged_app_moves_the_others_aside_and_is_saved_once_when_dropped() {
+        // APPS-12, APPS-18, AC-07
+        let fakes = Fakes::default();
+        let (storage, layout, mut holder) = editing(&fakes);
+
+        holder.handle(AppsIntent::Arrange {
+            app: app_id("maps"),
+            to: 1,
+        });
+        assert_eq!(labels(holder.state()), ["Camera", "Maps", "Mail", "Phone"]);
+        holder.handle(AppsIntent::Arrange {
+            app: app_id("maps"),
+            to: 0,
+        });
+        assert_eq!(labels(holder.state()), ["Maps", "Camera", "Mail", "Phone"]);
+        // Nothing is saved while the icon is still moving.
+        assert!(storage.writes.lock().unwrap().is_empty());
+
+        holder.handle(AppsIntent::Drop);
+
+        assert_eq!(labels(holder.state()), ["Maps", "Camera", "Mail", "Phone"]);
+        assert_eq!(*storage.writes.lock().unwrap(), [StoredFile::Layout]);
+        assert_eq!(saved_order(&layout), ["maps", "camera", "mail", "phone"]);
+        // The drop is final: a refresh, or another drop, changes nothing.
+        holder.handle(AppsIntent::Refresh);
+        holder.handle(AppsIntent::Drop);
+        assert_eq!(labels(holder.state()), ["Maps", "Camera", "Mail", "Phone"]);
+        assert_eq!(storage.writes.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_drag_that_isnt_dropped_puts_the_grid_back() {
+        // APPS-12: Back, Done, or anything else that ends a drag but a drop.
+        for end in [
+            AppsIntent::CancelArrange,
+            AppsIntent::ExitEditMode,
+            AppsIntent::Refresh,
+        ] {
+            let fakes = Fakes::default();
+            let (storage, _, mut holder) = editing(&fakes);
+            holder.handle(AppsIntent::Arrange {
+                app: app_id("phone"),
+                to: 0,
+            });
+
+            let refresh = matches!(end, AppsIntent::Refresh);
+            holder.handle(end);
+
+            if refresh {
+                // A refresh keeps it: the finger is still there.
+                assert_eq!(labels(holder.state()), ["Phone", "Camera", "Mail", "Maps"]);
+            } else {
+                assert_eq!(labels(holder.state()), ["Camera", "Mail", "Maps", "Phone"]);
+            }
+            assert!(storage.writes.lock().unwrap().is_empty());
+        }
+
+        let fakes = Fakes::default();
+        let (_, _, mut holder) = editing(&fakes);
+        holder.handle(AppsIntent::Arrange {
+            app: app_id("phone"),
+            to: 0,
+        });
+        assert!(holder.on_back());
+        assert!(!holder.state().edit_mode);
+        assert_eq!(labels(holder.state()), ["Camera", "Mail", "Maps", "Phone"]);
+    }
+
+    #[test]
+    fn an_arrangement_stays_where_the_finger_is_as_apps_come_and_go() {
+        // APPS-12, APPS-08: an app above it is removed while it is dragged; it keeps its place.
+        // If the dragged app itself goes, so does its arrangement.
+        let fakes = Fakes::default();
+        let (_, layout, mut holder) = editing(&fakes);
+        holder.handle(AppsIntent::Arrange {
+            app: app_id("phone"),
+            to: 1,
+        });
+
+        install(
+            &fakes,
+            &[("mail", "Mail"), ("maps", "Maps"), ("phone", "Phone")],
+        );
+        holder.handle(AppsIntent::Refresh);
+        assert_eq!(labels(holder.state()), ["Mail", "Phone", "Maps"]);
+
+        install(&fakes, &[("mail", "Mail"), ("maps", "Maps")]);
+        holder.handle(AppsIntent::Refresh);
+        holder.handle(AppsIntent::Drop);
+        assert_eq!(labels(holder.state()), ["Mail", "Maps"]);
+        assert_eq!(saved_order(&layout), ["mail", "maps"]);
+    }
+
+    #[test]
+    fn moving_is_an_arrangement_and_a_drop_at_once() {
+        // A11Y-05: a screen reader's "Move to…" actions.
+        let fakes = Fakes::default();
+        let (_, layout, mut holder) = editing(&fakes);
+
+        holder.handle(AppsIntent::Move {
+            app: app_id("camera"),
+            to: 99,
+        });
+
+        assert_eq!(labels(holder.state()), ["Mail", "Maps", "Phone", "Camera"]);
+        assert_eq!(saved_order(&layout), ["mail", "maps", "phone", "camera"]);
+    }
+
+    #[test]
+    fn nothing_moves_outside_edit_mode_or_when_the_layout_couldnt_be_read() {
+        // APPS-12, REL-02: an arrangement nothing can save isn't offered.
+        let fakes = Fakes::default();
+        let (storage, layout, mut done) = editing(&fakes);
+        done.handle(AppsIntent::ExitEditMode);
+        done.handle(AppsIntent::Move {
+            app: app_id("phone"),
+            to: 0,
+        });
+        assert_eq!(labels(done.state()), ["Camera", "Mail", "Maps", "Phone"]);
+
+        let fakes = Fakes::default();
+        install(&fakes, &[("mail", "Mail"), ("maps", "Maps")]);
+        layout
+            .save(&Layout {
+                entries: vec![LayoutEntry::App(app_id("maps"))],
+                ..Layout::default()
+            })
+            .unwrap();
+        *storage.error.lock().unwrap() = Some(DataError::Failed("Disk busy".into()));
+        storage.writes.lock().unwrap().clear();
+        let mut holder = holder(&fakes, &layout);
+        holder.handle(AppsIntent::EnterEditMode);
+        holder.handle(AppsIntent::Move {
+            app: app_id("maps"),
+            to: 0,
+        });
+        assert_eq!(labels(holder.state()), ["Mail", "Maps"]);
+        assert!(storage.writes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn in_edit_mode_a_tap_launches_nothing() {
+        // APPS-12
+        let fakes = Fakes::default();
+        let (_, _, mut holder) = editing(&fakes);
+
+        holder.handle(AppsIntent::Launch {
+            app: app_id("mail"),
+            from: None,
+        });
+        assert!(fakes.apps.launched.lock().unwrap().is_empty());
+
+        holder.handle(AppsIntent::ExitEditMode);
+        holder.handle(AppsIntent::Launch {
+            app: app_id("mail"),
+            from: None,
+        });
+        assert_eq!(*fakes.apps.launched.lock().unwrap(), [app_id("mail")]);
+    }
+
+    #[test]
+    fn the_cross_asks_the_system_to_uninstall_only_apps_the_user_can_uninstall() {
+        // APPS-13, AC-09: MeeGone never uninstalls anything itself.
+        let fakes = Fakes::default();
+        let mut camera = app("camera", "Camera");
+        camera.can_uninstall = false;
+        *fakes.apps.apps.lock().unwrap() = vec![camera, app("mail", "Mail")];
+        let mut holder = holder(&fakes, &layout_store());
+
+        // Not in edit mode: there is no ✕ to tap.
+        holder.handle(AppsIntent::RequestUninstall(app_id("mail")));
+        assert!(fakes.apps.uninstall_requested.lock().unwrap().is_empty());
+
+        holder.handle(AppsIntent::EnterEditMode);
+        holder.handle(AppsIntent::RequestUninstall(app_id("camera")));
+        holder.handle(AppsIntent::RequestUninstall(app_id("gone")));
+        holder.handle(AppsIntent::RequestUninstall(app_id("mail")));
+
+        assert_eq!(
+            *fakes.apps.uninstall_requested.lock().unwrap(),
+            [app_id("mail")]
+        );
+        assert_eq!(labels(holder.state()), ["Camera", "Mail"]);
+        assert!(holder.state().edit_mode);
+
+        // The system refusing is a problem shown briefly.
+        *fakes.apps.error.lock().unwrap() = Some(DataError::Failed("No".into()));
+        holder.handle(AppsIntent::RequestUninstall(app_id("mail")));
+        assert_eq!(holder.state().problem.as_deref(), Some("No"));
+    }
+
+    #[test]
+    fn done_leaves_edit_mode_and_closes_the_menu() {
+        // APPS-12
+        let fakes = Fakes::default();
+        let (_, _, mut holder) = editing(&fakes);
+        holder.handle(AppsIntent::OpenMenu(app_id("mail")));
+
+        holder.handle(AppsIntent::ExitEditMode);
+
+        assert!(!holder.state().edit_mode);
+        assert_eq!(holder.state().menu, None);
+        assert!(!holder.on_back());
+    }
+
+    /// A phone's grid: 4 columns of 1001 px in all, at 2.75 px per dp, rows 300 px apart,
+    /// 100 px of safe area above and 50 below, 2000 px tall.
+    fn phone_grid() -> GridLayout {
+        GridLayout {
+            width_px: 1001.0,
+            row_height_px: 300.0,
+            density: 2.75,
+            top_px: 100.0,
+            bottom_px: 50.0,
+            height_px: 2000.0,
+        }
+    }
+
+    #[test]
+    fn cell_places_are_worked_out_as_the_host_lays_them_out() {
+        // ADR 0014: AppsGrid spreads the leftover pixels, `width * column / columns`.
+        let grid = phone_grid();
+        assert_eq!(grid.columns(), 4);
+        let lefts: Vec<f64> = (0..5).map(|place| grid.cell_left(place, false)).collect();
+        assert_eq!(lefts, [0.0, 250.0, 500.0, 750.0, 0.0]);
+        assert_eq!(grid.cell_width(3, false), 251.0);
+        assert_eq!(grid.cell_top(5), 300.0);
+        // Right to left mirrors the columns (L10N-02).
+        assert_eq!(grid.cell_left(0, true), 750.0);
+        assert_eq!(grid.cell_width(0, true), 251.0);
+    }
+
+    #[test]
+    fn the_place_under_a_point_is_the_nearest_cell() {
+        // APPS-12
+        let grid = phone_grid();
+        assert_eq!(grid.place_at(10.0, 10.0, 10, false), Some(0));
+        assert_eq!(grid.place_at(260.0, 310.0, 10, false), Some(5));
+        assert_eq!(grid.place_at(260.0, 310.0, 10, true), Some(6));
+        // Past the ends of a row, above the first row and below the last cell.
+        assert_eq!(grid.place_at(-50.0, -50.0, 10, false), Some(0));
+        assert_eq!(grid.place_at(5_000.0, 310.0, 10, false), Some(7));
+        assert_eq!(grid.place_at(10.0, 5_000.0, 10, false), Some(9));
+        assert_eq!(grid.place_at(10.0, 10.0, 0, false), None);
+    }
+
+    #[test]
+    fn the_grid_scrolls_as_far_as_its_last_row() {
+        // 10 rows of 300 px and the safe area, in 2000 px.
+        assert_eq!(phone_grid().max_scroll(10), 1150.0);
+        assert_eq!(phone_grid().max_scroll(2), 0.0);
+    }
+
+    #[test]
+    fn a_layout_with_negative_room_changes_nothing() {
+        let fakes = Fakes::default();
+        let mut holder = holder(&fakes, &layout_store());
+        holder.handle(AppsIntent::Layout(GridLayout {
+            top_px: -1.0,
+            ..phone_grid()
+        }));
+        assert_eq!(holder.state().layout, None);
+        holder.handle(AppsIntent::Layout(phone_grid()));
+        assert_eq!(holder.state().layout, Some(phone_grid()));
     }
 }

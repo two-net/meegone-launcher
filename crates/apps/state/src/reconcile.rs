@@ -142,12 +142,57 @@ pub fn previous_places(before: &[GridItem], after: &[GridItem]) -> Vec<Option<us
         .collect()
 }
 
-/// Whether any cell joined or left the grid between `before` and `after`, so the grid moves
-/// (ANIM-21). A change of label, icon or availability alone doesn't.
-pub fn cells_came_or_went(before: &[GridItem], after: &[GridItem]) -> bool {
-    let places = previous_places(before, after);
-    let kept: HashSet<usize> = places.iter().flatten().copied().collect();
-    places.contains(&None) || kept.len() != before.len()
+/// Whether any cell joined, left or changed place between `before` and `after`, so the grid
+/// moves (ANIM-21, ANIM-13). A change of label, icon or availability alone doesn't.
+pub fn cells_moved(before: &[GridItem], after: &[GridItem]) -> bool {
+    before.len() != after.len()
+        || previous_places(before, after)
+            .iter()
+            .enumerate()
+            .any(|(place, from)| *from != Some(place))
+}
+
+/// `cells` with `app`'s own cell moved to place `to`, or as far as it goes, and the cells
+/// between moved aside (APPS-12). Returns false, changing nothing, if `app` has no cell of its
+/// own.
+pub fn arrange(cells: &mut Vec<GridItem>, app: &AppId, to: usize) -> bool {
+    let Some(from) = cells
+        .iter()
+        .position(|item| matches!(item, GridItem::App { app: shown, .. } if shown.id == *app))
+    else {
+        return false;
+    };
+    let cell = cells.remove(from);
+    cells.insert(to.min(cells.len()), cell);
+    true
+}
+
+/// `layout` in the order of the cells `shown` (APPS-12, APPS-18). Entries that show no cell,
+/// such as the apps of a locked profile, keep their slots; the slots of the entries that do are
+/// filled again in the order they are shown.
+pub fn follow_order(layout: &Layout, shown: &[GridItem]) -> Layout {
+    let order: HashMap<Key<'_>, usize> = shown
+        .iter()
+        .enumerate()
+        .map(|(place, item)| (Key::of(item), place))
+        .collect();
+    let slots: Vec<usize> = layout
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| order.contains_key(&Key::of_entry(entry)))
+        .map(|(slot, _)| slot)
+        .collect();
+    let mut visible: Vec<&LayoutEntry> = slots.iter().map(|&slot| &layout.entries[slot]).collect();
+    visible.sort_by_key(|entry| order[&Key::of_entry(entry)]);
+    let mut entries = layout.entries.clone();
+    for (&slot, entry) in slots.iter().zip(visible) {
+        entries[slot] = entry.clone();
+    }
+    Layout {
+        entries,
+        new: layout.new.clone(),
+    }
 }
 
 /// What identifies a cell across changes.
@@ -162,6 +207,14 @@ impl<'a> Key<'a> {
         match item {
             GridItem::App { app, .. } => Key::App(&app.id),
             GridItem::Folder { id, .. } => Key::Folder(*id),
+        }
+    }
+
+    /// The key of the cell `entry` shows, if it shows one.
+    fn of_entry(entry: &'a LayoutEntry) -> Self {
+        match entry {
+            LayoutEntry::App(id) => Key::App(id),
+            LayoutEntry::Folder { id, .. } => Key::Folder(*id),
         }
     }
 }
@@ -752,8 +805,8 @@ mod tests {
     }
 
     #[test]
-    fn only_cells_coming_or_going_move_the_grid() {
-        // ANIM-21: an update's new label or accent changes no place.
+    fn only_cells_coming_going_or_changing_place_move_the_grid() {
+        // ANIM-21, ANIM-13: an update's new label or accent changes no place.
         let before = cells(&["mail", "maps"]);
         let mut relabelled = before.clone();
         if let GridItem::App { app, new } = &mut relabelled[0] {
@@ -761,13 +814,79 @@ mod tests {
             *new = true;
         }
 
-        assert!(!cells_came_or_went(&before, &relabelled));
-        assert!(cells_came_or_went(&before, &cells(&["mail"])));
-        assert!(cells_came_or_went(
-            &before,
-            &cells(&["mail", "maps", "atlas"])
-        ));
-        assert!(cells_came_or_went(&before, &cells(&["mail", "atlas"])));
-        assert!(!cells_came_or_went(&[], &[]));
+        assert!(!cells_moved(&before, &relabelled));
+        assert!(cells_moved(&before, &cells(&["mail"])));
+        assert!(cells_moved(&before, &cells(&["mail", "maps", "atlas"])));
+        assert!(cells_moved(&before, &cells(&["mail", "atlas"])));
+        assert!(cells_moved(&before, &cells(&["maps", "mail"])));
+        assert!(!cells_moved(&[], &[]));
+    }
+
+    fn shown(cells: &[GridItem]) -> Vec<&str> {
+        cells
+            .iter()
+            .map(|item| match item {
+                GridItem::App { app, .. } => app.id.package.as_str(),
+                GridItem::Folder { name, .. } => name.as_str(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn arranging_moves_an_apps_cell_and_the_others_aside() {
+        // APPS-12
+        let mut grid = cells(&["camera", "mail", "maps", "phone"]);
+
+        assert!(arrange(&mut grid, &app_id("maps"), 0));
+        assert_eq!(shown(&grid), ["maps", "camera", "mail", "phone"]);
+
+        assert!(arrange(&mut grid, &app_id("maps"), 2));
+        assert_eq!(shown(&grid), ["camera", "mail", "maps", "phone"]);
+
+        // Past the end is the last place.
+        assert!(arrange(&mut grid, &app_id("camera"), 99));
+        assert_eq!(shown(&grid), ["mail", "maps", "phone", "camera"]);
+
+        // An app with no cell of its own changes nothing.
+        assert!(!arrange(&mut grid, &app_id("atlas"), 0));
+        assert_eq!(shown(&grid), ["mail", "maps", "phone", "camera"]);
+    }
+
+    #[test]
+    fn following_the_shown_order_keeps_hidden_entries_in_their_slots() {
+        // APPS-12, APPS-18, ADR 0012: the work apps of a locked profile show no cell, and keep
+        // their places among the others.
+        let mut saved = layout(vec![
+            LayoutEntry::App(app_id("camera")),
+            LayoutEntry::App(work_app("mail", "Mail").id),
+            folder(1, &["chess", "go"]),
+            LayoutEntry::App(app_id("maps")),
+            LayoutEntry::App(work_app("docs", "Docs").id),
+            LayoutEntry::App(app_id("phone")),
+        ]);
+        saved.new.insert(app_id("maps"));
+        let mut grid = cells(&["camera", "maps", "phone"]);
+        grid.insert(
+            1,
+            GridItem::Folder {
+                id: FolderId(1),
+                name: "Folder 1".into(),
+                apps: vec![app("chess", "Chess"), app("go", "Go")],
+            },
+        );
+        assert!(arrange(&mut grid, &app_id("phone"), 0));
+
+        let kept = follow_order(&saved, &grid);
+
+        assert_eq!(
+            packages(&kept),
+            ["phone", "mail", "camera", "[1: chess go]", "docs", "maps"]
+        );
+        assert_eq!(kept.entries[1], saved.entries[1]);
+        assert_eq!(kept.entries[4], saved.entries[4]);
+        // The marks stay.
+        assert_eq!(kept.new, saved.new);
+        // The order shown already is the layout's.
+        assert_eq!(follow_order(&kept, &grid), kept);
     }
 }

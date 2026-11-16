@@ -4,8 +4,6 @@
 //! Not automated yet, because the behaviour isn't built:
 //! - AC-01: first-run setup (#35)
 //! - AC-05's open folder, AC-08: folders (#14)
-//! - AC-07's drag and AC-09: edit mode (#13). AC-07's other half, the layout surviving a
-//!   restart, is automated, as is entering edit mode by dragging after a long-press (#12).
 //! - AC-12: Clear in Events (#20)
 //! - AC-13, AC-14: Recent density and close mode (#23, #24)
 //! - AC-15 to AC-17: the daily image (#27 to #30)
@@ -25,8 +23,8 @@ use meegone_core_data::{
 use meegone_core_state::{Access, Health, Theme};
 use meegone_core_ui::tokens;
 use meegone_launcher::{
-    AppMenuItem, Direction, HomeView, Launcher, Layout, LiftFrame, MenuItem, PointerEvent,
-    PointerKind, SettingsGroup, ShellIntent,
+    AppMenuItem, BADGE_ROWS, Direction, GridLayout, HomeView, Launcher, Layout, LiftFrame,
+    MenuItem, PointerEvent, PointerKind, SettingsGroup, ShellIntent,
 };
 
 /// A phone 1080 × 2400 px at 2.75 px per dp.
@@ -666,7 +664,8 @@ fn apps08_an_uninstalled_app_leaves_its_folder_and_the_grid_closes_up() {
     );
     let (mut launcher, mut clock) = on_a_phone(&fakes);
     assert_eq!(grid(&launcher), ["Games", "Maps", "Phone"]);
-    launcher.frame();
+    // The host draws them.
+    assert_eq!(froms(&mut launcher), [None, None, None]);
 
     fakes
         .apps
@@ -916,10 +915,14 @@ fn apps02_given_a_screen_600_dp_wide_or_more_every_cell_is_96_to_128_dp_wide() {
     let (mut launcher, _) = on_a_phone(&fakes);
     let columns = |launcher: &mut Launcher, screen_dp: f64, insets_dp: f64, density: f64| {
         let grid_dp = screen_dp - insets_dp - 2.0 * 16.0;
-        launcher
-            .view()
-            .apps()
-            .grid_laid_out(grid_dp * density, 112.0 * density, density);
+        launcher.view().apps().grid_laid_out(GridLayout {
+            width_px: grid_dp * density,
+            row_height_px: 112.0 * density,
+            density,
+            top_px: 0.0,
+            bottom_px: 0.0,
+            height_px: 0.0,
+        });
         let columns = f64::from(launcher.frame().apps.columns);
         (grid_dp, columns)
     };
@@ -1220,7 +1223,8 @@ fn apps11_given_meegone_isnt_the_default_home_app_then_no_shortcuts_appear() {
 
 #[test]
 fn apps11_given_a_long_press_followed_by_a_drag_then_the_icon_lifts_and_edit_mode_starts() {
-    // Issue #12. Dropping it elsewhere moves it with #13; here it goes back to its cell.
+    // Issues #12 and #13. With the grid not laid out yet, it takes no new place: dropped, it
+    // settles back into its cell.
     let fakes = Fakes::default();
     mail_and_settings(&fakes);
     let (mut launcher, mut clock) = on_a_phone(&fakes);
@@ -1231,19 +1235,26 @@ fn apps11_given_a_long_press_followed_by_a_drag_then_the_icon_lifts_and_edit_mod
     let frame = launcher.frame();
     assert_eq!(frame.apps.menu, None);
     assert!(launcher.shell().apps().state().edit_mode);
+    let lifted = frame.lifted.expect("lifted");
+    assert_eq!((lifted.cell, lifted.dx, lifted.dy), (1, 120, 150));
+    // The views stay put, so the drag moves only the icon.
+    assert_eq!(frame.pages[HomeView::Applications.index()], 0);
+    // ANIM-13: it lifts to 110 %.
+    come_to_rest(&mut launcher, &mut clock);
     assert_eq!(
-        frame.lifted,
+        launcher.frame().lifted,
         Some(LiftFrame {
             cell: 1,
             dx: 120,
             dy: 150,
             scale: 11_000,
+            settling: false,
         })
     );
-    // The views stay put, so the drag moves only the icon.
-    assert_eq!(frame.pages[HomeView::Applications.index()], 0);
 
     finger(&mut launcher, &mut clock, PointerKind::Up, 520.0, 450.0);
+    assert!(launcher.frame().lifted.unwrap().settling);
+    come_to_rest(&mut launcher, &mut clock);
     assert_eq!(launcher.frame().lifted, None);
     assert!(launcher.shell().apps().state().edit_mode);
     assert!(fakes.apps.launched.lock().unwrap().is_empty());
@@ -1317,4 +1328,201 @@ fn a11y05_a_screen_reader_opens_an_apps_menu_without_a_gesture() {
     assert_eq!(frame.apps.menu.map(|menu| menu.cell), Some(Some(1)));
     assert!(!frame.menu_offered);
     assert_eq!(*fakes.system.haptic_ticks.lock().unwrap(), 0);
+}
+
+/// The phone's grid as `AppsGrid` reports it: 992 px wide inside its 16 dp margins, four
+/// columns of 248 px, rows 308 px apart, the status bar's 82 px above and the navigation bar's
+/// 132 px below.
+fn grid_on_a_phone(launcher: &mut Launcher) {
+    launcher.view().apps().grid_laid_out(GridLayout {
+        width_px: 992.0,
+        row_height_px: 308.0,
+        density: 2.75,
+        top_px: 82.0,
+        bottom_px: 132.0,
+        height_px: HEIGHT,
+    });
+    // The host reads the cells it draws.
+    let _ = froms(launcher);
+}
+
+/// Camera, Mail, Maps and Phone, on a phone with the grid laid out, in edit mode, entered from
+/// the home menu (APPS-12, HOME-10).
+fn editing_four(fakes: &Fakes) -> (Launcher, u64) {
+    *fakes.apps.apps.lock().unwrap() = vec![
+        App {
+            can_uninstall: false,
+            ..app("camera", "Camera")
+        },
+        app("mail", "Mail"),
+        app("maps", "Maps"),
+        app("phone", "Phone"),
+    ];
+    let (mut launcher, mut clock) = on_a_phone(fakes);
+    grid_on_a_phone(&mut launcher);
+    long_press(&mut launcher, &mut clock, 500.0, 1500.0);
+    launcher.dispatch(ShellIntent::ChooseMenuItem(MenuItem::EditApplications));
+    come_to_rest(&mut launcher, &mut clock);
+    (launcher, clock)
+}
+
+#[test]
+fn ac07_given_edit_mode_when_maps_is_dragged_to_the_first_cell_then_the_others_move_aside_and_it_stays_first()
+ {
+    // Issue #13: APPS-12, APPS-18, ANIM-13. "After a reboot" is a new start on the same
+    // storage.
+    let fakes = Fakes::default();
+    let (mut launcher, mut clock) = editing_four(&fakes);
+    let frame = launcher.frame();
+    assert!(frame.edit.on);
+    // ANIM-12: the cells are at 92 %, and every row's badges show.
+    assert_eq!(frame.edit.scale, 9_200);
+    assert_eq!(frame.edit.badges, [10_000; BADGE_ROWS]);
+
+    assert!(long_press_cell(&mut launcher, &mut clock, 2, 620.0, 300.0));
+    finger(&mut launcher, &mut clock, PointerKind::Move, 124.0, 300.0);
+    // It waits over the first cell for a moment, then takes it.
+    for _ in 0..12 {
+        clock += 16;
+        launcher.dispatch(ShellIntent::Frame(Duration::from_millis(clock)));
+        launcher.frame();
+    }
+
+    assert_eq!(grid(&launcher), ["Maps", "Camera", "Mail", "Phone"]);
+    // The others move aside: the host moves each cell's view from where it was.
+    assert_eq!(froms(&mut launcher), [Some(2), Some(0), Some(1), Some(3)]);
+    let frame = launcher.frame();
+    assert!(frame.animating);
+    let lifted = frame.lifted.expect("still lifted");
+    assert_eq!((lifted.cell, lifted.dx, lifted.dy), (0, 0, 0));
+
+    finger(&mut launcher, &mut clock, PointerKind::Up, 124.0, 300.0);
+    come_to_rest(&mut launcher, &mut clock);
+    assert_eq!(launcher.frame().lifted, None);
+    assert_eq!(grid(&launcher), ["Maps", "Camera", "Mail", "Phone"]);
+    drop(launcher);
+
+    let restarted = Launcher::start(fakes.platform());
+    assert_eq!(grid(&restarted), ["Maps", "Camera", "Mail", "Phone"]);
+}
+
+#[test]
+fn apps12_dragging_an_icon_near_the_bottom_scrolls_the_grid() {
+    // Issue #13: 40 apps in 11 rows; the icon is held at the very bottom of the screen.
+    let fakes = Fakes::default();
+    *fakes.apps.apps.lock().unwrap() = (0..40)
+        .map(|i| app(&format!("app{i:02}"), &format!("App {i:02}")))
+        .collect();
+    let (mut launcher, mut clock) = on_a_phone(&fakes);
+    grid_on_a_phone(&mut launcher);
+
+    assert!(long_press_cell(&mut launcher, &mut clock, 5, 400.0, 600.0));
+    finger(
+        &mut launcher,
+        &mut clock,
+        PointerKind::Move,
+        400.0,
+        HEIGHT - 10.0,
+    );
+    for _ in 0..30 {
+        clock += 16;
+        launcher.dispatch(ShellIntent::Frame(Duration::from_millis(clock)));
+        launcher.frame();
+    }
+
+    let scrolled = launcher.frame().apps.scroll_px;
+    assert!(scrolled > 300, "{scrolled}");
+    assert!(launcher.frame().animating);
+}
+
+#[test]
+fn ac09_given_edit_mode_when_the_user_taps_the_cross_and_confirms_then_the_icon_animates_away() {
+    // Issue #13: APPS-12, APPS-13, ANIM-21. System apps show no ✕.
+    let fakes = Fakes::default();
+    let (mut launcher, _) = editing_four(&fakes);
+    let crosses: Vec<bool> = launcher
+        .view()
+        .apps()
+        .cells()
+        .map(|cell| cell.uninstallable)
+        .collect();
+    assert_eq!(crosses, [false, true, true, true]);
+
+    let revision = launcher.frame().apps.revision;
+    assert!(launcher.view().apps().badge_tapped(revision, 1));
+    launcher.frame();
+    // MeeGone only asks: the system shows its confirmation.
+    assert_eq!(
+        *fakes.apps.uninstall_requested.lock().unwrap(),
+        [app_id("mail")]
+    );
+    assert_eq!(grid(&launcher), ["Camera", "Mail", "Maps", "Phone"]);
+
+    // The user confirms, and the system removes Mail.
+    fakes
+        .apps
+        .apps
+        .lock()
+        .unwrap()
+        .retain(|app| app.id != app_id("mail"));
+    launcher.dispatch(ShellIntent::AppsChanged);
+
+    let frame = launcher.frame();
+    assert!(frame.animating);
+    assert_eq!(frame.grid_change.leave_alpha, 10_000);
+    assert_eq!(grid(&launcher), ["Camera", "Maps", "Phone"]);
+    assert!(launcher.shell().apps().state().edit_mode);
+}
+
+#[test]
+fn apps12_done_home_or_back_ends_edit_mode() {
+    // Issue #13: HOME-07, HOME-08. A tap on an icon launches nothing meanwhile.
+    for end in 0..3 {
+        let fakes = Fakes::default();
+        let (mut launcher, mut clock) = editing_four(&fakes);
+        let revision = launcher.frame().apps.revision;
+        assert!(
+            launcher
+                .view()
+                .apps()
+                .cell_tapped(revision, 2, Rect::default())
+        );
+        launcher.frame();
+        assert!(fakes.apps.launched.lock().unwrap().is_empty());
+
+        match end {
+            0 => launcher.view().apps().done(),
+            1 => launcher.dispatch(ShellIntent::Home),
+            _ => launcher.dispatch(ShellIntent::Back),
+        }
+
+        let frame = launcher.frame();
+        assert!(!frame.edit.on);
+        // ANIM-12: reversed on exit.
+        assert!(frame.animating);
+        come_to_rest(&mut launcher, &mut clock);
+        let frame = launcher.frame();
+        assert_eq!(frame.edit.scale, 10_000);
+        assert_eq!(frame.edit.badges, [0; BADGE_ROWS]);
+        // Home only closes it: the grid stays.
+        assert_eq!(frame.current, HomeView::Applications);
+    }
+}
+
+#[test]
+fn a11y05_a_screen_reader_moves_an_icon_without_a_gesture() {
+    // Issue #13: AC-19's "move an icon". The move is saved.
+    let fakes = Fakes::default();
+    let (mut launcher, _) = editing_four(&fakes);
+    let revision = launcher.frame().apps.revision;
+
+    assert!(launcher.view().apps().moved(revision, 3, 0));
+    launcher.frame();
+
+    assert_eq!(grid(&launcher), ["Phone", "Camera", "Mail", "Maps"]);
+    drop(launcher);
+    assert_eq!(
+        grid(&Launcher::start(fakes.platform())),
+        ["Phone", "Camera", "Mail", "Maps"]
+    );
 }

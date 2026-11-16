@@ -5,8 +5,8 @@
 //! It also tells the host what to draw for the home views in each frame, as a [`HomeFrame`]:
 //! where the carousel's views are, how the view indicator looks, how the content comes back
 //! from an app, the home menu, the Applications grid, the pressed icon, the grid's cells as
-//! apps come and go, an app's long-press menu and the picked-up icon (ADR 0006 to ADR 0008,
-//! ADR 0010, ADR 0012, ADR 0013).
+//! apps come, go and move, an app's long-press menu, the dragged icon and edit mode (ADR 0006
+//! to ADR 0008, ADR 0010, ADR 0012 to ADR 0014).
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -14,12 +14,13 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use meegone_apps_ui::AppsView;
-pub use meegone_apps_ui::{AppMenuFrame, AppMenuItem, AppsFrame, Cell};
+pub use meegone_apps_ui::{AppMenuFrame, AppMenuItem, AppsFrame, Cell, GridLayout};
 use meegone_core_ui::{Dispatch, Latest, Rgb, Slot, View, tokens};
 use meegone_events_ui::EventsView;
 use meegone_lockimage_ui::{ImageCard, ImageSettingsSection};
 use meegone_recent_ui::RecentView;
 use meegone_settings_ui::{HomeBanner, SettingsView};
+pub use meegone_shell_state::BADGE_ROWS;
 use meegone_shell_state::{HomeShell, HomeView, MenuItem, SettingsGroup, ShellIntent};
 
 type Outbox = Rc<RefCell<VecDeque<ShellIntent>>>;
@@ -52,16 +53,37 @@ pub struct GridChangeFrame {
     pub shift: u16,
 }
 
-/// The app icon a drag after a long-press picked up, as the host draws it (APPS-11).
+/// The app icon a drag after a long-press picked up, as the host draws it (APPS-11, APPS-12).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LiftFrame {
-    /// Its place in the Applications grid's cells.
+    /// Its cell's place in the Applications grid's cells now.
     pub cell: usize,
-    /// How far it is drawn from its place, in whole pixels: as far as the finger has moved.
+    /// How far it is drawn from its cell's place, in whole pixels, so it stays under the
+    /// finger.
     pub dx: i32,
     pub dy: i32,
-    /// Its scale in ten-thousandths: 11 000 while lifted (ANIM-13).
+    /// Its scale in ten-thousandths: 11 000 while lifted (ANIM-13), springing to edit mode's
+    /// 9 200 as it settles. It takes the place of edit mode's scale for this cell.
     pub scale: u16,
+    /// The finger has lifted, and it is settling into its cell (ANIM-13).
+    pub settling: bool,
+}
+
+/// Edit mode as the host draws it (APPS-12, ANIM-12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EditFrame {
+    /// Edit mode is on: a tap on a ✕ asks to uninstall, a tap on an icon does nothing, and
+    /// Done and the screen-reader actions are offered.
+    pub on: bool,
+    /// Every cell's scale in ten-thousandths: 10 000 out of edit mode, 9 200 in it.
+    pub scale: u16,
+    /// How far into edit mode the cells are, from 0 to 10 000. Done fades with it.
+    pub progress: u16,
+    /// The grid's first visible row, which `badges[0]` is for.
+    pub first_row: u16,
+    /// The ✕ scale, in ten-thousandths, of each visible row from `first_row`; rows further
+    /// down take the last one. 0 while none shows, and a little over 10 000 as one pops in.
+    pub badges: [u16; BADGE_ROWS],
 }
 
 /// What the host draws for the home views in one frame (ADR 0006).
@@ -92,8 +114,10 @@ pub struct HomeFrame {
     pub press_scale: u16,
     /// The grid's cells as apps come and go (ANIM-21).
     pub grid_change: GridChangeFrame,
-    /// The picked-up icon, while one is (APPS-11).
+    /// The picked-up icon, while one is, or settles into its cell (APPS-11, APPS-12).
     pub lifted: Option<LiftFrame>,
+    /// Edit mode and its motion (APPS-12, ANIM-12).
+    pub edit: EditFrame,
     /// Something is still moving or fading, so the host should draw another frame.
     pub animating: bool,
     /// The home menu, while it is open (HOME-10).
@@ -182,9 +206,11 @@ impl ShellView {
                 cell: self.apps.place_of(app)?,
                 dx: state.lift.dx.round() as i32,
                 dy: state.lift.dy.round() as i32,
-                scale: (state.lift.scale.clamp(0.0, 1.5) * 10_000.0).round() as u16,
+                scale: scale(state.lift.scale),
+                settling: state.lift.settling,
             })
         });
+        let mode = &state.mode;
         HomeFrame {
             pages: HomeView::ALL.map(|view| state.page_offset_px(view).round() as i32),
             indicator_alpha: (state.carousel.indicator.clamp(0.0, 1.0) * 255.0).round() as u8,
@@ -195,7 +221,7 @@ impl ShellView {
             apps,
             pressed: state.press.item,
             // A spring back overshoots full size a little.
-            press_scale: (state.press.scale.clamp(0.0, 1.5) * 10_000.0).round() as u16,
+            press_scale: scale(state.press.scale),
             grid_change: GridChangeFrame {
                 appear_scale: ten_thousandths(state.grid_change.appear_scale),
                 appear_alpha: ten_thousandths(state.grid_change.appear_alpha),
@@ -204,10 +230,19 @@ impl ShellView {
                 shift: ten_thousandths(state.grid_change.shift),
             },
             lifted,
+            edit: EditFrame {
+                on: mode.on,
+                scale: scale(mode.scale),
+                progress: ten_thousandths(mode.progress),
+                first_row: u16::try_from(mode.first_row).unwrap_or(u16::MAX),
+                badges: mode.badges.map(scale),
+            },
             animating: state.carousel.animating
                 || state.return_home.animating
                 || state.press.animating
-                || state.grid_change.animating,
+                || state.grid_change.animating
+                || state.lift.animating
+                || mode.animating,
             menu: state.menu.map(|menu| MenuFrame {
                 items: menu.items,
                 anchor: menu
@@ -265,6 +300,11 @@ impl ShellView {
 /// A value from 0 to 1 in ten-thousandths.
 fn ten_thousandths(value: f64) -> u16 {
     (value.clamp(0.0, 1.0) * 10_000.0).round() as u16
+}
+
+/// A scale in ten-thousandths. Springs and pops go a little past their ends.
+fn scale(value: f64) -> u16 {
+    (value.clamp(0.0, 1.5) * 10_000.0).round() as u16
 }
 
 /// A dispatcher that queues a view's intents, wrapped for the shell.

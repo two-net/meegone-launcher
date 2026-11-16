@@ -48,6 +48,23 @@
     <string name="uninstall_unavailable">This app can\'t be uninstalled right now</string>
     <string name="shortcut_unavailable">This shortcut can\'t open right now</string>
 
+    <!-- Edit mode in Applications (APPS-12). The button that ends it. -->
+    <string name="edit_done">Done</string>
+    <!-- Read by screen readers when edit mode starts (A11Y-08). -->
+    <string name="edit_mode">Edit mode</string>
+    <!-- The name of an app's ✕ in edit mode, which asks the system to uninstall it (APPS-13,
+         A11Y-01). Screen readers offer it as an action. %1$s is the app's name. -->
+    <string name="action_uninstall">Uninstall %1$s</string>
+    <!-- Screen-reader actions that move an app's icon in edit mode, instead of dragging it
+         (A11Y-05). -->
+    <string name="action_move_first">Move to start</string>
+    <string name="action_move_earlier">Move earlier</string>
+    <string name="action_move_later">Move later</string>
+    <string name="action_move_last">Move to end</string>
+    <!-- Read by screen readers after a move, e.g. "Mail, place 3 of 40" (A11Y-08). %1$s is the
+         app's name, %2$d its place from the start and %3$d how many places there are. -->
+    <string name="app_moved">%1$s, place %2$d of %3$d</string>
+
     <!-- Settings' title (SET-01). -->
     <string name="settings_title">Launcher settings</string>
 </resources>

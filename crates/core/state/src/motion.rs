@@ -90,6 +90,13 @@ pub const ICON_RELEASE: Spring = Spring {
     stiffness: 1600.0,
 };
 
+/// A picked-up icon lifts with this spring, and a dropped one settles into its cell with it, in
+/// about 220 ms, overshooting by about 1.5 % (ANIM-13, ANIM-02).
+pub const DROP: Spring = Spring {
+    damping_ratio: 0.8,
+    stiffness: 900.0,
+};
+
 /// No settle overshoots its target by more than this fraction of the distance between views
 /// (ANIM-02).
 pub const MAX_OVERSHOOT: f64 = 0.03;
@@ -122,6 +129,14 @@ pub const APP_INSTALL_REMOVE_SCALE: f64 = 0.5;
 pub const MODE_SCALE: f64 = 0.92;
 /// ANIM-13
 pub const DRAG_LIFT_SCALE: f64 = 1.10;
+/// APPS-12: a dragged icon takes a new place once its centre has stayed over it this long, so
+/// a quick drag across the grid doesn't shuffle every cell it passes.
+pub const REORDER_DWELL: Duration = ms(150);
+/// APPS-12: a dragged icon whose centre is this close to the top or bottom of the visible grid,
+/// in dp, scrolls it…
+pub const AUTO_SCROLL_ZONE_DP: f64 = 64.0;
+/// …faster the deeper it is, up to this many dp per second at the edge itself.
+pub const AUTO_SCROLL_MAX_DP: f64 = 640.0;
 
 const fn ms(millis: u64) -> Duration {
     Duration::from_millis(millis)
@@ -182,6 +197,21 @@ pub fn decelerate(progress: f64) -> f64 {
         progress.clamp(0.0, 1.0)
     };
     1.0 - (1.0 - progress) * (1.0 - progress)
+}
+
+/// How far [`pop`] goes past its end, as Android's `OvershootInterpolator` with this tension.
+const POP_TENSION: f64 = 0.8;
+
+/// Easing that pops in, as a ✕ badge does (ANIM-12): fast at first, a little past the end, about
+/// 2.3 %, then back to it. `progress` runs from 0 to 1 and is clamped to that range.
+pub fn pop(progress: f64) -> f64 {
+    let progress = if progress.is_nan() {
+        1.0
+    } else {
+        progress.clamp(0.0, 1.0)
+    };
+    let t = progress - 1.0;
+    t * t * ((POP_TENSION + 1.0) * t + POP_TENSION) + 1.0
 }
 
 /// One element settling with a [`Spring`] towards a target at displacement 0.
@@ -359,6 +389,30 @@ mod tests {
         assert!(ICON_RELEASE.overshoot() <= MAX_OVERSHOOT);
         let time = settle_time(ICON_RELEASE, -(1.0 - ICON_PRESS_SCALE), 0.0001);
         assert!((0.1..=0.25).contains(&time), "{time} s");
+    }
+
+    #[test]
+    fn a_dropped_icon_settles_in_about_220_ms_with_little_overshoot() {
+        // ANIM-13, ANIM-02: within 0.5 % of the distance, as a view settle is measured.
+        assert!(DROP.overshoot() > 0.0);
+        assert!(DROP.overshoot() <= MAX_OVERSHOOT);
+        let time = settle_time(DROP, 1.0, 0.005);
+        assert!((0.18..=0.27).contains(&time), "{time} s");
+    }
+
+    #[test]
+    fn a_badge_pops_a_little_past_full_size_and_ends_there() {
+        // ANIM-12
+        assert_eq!(pop(0.0), 0.0);
+        assert_eq!(pop(1.0), 1.0);
+        assert_eq!(pop(-1.0), 0.0);
+        assert_eq!(pop(f64::NAN), 1.0);
+        let peak = (0..=1000)
+            .map(|i| pop(f64::from(i) / 1000.0))
+            .fold(0.0, f64::max);
+        assert!((1.01..=1.03).contains(&peak), "{peak}");
+        // Fast at first.
+        assert!(pop(0.25) > 0.5);
     }
 
     #[test]

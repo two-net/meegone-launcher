@@ -9,13 +9,15 @@
 //! An app's long-press menu works the same way (ADR 0013): the frame says at which cell it is
 //! open and gives it a revision, the host reads its [`AppsView::menu_items`] when that changes,
 //! and refers to an item by its place in them.
+//!
+//! In edit mode (ADR 0014), the host names a cell the same way when its ✕ is tapped or a screen
+//! reader moves it, and Done ends it.
 
+use std::cell::RefCell;
 use std::sync::Arc;
 
-pub use meegone_apps_state::AppMenuItem;
-use meegone_apps_state::{
-    AppMenu, AppsIntent, AppsState, FolderId, GridItem, GridLayout, previous_places,
-};
+use meegone_apps_state::{AppMenu, AppsIntent, AppsState, FolderId, GridItem, previous_places};
+pub use meegone_apps_state::{AppMenuItem, GridLayout};
 use meegone_core_state::{AppId, Rect};
 use meegone_core_ui::{Dispatch, Tokens, View};
 
@@ -58,8 +60,10 @@ pub struct Cell<'a> {
     pub work: bool,
     /// Installed since the grid was set up and not opened yet: it carries a dot (APPS-07).
     pub new: bool,
-    /// Its place in the cells of the revision before, or `None` if it just joined the grid. The
-    /// host moves it from there, and the cells no one came from leave (ANIM-21).
+    /// The user can uninstall it: in edit mode it carries a ✕ (APPS-12, APPS-13).
+    pub uninstallable: bool,
+    /// Its place in the cells the host last read, or `None` if it joined the grid since. The
+    /// host moves it from there, and the cells no one came from leave (ANIM-21, ANIM-13).
     pub from: Option<usize>,
 }
 
@@ -67,7 +71,10 @@ pub struct AppsView {
     dispatch: Dispatch<AppsIntent>,
     /// The cells the host was last told about: the snapshot it draws (ARCH-06).
     cells: Arc<[GridItem]>,
-    /// Where each of `cells` was in the cells before them.
+    /// The cells the host last read. Two revisions can come between its reads, so each cell
+    /// says where it was in these, not in the revision before.
+    read: RefCell<Arc<[GridItem]>>,
+    /// Where each of `cells` was in `read`.
     from: Vec<Option<usize>>,
     revision: u32,
     /// The app menu the host was last told about.
@@ -80,6 +87,7 @@ impl AppsView {
         Self {
             dispatch,
             cells: Arc::new([]),
+            read: RefCell::new(Arc::new([])),
             from: Vec::new(),
             revision: 0,
             menu: None,
@@ -88,10 +96,10 @@ impl AppsView {
     }
 
     /// What the host draws for the grid now. Takes on the state's cells if they changed, and
-    /// where each was in the cells the host drew before, and the app menu if it changed.
+    /// where each was in the cells the host last read, and the app menu if it changed.
     pub fn frame(&mut self, state: &AppsState) -> AppsFrame {
         if !Arc::ptr_eq(&self.cells, &state.items) {
-            self.from = previous_places(&self.cells, &state.items);
+            self.from = previous_places(&self.read.borrow(), &state.items);
             self.cells = Arc::clone(&state.items);
             self.revision = self.revision.wrapping_add(1);
         }
@@ -115,8 +123,10 @@ impl AppsView {
         }
     }
 
-    /// The cells of the last [`AppsView::frame`], in order.
+    /// The cells of the last [`AppsView::frame`], in order. The host reads them to draw them,
+    /// so the next cells say where they were in these.
     pub fn cells(&self) -> impl ExactSizeIterator<Item = Cell<'_>> {
+        *self.read.borrow_mut() = Arc::clone(&self.cells);
         self.cells
             .iter()
             .zip(&self.from)
@@ -127,6 +137,7 @@ impl AppsView {
                     available: app.available,
                     work: app.work,
                     new: *new,
+                    uninstallable: app.can_uninstall,
                     from: *from,
                 },
                 GridItem::Folder { name, .. } => Cell {
@@ -135,6 +146,7 @@ impl AppsView {
                     available: true,
                     work: false,
                     new: false,
+                    uninstallable: false,
                     from: *from,
                 },
             })
@@ -197,6 +209,40 @@ impl AppsView {
         }
     }
 
+    /// The ✕ of cell `index` of the cells at `revision` was tapped, in edit mode: the system
+    /// asks the user to confirm the app's uninstall (APPS-13). Returns whether it asked
+    /// anything of Applications: not for a folder, nor when the cells changed since.
+    pub fn badge_tapped(&self, revision: u32, index: usize) -> bool {
+        match self.app_at(revision, index) {
+            Some(app) => {
+                self.dispatch
+                    .send(AppsIntent::RequestUninstall(app.clone()));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// A screen reader moved cell `index` of the cells at `revision` to place `to`, in edit
+    /// mode (A11Y-05). Returns whether it asked anything of Applications.
+    pub fn moved(&self, revision: u32, index: usize, to: usize) -> bool {
+        match self.app_at(revision, index) {
+            Some(app) => {
+                self.dispatch.send(AppsIntent::Move {
+                    app: app.clone(),
+                    to,
+                });
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Done: edit mode ends (APPS-12).
+    pub fn done(&self) {
+        self.dispatch.send(AppsIntent::ExitEditMode);
+    }
+
     /// APPS-10: launches `app`, growing its window from `from` (ANIM-08).
     pub fn icon_tapped(&self, app: AppId, from: Option<Rect>) {
         self.dispatch.send(AppsIntent::Launch { app, from });
@@ -212,14 +258,9 @@ impl AppsView {
         self.dispatch.send(AppsIntent::Scrolled(px));
     }
 
-    /// The grid was laid out `width_px` wide inside its margins, with rows `row_height_px`
-    /// apart, at `density` pixels per dp (APPS-02, APPS-16).
-    pub fn grid_laid_out(&self, width_px: f64, row_height_px: f64, density: f64) {
-        self.dispatch.send(AppsIntent::Layout(GridLayout {
-            width_px,
-            row_height_px,
-            density,
-        }));
+    /// The grid was laid out (APPS-02, APPS-16), in physical pixels.
+    pub fn grid_laid_out(&self, layout: GridLayout) {
+        self.dispatch.send(AppsIntent::Layout(layout));
     }
 }
 
@@ -345,6 +386,7 @@ mod tests {
                     available: false,
                     work: true,
                     new: true,
+                    uninstallable: true,
                     from: None,
                 },
                 Cell {
@@ -353,6 +395,7 @@ mod tests {
                     available: true,
                     work: false,
                     new: false,
+                    uninstallable: false,
                     from: None,
                 },
             ]
@@ -506,18 +549,65 @@ mod tests {
     fn the_grid_reports_its_layout_and_scroll_position() {
         let (view, sent) = view();
 
-        view.grid_laid_out(1_000.0, 200.0, 2.5);
+        let layout = GridLayout {
+            width_px: 1_000.0,
+            row_height_px: 200.0,
+            density: 2.5,
+            top_px: 60.0,
+            bottom_px: 40.0,
+            height_px: 2_000.0,
+        };
+        view.grid_laid_out(layout);
         view.grid_scrolled(320.0);
 
         let sent = sent.borrow();
-        assert!(matches!(
-            sent[0],
-            AppsIntent::Layout(GridLayout {
-                width_px: 1_000.0,
-                row_height_px: 200.0,
-                density: 2.5,
-            })
-        ));
+        assert!(matches!(sent[0], AppsIntent::Layout(sent) if sent == layout));
         assert!(matches!(sent[1], AppsIntent::Scrolled(320.0)));
+    }
+
+    #[test]
+    fn each_cell_says_where_it_was_in_the_cells_the_host_last_read() {
+        // ANIM-13: two moves before the host reads again still move the right views.
+        let (mut view, _) = view();
+        let [mail, maps, phone] = ["mail", "maps", "phone"].map(|p| cell(app(p, p, true, false)));
+        view.frame(&state(vec![mail.clone(), maps.clone(), phone.clone()]));
+        let _ = view.cells().count();
+
+        view.frame(&state(vec![maps.clone(), mail.clone(), phone.clone()]));
+        view.frame(&state(vec![phone, maps, mail]));
+
+        let from: Vec<_> = view.cells().map(|cell| cell.from).collect();
+        assert_eq!(from, [Some(2), Some(1), Some(0)]);
+    }
+
+    #[test]
+    fn edit_mode_names_cells_by_revision_and_place() {
+        // APPS-12, APPS-13, A11Y-05
+        let (mut view, sent) = view();
+        let mail = app("mail", "Mail", true, false);
+        let revision = view
+            .frame(&state(vec![
+                GridItem::Folder {
+                    id: FolderId(1),
+                    name: "Games".into(),
+                    apps: Vec::new(),
+                },
+                cell(mail.clone()),
+            ]))
+            .revision;
+
+        assert!(view.badge_tapped(revision, 1));
+        assert!(view.moved(revision, 1, 0));
+        view.done();
+        // A folder, a place with no cell, or cells that changed since, do nothing.
+        assert!(!view.badge_tapped(revision, 0));
+        assert!(!view.moved(revision, 2, 0));
+        assert!(!view.badge_tapped(revision.wrapping_add(1), 1));
+
+        let sent = sent.borrow();
+        assert_eq!(sent.len(), 3);
+        assert!(matches!(&sent[0], AppsIntent::RequestUninstall(app) if *app == mail.id));
+        assert!(matches!(&sent[1], AppsIntent::Move { app, to: 0 } if *app == mail.id));
+        assert!(matches!(sent[2], AppsIntent::ExitEditMode));
     }
 }

@@ -1,6 +1,6 @@
 //! Home shell state (SRS 4.1): the carousel of views, the home menu, which long-press counts,
-//! Home and Back, coming back to the home, the icon press, the picked-up icon, the grid's motion
-//! as apps come and go, and the theme.
+//! Home and Back, coming back to the home, the icon press, the dragged icon, the grid's motion
+//! as apps come, go and move, edit mode's motion, and the theme.
 //!
 //! [`HomeShell::compose`] is the only place features are put together (ARCH-03). Each feature
 //! runs in its own [`Store`], so a failing feature never takes down the shell (ARCH-09).
@@ -9,6 +9,7 @@ mod carousel;
 mod grid_change;
 mod home_menu;
 mod lift;
+mod mode;
 mod press;
 mod return_home;
 
@@ -16,10 +17,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use meegone_apps_data::PersistentLayoutStore;
-use meegone_apps_state::{AppsHolder, AppsIntent, cells_came_or_went};
+use meegone_apps_state::{AppsHolder, AppsIntent, GridItem, cells_moved};
 use meegone_core_data::{
     HomeTarget, PersistentSettingsStore, Platform, SettingsStore, SystemConfigAdapter,
 };
+use meegone_core_state::motion::MODE_SCALE;
 use meegone_core_state::{AppId, Health, Store, ThemeHolder, ThemeIntent};
 use meegone_events_state::{EventsHolder, EventsIntent};
 use meegone_lockimage_data::PersistentImageCache;
@@ -32,9 +34,11 @@ pub use carousel::{CarouselState, Layout, PointerEvent, PointerKind};
 use grid_change::GridChange;
 pub use grid_change::GridChangeState;
 pub use home_menu::{HomeMenu, MenuItem};
-use lift::Lift;
 pub use lift::LiftState;
+use lift::{DragGrid, Lift, LiftEvent};
 pub use meegone_settings_state::SettingsGroup;
+use mode::Mode;
+pub use mode::{BADGE_ROWS, ModeState};
 use press::Press;
 pub use press::PressState;
 use return_home::ReturnHome;
@@ -115,8 +119,12 @@ pub struct ShellState {
     pub press: PressState,
     /// How far the Applications grid has come in showing apps that came and went (ANIM-21).
     pub grid_change: GridChangeState,
-    /// The app icon a drag after a long-press picked up, which follows the finger (APPS-11).
+    /// The app icon a drag after a long-press picked up, which follows the finger and settles
+    /// into its cell when dropped (APPS-11, APPS-12).
     pub lift: LiftState,
+    /// Edit mode as Applications shows it, with its motion: the cells' size, the ✕ badges and
+    /// Done (APPS-12, ANIM-12).
+    pub mode: ModeState,
 }
 
 impl ShellState {
@@ -137,7 +145,7 @@ impl ShellState {
         !self.settings_open
             && self.menu.is_none()
             && !self.app_menu_open
-            && HomeMenu::items_for(self.current).is_some()
+            && HomeMenu::items_for(self.current, false).is_some()
     }
 }
 
@@ -237,6 +245,13 @@ pub struct HomeShell {
     press: Press,
     lift: Lift,
     grid_change: GridChange,
+    mode: Mode,
+    /// The Applications cells as of the last intent, to tell when they came, went or moved.
+    seen_cells: Arc<[GridItem]>,
+    /// An icon was lifted after the last intent.
+    was_lifted: bool,
+    /// Edit mode was just entered by picking an icon up, whose long-press already ticked.
+    picked_up: bool,
     theme: Store<ThemeHolder>,
     apps: Store<AppsHolder>,
     events: Store<EventsHolder>,
@@ -259,6 +274,10 @@ impl HomeShell {
             press: Press::default(),
             lift: Lift::default(),
             grid_change: GridChange::default(),
+            mode: Mode::default(),
+            seen_cells: Arc::new([]),
+            was_lifted: false,
+            picked_up: false,
             theme: Store::new(ThemeHolder::new(
                 settings_store.clone(),
                 platform.system.clone(),
@@ -297,6 +316,8 @@ impl HomeShell {
         shell.lockimage.dispatch(LockImageIntent::Refresh);
         shell.settings.dispatch(SettingsIntent::Refresh);
         shell.configure_carousel();
+        // The grid as it starts is shown as it is: nothing moves (ANIM-21).
+        shell.seen_cells = shell.apps.state().items.clone();
         shell
     }
 
@@ -372,11 +393,8 @@ impl HomeShell {
                 }
                 // A long-press on an app's icon keeps the rest of its gesture, even under the
                 // app's menu: dragging on picks the icon up and enters edit mode, which closes
-                // the menu (APPS-11).
-                let slop = self.carousel.state().layout.touch_slop_px;
-                if self.lift.pointer(&event, slop) {
-                    self.apps.dispatch(AppsIntent::EnterEditMode);
-                }
+                // the menu (APPS-11). Lifting the finger drops it (APPS-12).
+                self.drag(&event);
                 // Settings and the menus cover the home views, but a finger that was already
                 // down may still lift.
                 if !self.covered() || matches!(event.kind, PointerKind::Up | PointerKind::Cancel) {
@@ -394,6 +412,8 @@ impl HomeShell {
                 self.return_home.frame(at);
                 self.press.frame(at);
                 self.grid_change.frame(at);
+                self.mode.frame(at);
+                self.drag_frame(at);
             }
             ShellIntent::Press { item, at } => self.press_item(item, at),
             ShellIntent::Release(at) => {
@@ -434,11 +454,15 @@ impl HomeShell {
             }
         }
         self.keep_lift_in_step();
+        self.keep_mode_in_step();
+        self.keep_cells_in_step();
+        self.lift.sync(&self.drag_grid());
         self.state.carousel = self.carousel.state();
         self.state.return_home = self.return_home.state();
         self.state.press = self.press.state();
         self.state.lift = self.lift.state();
         self.state.grid_change = self.grid_change.state();
+        self.state.mode = self.mode_state();
         self.state.app_menu_open = self.app_menu_shown();
     }
 
@@ -459,35 +483,138 @@ impl HomeShell {
         }
     }
 
+    /// Whether Applications shows edit mode. A failed Applications can't leave it, so it never
+    /// counts: no badge, Done or drag is left on screen for good (ARCH-09).
+    fn editing_shown(&self) -> bool {
+        *self.apps.health() == Health::Ready && self.apps.state().edit_mode
+    }
+
     /// A long-press can pick its icon up only while the app's menu it opened is still open, and
-    /// a lifted icon stays lifted only in edit mode. Otherwise, such as after Back, the icon is
-    /// back in its cell at once.
+    /// an icon stays lifted or settling only in edit mode, while its app has a cell of its own.
+    /// Otherwise, such as after Back, the icon is back in its cell at once. A drag that ends any
+    /// way but a drop puts the grid back as it was (APPS-12).
     fn keep_lift_in_step(&mut self) {
         let apps = self.apps.state();
-        let in_step = match self.lift.armed() {
-            Some(app) => {
+        let in_step = match (self.lift.armed(), self.lift.app()) {
+            (Some(app), _) => {
                 self.app_menu_shown() && apps.menu.as_ref().is_some_and(|menu| menu.app == *app)
             }
-            None => !self.lift.is_lifted() || apps.edit_mode,
+            (None, Some(app)) => self.editing_shown() && apps.place_of(app).is_some(),
+            (None, None) => true,
         };
         if !in_step {
             self.lift.cancel();
         }
+        let lifted = self.lift.is_lifted();
+        if std::mem::replace(&mut self.was_lifted, lifted) && !lifted {
+            // After a drop, there is nothing left to put back.
+            self.apps.dispatch(AppsIntent::CancelArrange);
+        }
+    }
+
+    /// Edit mode's motion follows Applications (ANIM-12), and entering it ticks (ANIM-24),
+    /// unless picking an icon up entered it: its long-press just ticked.
+    fn keep_mode_in_step(&mut self) {
+        let editing = self.editing_shown();
+        let picked_up = std::mem::take(&mut self.picked_up);
+        if editing != self.mode.is_on() {
+            self.mode.set(editing, self.carousel.animation_scale());
+            if editing && !picked_up {
+                self.system.haptic_tick();
+            }
+        }
+    }
+
+    /// When Applications' cells came, went or moved, the grid moves to its new cells (ANIM-21,
+    /// ANIM-13), and a pressed icon lets go: it is named by its place, which may now hold
+    /// another cell (ANIM-10).
+    fn keep_cells_in_step(&mut self) {
+        let cells = self.apps.state().items.clone();
+        if Arc::ptr_eq(&cells, &self.seen_cells) {
+            return;
+        }
+        if cells_moved(&self.seen_cells, &cells) {
+            self.press.finish();
+            self.grid_change.start(self.carousel.animation_scale());
+        }
+        self.seen_cells = cells;
+    }
+
+    /// The Applications grid as a drag needs it now.
+    fn drag_grid(&self) -> DragGrid {
+        let apps = self.apps.state();
+        DragGrid {
+            layout: apps.layout,
+            rtl: self.carousel.state().layout.rtl,
+            // As the host draws it, in whole pixels.
+            scroll_px: apps.scroll_px.round(),
+            count: apps.items.len(),
+            rows: apps.rows(),
+            // While armed, it is the cell the icon is about to be picked up from.
+            place: (self.lift.armed())
+                .or(self.lift.app())
+                .and_then(|app| apps.place_of(app)),
+        }
+    }
+
+    /// Follows the finger that made a long-press on an icon: dragging picks the icon up and
+    /// enters edit mode (APPS-11), and lifting it drops the icon where it is (APPS-12).
+    fn drag(&mut self, event: &PointerEvent) {
+        let slop = self.carousel.state().layout.touch_slop_px;
+        let grid = self.drag_grid();
+        match self
+            .lift
+            .pointer(event, slop, &grid, self.mode_state().scale)
+        {
+            Some(LiftEvent::PickedUp) => {
+                self.picked_up = true;
+                self.apps.dispatch(AppsIntent::EnterEditMode);
+            }
+            Some(LiftEvent::Dropped { app, to }) => {
+                match to {
+                    Some(to) => self.apps.dispatch(AppsIntent::Move { app, to }),
+                    None => self.apps.dispatch(AppsIntent::Drop),
+                }
+                let grid = self.drag_grid();
+                self.lift
+                    .settle(&grid, MODE_SCALE, self.carousel.animation_scale());
+            }
+            None => {}
+        }
+    }
+
+    /// While an icon is lifted, it takes the place it waited over, and scrolls the grid near
+    /// its edges (APPS-12).
+    fn drag_frame(&mut self, at: Duration) {
+        let grid = self.drag_grid();
+        let step = self.lift.frame(at, &grid, self.carousel.animation_scale());
+        if let Some(px) = step.scroll_to {
+            self.apps.dispatch(AppsIntent::Scrolled(px));
+        }
+        if let Some((app, to)) = step.arrange {
+            self.apps.dispatch(AppsIntent::Arrange { app, to });
+        }
+    }
+
+    /// Edit mode's motion for the grid as it is scrolled now: the badges stagger from its first
+    /// visible row.
+    fn mode_state(&self) -> ModeState {
+        let apps = self.apps.state();
+        let (first_row, visible_rows) = apps.layout.map_or((0, BADGE_ROWS), |layout| {
+            let row = layout.row_height_px.round().max(1.0);
+            let visible = (layout.height_px - layout.top_px - layout.bottom_px).max(0.0);
+            let first = (apps.scroll_px.round() / row).floor() as usize;
+            (first, (visible / row).ceil() as usize + 1)
+        });
+        self.mode.state(first_row, visible_rows)
     }
 
     /// APPS-06, APPS-08: the grid and Recent take on the system's change. If apps came or went,
-    /// the grid moves to its new cells (ANIM-21).
+    /// the grid moves to its new cells (ANIM-21); a dragged icon keeps going unless its own app
+    /// left.
     fn apps_changed(&mut self) {
-        let before = self.apps.state();
         self.apps.dispatch(AppsIntent::Refresh);
         self.recent.dispatch(RecentIntent::Refresh);
-        if cells_came_or_went(&before.items, &self.apps.state().items) {
-            // A pressed item is named by its place, which may now hold another cell (ANIM-10).
-            // A lifted icon goes back to its cell, which may have moved under it.
-            self.press.finish();
-            self.lift.cancel();
-            self.grid_change.start(self.carousel.animation_scale());
-        }
     }
 
     /// Takes on the wrap-around setting and the system animation speed, which the carousel
@@ -508,7 +635,8 @@ impl HomeShell {
     /// ANIM-10: an item of the current view shrinks under the finger, unless the views are
     /// moving or something covers them.
     fn press_item(&mut self, item: usize, at: Duration) {
-        if self.covered() || self.carousel.state().dragging {
+        // In edit mode a tap launches nothing, so nothing shrinks to say it would (APPS-12).
+        if self.covered() || self.carousel.state().dragging || self.editing_shown() {
             return;
         }
         self.press.press(item, at, self.carousel.animation_scale());
@@ -590,7 +718,8 @@ impl HomeShell {
         if self.covered() {
             return;
         }
-        let Some(items) = HomeMenu::items_for(self.state.current) else {
+        let editing = self.editing_shown();
+        let Some(items) = HomeMenu::items_for(self.state.current, editing) else {
             return;
         };
         // The menu covers the home views, so a drag on them ends and a pressed icon lets go.
@@ -722,11 +851,14 @@ impl HomeShell {
 
     fn show(&mut self, view: HomeView) {
         self.state.current = view;
-        // The menus and the pressed or lifted item belong to the view they were in.
+        // The menus, the pressed or lifted item and edit mode belong to the view they were in.
         self.state.menu = None;
         self.close_app_menu();
         self.press.finish();
         self.lift.cancel();
+        if view != HomeView::Applications && self.editing_shown() {
+            self.apps.dispatch(AppsIntent::ExitEditMode);
+        }
         // Recent refreshes whenever it becomes visible (REC-09); Events does too, to stay live.
         match view {
             HomeView::Events => self.events.dispatch(EventsIntent::Refresh),
@@ -739,12 +871,12 @@ impl HomeShell {
 #[cfg(test)]
 mod tests {
     use meegone_apps_data::{Layout as SavedLayout, LayoutEntry, LayoutStore};
-    use meegone_apps_state::{FolderId, GridItem};
+    use meegone_apps_state::{FolderId, GridItem, GridLayout};
     use meegone_core_data::fakes::{FakeApps, Fakes, app, app_id};
     use meegone_core_data::{
         App, AppId, AppsAdapter, DataError, Profile, RecentUse, Rect, Shortcut,
     };
-    use meegone_core_state::motion::ICON_PRESS_SCALE;
+    use meegone_core_state::motion::{DRAG_LIFT_SCALE, ICON_PRESS_SCALE};
     use meegone_core_state::{Access, Health, Theme, ThemeChoice};
 
     use super::*;
@@ -965,7 +1097,7 @@ mod tests {
         assert_eq!(shell.events().state().access, Access::Granted);
     }
 
-    /// Works like [`FakeApps`], except that it panics when asked to launch an app.
+    /// Works like [`FakeApps`], except that it panics when asked to launch or uninstall an app.
     struct BrokenLauncher(FakeApps);
 
     impl AppsAdapter for BrokenLauncher {
@@ -993,8 +1125,8 @@ mod tests {
             self.0.launch_shortcut(shortcut)
         }
 
-        fn request_uninstall(&self, app: &AppId) -> Result<(), DataError> {
-            self.0.request_uninstall(app)
+        fn request_uninstall(&self, _app: &AppId) -> Result<(), DataError> {
+            panic!("uninstaller bug");
         }
 
         fn open_app_info(&self, app: &AppId) -> Result<(), DataError> {
@@ -1316,6 +1448,15 @@ mod tests {
 
     fn ticks(fakes: &Fakes) -> u32 {
         *fakes.system.haptic_ticks.lock().unwrap()
+    }
+
+    /// Draws frames every 8 ms from `from_ms` until nothing moves.
+    fn come_to_rest(shell: &mut HomeShell, from_ms: u64) {
+        for frame in 0..200 {
+            shell.dispatch(ShellIntent::Frame(ms(from_ms + frame * 8)));
+        }
+        let state = shell.state();
+        assert!(!state.lift.animating && !state.mode.animating, "{state:?}");
     }
 
     #[test]
@@ -1836,17 +1977,18 @@ mod tests {
         let state = shell.state();
         assert!(!state.app_menu_open);
         assert!(shell.apps().state().edit_mode);
+        let lifted = &state.lift;
         assert_eq!(
-            state.lift,
-            LiftState {
-                app: Some(app_id("mail")),
-                dx: 220.0,
-                dy: -20.0,
-                scale: meegone_core_state::motion::DRAG_LIFT_SCALE,
-            }
+            (&lifted.app, lifted.dx, lifted.dy, lifted.settling),
+            (&Some(app_id("mail")), 220.0, -20.0, false)
         );
         assert_eq!(state.carousel.offset, 0.0);
         assert!(!state.carousel.dragging);
+        // ANIM-13: it lifts to 110 % on a spring.
+        for frame in 0..40 {
+            shell.dispatch(ShellIntent::Frame(ms(10_200 + frame * 8)));
+        }
+        assert!((shell.state().lift.scale - DRAG_LIFT_SCALE).abs() < 0.001);
 
         finger(&mut shell, PointerKind::Move, 700.0, 900.0);
         assert_eq!(
@@ -1854,8 +1996,11 @@ mod tests {
             (400.0, 500.0)
         );
 
-        // Lifting the finger puts the icon back in its cell; edit mode stays.
+        // Lifting the finger drops it: with no grid laid out, it settles back into its cell.
+        // Edit mode stays.
         lift(&mut shell);
+        assert!(shell.state().lift.settling);
+        come_to_rest(&mut shell, 10_500);
         assert_eq!(shell.state().lift, LiftState::default());
         assert!(shell.apps().state().edit_mode);
         assert!(!shell.state().carousel.held);
@@ -1901,8 +2046,17 @@ mod tests {
         assert_eq!(shell.state().lift, LiftState::default());
         lift(&mut shell);
 
+        // An app coming leaves it lifted; its own app going puts it back.
         pick_up(&mut shell);
         fakes.apps.apps.lock().unwrap().push(app("atlas", "Atlas"));
+        shell.dispatch(ShellIntent::AppsChanged);
+        assert!(shell.state().lift.app.is_some());
+        fakes
+            .apps
+            .apps
+            .lock()
+            .unwrap()
+            .retain(|app| app.id != app_id("mail"));
         shell.dispatch(ShellIntent::AppsChanged);
         assert_eq!(shell.state().lift, LiftState::default());
         // A later move picks nothing up.
@@ -2042,5 +2196,287 @@ mod tests {
         for view in HomeView::ALL {
             assert_eq!(HomeView::from_index(view.index()), Some(view));
         }
+    }
+
+    /// A grid 800 px wide at 2 px per dp: four columns of 200 px, rows 200 px apart, 100 px of
+    /// safe area above and below, 1600 px tall.
+    const GRID: GridLayout = GridLayout {
+        width_px: 800.0,
+        row_height_px: 200.0,
+        density: 2.0,
+        top_px: 100.0,
+        bottom_px: 100.0,
+        height_px: 1600.0,
+    };
+
+    /// `fakes`' apps in [`GRID`].
+    fn in_a_grid(fakes: &Fakes) -> HomeShell {
+        let mut shell = laid_out(fakes);
+        shell.dispatch(ShellIntent::Apps(AppsIntent::Layout(GRID)));
+        fakes.storage.writes.lock().unwrap().clear();
+        shell
+    }
+
+    /// Camera, Mail, Maps and Phone in [`GRID`].
+    fn with_four(fakes: &Fakes) -> HomeShell {
+        *fakes.apps.apps.lock().unwrap() = vec![
+            app("camera", "Camera"),
+            app("mail", "Mail"),
+            app("maps", "Maps"),
+            app("phone", "Phone"),
+        ];
+        in_a_grid(fakes)
+    }
+
+    fn grid_labels(shell: &HomeShell) -> Vec<String> {
+        shell
+            .apps()
+            .state()
+            .items
+            .iter()
+            .map(|item| item.label().to_owned())
+            .collect()
+    }
+
+    fn pointer_at(shell: &mut HomeShell, kind: PointerKind, x: f64, y: f64, millis: u64) {
+        shell.dispatch(ShellIntent::Pointer(PointerEvent {
+            kind,
+            x,
+            y,
+            at: ms(millis),
+        }));
+    }
+
+    /// Maps, at place 2, picked up and held over the first place long enough to take it.
+    fn maps_moved_first(shell: &mut HomeShell) {
+        hold_app(shell, "maps", 500.0, 300.0);
+        pointer_at(shell, PointerKind::Move, 100.0, 300.0, 10_050);
+        shell.dispatch(ShellIntent::Frame(ms(10_060)));
+        assert_eq!(grid_labels(shell), ["Camera", "Mail", "Maps", "Phone"]);
+        shell.dispatch(ShellIntent::Frame(ms(10_200)));
+        assert_eq!(grid_labels(shell), ["Maps", "Camera", "Mail", "Phone"]);
+    }
+
+    fn saved_first(fakes: &Fakes) -> Option<LayoutEntry> {
+        match PersistentLayoutStore::new(fakes.storage.clone()).load() {
+            Ok(meegone_apps_data::SavedLayout::Read(saved)) => saved.entries.first().cloned(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_dragged_icon_moves_the_others_aside_and_a_drop_keeps_the_new_order() {
+        // APPS-12, APPS-18, ANIM-13, AC-07
+        let fakes = Fakes::default();
+        let mut shell = with_four(&fakes);
+
+        maps_moved_first(&mut shell);
+
+        // The others slide to their new places, and the icon is drawn from its own new one,
+        // still under the finger.
+        let state = shell.state();
+        assert!(state.grid_change.animating);
+        assert_eq!((state.lift.dx, state.lift.dy), (0.0, 0.0));
+        assert!(fakes.storage.writes.lock().unwrap().is_empty());
+
+        pointer_at(&mut shell, PointerKind::Up, 110.0, 290.0, 10_300);
+
+        assert!(shell.state().lift.settling);
+        assert_eq!(
+            (shell.state().lift.dx, shell.state().lift.dy),
+            (10.0, -10.0)
+        );
+        assert_eq!(saved_first(&fakes), Some(LayoutEntry::App(app_id("maps"))));
+        come_to_rest(&mut shell, 10_300);
+        assert_eq!(shell.state().lift, LiftState::default());
+        assert_eq!(grid_labels(&shell), ["Maps", "Camera", "Mail", "Phone"]);
+        assert!(shell.apps().state().edit_mode);
+        assert!(fakes.apps.launched.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_drop_before_the_wait_is_over_still_takes_the_place_under_it() {
+        // APPS-12
+        let fakes = Fakes::default();
+        let mut shell = with_four(&fakes);
+        hold_app(&mut shell, "maps", 500.0, 300.0);
+        pointer_at(&mut shell, PointerKind::Move, 100.0, 300.0, 10_050);
+
+        pointer_at(&mut shell, PointerKind::Up, 100.0, 300.0, 10_060);
+
+        assert_eq!(grid_labels(&shell), ["Maps", "Camera", "Mail", "Phone"]);
+        assert_eq!(saved_first(&fakes), Some(LayoutEntry::App(app_id("maps"))));
+    }
+
+    #[test]
+    fn a_drag_that_ends_any_way_but_a_drop_puts_the_grid_back() {
+        // APPS-12: Back, a new layout, Settings or another view.
+        let ends: [fn(&mut HomeShell); 4] = [
+            |shell| shell.dispatch(ShellIntent::Back),
+            |shell| {
+                let layout = shell.state().carousel.layout;
+                shell.dispatch(ShellIntent::Layout(Layout {
+                    width_px: 2000.0,
+                    ..layout
+                }));
+            },
+            |shell| shell.dispatch(ShellIntent::OpenSettings),
+            |shell| shell.dispatch(ShellIntent::Swipe(Direction::Next)),
+        ];
+        for end in ends {
+            let fakes = Fakes::default();
+            let mut shell = with_four(&fakes);
+            maps_moved_first(&mut shell);
+
+            end(&mut shell);
+
+            assert_eq!(grid_labels(&shell), ["Camera", "Mail", "Maps", "Phone"]);
+            assert_eq!(shell.state().lift, LiftState::default());
+            assert!(fakes.storage.writes.lock().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn near_the_bottom_a_dragged_icon_scrolls_the_grid() {
+        // APPS-12: 40 apps in 11 rows of 200 px; 1400 px of grid show.
+        let fakes = Fakes::default();
+        *fakes.apps.apps.lock().unwrap() = (0..40)
+            .map(|i| app(&format!("app{i:02}"), &format!("App {i:02}")))
+            .collect();
+        let mut shell = in_a_grid(&fakes);
+        hold_app(&mut shell, "app01", 300.0, 300.0);
+        // Its centre 1300 px down the visible grid: 128 px into the bottom zone of 128 px.
+        pointer_at(&mut shell, PointerKind::Move, 300.0, 1500.0, 10_050);
+        shell.dispatch(ShellIntent::Frame(ms(10_060)));
+        shell.dispatch(ShellIntent::Frame(ms(10_076)));
+        let scrolled = shell.apps().state().scroll_px;
+        assert!(scrolled > 0.0, "{scrolled}");
+        assert!(shell.state().lift.animating);
+        // The icon stays under the finger.
+        assert_eq!(shell.state().lift.dy, 1200.0 + scrolled.round());
+    }
+
+    #[test]
+    fn entering_edit_mode_ticks_once() {
+        // ANIM-24: from a menu it ticks; picking an icon up ticks only for its long-press.
+        let fakes = Fakes::default();
+        let mut shell = with_mail(&fakes);
+        shell.dispatch(ShellIntent::OpenMenu);
+        shell.dispatch(ShellIntent::ChooseMenuItem(MenuItem::EditApplications));
+        assert!(shell.state().mode.on);
+        assert_eq!(ticks(&fakes), 1);
+        shell.dispatch(ShellIntent::Back);
+        assert!(!shell.state().mode.on);
+        assert_eq!(ticks(&fakes), 1);
+
+        hold_app(&mut shell, "mail", 300.0, 400.0);
+        assert_eq!(ticks(&fakes), 2);
+        finger(&mut shell, PointerKind::Move, 300.0, 600.0);
+        assert!(shell.state().mode.on);
+        assert_eq!(ticks(&fakes), 2);
+    }
+
+    #[test]
+    fn edit_mode_shrinks_the_icons_and_pops_the_badges_in_then_back_out() {
+        // ANIM-12
+        let fakes = Fakes::default();
+        let mut shell = with_four(&fakes);
+        shell.dispatch(ShellIntent::Apps(AppsIntent::EnterEditMode));
+        assert!(shell.state().mode.animating);
+        come_to_rest(&mut shell, 0);
+        let mode = shell.state().mode;
+        assert_eq!(mode.scale, meegone_core_state::motion::MODE_SCALE);
+        assert_eq!(mode.badges, [1.0; BADGE_ROWS]);
+
+        shell.dispatch(ShellIntent::Apps(AppsIntent::ExitEditMode));
+        assert!(shell.state().mode.animating);
+        come_to_rest(&mut shell, 2_000);
+        assert_eq!(shell.state().mode, ModeState::default());
+    }
+
+    #[test]
+    fn leaving_applications_ends_edit_mode() {
+        // So Done is never left out of sight, and Home from Events shows a plain grid.
+        let mut shell = with_mail(&Fakes::default());
+        shell.dispatch(ShellIntent::Apps(AppsIntent::EnterEditMode));
+
+        go(&mut shell, Direction::Previous);
+        assert!(!shell.apps().state().edit_mode);
+        shell.dispatch(ShellIntent::Home);
+        assert_eq!(shell.state().current, HomeView::Applications);
+        assert!(!shell.apps().state().edit_mode);
+    }
+
+    #[test]
+    fn in_edit_mode_an_icon_doesnt_shrink_under_the_finger() {
+        // APPS-12: a tap launches nothing, so nothing says it would.
+        let mut shell = with_mail(&Fakes::default());
+        shell.dispatch(ShellIntent::Apps(AppsIntent::EnterEditMode));
+
+        shell.dispatch(ShellIntent::Press { item: 0, at: ms(0) });
+
+        assert_eq!(shell.state().press, PressState::default());
+    }
+
+    #[test]
+    fn in_edit_mode_the_home_menu_has_no_edit_applications() {
+        let mut shell = with_mail(&Fakes::default());
+        shell.dispatch(ShellIntent::Apps(AppsIntent::EnterEditMode));
+
+        shell.dispatch(ShellIntent::OpenMenu);
+
+        assert_eq!(
+            shell.state().menu.map(|menu| menu.items),
+            Some(&[MenuItem::LauncherSettings, MenuItem::LockScreenImage][..])
+        );
+    }
+
+    #[test]
+    fn moving_an_icon_moves_the_grid_but_a_refresh_in_the_same_order_doesnt() {
+        // ANIM-13, ANIM-21: one rule for every change of the cells.
+        let mut shell = with_four(&Fakes::default());
+        shell.dispatch(ShellIntent::Apps(AppsIntent::EnterEditMode));
+        come_to_rest(&mut shell, 0);
+
+        shell.dispatch(ShellIntent::Apps(AppsIntent::Move {
+            app: app_id("phone"),
+            to: 0,
+        }));
+        assert!(shell.state().grid_change.animating);
+        come_to_rest(&mut shell, 2_000);
+
+        shell.dispatch(ShellIntent::AppsChanged);
+        assert!(!shell.state().grid_change.animating);
+    }
+
+    #[test]
+    fn a_failing_applications_ends_edit_mode_and_the_drag() {
+        // ARCH-09: nothing Applications can no longer end is left on screen.
+        let fakes = Fakes::default();
+        let mut platform = fakes.platform();
+        let broken = FakeApps::default();
+        broken.apps.lock().unwrap().push(app("mail", "Mail"));
+        platform.apps = Arc::new(BrokenLauncher(broken));
+        let mut shell = HomeShell::compose(platform);
+        shell.dispatch(ShellIntent::Layout(Layout {
+            width_px: 1000.0,
+            density: 2.0,
+            touch_slop_px: 16.0,
+            rtl: false,
+        }));
+        hold_app(&mut shell, "mail", 300.0, 400.0);
+        finger(&mut shell, PointerKind::Move, 300.0, 600.0);
+        assert!(shell.state().lift.app.is_some() && shell.state().mode.on);
+
+        shell.dispatch(ShellIntent::Apps(AppsIntent::RequestUninstall(app_id(
+            "mail",
+        ))));
+
+        assert!(matches!(shell.apps().health(), Health::Failed(_)));
+        let state = shell.state();
+        assert_eq!(state.lift, LiftState::default());
+        assert!(!state.mode.on);
+        shell.dispatch(ShellIntent::Press { item: 0, at: ms(0) });
+        assert!(shell.state().press.item.is_some());
     }
 }
