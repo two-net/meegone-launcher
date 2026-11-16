@@ -4,8 +4,8 @@
 //!
 //! It also tells the host what to draw for the home views in each frame, as a [`HomeFrame`]:
 //! where the carousel's views are, how the view indicator looks, how the content comes back
-//! from an app, the home menu, the Applications grid and the pressed icon (ADR 0006 to
-//! ADR 0008, ADR 0010).
+//! from an app, the home menu, the Applications grid, the pressed icon, and the grid's cells as
+//! apps come and go (ADR 0006 to ADR 0008, ADR 0010, ADR 0012).
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -31,6 +31,24 @@ pub struct MenuFrame {
     /// Where the finger was held, in whole pixels from the home views' top left, or `None` to
     /// centre it, when a screen reader opened it (A11Y-05).
     pub anchor: Option<(i32, i32)>,
+}
+
+/// How the Applications grid's cells come, go and move as apps are installed and removed, in
+/// ten-thousandths (ANIM-21). Each cell says where it was, so the host knows which values apply
+/// to it (ADR 0012).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GridChangeFrame {
+    /// The scale of a cell that just joined: 5 000 at first, 10 000 at rest.
+    pub appear_scale: u16,
+    /// Its opacity: 0 at first, 10 000 at rest.
+    pub appear_alpha: u16,
+    /// The scale of a cell that left: 10 000 at first, 5 000 at the end.
+    pub leave_scale: u16,
+    /// Its opacity: 10 000 at first, 0 at the end, when the host drops it.
+    pub leave_alpha: u16,
+    /// How far every other cell has come from its old place to its new one: 0 at first,
+    /// 10 000 at rest.
+    pub shift: u16,
 }
 
 /// What the host draws for the home views in one frame (ADR 0006).
@@ -59,6 +77,8 @@ pub struct HomeFrame {
     pub pressed: Option<usize>,
     /// The pressed item's icon scale in ten-thousandths: 10 000 at rest, 9 200 held (ANIM-10).
     pub press_scale: u16,
+    /// The grid's cells as apps come and go (ANIM-21).
+    pub grid_change: GridChangeFrame,
     /// Something is still moving or fading, so the host should draw another frame.
     pub animating: bool,
     /// The home menu, while it is open (HOME-10).
@@ -78,6 +98,8 @@ pub struct HomeFrame {
     pub foreground: Rgb,
     /// The indicator's other segments.
     pub dim: Rgb,
+    /// The dot on a newly installed app (APPS-07).
+    pub accent: Rgb,
 }
 
 pub struct ShellView {
@@ -150,9 +172,17 @@ impl ShellView {
             pressed: state.press.item,
             // A spring back overshoots full size a little.
             press_scale: (state.press.scale.clamp(0.0, 1.5) * 10_000.0).round() as u16,
+            grid_change: GridChangeFrame {
+                appear_scale: ten_thousandths(state.grid_change.appear_scale),
+                appear_alpha: ten_thousandths(state.grid_change.appear_alpha),
+                leave_scale: ten_thousandths(state.grid_change.leave_scale),
+                leave_alpha: ten_thousandths(state.grid_change.leave_alpha),
+                shift: ten_thousandths(state.grid_change.shift),
+            },
             animating: state.carousel.animating
                 || state.return_home.animating
-                || state.press.animating,
+                || state.press.animating
+                || state.grid_change.animating,
             menu: state.menu.map(|menu| MenuFrame {
                 items: menu.items,
                 anchor: menu
@@ -166,6 +196,7 @@ impl ShellView {
             surface: tokens.surface,
             foreground: tokens.text_primary,
             dim: tokens.text_secondary,
+            accent: tokens.accent,
         }
     }
 
@@ -204,6 +235,11 @@ impl ShellView {
     pub fn home_banner(&self) -> &HomeBanner {
         &self.home_banner
     }
+}
+
+/// A value from 0 to 1 in ten-thousandths.
+fn ten_thousandths(value: f64) -> u16 {
+    (value.clamp(0.0, 1.0) * 10_000.0).round() as u16
 }
 
 /// A dispatcher that queues a view's intents, wrapped for the shell.

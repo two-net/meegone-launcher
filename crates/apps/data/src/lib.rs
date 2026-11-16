@@ -1,17 +1,25 @@
 //! Applications data layer: the layout store, the one store Applications owns (SRS 7.3).
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use meegone_core_data::storage::format::{Fields, Line};
-use meegone_core_data::storage::{Decode, Encode, Format, Migration, Reader, Writer, load, save};
+use meegone_core_data::storage::{
+    Decode, Encode, Format, Migration, Reader, Stored, Writer, read, salvage, save,
+};
 use meegone_core_data::{AppId, DataError, StorageAdapter, StoredFile};
 
 /// Version of the saved layout format (MAINT-04). Changing the format means a new version, a
 /// migration in [`LAYOUT_MIGRATIONS`] and a fixture (ARCHITECTURE.md, "Persistence").
-pub const LAYOUT_VERSION: u32 = 1;
+pub const LAYOUT_VERSION: u32 = 2;
 
 /// Brings layouts saved by older versions up to date, one version at a time.
-const LAYOUT_MIGRATIONS: [Migration; LAYOUT_VERSION as usize - 1] = [];
+const LAYOUT_MIGRATIONS: [Migration; LAYOUT_VERSION as usize - 1] = [add_new_apps];
+
+/// Version 2 added `new` records (APPS-07). A version 1 body is a version 2 body without any.
+fn add_new_apps(body: &str) -> Option<String> {
+    Some(body.to_owned())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FolderId(pub u32);
@@ -31,11 +39,26 @@ pub enum LayoutEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Layout {
     pub entries: Vec<LayoutEntry>,
+    /// Apps that joined the grid after it was first set up and haven't been opened from MeeGone
+    /// since. Each carries a dot (APPS-07).
+    pub new: BTreeSet<AppId>,
+}
+
+/// What the layout store holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SavedLayout {
+    /// No layout has ever been saved: this is the first start (APPS-04, APPS-05).
+    Missing,
+    Read(Layout),
+    /// The saved layout couldn't be read whole. These are the cells recovered from it, in their
+    /// order; the grid is rebuilt around them (REL-02).
+    Recovered(Layout),
 }
 
 pub trait LayoutStore: Send + Sync {
-    /// The saved layout, or an empty one if none could be read (MAINT-04, REL-02).
-    fn load(&self) -> Layout;
+    /// The saved layout. Fails only when the storage itself can't be read; a damaged, cut short
+    /// or newer file is [`SavedLayout::Recovered`] (MAINT-04, REL-02).
+    fn load(&self) -> Result<SavedLayout, DataError>;
     /// Saves the layout atomically (REL-03).
     fn save(&self, layout: &Layout) -> Result<(), DataError>;
 }
@@ -52,8 +75,12 @@ impl PersistentLayoutStore {
 }
 
 impl LayoutStore for PersistentLayoutStore {
-    fn load(&self) -> Layout {
-        load(&*self.storage, StoredFile::Layout)
+    fn load(&self) -> Result<SavedLayout, DataError> {
+        Ok(match read(&*self.storage, StoredFile::Layout)? {
+            Stored::Missing => SavedLayout::Missing,
+            Stored::Read(layout) => SavedLayout::Read(layout),
+            Stored::Unreadable(bytes) => SavedLayout::Recovered(recover(&bytes)),
+        })
     }
 
     fn save(&self, layout: &Layout) -> Result<(), DataError> {
@@ -61,7 +88,20 @@ impl LayoutStore for PersistentLayoutStore {
     }
 }
 
-/// One record per grid cell, in order: `app <app>` or `folder <id> <name> <apps>`.
+/// Every cell and mark of a damaged file that still reads on its own (REL-02).
+fn recover(bytes: &[u8]) -> Layout {
+    salvage::<Layout>(bytes)
+        .into_iter()
+        .fold(Layout::default(), |mut layout, part| {
+            layout.entries.extend(part.entries);
+            layout.new.extend(part.new);
+            layout
+        })
+}
+
+/// One record per grid cell, in order: `app <app>` or `folder <id> <name> <apps>`. Then one
+/// `new <app>` record per app not yet opened. Each record stands alone, so a damaged file can be
+/// recovered record by record.
 impl Format for Layout {
     const KIND: &'static str = "layout";
     const VERSION: u32 = LAYOUT_VERSION;
@@ -74,21 +114,25 @@ impl Format for Layout {
                 LayoutEntry::Folder { id, name, apps } => out.line("folder", (id, name, apps)),
             };
         }
+        for app in &self.new {
+            out.line("new", app);
+        }
     }
 
     fn read(input: &mut Reader<'_>) -> Option<Self> {
         let mut entries = Vec::new();
-        while let Some(key) = input.peek_key() {
-            entries.push(match key {
-                "app" => LayoutEntry::App(input.line(key)?),
-                "folder" => {
+        loop {
+            match input.peek_key() {
+                Some(key @ "app") => entries.push(LayoutEntry::App(input.line(key)?)),
+                Some(key @ "folder") => {
                     let (id, name, apps) = input.line(key)?;
-                    LayoutEntry::Folder { id, name, apps }
+                    entries.push(LayoutEntry::Folder { id, name, apps });
                 }
-                _ => return None,
-            });
+                _ => break,
+            }
         }
-        Some(Self { entries })
+        let new = input.lines("new")?.into_iter().collect();
+        Some(Self { entries, new })
     }
 }
 
@@ -117,10 +161,13 @@ mod tests {
 
     /// Every saved version, oldest first, with the layout it must load as (MAINT-04). Never
     /// change or remove a fixture; add one for each new version.
-    const FIXTURES: [Fixture; LAYOUT_VERSION as usize] =
-        [(include_str!("../fixtures/layout-v1.txt"), sample)];
+    const FIXTURES: [Fixture; LAYOUT_VERSION as usize] = [
+        (include_str!("../fixtures/layout-v1.txt"), sample_v1),
+        (include_str!("../fixtures/layout-v2.txt"), sample),
+    ];
 
-    fn sample() -> Layout {
+    /// The layout of the version 1 fixture: no app is marked new.
+    fn sample_v1() -> Layout {
         Layout {
             entries: vec![
                 LayoutEntry::App(app_id("phone")),
@@ -140,7 +187,17 @@ mod tests {
                     apps: Vec::new(),
                 },
             ],
+            new: BTreeSet::new(),
         }
+    }
+
+    /// Version 2: Atlas and Zoom were installed later and haven't been opened (APPS-07).
+    fn sample() -> Layout {
+        let mut layout = sample_v1();
+        layout.entries.push(LayoutEntry::App(app_id("atlas")));
+        layout.entries.push(LayoutEntry::App(app_id("zoom")));
+        layout.new = [app_id("zoom"), app_id("atlas")].into();
+        layout
     }
 
     fn store() -> (Arc<FakeStorage>, PersistentLayoutStore) {
@@ -148,15 +205,26 @@ mod tests {
         (storage.clone(), PersistentLayoutStore::new(storage))
     }
 
+    fn put(storage: &FakeStorage, bytes: Vec<u8>) {
+        storage
+            .files
+            .lock()
+            .unwrap()
+            .insert(StoredFile::Layout, bytes);
+    }
+
     #[test]
     fn a_saved_layout_is_there_after_a_restart() {
-        // APPS-18
+        // APPS-18; nothing saved yet is the first start (APPS-04).
         let (storage, store) = store();
-        assert_eq!(store.load(), Layout::default());
+        assert_eq!(store.load(), Ok(SavedLayout::Missing));
 
         store.save(&sample()).unwrap();
 
-        assert_eq!(PersistentLayoutStore::new(storage).load(), sample());
+        assert_eq!(
+            PersistentLayoutStore::new(storage).load(),
+            Ok(SavedLayout::Read(sample()))
+        );
     }
 
     #[test]
@@ -169,38 +237,98 @@ mod tests {
         assert!(store.save(&Layout::default()).is_err());
 
         *storage.error.lock().unwrap() = None;
-        assert_eq!(store.load(), sample());
+        assert_eq!(store.load(), Ok(SavedLayout::Read(sample())));
     }
 
     #[test]
-    fn damaged_or_newer_layouts_load_as_empty() {
-        // MAINT-04; #11 rebuilds the grid from the installed apps (REL-02).
+    fn storage_that_cant_be_read_is_an_error_not_an_empty_layout() {
+        // REL-02: a passing read error must never look like a layout to replace.
+        let (storage, store) = store();
+        store.save(&sample()).unwrap();
+        let error = DataError::Failed("Disk error".into());
+        *storage.error.lock().unwrap() = Some(error.clone());
+
+        assert_eq!(store.load(), Err(error));
+    }
+
+    /// The text of the saved sample, and where `needle` starts in it.
+    fn saved_with(needle: &str) -> (Vec<u8>, usize) {
         let saved = encode(&sample());
-        let text = String::from_utf8(saved.clone()).unwrap();
+        let at = String::from_utf8(saved.clone())
+            .unwrap()
+            .find(needle)
+            .unwrap();
+        (saved, at)
+    }
+
+    #[test]
+    fn a_damaged_layout_keeps_the_cells_that_still_read() {
+        // REL-02: the games folder's record is damaged; everything else is recovered in order.
+        let (mut damaged, folder) = saved_with("folder 7");
+        damaged[folder + 1] ^= 0x20;
+        let mut expected = sample();
+        expected.entries.remove(1);
+
+        let (storage, store) = store();
+        put(&storage, damaged);
+
+        assert_eq!(store.load(), Ok(SavedLayout::Recovered(expected)));
+    }
+
+    #[test]
+    fn a_layout_cut_short_keeps_its_whole_records() {
+        // REL-02, REL-03
+        let (saved, atlas) = saved_with("app 0 atlas");
+        let mut expected = sample_v1();
+
+        let (storage, store) = store();
+        put(&storage, saved[..atlas + 4].to_vec());
+        assert_eq!(store.load(), Ok(SavedLayout::Recovered(expected.clone())));
+
+        let (saved, mark) = saved_with("new 0 zoom");
+        put(&storage, saved[..mark].to_vec());
+        expected = sample();
+        expected.new.remove(&app_id("zoom"));
+        assert_eq!(store.load(), Ok(SavedLayout::Recovered(expected)));
+    }
+
+    #[test]
+    fn newer_or_foreign_layouts_recover_nothing() {
+        // MAINT-04: the grid is rebuilt from the installed apps (REL-02).
+        let saved = encode(&sample());
+        let text = String::from_utf8(saved).unwrap();
         let body: String = text
             .lines()
-            .filter(|line| line.starts_with("app ") || line.starts_with("folder "))
+            .filter(|line| !line.starts_with("meegone-") && !line.starts_with("end "))
             .map(|line| format!("{line}\n"))
             .collect();
-        let mut damaged = saved.clone();
-        damaged[40] ^= 0x20;
 
         for bytes in [
             seal("layout", LAYOUT_VERSION + 1, &body),
-            seal("layout", LAYOUT_VERSION, &format!("{body}shelf 1\n")),
-            seal("layout", LAYOUT_VERSION, "folder 1 Games 2 0 a a.Main\n"),
             seal("settings", LAYOUT_VERSION, &body),
-            damaged,
-            saved[..saved.len() - 1].to_vec(),
+            b"\x00garbage".to_vec(),
         ] {
             let (storage, store) = store();
-            storage
-                .files
-                .lock()
-                .unwrap()
-                .insert(StoredFile::Layout, bytes);
+            put(&storage, bytes);
 
-            assert_eq!(store.load(), Layout::default());
+            assert_eq!(store.load(), Ok(SavedLayout::Recovered(Layout::default())));
+        }
+    }
+
+    #[test]
+    fn malformed_layouts_are_unreadable() {
+        // MAINT-04: parsing stays strict; only recovery is lenient.
+        for body in [
+            "shelf 1\n",
+            "folder 1 Games 2 0 a a.Main\n",
+            "new 0 a a.Main\napp 0 a a.Main\n",
+            "new 0 a\n",
+        ] {
+            assert_eq!(
+                decode::<Layout>(&seal("layout", LAYOUT_VERSION, body)),
+                None,
+                "{body:?}"
+            );
         }
     }
 

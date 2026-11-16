@@ -62,11 +62,13 @@ pub fn app_id(package: &str) -> AppId {
 /// The work profile that [`work_app`] puts apps in.
 pub const WORK_PROFILE: ProfileId = ProfileId(10);
 
-/// An available app in the personal profile that the user can uninstall.
+/// An available app in the personal profile that the user can uninstall. Its sort key is its
+/// lowercased label, a simple stand-in for the platform's collation key (L10N-04).
 pub fn app(package: &str, label: &str) -> App {
     App {
         id: app_id(package),
         label: label.to_owned(),
+        sort_key: label.to_lowercase().into_bytes(),
         accent: accent::NEUTRAL,
         available: true,
         work: false,
@@ -101,6 +103,9 @@ pub struct FakeApps {
     pub apps: Mutex<Vec<App>>,
     /// The personal profile only, unless set.
     pub profiles: Mutex<Vec<Profile>>,
+    /// The packages of the default phone, messaging, browser and camera apps (APPS-05). None
+    /// unless set.
+    pub default_apps: Mutex<Vec<String>>,
     pub shortcuts: Mutex<BTreeMap<AppId, Vec<Shortcut>>>,
     /// The system offers shortcuts only while MeeGone is the default home app (APPS-11).
     pub shortcuts_allowed: Mutex<bool>,
@@ -121,7 +126,9 @@ impl Default for FakeApps {
                 id: ProfileId(0),
                 work: false,
                 paused: false,
+                locked: false,
             }]),
+            default_apps: Mutex::default(),
             shortcuts: Mutex::default(),
             shortcuts_allowed: Mutex::default(),
             launched: Mutex::default(),
@@ -143,6 +150,10 @@ impl AppsAdapter for FakeApps {
     fn profiles(&self) -> Result<Vec<Profile>, DataError> {
         check(&self.error)?;
         Ok(self.profiles.lock().unwrap().clone())
+    }
+
+    fn default_apps(&self) -> Vec<String> {
+        self.default_apps.lock().unwrap().clone()
     }
 
     fn launch(&self, app: &AppId, from: Option<Rect>) -> Result<(), DataError> {
@@ -535,6 +546,8 @@ impl SystemConfigAdapter for FakeSystem {
 #[derive(Default)]
 pub struct FakeStorage {
     pub files: Mutex<BTreeMap<StoredFile, Vec<u8>>>,
+    /// Every file read, in order.
+    pub reads: Mutex<Vec<StoredFile>>,
     /// Every file written, in order.
     pub writes: Mutex<Vec<StoredFile>>,
     pub error: Mutex<Option<DataError>>,
@@ -553,6 +566,7 @@ impl FakeStorage {
 
 impl StorageAdapter for FakeStorage {
     fn read(&self, file: StoredFile) -> Result<Option<Vec<u8>>, DataError> {
+        record(&self.reads, file);
         check(&self.error)?;
         Ok(self.files.lock().unwrap().get(&file).cloned())
     }

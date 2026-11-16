@@ -17,6 +17,8 @@ import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.graphics.Insets;
 import android.graphics.Rect;
+import android.icu.text.Collator;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
@@ -25,7 +27,10 @@ import android.os.Process;
 import android.os.SystemClock;
 import android.os.UserHandle;
 import android.os.UserManager;
+import android.provider.MediaStore;
 import android.provider.Settings;
+import android.provider.Telephony;
+import android.telecom.TelecomManager;
 import android.util.Log;
 import android.view.HapticFeedbackConstants;
 import android.view.View;
@@ -33,6 +38,7 @@ import android.view.WindowInsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.TimeZone;
+import java.util.function.Supplier;
 
 /**
  * What the Rust platform adapters ask of Android (ADR 0005).
@@ -46,20 +52,28 @@ final class Bridge {
     private static final String TAG = "MeeGone";
 
     // The app catalogue's records (ADR 0010), mirrored in crates/core/data/src/catalogue.rs.
-    // An app: package, activity, label, profile serial number, flags, accent (ADR 0011).
+    // An app: package, activity, label, profile serial number, flags, accent (ADR 0011),
+    // collation key and first install time (ADR 0012).
     private static final int APP_AVAILABLE = 1;
     private static final int APP_CAN_UNINSTALL = 2;
     private static final int APP_WORK = 4;
     // A profile: serial number, flags.
     private static final int PROFILE_WORK = 1;
     private static final int PROFILE_PAUSED = 2;
-    /** The system's broadcasts about the work profile, sent only to registered receivers. */
-    private static final String[] PROFILE_CHANGES = {
+    private static final int PROFILE_LOCKED = 4;
+    /**
+     * The system's broadcasts about the work profile, and about the language, which changes the
+     * apps' labels and their alphabetical order (L10N-04). Sent only to registered receivers.
+     */
+    private static final String[] CATALOGUE_CHANGES = {
         Intent.ACTION_MANAGED_PROFILE_ADDED,
         Intent.ACTION_MANAGED_PROFILE_REMOVED,
         Intent.ACTION_MANAGED_PROFILE_AVAILABLE,
         Intent.ACTION_MANAGED_PROFILE_UNAVAILABLE,
+        Intent.ACTION_MANAGED_PROFILE_UNLOCKED,
+        Intent.ACTION_LOCALE_CHANGED,
     };
+    private static final char[] HEX = "0123456789abcdef".toCharArray();
     private static final int REQUEST_HOME_ROLE = 1;
     /**
      * A role dialog that closes this fast was never shown: the system refuses after "Don't ask
@@ -229,15 +243,20 @@ final class Bridge {
     /**
      * Every launchable app in every profile, except MeeGone itself, which is already on screen
      * (APPS-01, ADR 0010). One record per app: package, activity, label, profile serial number,
-     * flags and accent. An app is unavailable while its profile is paused or it is suspended
-     * (APPS-09). Its accent is empty until it has been derived from its icon, in the background;
-     * the catalogue then changes (APPS-17, ADR 0011). Returns null if the system couldn't
-     * answer, so the saved layout keeps its apps. Called from Rust.
+     * flags, accent, collation key and first install time. An app is unavailable while its
+     * profile is paused or it is suspended (APPS-09). Its accent is empty until it has been
+     * derived from its icon, in the background; the catalogue then changes (APPS-17, ADR 0011).
+     * The collation key orders labels as the device's language does, ignoring case and accents
+     * (L10N-04, ADR 0012). Returns null if the system couldn't answer, so the saved layout keeps
+     * its apps. Called from Rust.
      */
     String[] launchableApps() {
         try {
             LauncherApps launcher = context.getSystemService(LauncherApps.class);
             UserManager users = context.getSystemService(UserManager.class);
+            // Made for each read, so it follows the current language.
+            Collator collator = Collator.getInstance();
+            collator.setStrength(Collator.PRIMARY);
             List<String> fields = new ArrayList<>();
             for (UserHandle user : launcher.getProfiles()) {
                 int profile = profileFlags(launcher, users, user);
@@ -261,12 +280,17 @@ final class Bridge {
                         flags |= APP_WORK;
                     }
                     CharSequence label = info.getLabel();
+                    String text = label == null ? "" : label.toString().trim();
                     fields.add(component.getPackageName());
                     fields.add(component.getClassName());
-                    fields.add(label == null ? "" : label.toString());
+                    fields.add(text);
                     fields.add(serial);
                     fields.add(Integer.toString(flags));
                     fields.add(accents.field(serialNumber, info));
+                    // An app without a label is named by its package in Rust; sort it so too.
+                    fields.add(hex(collator.getCollationKey(
+                            text.isEmpty() ? component.getPackageName() : text).toByteArray()));
+                    fields.add(Long.toString(Math.max(0, info.getFirstInstallTime())));
                 }
             }
             accents.deriveWaiting();
@@ -278,8 +302,8 @@ final class Bridge {
     }
 
     /**
-     * Every profile that holds apps: its serial number and flags, work and paused (APPS-09,
-     * APPS-20). Returns null if the system couldn't answer. Called from Rust.
+     * Every profile that holds apps: its serial number and flags, work, paused and locked
+     * (APPS-09, APPS-18, APPS-20). Returns null if the system couldn't answer. Called from Rust.
      */
     String[] profiles() {
         try {
@@ -305,7 +329,63 @@ final class Bridge {
         if (users.isQuietModeEnabled(user)) {
             flags |= PROFILE_PAUSED;
         }
+        // A profile with its own lock lists no apps until it is unlocked after a restart; the
+        // layout keeps their places meanwhile (APPS-18).
+        if (!users.isUserUnlocked(user)) {
+            flags |= PROFILE_LOCKED;
+        }
         return flags;
+    }
+
+    /** Lowercase hex, two digits a byte, as catalogue.rs reads it. */
+    private static String hex(byte[] bytes) {
+        char[] text = new char[bytes.length * 2];
+        for (int i = 0; i < bytes.length; i++) {
+            text[2 * i] = HEX[(bytes[i] >> 4) & 0xF];
+            text[2 * i + 1] = HEX[bytes[i] & 0xF];
+        }
+        return new String(text);
+    }
+
+    /**
+     * The packages of the default phone, messaging, browser and camera apps, in that order,
+     * leaving out those the system doesn't identify, such as the phone app on a tablet (APPS-05,
+     * ADR 0012). The first grid puts them first. Called from Rust.
+     */
+    String[] defaultApps() {
+        List<String> packages = new ArrayList<>();
+        addDefault(packages,
+                () -> context.getSystemService(TelecomManager.class).getDefaultDialerPackage());
+        addDefault(packages, () -> Telephony.Sms.getDefaultSmsPackage(context));
+        addDefault(packages, () -> handler(new Intent(Intent.ACTION_VIEW, Uri.parse("https://"))
+                .addCategory(Intent.CATEGORY_BROWSABLE)));
+        addDefault(packages, () -> handler(new Intent(MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA)));
+        return packages.toArray(new String[0]);
+    }
+
+    private static void addDefault(List<String> packages, Supplier<String> lookup) {
+        try {
+            String packageName = lookup.get();
+            if (packageName != null && !packageName.isEmpty()) {
+                packages.add(packageName);
+            }
+        } catch (RuntimeException e) {
+            // This one isn't known; the others still come first.
+        }
+    }
+
+    /**
+     * The package of the app the user chose for {@code intent}, or null if they haven't chosen
+     * one: the system would ask, which its chooser in the "android" package does.
+     */
+    private String handler(Intent intent) {
+        ResolveInfo info = context.getPackageManager()
+                .resolveActivity(intent, PackageManager.MATCH_DEFAULT_ONLY);
+        if (info == null || info.activityInfo == null) {
+            return null;
+        }
+        String packageName = info.activityInfo.packageName;
+        return "android".equals(packageName) ? null : packageName;
     }
 
     /**
@@ -373,9 +453,10 @@ final class Bridge {
 
     /**
      * Starts telling the Rust app when apps are installed, updated, removed, suspended or
-     * unsuspended, and when a work profile is added, removed, paused or resumed (APPS-09,
-     * ADR 0010). Once per process; later calls do nothing. A burst of changes, such as an
-     * update's removal and addition, is reported once, on the main thread.
+     * unsuspended, when a work profile is added, removed, paused, resumed or unlocked, and when
+     * the language changes (APPS-09, APPS-18, L10N-04, ADR 0010, ADR 0012). Once per process;
+     * later calls do nothing. A burst of changes, such as an update's removal and addition, is
+     * reported once, on the main thread.
      */
     void watchApps() {
         if (watchingApps) {
@@ -391,7 +472,7 @@ final class Bridge {
                 }
             };
             IntentFilter filter = new IntentFilter();
-            for (String action : PROFILE_CHANGES) {
+            for (String action : CATALOGUE_CHANGES) {
                 filter.addAction(action);
             }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {

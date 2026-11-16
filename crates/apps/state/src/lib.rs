@@ -1,14 +1,17 @@
 //! Applications state (SRS 4.2): the grid, its layout and scroll position, edit mode and the
-//! open folder.
+//! open folder. [`reconcile`] keeps the layout in step with the installed apps (ADR 0012).
 
-use std::collections::{HashMap, HashSet};
+mod reconcile;
+
 use std::sync::Arc;
 
-use meegone_apps_data::{Layout, LayoutEntry, LayoutStore};
-use meegone_core_data::AppsAdapter;
+use meegone_apps_data::{Layout, LayoutStore, SavedLayout};
+use meegone_core_data::{AppsAdapter, DataError, Profile};
 use meegone_core_state::{App, AppId, Rect, StateHolder};
 
 pub use meegone_apps_data::FolderId;
+use reconcile::{Start, grid, reconcile};
+pub use reconcile::{cells_came_or_went, previous_places};
 
 /// Columns on a phone (APPS-02).
 pub const PHONE_COLUMNS: usize = 4;
@@ -33,7 +36,12 @@ pub fn columns_for(width_dp: f64) -> usize {
 /// One cell of the grid, ready to render.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GridItem {
-    App(App),
+    App {
+        app: App,
+        /// Installed since the grid was set up and not opened from MeeGone yet: it carries a
+        /// dot (APPS-07).
+        new: bool,
+    },
     Folder {
         id: FolderId,
         name: String,
@@ -46,7 +54,7 @@ impl GridItem {
     /// FOLD-02).
     pub fn label(&self) -> &str {
         match self {
-            GridItem::App(app) => &app.label,
+            GridItem::App { app, .. } => &app.label,
             GridItem::Folder { name, .. } => name,
         }
     }
@@ -137,7 +145,12 @@ pub enum AppsIntent {
 
 pub struct AppsHolder {
     apps: Arc<dyn AppsAdapter>,
-    layout: Arc<dyn LayoutStore>,
+    store: Arc<dyn LayoutStore>,
+    /// The layout, kept once the store has been read. Applications is its only writer, so the
+    /// file is read at start, or until a read succeeds, and written after each change.
+    layout: Option<Layout>,
+    /// The kept layout's last save failed, so the next refresh saves it again.
+    unsaved: bool,
     /// The grid's last layout, if the host has laid it out yet.
     grid: Option<GridLayout>,
     state: AppsState,
@@ -147,29 +160,77 @@ impl AppsHolder {
     pub fn new(apps: Arc<dyn AppsAdapter>, layout: Arc<dyn LayoutStore>) -> Self {
         Self {
             apps,
-            layout,
+            store: layout,
+            layout: None,
+            unsaved: false,
             grid: None,
             state: AppsState::default(),
         }
     }
 
+    /// Reconciles the layout with the installed apps, saves it if it changed, and shows it
+    /// (APPS-06, APPS-08, APPS-18). If the system can't list the apps, the grid stays as it is.
     fn refresh(&mut self) {
-        let installed = match self.apps.launchable_apps() {
-            Ok(installed) => installed,
+        let (installed, profiles) = match self.catalogue() {
+            Ok(catalogue) => catalogue,
             Err(error) => {
                 self.state.problem = Some(error.to_string());
                 return;
             }
         };
-        let saved = self.layout.load();
-        let layout = reconcile(&saved, &installed);
         self.state.problem = None;
-        if layout != saved {
-            if let Err(error) = self.layout.save(&layout) {
-                self.state.problem = Some(error.to_string());
-            }
+        let reconciled = |saved: &Layout, start: &Start| {
+            let layout = reconcile(saved, &installed, &profiles, start);
+            let changed = layout != *saved;
+            (layout, changed)
+        };
+        let (layout, changed) = match self.layout.take() {
+            Some(kept) => reconciled(&kept, &Start::Saved),
+            None => match self.store.load() {
+                Ok(SavedLayout::Missing) => {
+                    let defaults = self.apps.default_apps();
+                    (
+                        reconciled(&Layout::default(), &Start::First { defaults }).0,
+                        true,
+                    )
+                }
+                Ok(SavedLayout::Read(saved)) => reconciled(&saved, &Start::Saved),
+                // Saved at once, so the damaged file is replaced before anything else can read
+                // it (REL-02).
+                Ok(SavedLayout::Recovered(recovered)) => {
+                    (reconciled(&recovered, &Start::Rebuilt).0, true)
+                }
+                Err(error) => {
+                    // Shown but never saved: the file may be fine, so the next refresh reads it
+                    // again instead of replacing it (REL-02).
+                    let shown = reconciled(&Layout::default(), &Start::Rebuilt).0;
+                    self.show(&shown, &installed);
+                    self.state.problem = Some(error.to_string());
+                    return;
+                }
+            },
+        };
+        if changed || self.unsaved {
+            self.save(&layout);
         }
-        let items = grid(&layout, &installed);
+        self.show(&layout, &installed);
+        self.layout = Some(layout);
+    }
+
+    fn catalogue(&self) -> Result<(Vec<App>, Vec<Profile>), DataError> {
+        Ok((self.apps.launchable_apps()?, self.apps.profiles()?))
+    }
+
+    fn save(&mut self, layout: &Layout) {
+        let saved = self.store.save(layout);
+        self.unsaved = saved.is_err();
+        if let Err(error) = saved {
+            self.state.problem = Some(error.to_string());
+        }
+    }
+
+    fn show(&mut self, layout: &Layout, installed: &[App]) {
+        let items = grid(layout, installed);
         if *self.state.items != *items {
             self.state.items = items.into();
         }
@@ -181,6 +242,33 @@ impl AppsHolder {
             .launch(app, from)
             .err()
             .map(|error| error.to_string());
+        if self.state.problem.is_none() {
+            self.opened(app);
+        }
+    }
+
+    /// An app opened from MeeGone loses its dot, for good (APPS-07).
+    fn opened(&mut self, app: &AppId) {
+        let Some(mut layout) = self.layout.take() else {
+            return;
+        };
+        if layout.new.remove(app) {
+            self.save(&layout);
+            let items: Vec<GridItem> = self
+                .state
+                .items
+                .iter()
+                .map(|item| match item {
+                    GridItem::App { app: shown, .. } if shown.id == *app => GridItem::App {
+                        app: shown.clone(),
+                        new: false,
+                    },
+                    other => other.clone(),
+                })
+                .collect();
+            self.state.items = items.into();
+        }
+        self.layout = Some(layout);
     }
 
     /// Takes on a new layout. When it changes the columns or the row height, as folding,
@@ -246,67 +334,12 @@ impl StateHolder for AppsHolder {
     }
 }
 
-/// Keeps the saved order, drops apps that are gone and adds new apps at the end in
-/// alphabetical order (APPS-04, APPS-06, APPS-18). A folder left with one app becomes that app;
-/// an empty folder is deleted (FOLD-06).
-fn reconcile(saved: &Layout, installed: &[App]) -> Layout {
-    let present: HashSet<&AppId> = installed.iter().map(|app| &app.id).collect();
-    let mut placed: HashSet<AppId> = HashSet::new();
-    let mut keep = |id: &AppId| present.contains(id) && placed.insert(id.clone());
-    let mut entries = Vec::new();
-
-    for entry in &saved.entries {
-        match entry {
-            LayoutEntry::App(id) => {
-                if keep(id) {
-                    entries.push(entry.clone());
-                }
-            }
-            LayoutEntry::Folder { id, name, apps } => {
-                let kept: Vec<AppId> = apps.iter().filter(|app| keep(app)).cloned().collect();
-                if kept.len() > 1 {
-                    entries.push(LayoutEntry::Folder {
-                        id: *id,
-                        name: name.clone(),
-                        apps: kept,
-                    });
-                } else if let Some(only) = kept.into_iter().next() {
-                    entries.push(LayoutEntry::App(only));
-                }
-            }
-        }
-    }
-
-    // Alphabetical by label for now; locale-aware ordering comes with L10N-04.
-    let mut new: Vec<&App> = installed.iter().filter(|app| keep(&app.id)).collect();
-    new.sort_by_cached_key(|app| app.label.to_lowercase());
-    entries.extend(new.into_iter().map(|app| LayoutEntry::App(app.id.clone())));
-
-    Layout { entries }
-}
-
-fn grid(layout: &Layout, installed: &[App]) -> Vec<GridItem> {
-    let by_id: HashMap<&AppId, &App> = installed.iter().map(|app| (&app.id, app)).collect();
-    let app = |id: &AppId| by_id.get(id).map(|app| (*app).clone());
-    layout
-        .entries
-        .iter()
-        .filter_map(|entry| match entry {
-            LayoutEntry::App(id) => app(id).map(GridItem::App),
-            LayoutEntry::Folder { id, name, apps } => Some(GridItem::Folder {
-                id: *id,
-                name: name.clone(),
-                apps: apps.iter().filter_map(app).collect(),
-            }),
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
-    use meegone_apps_data::PersistentLayoutStore;
-    use meegone_core_data::DataError;
+    use meegone_apps_data::{LayoutEntry, PersistentLayoutStore};
     use meegone_core_data::fakes::{FakeStorage, Fakes, app, app_id, work_app};
+    use meegone_core_data::storage::format::seal;
+    use meegone_core_data::{ProfileId, StoredFile};
 
     use super::*;
 
@@ -325,7 +358,8 @@ mod tests {
             .items
             .iter()
             .map(|item| match item {
-                GridItem::App(app) => app.label.clone(),
+                GridItem::App { app, new: false } => app.label.clone(),
+                GridItem::App { app, new: true } => format!("{}•", app.label),
                 GridItem::Folder { name, .. } => format!("[{name}]"),
             })
             .collect()
@@ -351,7 +385,10 @@ mod tests {
         let holder = holder(&fakes, &layout);
 
         assert_eq!(labels(holder.state()), ["camera", "Mail", "Phone"]);
-        assert_eq!(layout.load().entries.len(), 3);
+        let Ok(SavedLayout::Read(saved)) = layout.load() else {
+            panic!("not saved");
+        };
+        assert_eq!(saved.entries.len(), 3);
     }
 
     #[test]
@@ -366,6 +403,7 @@ mod tests {
                     LayoutEntry::App(app_id("gone")),
                     LayoutEntry::App(app_id("mail")),
                 ],
+                ..Layout::default()
             })
             .unwrap();
         install(
@@ -375,7 +413,8 @@ mod tests {
 
         let holder = holder(&fakes, &layout);
 
-        assert_eq!(labels(holder.state()), ["Phone", "Mail", "Atlas"]);
+        // Atlas is new: it carries a dot (APPS-07).
+        assert_eq!(labels(holder.state()), ["Phone", "Mail", "Atlas•"]);
     }
 
     #[test]
@@ -397,6 +436,7 @@ mod tests {
                         apps: vec![app_id("chess"), app_id("go")],
                     },
                 ],
+                ..Layout::default()
             })
             .unwrap();
         install(
@@ -443,7 +483,13 @@ mod tests {
         paused.available = false;
         *fakes.apps.apps.lock().unwrap() = vec![paused.clone()];
         let mut holder = holder(&fakes, &layout_store());
-        assert_eq!(*holder.state().items, [GridItem::App(paused.clone())]);
+        assert_eq!(
+            *holder.state().items,
+            [GridItem::App {
+                app: paused.clone(),
+                new: false
+            }]
+        );
 
         holder.handle(AppsIntent::Launch {
             app: paused.id.clone(),
@@ -496,7 +542,7 @@ mod tests {
             .items
             .iter()
             .map(|item| match item {
-                GridItem::App(app) => (app.label.as_str(), app.work),
+                GridItem::App { app, .. } => (app.label.as_str(), app.work),
                 GridItem::Folder { .. } => unreachable!(),
             })
             .collect();
@@ -643,6 +689,7 @@ mod tests {
                     name: "Folder".into(),
                     apps: vec![app_id("maps"), app_id("mail")],
                 }],
+                ..Layout::default()
             })
             .unwrap();
         install(&fakes, &[("maps", "Maps"), ("mail", "Mail")]);
@@ -715,6 +762,7 @@ mod tests {
                     name: "Folder".into(),
                     apps: vec![app_id("maps"), app_id("mail")],
                 }],
+                ..Layout::default()
             })
             .unwrap();
         install(&fakes, &[("maps", "Maps"), ("mail", "Mail")]);
@@ -724,5 +772,264 @@ mod tests {
 
         assert!(holder.on_back());
         assert_eq!(holder.state().scroll_px, 480.0);
+    }
+
+    fn storage_and_store() -> (Arc<FakeStorage>, Arc<PersistentLayoutStore>) {
+        let storage = Arc::new(FakeStorage::default());
+        (
+            storage.clone(),
+            Arc::new(PersistentLayoutStore::new(storage)),
+        )
+    }
+
+    fn saved(layout: &PersistentLayoutStore) -> Layout {
+        match layout.load() {
+            Ok(SavedLayout::Read(saved)) => saved,
+            other => panic!("not saved: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_first_start_puts_the_default_apps_first_and_marks_nothing() {
+        // APPS-04, APPS-05
+        let fakes = Fakes::default();
+        install(
+            &fakes,
+            &[
+                ("atlas", "Atlas"),
+                ("camera", "Camera"),
+                ("dialer", "Phone"),
+                ("sms", "Messages"),
+            ],
+        );
+        *fakes.apps.default_apps.lock().unwrap() = vec!["dialer".into(), "camera".into()];
+        let layout = layout_store();
+
+        let holder = holder(&fakes, &layout);
+
+        assert_eq!(
+            labels(holder.state()),
+            ["Phone", "Camera", "Atlas", "Messages"]
+        );
+        assert!(saved(&layout).new.is_empty());
+    }
+
+    #[test]
+    fn the_defaults_apply_only_to_the_first_start() {
+        // APPS-05: a saved grid keeps its order when the default apps change.
+        let fakes = Fakes::default();
+        install(&fakes, &[("atlas", "Atlas"), ("dialer", "Phone")]);
+        let layout = layout_store();
+        holder(&fakes, &layout);
+
+        *fakes.apps.default_apps.lock().unwrap() = vec!["dialer".into()];
+        let holder = holder(&fakes, &layout);
+
+        assert_eq!(labels(holder.state()), ["Atlas", "Phone"]);
+    }
+
+    #[test]
+    fn a_damaged_layout_is_rebuilt_around_what_it_kept_and_replaced_at_once() {
+        // REL-02: Zoom's cell survived; the rest is alphabetical, with no dots.
+        let fakes = Fakes::default();
+        install(
+            &fakes,
+            &[("mail", "Mail"), ("zoom", "Zoom"), ("atlas", "Atlas")],
+        );
+        let (storage, layout) = storage_and_store();
+        let mut damaged = seal(
+            "layout",
+            meegone_apps_data::LAYOUT_VERSION,
+            "app 0 zoom zoom.Main\n",
+        );
+        damaged.truncate(damaged.len() - 3);
+        storage
+            .files
+            .lock()
+            .unwrap()
+            .insert(StoredFile::Layout, damaged);
+
+        let holder = holder(&fakes, &layout);
+
+        assert_eq!(labels(holder.state()), ["Zoom", "Atlas", "Mail"]);
+        assert_eq!(holder.state().problem, None);
+        assert_eq!(saved(&layout).entries.len(), 3);
+    }
+
+    #[test]
+    fn a_layout_that_cant_be_read_is_shown_rebuilt_but_never_overwritten() {
+        // REL-02: a passing read error must not cost the user their arrangement.
+        let fakes = Fakes::default();
+        install(&fakes, &[("atlas", "Atlas"), ("mail", "Mail")]);
+        let (storage, layout) = storage_and_store();
+        layout
+            .save(&Layout {
+                entries: vec![
+                    LayoutEntry::App(app_id("mail")),
+                    LayoutEntry::App(app_id("atlas")),
+                ],
+                ..Layout::default()
+            })
+            .unwrap();
+        storage.writes.lock().unwrap().clear();
+        *storage.error.lock().unwrap() = Some(DataError::Failed("Disk busy".into()));
+
+        let mut holder = holder(&fakes, &layout);
+        assert_eq!(labels(holder.state()), ["Atlas", "Mail"]);
+        assert_eq!(holder.state().problem.as_deref(), Some("Disk busy"));
+
+        *storage.error.lock().unwrap() = None;
+        holder.handle(AppsIntent::Refresh);
+        assert_eq!(labels(holder.state()), ["Mail", "Atlas"]);
+        assert_eq!(holder.state().problem, None);
+        assert!(storage.writes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_layout_is_read_once_and_saved_only_when_it_changes() {
+        // PERF-04: every accent the host derives refreshes the grid.
+        let fakes = Fakes::default();
+        install(&fakes, &[("mail", "Mail")]);
+        let (storage, layout) = storage_and_store();
+        let mut holder = holder(&fakes, &layout);
+        assert_eq!(*storage.writes.lock().unwrap(), [StoredFile::Layout]);
+
+        for _ in 0..5 {
+            holder.handle(AppsIntent::Refresh);
+        }
+        install(&fakes, &[("mail", "Mail"), ("maps", "Maps")]);
+        holder.handle(AppsIntent::Refresh);
+
+        assert_eq!(*storage.reads.lock().unwrap(), [StoredFile::Layout]);
+        assert_eq!(storage.writes.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_failed_save_is_tried_again_at_the_next_refresh() {
+        // REL-03: the failure shows as the problem until a save succeeds.
+        let fakes = Fakes::default();
+        install(&fakes, &[("mail", "Mail")]);
+        let (storage, layout) = storage_and_store();
+        let mut holder = holder(&fakes, &layout);
+        *storage.error.lock().unwrap() = Some(DataError::Failed("Disk full".into()));
+        install(&fakes, &[("mail", "Mail"), ("maps", "Maps")]);
+
+        holder.handle(AppsIntent::Refresh);
+        assert_eq!(holder.state().problem.as_deref(), Some("Disk full"));
+        assert_eq!(labels(holder.state()), ["Mail", "Maps•"]);
+
+        *storage.error.lock().unwrap() = None;
+        holder.handle(AppsIntent::Refresh);
+        assert_eq!(holder.state().problem, None);
+        assert_eq!(saved(&layout).entries.len(), 2);
+    }
+
+    #[test]
+    fn opening_a_new_app_takes_its_dot_away_for_good() {
+        // APPS-07
+        let fakes = Fakes::default();
+        install(&fakes, &[("mail", "Mail")]);
+        let layout = layout_store();
+        let mut holder = holder(&fakes, &layout);
+        install(&fakes, &[("mail", "Mail"), ("maps", "Maps")]);
+        holder.handle(AppsIntent::Refresh);
+        assert_eq!(labels(holder.state()), ["Mail", "Maps•"]);
+
+        // A launch the system refuses didn't open it.
+        *fakes.apps.error.lock().unwrap() = Some(DataError::Failed("No".into()));
+        holder.handle(AppsIntent::Launch {
+            app: app_id("maps"),
+            from: None,
+        });
+        assert_eq!(labels(holder.state()), ["Mail", "Maps•"]);
+
+        *fakes.apps.error.lock().unwrap() = None;
+        holder.handle(AppsIntent::Launch {
+            app: app_id("maps"),
+            from: None,
+        });
+        assert_eq!(labels(holder.state()), ["Mail", "Maps"]);
+        assert!(saved(&layout).new.is_empty());
+        assert_eq!(
+            labels(self::holder(&fakes, &layout).state()),
+            ["Mail", "Maps"]
+        );
+    }
+
+    #[test]
+    fn an_app_installed_while_meegone_was_closed_joins_the_end_with_a_dot() {
+        // APPS-06, APPS-07, APPS-18
+        let fakes = Fakes::default();
+        install(&fakes, &[("mail", "Mail"), ("phone", "Phone")]);
+        let layout = layout_store();
+        holder(&fakes, &layout);
+
+        install(
+            &fakes,
+            &[("atlas", "Atlas"), ("mail", "Mail"), ("phone", "Phone")],
+        );
+        let holder = holder(&fakes, &layout);
+
+        assert_eq!(labels(holder.state()), ["Mail", "Phone", "Atlas•"]);
+    }
+
+    #[test]
+    fn every_damaged_or_shortened_layout_still_shows_every_app() {
+        // REL-02: whatever happened to the file, MeeGone starts, shows each app once and
+        // replaces the file, so it can't fail the same way twice.
+        let fakes = Fakes::default();
+        *fakes.apps.profiles.lock().unwrap() = vec![meegone_core_data::Profile {
+            id: ProfileId(0),
+            work: false,
+            paused: false,
+            locked: false,
+        }];
+        install(&fakes, &[("mail", "Mail"), ("maps", "Maps"), ("go", "Go")]);
+        let (storage, layout) = storage_and_store();
+        layout
+            .save(&Layout {
+                entries: vec![
+                    LayoutEntry::Folder {
+                        id: FolderId(1),
+                        name: "Fun & games".into(),
+                        apps: vec![app_id("go"), app_id("chess")],
+                    },
+                    LayoutEntry::App(app_id("maps")),
+                    LayoutEntry::App(app_id("mail")),
+                ],
+                new: [app_id("mail")].into(),
+            })
+            .unwrap();
+        let bytes = storage.files.lock().unwrap()[&StoredFile::Layout].clone();
+
+        let mut damaged_files: Vec<Vec<u8>> =
+            (0..bytes.len()).map(|len| bytes[..len].to_vec()).collect();
+        for i in 0..bytes.len() {
+            for bit in 0..8 {
+                let mut damaged = bytes.clone();
+                damaged[i] ^= 1 << bit;
+                damaged_files.push(damaged);
+            }
+        }
+        for damaged in damaged_files {
+            storage
+                .files
+                .lock()
+                .unwrap()
+                .insert(StoredFile::Layout, damaged.clone());
+
+            let holder = holder(&fakes, &layout);
+
+            let mut shown = labels(holder.state())
+                .into_iter()
+                .map(|label| label.trim_end_matches('•').to_owned())
+                .collect::<Vec<_>>();
+            shown.sort();
+            assert_eq!(shown, ["Go", "Mail", "Maps"], "{damaged:?}");
+            assert!(
+                matches!(layout.load(), Ok(SavedLayout::Read(_))),
+                "{damaged:?}"
+            );
+        }
     }
 }

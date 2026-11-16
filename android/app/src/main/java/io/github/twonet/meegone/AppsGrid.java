@@ -9,6 +9,10 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.widget.ScrollView;
 import android.widget.Toast;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
 
 /**
  * The Applications view: every app in one grid that scrolls vertically, with no pages and no
@@ -26,24 +30,42 @@ import android.widget.Toast;
  * platform does (ANIM-23). Scrolling hands the gesture away from the carousel through {@link
  * #requestDisallowInterceptTouchEvent}, as {@link HomeViews} expects. A tap launches the app at
  * once (PERF-06), and a pressed icon shrinks (ANIM-10).
+ *
+ * <p>Each cell says where it was in the cells before, so its view, icon and all, moves to its
+ * new place instead of another app being drawn there (ADR 0012). As apps come and go, new cells
+ * grow and fade in, the views no cell took shrink away at their old places, and the others slide
+ * to their new ones, as far as the frame says (ANIM-21).
  */
 final class AppsGrid extends ScrollView {
     // The fields of one cell in nativeAppsCells, mirrored in cell_fields in src/android.rs.
-    private static final int CELL_FIELDS = 5;
+    private static final int CELL_FIELDS = 6;
     private static final int LABEL = 0;
     private static final int PACKAGE = 1;
     private static final int ACTIVITY = 2;
     private static final int PROFILE = 3;
     private static final int FLAGS = 4;
+    private static final int FROM = 5; // its place in the cells before, or -1 if it just joined
     // A cell's flags.
     private static final int IS_APP = 1;
     private static final int AVAILABLE = 2;
     private static final int WORK = 4;
+    private static final int NEW = 8;
+    private static final float WHOLE = 10_000f; // ten-thousandths
 
     private static final float MARGIN_DP = 16f;
     private static final int NONE = -1;
 
     private final Cells cells;
+    /** The cells' views, in order. They are the first of the grid's children. */
+    private final List<AppCell> shown = new ArrayList<>();
+    /** Each shown cell's place in the cells before, or {@link #NONE} if it just joined. */
+    private int[] from = new int[0];
+    /** Views of cells that left the grid, shrinking away after the shown ones (ANIM-21). */
+    private final List<AppCell> leaving = new ArrayList<>();
+    /** Each leaving view's place in the cells before. */
+    private int[] leftFrom = new int[0];
+    /** Every cell is in its place at full size, so frames at rest change nothing. */
+    private boolean settled = true;
     private final AppIcons icons;
     /** Reads the frame again and draws it, after a native call: {@code HomeViews.apply}. */
     private final Runnable redraw;
@@ -64,6 +86,7 @@ final class AppsGrid extends ScrollView {
     private int pressed = NONE;
     private int foreground;
     private int dim;
+    private int accent;
 
     AppsGrid(Context context, Runnable redraw) {
         super(context);
@@ -85,15 +108,17 @@ final class AppsGrid extends ScrollView {
 
     /**
      * Draws the frame's Applications slots. {@code pressedCell} is -1 unless a cell of this
-     * view is pressed, and {@code pressScale} its icon scale in ten-thousandths.
+     * view is pressed, and {@code pressScale} its icon scale in ten-thousandths. {@code accent}
+     * colours the dot of a new app (APPS-07).
      */
     void apply(int cellsRevision, int scrollPx, int columns, int rows, int pressedCell,
-            int pressScale, int foreground, int dim) {
-        if (foreground != this.foreground || dim != this.dim) {
+            int pressScale, int foreground, int dim, int accent) {
+        if (foreground != this.foreground || dim != this.dim || accent != this.accent) {
             this.foreground = foreground;
             this.dim = dim;
+            this.accent = accent;
             for (int i = 0; i < cells.getChildCount(); i++) {
-                cell(i).setColours(foreground, dim);
+                ((AppCell) cells.getChildAt(i)).setColours(foreground, dim, accent);
             }
         }
         if (!loaded || cellsRevision != revision) {
@@ -110,31 +135,117 @@ final class AppsGrid extends ScrollView {
         press(pressedCell, pressScale / 10_000f);
     }
 
-    /** Shows the cells in {@code fields}, reusing the cells already there. */
+    /**
+     * Shows the cells in {@code fields}. A cell that was there before keeps its view, so its
+     * icon goes with it; views that no cell takes start leaving (ANIM-21).
+     */
     private void bind(String[] fields) {
         int count = fields == null ? 0 : fields.length / CELL_FIELDS;
-        while (cells.getChildCount() > count) {
-            cells.removeViewAt(cells.getChildCount() - 1);
+        int[] places = new int[count];
+        boolean moved = count != shown.size();
+        for (int i = 0; i < count; i++) {
+            places[i] = parseInt(fields[i * CELL_FIELDS + FROM], NONE);
+            moved |= places[i] != i;
         }
-        while (cells.getChildCount() < count) {
-            AppCell cell = new AppCell(getContext(), this);
-            cell.setColours(foreground, dim);
-            cells.addView(cell);
+        // When every cell keeps its place, the cells were only refreshed, as when a new app's
+        // accent arrives just after it was installed. A change still playing carries on: each
+        // cell keeps where it came from, and views still leaving stay.
+        if (moved) {
+            // Views still leaving after an earlier change go at once.
+            dropLeaving();
+            rearrange(places);
         }
         for (int i = 0; i < count; i++) {
             int at = i * CELL_FIELDS;
-            int flags = parseInt(fields[at + FLAGS]);
+            int flags = parseInt(fields[at + FLAGS], 0);
             boolean app = (flags & IS_APP) != 0;
             cell(i).bind(i, orEmpty(fields[at + LABEL]),
                     app ? orEmpty(fields[at + PACKAGE]) : null,
                     orEmpty(fields[at + ACTIVITY]),
                     parseLong(fields[at + PROFILE]),
                     (flags & AVAILABLE) != 0,
-                    (flags & WORK) != 0);
+                    (flags & WORK) != 0,
+                    (flags & NEW) != 0);
         }
         // The new cells start at full size; the next frame says what is pressed.
         pressed = NONE;
+        settled = false;
         cells.requestLayout();
+    }
+
+    /**
+     * Puts the views in the cells' new order: the view of the cell each was before, or a new one
+     * for a cell that just joined. The views no cell took leave after them.
+     */
+    private void rearrange(int[] places) {
+        List<AppCell> before = new ArrayList<>(shown);
+        boolean[] taken = new boolean[before.size()];
+        shown.clear();
+        for (int i = 0; i < places.length; i++) {
+            int place = places[i];
+            if (place >= 0 && place < before.size() && !taken[place]) {
+                taken[place] = true;
+                shown.add(before.get(place));
+            } else {
+                places[i] = NONE;
+                AppCell cell = new AppCell(getContext(), this);
+                cell.setColours(foreground, dim, accent);
+                shown.add(cell);
+            }
+        }
+        from = places;
+        int left = 0;
+        leftFrom = new int[before.size()];
+        for (int place = 0; place < before.size(); place++) {
+            if (!taken[place]) {
+                AppCell cell = before.get(place);
+                cell.leave();
+                leaving.add(cell);
+                leftFrom[left++] = place;
+            }
+        }
+        cells.arrange(before);
+    }
+
+    private void dropLeaving() {
+        for (AppCell cell : leaving) {
+            cells.removeView(cell);
+        }
+        leaving.clear();
+        leftFrom = new int[0];
+    }
+
+    /**
+     * Draws the cells as apps come and go, from the frame's values in ten-thousandths (ANIM-21).
+     * Cells that just joined take the appearing scale and opacity, and those that left the
+     * leaving ones, at their old places. Every other cell is {@code shift} of the way from its
+     * old place to its new one. Leaving views go once they have faded out.
+     */
+    void move(int appearScale, int appearAlpha, int leaveScale, int leaveAlpha, int shift) {
+        boolean atRest = appearScale == WHOLE && appearAlpha == WHOLE && leaveAlpha <= 0
+                && shift == WHOLE;
+        if (settled && atRest) {
+            return;
+        }
+        float still = 1f - shift / WHOLE;
+        for (int i = 0; i < shown.size(); i++) {
+            AppCell cell = shown.get(i);
+            int place = i < from.length ? from[i] : i;
+            if (place == NONE) {
+                cell.setMotion(appearScale / WHOLE, appearAlpha / WHOLE, 0f, 0f);
+            } else {
+                cell.setMotion(1f, 1f, still * (cells.left(place) - cells.left(i)),
+                        still * (cells.top(place) - cells.top(i)));
+            }
+        }
+        if (leaveAlpha <= 0) {
+            dropLeaving();
+        } else {
+            for (AppCell cell : leaving) {
+                cell.setMotion(leaveScale / WHOLE, leaveAlpha / WHOLE, 0f, 0f);
+            }
+        }
+        settled = atRest;
     }
 
     /** Scrolls to a position the Rust app set, unless it is the one this grid reported. */
@@ -223,23 +334,23 @@ final class AppsGrid extends ScrollView {
 
     private void refreshIcons() {
         for (int i = 0; i < cells.getChildCount(); i++) {
-            cell(i).refreshIcon();
+            ((AppCell) cells.getChildAt(i)).refreshIcon();
         }
     }
 
     private AppCell cell(int index) {
-        return (AppCell) cells.getChildAt(index);
+        return shown.get(index);
     }
 
     private static String orEmpty(String text) {
         return text == null ? "" : text;
     }
 
-    private static int parseInt(String text) {
+    private static int parseInt(String text, int otherwise) {
         try {
             return Integer.parseInt(text);
         } catch (NumberFormatException e) {
-            return 0;
+            return otherwise;
         }
     }
 
@@ -255,6 +366,50 @@ final class AppsGrid extends ScrollView {
     private final class Cells extends ViewGroup {
         Cells(Context context) {
             super(context);
+        }
+
+        /**
+         * Makes the children the shown views, in order, then the leaving ones. Views that were
+         * children, {@code before}, are moved without leaving the window, so they keep their
+         * icons and state.
+         */
+        void arrange(List<AppCell> before) {
+            Set<View> children = new HashSet<>(before);
+            detachAllViewsFromParent();
+            int index = 0;
+            for (AppCell view : shown) {
+                put(view, index++, children);
+            }
+            for (AppCell view : leaving) {
+                put(view, index++, children);
+            }
+            requestLayout();
+            invalidate();
+        }
+
+        private void put(View view, int index, Set<View> children) {
+            if (children.contains(view)) {
+                attachViewToParent(view, index, view.getLayoutParams());
+            } else {
+                addViewInLayout(view, index, generateDefaultLayoutParams(), true);
+            }
+        }
+
+        /** The column cell {@code index} is drawn in, from the left: mirrored right to left. */
+        private int column(int index) {
+            int column = index % columns;
+            return getLayoutDirection() == LAYOUT_DIRECTION_RTL ? columns - 1 - column : column;
+        }
+
+        /** Where cell {@code index} starts, from this view's left, in px. */
+        int left(int index) {
+            // Spread the leftover pixels, so the cells fill the width exactly.
+            return getWidth() * column(index) / columns;
+        }
+
+        /** Where cell {@code index} starts, from this view's top, in px. */
+        int top(int index) {
+            return index / columns * rowPx;
         }
 
         @Override
@@ -275,23 +430,25 @@ final class AppsGrid extends ScrollView {
             for (int i = 0; i < getChildCount(); i++) {
                 getChildAt(i).measure(cellWidth, cellHeight);
             }
-            int rowCount = Math.max(rows, (getChildCount() + columns - 1) / columns + 1);
+            int rowCount = Math.max(rows, (shown.size() + columns - 1) / columns + 1);
             setMeasuredDimension(width, rowCount * rowPx);
         }
 
         @Override
         protected void onLayout(boolean changed, int left, int top, int right, int bottom) {
-            int width = right - left;
-            boolean rtl = getLayoutDirection() == LAYOUT_DIRECTION_RTL;
-            for (int i = 0; i < getChildCount(); i++) {
-                int row = i / columns;
-                int column = rtl ? columns - 1 - i % columns : i % columns;
-                // Spread the leftover pixels, so the cells fill the width exactly.
-                int cellLeft = width * column / columns;
-                int cellRight = width * (column + 1) / columns;
-                View cell = getChildAt(i);
-                cell.layout(cellLeft, row * rowPx, cellRight, (row + 1) * rowPx);
+            for (int i = 0; i < shown.size(); i++) {
+                place(shown.get(i), i, right - left);
             }
+            // Leaving views stay where they were until they have faded out (ANIM-21).
+            for (int i = 0; i < leaving.size(); i++) {
+                place(leaving.get(i), leftFrom[i], right - left);
+            }
+        }
+
+        private void place(View cell, int index, int width) {
+            int column = column(index);
+            cell.layout(width * column / columns, top(index), width * (column + 1) / columns,
+                    top(index) + rowPx);
         }
     }
 

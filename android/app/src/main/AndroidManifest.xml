@@ -3,12 +3,21 @@
      the system dialog (HOME-01). -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- Applications lists every app with a launcher entry (APPS-01). From Android 11, other
-         apps are hidden from MeeGone unless it declares this. It is not a permission (SEC-03). -->
+    <!-- Applications lists every app with a launcher entry (APPS-01), and the first grid puts
+         the default browser and camera first (APPS-05). From Android 11, other apps are hidden
+         from MeeGone unless it declares them here. It is not a permission (SEC-03). -->
     <queries>
         <intent>
             <action android:name="android.intent.action.MAIN" />
             <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <category android:name="android.intent.category.BROWSABLE" />
+            <data android:scheme="https" />
+        </intent>
+        <intent>
+            <action android:name="android.media.action.STILL_IMAGE_CAMERA" />
         </intent>
     </queries>
 

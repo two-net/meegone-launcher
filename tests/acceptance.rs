@@ -4,7 +4,8 @@
 //! Not automated yet, because the behaviour isn't built:
 //! - AC-01: first-run setup (#35)
 //! - AC-05's open folder, AC-08: folders (#14)
-//! - AC-07, AC-09: edit mode and a persisted layout (#13, #11)
+//! - AC-07's drag and AC-09: edit mode (#13). AC-07's other half, the layout surviving a
+//!   restart, is automated.
 //! - AC-12: Clear in Events (#20)
 //! - AC-13, AC-14: Recent density and close mode (#23, #24)
 //! - AC-15 to AC-17: the daily image (#27 to #30)
@@ -16,8 +17,9 @@
 use std::time::Duration;
 
 use meegone_core_data::fakes::{Fakes, WORK_PROFILE, app, app_id, work_app};
+use meegone_core_data::storage::format::seal;
 use meegone_core_data::{
-    App, DataError, HomeTarget, Notification, Profile, ProfileId, RecentUse, Rect, Rgb,
+    App, DataError, HomeTarget, Notification, Profile, ProfileId, RecentUse, Rect, Rgb, StoredFile,
     ThemeChoice, accent,
 };
 use meegone_core_state::{Access, Health, Theme};
@@ -477,15 +479,332 @@ fn ac06_with_theme_light_the_app_stays_light_when_the_device_turns_dark() {
 
 #[test]
 fn ac10_a_newly_installed_app_appears_at_the_end_of_the_grid() {
+    // Issue #11: APPS-06, APPS-07, ANIM-21. It scales and fades in, with a dot.
     let fakes = Fakes::default();
     *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail"), app("phone", "Phone")];
-    let mut launcher = Launcher::start(fakes.platform());
+    let (mut launcher, mut clock) = on_a_phone(&fakes);
     assert_eq!(grid(&launcher), ["Mail", "Phone"]);
+    assert_eq!(dots(&mut launcher), [false, false]);
 
     fakes.apps.apps.lock().unwrap().push(app("atlas", "Atlas"));
     launcher.dispatch(ShellIntent::AppsChanged);
 
     assert_eq!(grid(&launcher), ["Mail", "Phone", "Atlas"]);
+    let change = launcher.frame().grid_change;
+    assert_eq!((change.appear_scale, change.appear_alpha), (5_000, 0));
+    assert_eq!(dots(&mut launcher), [false, false, true]);
+    // The host draws Atlas as the cell that joined; Mail and Phone keep their places.
+    assert_eq!(froms(&mut launcher), [Some(0), Some(1), None]);
+    come_to_rest(&mut launcher, &mut clock);
+    let change = launcher.frame().grid_change;
+    assert_eq!((change.appear_scale, change.appear_alpha), (10_000, 10_000));
+}
+
+/// Whether each cell the host draws carries the new-app dot (APPS-07).
+fn dots(launcher: &mut Launcher) -> Vec<bool> {
+    launcher.frame();
+    launcher
+        .view()
+        .apps()
+        .cells()
+        .map(|cell| cell.new)
+        .collect()
+}
+
+/// Where each cell the host draws was in the cells before (ANIM-21).
+fn froms(launcher: &mut Launcher) -> Vec<Option<usize>> {
+    launcher.frame();
+    launcher
+        .view()
+        .apps()
+        .cells()
+        .map(|cell| cell.from)
+        .collect()
+}
+
+/// A layout saved in today's format, as the user arranged it.
+fn saved_layout(fakes: &Fakes, records: &str) {
+    fakes
+        .storage
+        .files
+        .lock()
+        .unwrap()
+        .insert(StoredFile::Layout, seal("layout", 2, records));
+}
+
+#[test]
+fn ac07_given_maps_was_moved_to_the_first_cell_after_a_restart_it_is_still_first() {
+    // Issue #11: APPS-18. Moving it takes edit mode (#13); here the user's arrangement is
+    // saved as edit mode will save it.
+    let fakes = Fakes::default();
+    *fakes.apps.apps.lock().unwrap() = vec![
+        app("camera", "Camera"),
+        app("mail", "Mail"),
+        app("maps", "Maps"),
+    ];
+    let launcher = Launcher::start(fakes.platform());
+    assert_eq!(grid(&launcher), ["Camera", "Mail", "Maps"]);
+    drop(launcher);
+    saved_layout(
+        &fakes,
+        "app 0 maps maps.Main\napp 0 camera camera.Main\napp 0 mail mail.Main\n",
+    );
+
+    let restarted = Launcher::start(fakes.platform());
+
+    assert_eq!(grid(&restarted), ["Maps", "Camera", "Mail"]);
+}
+
+#[test]
+fn apps06_given_an_app_installed_while_meegone_wasnt_running_it_is_at_the_end() {
+    // Issue #11: APPS-06, APPS-07, APPS-18. It keeps its dot until it is opened, and that
+    // too survives a restart.
+    let fakes = Fakes::default();
+    *fakes.apps.apps.lock().unwrap() = vec![app("phone", "Phone"), app("mail", "Mail")];
+    drop(Launcher::start(fakes.platform()));
+
+    fakes.apps.apps.lock().unwrap().push(app("atlas", "Atlas"));
+    let mut launcher = Launcher::start(fakes.platform());
+
+    assert_eq!(grid(&launcher), ["Mail", "Phone", "Atlas"]);
+    assert_eq!(dots(&mut launcher), [false, false, true]);
+    // Starting shows the grid as it is: nothing moves (ANIM-21).
+    assert!(!launcher.frame().animating);
+
+    let revision = launcher.frame().apps.revision;
+    assert!(
+        launcher
+            .view()
+            .apps()
+            .cell_tapped(revision, 2, Rect::default())
+    );
+    launcher.frame();
+    assert_eq!(*fakes.apps.launched.lock().unwrap(), [app_id("atlas")]);
+    assert_eq!(dots(&mut launcher), [false, false, false]);
+    drop(launcher);
+
+    let mut restarted = Launcher::start(fakes.platform());
+    assert_eq!(dots(&mut restarted), [false, false, false]);
+}
+
+#[test]
+fn rel02_given_an_unreadable_layout_meegone_shows_an_alphabetical_grid_and_doesnt_crash() {
+    // Issue #11: REL-02, MAINT-04. The rebuilt layout replaces the file at once.
+    let fakes = Fakes::default();
+    *fakes.apps.apps.lock().unwrap() = vec![
+        app("zoom", "Zoom"),
+        app("mail", "Mail"),
+        app("atlas", "Atlas"),
+    ];
+    fakes
+        .storage
+        .files
+        .lock()
+        .unwrap()
+        .insert(StoredFile::Layout, b"\xff\x00 not a layout".to_vec());
+
+    let mut launcher = Launcher::start(fakes.platform());
+
+    assert_eq!(*launcher.shell().apps().health(), Health::Ready);
+    assert_eq!(grid(&launcher), ["Atlas", "Mail", "Zoom"]);
+    assert_eq!(dots(&mut launcher), [false, false, false]);
+    let stored = fakes.storage.stored_text();
+    assert!(stored.starts_with("meegone-layout 2\n"), "{stored}");
+    drop(launcher);
+    assert_eq!(
+        grid(&Launcher::start(fakes.platform())),
+        ["Atlas", "Mail", "Zoom"]
+    );
+}
+
+#[test]
+fn rel02_a_partly_damaged_layout_keeps_what_can_be_recovered() {
+    // Issue #11: REL-02. The record after Zoom's was damaged; Zoom stays first and the rest
+    // is rebuilt alphabetically.
+    let fakes = Fakes::default();
+    *fakes.apps.apps.lock().unwrap() = vec![
+        app("zoom", "Zoom"),
+        app("mail", "Mail"),
+        app("atlas", "Atlas"),
+    ];
+    let mut damaged = seal(
+        "layout",
+        2,
+        "app 0 zoom zoom.Main\napp 0 mail mail.Main\napp 0 atlas atlas.Main\n",
+    );
+    let mail = String::from_utf8_lossy(&damaged)
+        .find("app 0 mail")
+        .unwrap();
+    damaged[mail] = b'?';
+    fakes
+        .storage
+        .files
+        .lock()
+        .unwrap()
+        .insert(StoredFile::Layout, damaged);
+
+    let launcher = Launcher::start(fakes.platform());
+
+    assert_eq!(grid(&launcher), ["Zoom", "Atlas", "Mail"]);
+}
+
+#[test]
+fn apps08_an_uninstalled_app_leaves_its_folder_and_the_grid_closes_up() {
+    // Issue #11: APPS-08, FOLD-06, ANIM-21. Go leaves the games folder, which turns back into
+    // Chess; Maps leaves the grid, and Phone slides into its place.
+    let fakes = Fakes::default();
+    *fakes.apps.apps.lock().unwrap() = vec![
+        app("chess", "Chess"),
+        app("go", "Go"),
+        app("maps", "Maps"),
+        app("phone", "Phone"),
+    ];
+    saved_layout(
+        &fakes,
+        "folder 1 Games 2 0 chess chess.Main 0 go go.Main\n\
+         app 0 maps maps.Main\napp 0 phone phone.Main\n",
+    );
+    let (mut launcher, mut clock) = on_a_phone(&fakes);
+    assert_eq!(grid(&launcher), ["Games", "Maps", "Phone"]);
+    launcher.frame();
+
+    fakes
+        .apps
+        .apps
+        .lock()
+        .unwrap()
+        .retain(|app| !["go", "maps"].contains(&app.id.package.as_str()));
+    launcher.dispatch(ShellIntent::AppsChanged);
+
+    assert_eq!(grid(&launcher), ["Chess", "Phone"]);
+    // Games and Maps leave, shrinking; Chess joins; Phone moves up from the third cell.
+    assert_eq!(froms(&mut launcher), [None, Some(2)]);
+    let change = launcher.frame().grid_change;
+    assert_eq!(
+        (change.leave_scale, change.leave_alpha, change.shift),
+        (10_000, 10_000, 0)
+    );
+    come_to_rest(&mut launcher, &mut clock);
+    let change = launcher.frame().grid_change;
+    assert_eq!(
+        (change.leave_scale, change.leave_alpha, change.shift),
+        (5_000, 0, 10_000)
+    );
+    assert!(clock <= 208, "{clock} ms");
+}
+
+#[test]
+fn apps08_an_updated_app_gets_its_new_label_without_moving() {
+    // Issue #11: APPS-08. Also when the update renames its launcher activity.
+    let fakes = Fakes::default();
+    *fakes.apps.apps.lock().unwrap() = vec![
+        app("mail", "Mail"),
+        app("maps", "Maps"),
+        app("phone", "Phone"),
+    ];
+    let mut launcher = Launcher::start(fakes.platform());
+
+    {
+        let mut apps = fakes.apps.apps.lock().unwrap();
+        apps[0].label = "Email".into();
+        apps[1].id.activity = "maps.Start".into();
+        apps[1].label = "Maps Go".into();
+    }
+    launcher.dispatch(ShellIntent::AppsChanged);
+
+    assert_eq!(grid(&launcher), ["Email", "Maps Go", "Phone"]);
+    assert_eq!(dots(&mut launcher), [false, false, false]);
+    drop(launcher);
+    assert_eq!(
+        grid(&Launcher::start(fakes.platform())),
+        ["Email", "Maps Go", "Phone"]
+    );
+}
+
+#[test]
+fn apps05_the_first_start_puts_the_default_phone_messaging_browser_and_camera_first() {
+    // Issue #11: APPS-04, APPS-05. A tablet without a phone app leaves it out.
+    let fakes = Fakes::default();
+    *fakes.apps.apps.lock().unwrap() = vec![
+        app("atlas", "Atlas"),
+        app("browser", "Browser"),
+        app("camera", "Camera"),
+        app("messages", "Messages"),
+        app("zoom", "Zoom"),
+    ];
+    *fakes.apps.default_apps.lock().unwrap() =
+        vec!["messages".into(), "browser".into(), "camera".into()];
+
+    let launcher = Launcher::start(fakes.platform());
+
+    assert_eq!(
+        grid(&launcher),
+        ["Messages", "Browser", "Camera", "Atlas", "Zoom"]
+    );
+}
+
+#[test]
+fn l10n04_apps_are_sorted_in_the_locales_alphabetical_order() {
+    // Issue #11: L10N-04. The platform's collation keys decide: here, a locale that sorts
+    // "Ö" after "Z", as Swedish does, and ignores the accent of "Él".
+    let fakes = Fakes::default();
+    let with_key = |package: &str, label: &str, key: &[u8]| App {
+        sort_key: key.to_vec(),
+        ..app(package, label)
+    };
+    *fakes.apps.apps.lock().unwrap() = vec![
+        with_key("orter", "Örter", b"z\x01"),
+        with_key("zoom", "Zoom", b"z"),
+        with_key("el", "Él", b"el"),
+        with_key("atlas", "Atlas", b"atlas"),
+    ];
+
+    let launcher = Launcher::start(fakes.platform());
+
+    assert_eq!(grid(&launcher), ["Atlas", "Él", "Zoom", "Örter"]);
+}
+
+#[test]
+fn apps18_a_locked_work_profile_keeps_its_apps_places_until_it_unlocks() {
+    // Issue #11: APPS-18. After a restart, a work profile with its own lock lists no apps.
+    let fakes = Fakes::default();
+    let work_profile = |locked| {
+        *fakes.apps.profiles.lock().unwrap() = vec![
+            Profile {
+                id: ProfileId(0),
+                work: false,
+                paused: false,
+                locked: false,
+            },
+            Profile {
+                id: WORK_PROFILE,
+                work: true,
+                paused: false,
+                locked,
+            },
+        ];
+    };
+    work_profile(false);
+    *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail"), work_app("docs", "Docs")];
+    saved_layout(&fakes, "app 10 docs docs.Main\napp 0 mail mail.Main\n");
+    drop(Launcher::start(fakes.platform()));
+
+    work_profile(true);
+    fakes.apps.apps.lock().unwrap().retain(|app| !app.work);
+    let mut launcher = Launcher::start(fakes.platform());
+    assert_eq!(grid(&launcher), ["Mail"]);
+
+    work_profile(false);
+    fakes
+        .apps
+        .apps
+        .lock()
+        .unwrap()
+        .push(work_app("docs", "Docs"));
+    launcher.dispatch(ShellIntent::AppsChanged);
+
+    assert_eq!(grid(&launcher), ["Docs", "Mail"]);
+    assert_eq!(dots(&mut launcher), [false, false]);
 }
 
 #[test]
@@ -549,11 +868,13 @@ fn with_a_work_profile(fakes: &Fakes, paused: bool) {
             id: ProfileId(0),
             work: false,
             paused: false,
+            locked: false,
         },
         Profile {
             id: WORK_PROFILE,
             work: true,
             paused,
+            locked: false,
         },
     ];
 }

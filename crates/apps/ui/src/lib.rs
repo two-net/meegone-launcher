@@ -3,11 +3,12 @@
 //! Android's views draw the grid (ADR 0006, ADR 0010). Each frame, [`AppsView::frame`] tells the
 //! host the grid's columns, rows and scroll position, and a revision that changes whenever the
 //! cells do. The host then reads the [`AppsView::cells`] it draws, and refers to a cell by its
-//! place in them.
+//! place in them. Each cell says where it was in the cells before, so the host moves the same
+//! view, icon and all, to its new place (ANIM-21, ADR 0012).
 
 use std::sync::Arc;
 
-use meegone_apps_state::{AppsIntent, AppsState, FolderId, GridItem, GridLayout};
+use meegone_apps_state::{AppsIntent, AppsState, FolderId, GridItem, GridLayout, previous_places};
 use meegone_core_state::{AppId, Rect};
 use meegone_core_ui::{Dispatch, Tokens, View};
 
@@ -36,12 +37,19 @@ pub struct Cell<'a> {
     pub available: bool,
     /// In a work profile: its name says so (APPS-20, A11Y-01).
     pub work: bool,
+    /// Installed since the grid was set up and not opened yet: it carries a dot (APPS-07).
+    pub new: bool,
+    /// Its place in the cells of the revision before, or `None` if it just joined the grid. The
+    /// host moves it from there, and the cells no one came from leave (ANIM-21).
+    pub from: Option<usize>,
 }
 
 pub struct AppsView {
     dispatch: Dispatch<AppsIntent>,
     /// The cells the host was last told about: the snapshot it draws (ARCH-06).
     cells: Arc<[GridItem]>,
+    /// Where each of `cells` was in the cells before them.
+    from: Vec<Option<usize>>,
     revision: u32,
 }
 
@@ -50,13 +58,16 @@ impl AppsView {
         Self {
             dispatch,
             cells: Arc::new([]),
+            from: Vec::new(),
             revision: 0,
         }
     }
 
-    /// What the host draws for the grid now. Takes on the state's cells if they changed.
+    /// What the host draws for the grid now. Takes on the state's cells if they changed, and
+    /// where each was in the cells the host drew before.
     pub fn frame(&mut self, state: &AppsState) -> AppsFrame {
         if !Arc::ptr_eq(&self.cells, &state.items) {
+            self.from = previous_places(&self.cells, &state.items);
             self.cells = Arc::clone(&state.items);
             self.revision = self.revision.wrapping_add(1);
         }
@@ -70,20 +81,27 @@ impl AppsView {
 
     /// The cells of the last [`AppsView::frame`], in order.
     pub fn cells(&self) -> impl ExactSizeIterator<Item = Cell<'_>> {
-        self.cells.iter().map(|item| match item {
-            GridItem::App(app) => Cell {
-                label: &app.label,
-                app: Some(&app.id),
-                available: app.available,
-                work: app.work,
-            },
-            GridItem::Folder { name, .. } => Cell {
-                label: name,
-                app: None,
-                available: true,
-                work: false,
-            },
-        })
+        self.cells
+            .iter()
+            .zip(&self.from)
+            .map(|(item, from)| match item {
+                GridItem::App { app, new } => Cell {
+                    label: &app.label,
+                    app: Some(&app.id),
+                    available: app.available,
+                    work: app.work,
+                    new: *new,
+                    from: *from,
+                },
+                GridItem::Folder { name, .. } => Cell {
+                    label: name,
+                    app: None,
+                    available: true,
+                    work: false,
+                    new: false,
+                    from: *from,
+                },
+            })
     }
 
     /// Cell `index` of the cells at `revision` was tapped. Its icon is at `from` on the screen,
@@ -94,7 +112,7 @@ impl AppsView {
             return false;
         }
         match self.cells.get(index) {
-            Some(GridItem::App(app)) => {
+            Some(GridItem::App { app, .. }) => {
                 self.icon_tapped(app.id.clone(), Some(from));
                 true
             }
@@ -158,12 +176,17 @@ mod tests {
                 activity: format!("{package}.Main"),
             },
             label: label.into(),
+            sort_key: label.to_lowercase().into_bytes(),
             accent: Rgb::hex(0x808080),
             available,
             work,
             can_uninstall: true,
             installed_at_ms: 0,
         }
+    }
+
+    fn cell(app: App) -> GridItem {
+        GridItem::App { app, new: false }
     }
 
     fn view() -> (AppsView, Rc<RefCell<Vec<AppsIntent>>>) {
@@ -192,7 +215,7 @@ mod tests {
     #[test]
     fn the_revision_changes_only_with_the_cells() {
         let (mut view, _) = view();
-        let mut apps = state(vec![GridItem::App(app("mail", "Mail", true, false))]);
+        let mut apps = state(vec![cell(app("mail", "Mail", true, false))]);
 
         let first = view.frame(&apps).revision;
         assert_eq!(view.frame(&apps).revision, first);
@@ -201,7 +224,7 @@ mod tests {
         let frame = view.frame(&apps);
         assert_eq!((frame.revision, frame.scroll_px), (first, 640));
 
-        apps.items = vec![GridItem::App(app("maps", "Maps", true, false))].into();
+        apps.items = vec![cell(app("maps", "Maps", true, false))].into();
         assert_ne!(view.frame(&apps).revision, first);
     }
 
@@ -210,7 +233,7 @@ mod tests {
         // APPS-02, HOME-14
         let (mut view, _) = view();
         let items = (0..9)
-            .map(|i| GridItem::App(app(&format!("app{i}"), "App", true, false)))
+            .map(|i| cell(app(&format!("app{i}"), "App", true, false)))
             .collect();
         let apps = AppsState {
             columns: 5,
@@ -228,7 +251,10 @@ mod tests {
         let (mut view, _) = view();
         let paused = app("mail", "Mail", false, true);
         view.frame(&state(vec![
-            GridItem::App(paused.clone()),
+            GridItem::App {
+                app: paused.clone(),
+                new: true,
+            },
             GridItem::Folder {
                 id: FolderId(1),
                 name: "Games".into(),
@@ -246,12 +272,16 @@ mod tests {
                     app: Some(&paused.id),
                     available: false,
                     work: true,
+                    new: true,
+                    from: None,
                 },
                 Cell {
                     label: "Games",
                     app: None,
                     available: true,
                     work: false,
+                    new: false,
+                    from: None,
                 },
             ]
         );
@@ -269,7 +299,7 @@ mod tests {
                     name: "Games".into(),
                     apps: Vec::new(),
                 },
-                GridItem::App(mail.clone()),
+                cell(mail.clone()),
             ]))
             .revision;
 
@@ -291,16 +321,40 @@ mod tests {
         // The grid changed under the finger: the tap can't know what it meant.
         let (mut view, sent) = view();
         let old = view
-            .frame(&state(vec![GridItem::App(app(
-                "mail", "Mail", true, false,
-            ))]))
+            .frame(&state(vec![cell(app("mail", "Mail", true, false))]))
             .revision;
-        view.frame(&state(vec![GridItem::App(app(
-            "maps", "Maps", true, false,
-        ))]));
+        view.frame(&state(vec![cell(app("maps", "Maps", true, false))]));
 
         assert!(!view.cell_tapped(old, 0, ICON));
         assert!(sent.borrow().is_empty());
+    }
+
+    #[test]
+    fn each_cell_says_where_it_was_in_the_cells_the_host_drew_before() {
+        // ANIM-21: Maps was removed, Atlas installed; Phone moves up a place.
+        let (mut view, _) = view();
+        let mail = app("mail", "Mail", true, false);
+        let maps = app("maps", "Maps", true, false);
+        let phone = app("phone", "Phone", true, false);
+        let atlas = app("atlas", "Atlas", true, false);
+        view.frame(&state(vec![
+            cell(mail.clone()),
+            cell(maps),
+            cell(phone.clone()),
+        ]));
+        let from = |view: &AppsView| view.cells().map(|cell| cell.from).collect::<Vec<_>>();
+        assert_eq!(from(&view), [None, None, None]);
+
+        let mut after = state(vec![cell(mail.clone()), cell(phone.clone()), cell(atlas)]);
+        view.frame(&after);
+        assert_eq!(from(&view), [Some(0), Some(2), None]);
+
+        // A new snapshot of the same cells moves none of them.
+        after.items = vec![cell(mail), cell(phone)].into();
+        view.frame(&after);
+        assert_eq!(from(&view), [Some(0), Some(1)]);
+        view.frame(&after);
+        assert_eq!(from(&view), [Some(0), Some(1)]);
     }
 
     #[test]

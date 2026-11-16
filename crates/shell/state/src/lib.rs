@@ -1,10 +1,11 @@
 //! Home shell state (SRS 4.1): the carousel of views, the home menu, Home and Back, coming back
-//! to the home, the icon press, and the theme.
+//! to the home, the icon press, the grid's motion as apps come and go, and the theme.
 //!
 //! [`HomeShell::compose`] is the only place features are put together (ARCH-03). Each feature
 //! runs in its own [`Store`], so a failing feature never takes down the shell (ARCH-09).
 
 mod carousel;
+mod grid_change;
 mod home_menu;
 mod press;
 mod return_home;
@@ -13,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use meegone_apps_data::PersistentLayoutStore;
-use meegone_apps_state::{AppsHolder, AppsIntent};
+use meegone_apps_state::{AppsHolder, AppsIntent, cells_came_or_went};
 use meegone_core_data::{
     HomeTarget, PersistentSettingsStore, Platform, SettingsStore, SystemConfigAdapter,
 };
@@ -26,6 +27,8 @@ use meegone_settings_state::{SettingsHolder, SettingsIntent, SettingsState};
 
 use carousel::{Carousel, Release};
 pub use carousel::{CarouselState, Layout, PointerEvent, PointerKind};
+use grid_change::GridChange;
+pub use grid_change::GridChangeState;
 pub use home_menu::{HomeMenu, MenuItem};
 pub use meegone_settings_state::SettingsGroup;
 use press::Press;
@@ -103,6 +106,8 @@ pub struct ShellState {
     pub return_home: ReturnHomeState,
     /// The item of the current view under the finger, which shrinks while pressed (ANIM-10).
     pub press: PressState,
+    /// How far the Applications grid has come in showing apps that came and went (ANIM-21).
+    pub grid_change: GridChangeState,
 }
 
 impl ShellState {
@@ -210,6 +215,7 @@ pub struct HomeShell {
     carousel: Carousel,
     return_home: ReturnHome,
     press: Press,
+    grid_change: GridChange,
     theme: Store<ThemeHolder>,
     apps: Store<AppsHolder>,
     events: Store<EventsHolder>,
@@ -230,6 +236,7 @@ impl HomeShell {
             carousel: Carousel::new(true, 1.0),
             return_home: ReturnHome::default(),
             press: Press::default(),
+            grid_change: GridChange::default(),
             theme: Store::new(ThemeHolder::new(
                 settings_store.clone(),
                 platform.system.clone(),
@@ -356,6 +363,7 @@ impl HomeShell {
                 self.carousel.frame(at);
                 self.return_home.frame(at);
                 self.press.frame(at);
+                self.grid_change.frame(at);
             }
             ShellIntent::Press { item, at } => self.press_item(item, at),
             ShellIntent::Release(at) => {
@@ -376,10 +384,7 @@ impl HomeShell {
             ShellIntent::Returned { home } => self.returned(home),
             ShellIntent::Restore(saved) => self.restore(saved),
             ShellIntent::SystemThemeChanged => self.theme.dispatch(ThemeIntent::Refresh),
-            ShellIntent::AppsChanged => {
-                self.apps.dispatch(AppsIntent::Refresh);
-                self.recent.dispatch(RecentIntent::Refresh);
-            }
+            ShellIntent::AppsChanged => self.apps_changed(),
             ShellIntent::NotificationsChanged => self.events.dispatch(EventsIntent::Refresh),
             ShellIntent::Apps(intent) => self.apps.dispatch(intent),
             ShellIntent::Events(intent) => self.events.dispatch(intent),
@@ -396,6 +401,20 @@ impl HomeShell {
         self.state.carousel = self.carousel.state();
         self.state.return_home = self.return_home.state();
         self.state.press = self.press.state();
+        self.state.grid_change = self.grid_change.state();
+    }
+
+    /// APPS-06, APPS-08: the grid and Recent take on the system's change. If apps came or went,
+    /// the grid moves to its new cells (ANIM-21).
+    fn apps_changed(&mut self) {
+        let before = self.apps.state();
+        self.apps.dispatch(AppsIntent::Refresh);
+        self.recent.dispatch(RecentIntent::Refresh);
+        if cells_came_or_went(&before.items, &self.apps.state().items) {
+            // A pressed item is named by its place, which may now hold another cell (ANIM-10).
+            self.press.finish();
+            self.grid_change.start(self.carousel.animation_scale());
+        }
     }
 
     /// Takes on the wrap-around setting and the system animation speed, which the carousel
@@ -634,6 +653,7 @@ mod tests {
                     name: "Folder".into(),
                     apps: vec![app_id("maps"), app_id("mail")],
                 }],
+                ..SavedLayout::default()
             })
             .unwrap();
         let shell = HomeShell::compose(fakes.platform());
@@ -771,8 +791,41 @@ mod tests {
 
         assert!(matches!(
             &shell.apps().state().items[..],
-            [GridItem::App(app)] if app.label == "Maps"
+            [GridItem::App { app, .. }] if app.label == "Maps"
         ));
+    }
+
+    #[test]
+    fn apps_coming_or_going_move_the_grid_and_nothing_else_does() {
+        // ANIM-21: the start's grid and an update's new label appear as they are.
+        let fakes = Fakes::default();
+        *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail"), app("maps", "Maps")];
+        let mut shell = HomeShell::compose(fakes.platform());
+        assert!(!shell.state().grid_change.animating);
+
+        fakes.apps.apps.lock().unwrap()[0].label = "Email".into();
+        shell.dispatch(ShellIntent::AppsChanged);
+        assert!(!shell.state().grid_change.animating);
+
+        shell.dispatch(ShellIntent::Press {
+            item: 1,
+            at: ms(1_000),
+        });
+        fakes.apps.apps.lock().unwrap().remove(0);
+        shell.dispatch(ShellIntent::AppsChanged);
+        let change = shell.state().grid_change;
+        assert!(change.animating);
+        assert_eq!((change.leave_alpha, change.shift), (1.0, 0.0));
+        // The pressed place now holds another cell, so nothing stays pressed (ANIM-10).
+        assert_eq!(shell.state().press.item, None);
+
+        let mut at = 2_000;
+        shell.dispatch(ShellIntent::Frame(ms(at)));
+        while shell.state().grid_change.animating {
+            at += 8;
+            shell.dispatch(ShellIntent::Frame(ms(at)));
+        }
+        assert_eq!(at, 2_200);
     }
 
     #[test]
@@ -811,6 +864,10 @@ mod tests {
 
         fn profiles(&self) -> Result<Vec<Profile>, DataError> {
             self.0.profiles()
+        }
+
+        fn default_apps(&self) -> Vec<String> {
+            self.0.default_apps()
         }
 
         fn launch(&self, _app: &AppId, _from: Option<Rect>) -> Result<(), DataError> {

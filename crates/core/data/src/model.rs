@@ -14,6 +14,10 @@ pub struct Profile {
     pub work: bool,
     /// Its apps are shown dimmed while it is paused (APPS-09).
     pub paused: bool,
+    /// Locked until the user unlocks it, such as a work profile with its own lock after a
+    /// restart. The system lists none of its apps meanwhile, so the layout keeps their places
+    /// (APPS-18).
+    pub locked: bool,
 }
 
 /// Identifies one launchable app: its profile, package and launcher activity.
@@ -49,6 +53,10 @@ impl Rgb {
 pub struct App {
     pub id: AppId,
     pub label: String,
+    /// The label's collation key in the device's locale: comparing keys byte by byte follows the
+    /// locale's alphabetical order, ignoring case and accents (L10N-04). The platform makes it,
+    /// because only it knows the locale's rules.
+    pub sort_key: Vec<u8>,
     /// Derived once from the icon and reused in Events and Recent (APPS-17).
     pub accent: Rgb,
     /// False while the profile is paused, the app is suspended or its storage is missing
@@ -58,6 +66,8 @@ pub struct App {
     pub work: bool,
     /// False for apps the user can't uninstall, which show no ✕ in edit mode (APPS-13).
     pub can_uninstall: bool,
+    /// When the app was first installed, in milliseconds since the Unix epoch. Apps that are new
+    /// to the grid join its end in this order (APPS-06).
     pub installed_at_ms: u64,
 }
 

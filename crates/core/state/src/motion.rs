@@ -115,6 +115,9 @@ pub const REST_SPEED_PX: f64 = 30.0;
 pub const RETURN_HOME_FROM_SCALE: f64 = 0.94;
 /// ANIM-10
 pub const ICON_PRESS_SCALE: f64 = 0.92;
+/// ANIM-21: a new icon grows from this scale as it fades in, and a removed one shrinks to it as
+/// it fades out.
+pub const APP_INSTALL_REMOVE_SCALE: f64 = 0.5;
 /// ANIM-12
 pub const MODE_SCALE: f64 = 0.92;
 /// ANIM-13

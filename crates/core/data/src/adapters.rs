@@ -28,6 +28,9 @@ pub trait AppsAdapter: Send + Sync {
     fn launchable_apps(&self) -> Result<Vec<App>, DataError>;
     /// Every profile that holds apps, such as personal and work (APPS-09, APPS-20).
     fn profiles(&self) -> Result<Vec<Profile>, DataError>;
+    /// The packages of the default phone, messaging, browser and camera apps, in that order,
+    /// leaving out any the system doesn't identify (APPS-05).
+    fn default_apps(&self) -> Vec<String>;
     /// Starts or resumes an app (APPS-10, REC-06). Its window grows from `from`, the tapped icon
     /// or card, with the platform's launch-from-bounds transition (ANIM-08).
     ///

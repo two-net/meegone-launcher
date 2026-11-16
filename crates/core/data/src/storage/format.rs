@@ -66,14 +66,72 @@ pub fn decode<F: Format>(bytes: &[u8]) -> Option<F> {
     input.is_done().then_some(value)
 }
 
+/// What a store's file holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stored<F> {
+    /// Nothing has been saved yet.
+    Missing,
+    Read(F),
+    /// The file is damaged, cut short, of another kind or from a newer version. Its bytes are
+    /// kept, so a store can [`salvage`] what it can (REL-02).
+    Unreadable(Vec<u8>),
+}
+
+/// What is saved in `file`. Fails only when the storage itself can't be read.
+pub fn read<F: Format>(
+    storage: &dyn StorageAdapter,
+    file: StoredFile,
+) -> Result<Stored<F>, DataError> {
+    Ok(match storage.read(file)? {
+        None => Stored::Missing,
+        Some(bytes) => match decode(&bytes) {
+            Some(value) => Stored::Read(value),
+            None => Stored::Unreadable(bytes),
+        },
+    })
+}
+
 /// The saved value, or the defaults if there is none or it can't be read (MAINT-04).
 pub fn load<F: Format>(storage: &dyn StorageAdapter, file: StoredFile) -> F {
-    storage
-        .read(file)
-        .ok()
-        .flatten()
-        .and_then(|bytes| decode(&bytes))
-        .unwrap_or_default()
+    match read(storage, file) {
+        Ok(Stored::Read(value)) => value,
+        Ok(Stored::Missing | Stored::Unreadable(_)) | Err(_) => F::default(),
+    }
+}
+
+/// The records of an unreadable file that still read on their own, each as a value of its own,
+/// in the order they were saved (REL-02). It suits formats whose records stand alone, such as the
+/// layout's cells; for others it finds nothing.
+///
+/// The header must be whole: a file of another kind, or from a newer version, gives nothing, as
+/// [`decode`] would (MAINT-04). The checksum is ignored, and a last line without its line break
+/// was cut short, so it is dropped. Each record is brought up to date by the format's migrations
+/// on its own.
+pub fn salvage<F: Format>(bytes: &[u8]) -> Vec<F> {
+    let text = String::from_utf8_lossy(bytes);
+    let Some((header, body)) = text.split_once('\n') else {
+        return Vec::new();
+    };
+    let version = header
+        .strip_prefix(MAGIC)
+        .and_then(|rest| rest.strip_prefix(F::KIND))
+        .and_then(|rest| rest.strip_prefix(' '))
+        .and_then(canonical::<u32>);
+    let Some(version) = version.filter(|version| (1..=F::VERSION).contains(version)) else {
+        return Vec::new();
+    };
+    let whole = body.rfind('\n').map_or("", |end| &body[..=end]);
+    whole
+        .split_terminator('\n')
+        .filter(|record| record.split(' ').next() != Some(TRAILER_KEY))
+        .filter_map(|record| {
+            let record = format!("{record}\n");
+            let record = migrate(version, F::VERSION, F::MIGRATIONS, &record)?;
+            let mut input = Reader::new(&record);
+            let value = F::read(&mut input)?;
+            input.is_done().then_some(value)
+        })
+        .collect()
 }
 
 /// Saves `value` atomically (REL-03).
@@ -96,6 +154,8 @@ pub fn seal(kind: &str, version: u32, body: &str) -> Vec<u8> {
 }
 
 const MAGIC: &str = "meegone-";
+/// The key of the trailer, which no record uses.
+const TRAILER_KEY: &str = "end";
 /// Written for `None`, and never for any other value.
 const NONE: &str = "-";
 
@@ -115,7 +175,7 @@ fn open<'a>(kind: &str, bytes: &'a [u8]) -> Option<(u32, &'a str)> {
 }
 
 fn trailer(content: &[u8]) -> String {
-    format!("end {:016x}", checksum(content))
+    format!("{TRAILER_KEY} {:016x}", checksum(content))
 }
 
 /// 64-bit FNV-1a. It catches any single changed byte and nearly every other accident; it is not
@@ -741,5 +801,147 @@ mod tests {
             load::<Sample>(&storage, StoredFile::Layout),
             Sample::default()
         );
+    }
+
+    #[test]
+    fn a_read_tells_missing_read_and_unreadable_files_apart() {
+        // APPS-04, REL-02: a first start and a damaged file are handled differently.
+        let storage = FakeStorage::default();
+        assert_eq!(
+            read::<Sample>(&storage, StoredFile::Layout),
+            Ok(Stored::Missing)
+        );
+
+        save(&storage, StoredFile::Layout, &sample()).unwrap();
+        assert_eq!(
+            read::<Sample>(&storage, StoredFile::Layout),
+            Ok(Stored::Read(sample()))
+        );
+
+        let garbage = b"\x00garbage".to_vec();
+        storage
+            .files
+            .lock()
+            .unwrap()
+            .insert(StoredFile::Layout, garbage.clone());
+        assert_eq!(
+            read::<Sample>(&storage, StoredFile::Layout),
+            Ok(Stored::Unreadable(garbage))
+        );
+
+        let error = DataError::Failed("Disk error".into());
+        *storage.error.lock().unwrap() = Some(error.clone());
+        assert_eq!(read::<Sample>(&storage, StoredFile::Layout), Err(error));
+    }
+
+    /// A format of standalone records, at version 2: version 2 renamed `thing` to `item`.
+    #[derive(Debug, PartialEq, Default)]
+    struct Shelf {
+        items: Vec<String>,
+    }
+
+    const SHELF_MIGRATIONS: [Migration; 1] = [|body| Some(body.replace("thing ", "item "))];
+
+    impl Format for Shelf {
+        const KIND: &'static str = "shelf";
+        const VERSION: u32 = 2;
+        const MIGRATIONS: &'static [Migration] = &SHELF_MIGRATIONS;
+
+        fn write(&self, out: &mut Writer) {
+            for item in &self.items {
+                out.line("item", item);
+            }
+        }
+
+        fn read(input: &mut Reader<'_>) -> Option<Self> {
+            Some(Self {
+                items: input.lines("item")?,
+            })
+        }
+    }
+
+    fn items(found: Vec<Shelf>) -> Vec<String> {
+        found.into_iter().flat_map(|shelf| shelf.items).collect()
+    }
+
+    fn shelf(items: &[&str]) -> Vec<u8> {
+        encode(&Shelf {
+            items: items.iter().map(|item| (*item).to_owned()).collect(),
+        })
+    }
+
+    #[test]
+    fn a_damaged_file_gives_back_the_records_that_still_read() {
+        // REL-02
+        let mut damaged = shelf(&["mail", "maps", "music"]);
+        let text = String::from_utf8(damaged.clone()).unwrap();
+        // "maps" becomes "m\x01ps": the checksum fails, and the record still reads, changed.
+        let maps = text.find("maps").unwrap();
+        damaged[maps + 1] = 0x01;
+        assert_eq!(decode::<Shelf>(&damaged), None);
+        // A record whose key was damaged reads as nothing.
+        let mut odd = damaged.clone();
+        let music = text.find("item music").unwrap();
+        odd[music] = b'?';
+
+        assert_eq!(items(salvage(&damaged)), ["mail", "m\u{1}ps", "music"]);
+        assert_eq!(items(salvage(&odd)), ["mail", "m\u{1}ps"]);
+    }
+
+    #[test]
+    fn a_file_cut_short_gives_back_its_whole_records() {
+        // REL-02
+        let bytes = shelf(&["mail", "maps"]);
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        let second = text.find("item maps").unwrap();
+
+        assert_eq!(items(salvage(&bytes[..second + 6])), ["mail"]);
+        assert_eq!(items(salvage(&bytes[..second + 10])), ["mail", "maps"]);
+        assert_eq!(items(salvage(&bytes)), ["mail", "maps"]);
+        assert_eq!(items(salvage(&bytes[..second])), ["mail"]);
+    }
+
+    #[test]
+    fn records_of_an_older_version_are_migrated_one_by_one() {
+        // MAINT-04, REL-02
+        let mut v1 = seal("shelf", 1, "thing mail\nthing maps\n");
+        let last = v1.len() - 2;
+        v1[last] ^= 1;
+
+        assert_eq!(items(salvage(&v1)), ["mail", "maps"]);
+    }
+
+    #[test]
+    fn nothing_is_recovered_from_another_kind_a_newer_version_or_a_damaged_header() {
+        // MAINT-04
+        let body = "item mail\n";
+        for bytes in [
+            seal("other", 2, body),
+            seal("shelf", 3, body),
+            seal("shelf", 0, body),
+            seal("shelf", 2, body)[1..].to_vec(),
+            format!("meegone-shelf 02\n{body}").into_bytes(),
+            b"item mail\n".to_vec(),
+            Vec::new(),
+            b"\xff\xfe".to_vec(),
+        ] {
+            assert!(salvage::<Shelf>(&bytes).is_empty(), "{bytes:?}");
+        }
+    }
+
+    #[test]
+    fn every_damaged_or_shortened_file_is_salvaged_without_a_panic() {
+        // REL-02: whatever happened to the file, recovering it never crashes.
+        let bytes = shelf(&["mail", "two words", "ünïcode ✕", ""]);
+        for len in 0..bytes.len() {
+            salvage::<Shelf>(&bytes[..len]);
+        }
+        for i in 0..bytes.len() {
+            for bit in 0..8 {
+                let mut damaged = bytes.clone();
+                damaged[i] ^= 1 << bit;
+                salvage::<Shelf>(&damaged);
+            }
+        }
     }
 }

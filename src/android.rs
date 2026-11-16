@@ -470,10 +470,17 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_AppsGrid_nativeAppsC
 
 /// The fields of one cell in `nativeAppsCells`, mirrored in `AppsGrid.java`: its label, then
 /// the package, activity and profile serial number of the app it launches (empty for a
-/// folder), then its flags: 1 an app, 2 available (APPS-09), 4 in a work profile (APPS-20).
-fn cell_fields(cell: Cell<'_>) -> [String; 5] {
-    let flags =
-        u8::from(cell.app.is_some()) | u8::from(cell.available) << 1 | u8::from(cell.work) << 2;
+/// folder), then its flags: 1 an app, 2 available (APPS-09), 4 in a work profile (APPS-20),
+/// 8 new (APPS-07). Last, its place in the cells before, or -1 if it just joined (ANIM-21).
+fn cell_fields(cell: Cell<'_>) -> [String; 6] {
+    let flags = u8::from(cell.app.is_some())
+        | u8::from(cell.available) << 1
+        | u8::from(cell.work) << 2
+        | u8::from(cell.new) << 3;
+    let from = cell
+        .from
+        .and_then(|from| i32::try_from(from).ok())
+        .unwrap_or(-1);
     let (package, activity, profile) = match cell.app {
         Some(app) => (
             app.package.clone(),
@@ -488,6 +495,7 @@ fn cell_fields(cell: Cell<'_>) -> [String; 5] {
         activity,
         profile,
         flags.to_string(),
+        from.to_string(),
     ]
 }
 
@@ -697,7 +705,11 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRead
 /// | 21 | Applications' rows, the last one empty (HOME-14) |
 /// | 22 | The pressed cell of the current view, or -1 (ANIM-10) |
 /// | 23 | The pressed cell's icon scale in ten-thousandths, 10 000 at rest (ANIM-10) |
-fn frame_slots(frame: &HomeFrame) -> [i32; 24] {
+/// | 24–25 | The scale and opacity of cells that just joined the grid, in ten-thousandths (ANIM-21) |
+/// | 26–27 | The scale and opacity of cells that left the grid, in ten-thousandths (ANIM-21) |
+/// | 28 | How far the other cells have come from their old places, in ten-thousandths (ANIM-21) |
+/// | 29 | The new-app dot's colour, as opaque ARGB (APPS-07) |
+fn frame_slots(frame: &HomeFrame) -> [i32; 30] {
     let [events, applications, recent] = frame.pages;
     let menu_items = frame.menu.map_or(0, |menu| {
         menu.items
@@ -739,6 +751,12 @@ fn frame_slots(frame: &HomeFrame) -> [i32; 24] {
             .and_then(|item| i32::try_from(item).ok())
             .unwrap_or(-1),
         i32::from(frame.press_scale),
+        i32::from(frame.grid_change.appear_scale),
+        i32::from(frame.grid_change.appear_alpha),
+        i32::from(frame.grid_change.leave_scale),
+        i32::from(frame.grid_change.leave_alpha),
+        i32::from(frame.grid_change.shift),
+        argb(frame.accent),
     ]
 }
 

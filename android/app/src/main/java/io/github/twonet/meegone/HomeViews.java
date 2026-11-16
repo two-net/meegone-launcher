@@ -77,7 +77,14 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private static final int APPS_ROWS = 21; // the last one empty
     private static final int PRESSED = 22; // the current view's pressed cell, or -1
     private static final int PRESS_SCALE = 23; // its icon's scale in ten-thousandths
-    private static final int FRAME_SIZE = 24;
+    // As apps come and go (ANIM-21), in ten-thousandths:
+    private static final int APPEAR_SCALE = 24; // cells that just joined the grid
+    private static final int APPEAR_ALPHA = 25;
+    private static final int LEAVE_SCALE = 26; // cells that left it
+    private static final int LEAVE_ALPHA = 27;
+    private static final int SHIFT = 28; // how far the others are from their old places
+    private static final int ACCENT = 29; // ARGB: the new-app dot (APPS-07)
+    private static final int FRAME_SIZE = 30;
 
     private static final int VIEWS = 3;
     private static final int APPLICATIONS = 1;
@@ -617,7 +624,9 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         int current = frame[CURRENT];
         apps.apply(frame[APPS_REVISION], frame[APPS_SCROLL], frame[APPS_COLUMNS],
                 frame[APPS_ROWS], current == APPLICATIONS ? frame[PRESSED] : -1,
-                frame[PRESS_SCALE], foreground, dim);
+                frame[PRESS_SCALE], foreground, dim, frame[ACCENT]);
+        apps.move(frame[APPEAR_SCALE], frame[APPEAR_ALPHA], frame[LEAVE_SCALE],
+                frame[LEAVE_ALPHA], frame[SHIFT]);
         if (current != announced) {
             announced = current;
             status.setText(getResources().getString(R.string.view_position,

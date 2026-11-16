@@ -26,9 +26,12 @@ import java.util.Objects;
  * The label sits 4 dp below it, at 12 sp in the theme's text colour, on one line and ellipsised
  * (APPS-16). The cell's height follows the font, so it grows with the system font size instead
  * of overlapping, and its 8 dp above and below leave 16 dp between rows. A pressed icon shrinks
- * (ANIM-10). An unavailable app is drawn greyed and at half opacity (APPS-09).
+ * (ANIM-10). An unavailable app is drawn greyed and at half opacity (APPS-09). A new app has a
+ * small dot in the accent colour before its label (APPS-07). As apps come and go, the grid
+ * scales, fades and slides the whole cell (ANIM-21).
  *
- * <p>Screen readers read its label, and "work" for a work-profile app (A11Y-01).
+ * <p>Screen readers read its label, "work" for a work-profile app (A11Y-01), and "new" for a
+ * new one.
  */
 final class AppCell extends View {
     private static final float ICON_DP = 56f;
@@ -37,6 +40,8 @@ final class AppCell extends View {
     /** Above the icon and below the label: half the 16 dp between rows. */
     private static final float VERTICAL_PADDING_DP = 8f;
     private static final float SIDE_PADDING_DP = 4f;
+    private static final float DOT_DP = 6f;
+    private static final float DOT_GAP_DP = 4f;
     private static final float DIMMED_ALPHA = 0.5f;
     private static final ColorMatrixColorFilter GREYED;
 
@@ -49,6 +54,7 @@ final class AppCell extends View {
     private final AppsGrid grid;
     private final TextPaint text = new TextPaint(Paint.ANTI_ALIAS_FLAG);
     private final Paint plate = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final Paint dot = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final RectF plateBounds = new RectF();
     /** The font size only changes with a new configuration, which recreates the views. */
     private final int heightPx;
@@ -56,6 +62,8 @@ final class AppCell extends View {
     private final int labelGapPx;
     private final int verticalPaddingPx;
     private final int sidePaddingPx;
+    private final int dotPx;
+    private final int dotGapPx;
 
     /** Its place in the grid's cells. */
     private int index;
@@ -65,6 +73,12 @@ final class AppCell extends View {
     private String activity;
     private long profile;
     private boolean available = true;
+    /** Installed since the grid was set up and not opened yet: it has a dot (APPS-07). */
+    private boolean isNew;
+    /** Its cell left the grid: it only shrinks away, and can't be tapped (ANIM-21). */
+    private boolean leaving;
+    /** Its opacity as the grid changes, on top of the dimming of an unavailable app. */
+    private float motionAlpha = 1f;
     private Drawable icon;
     private StaticLayout labelLayout;
     private float iconScale = 1f;
@@ -77,6 +91,8 @@ final class AppCell extends View {
         labelGapPx = Math.round(LABEL_GAP_DP * density);
         verticalPaddingPx = Math.round(VERTICAL_PADDING_DP * density);
         sidePaddingPx = Math.round(SIDE_PADDING_DP * density);
+        dotPx = Math.round(DOT_DP * density);
+        dotGapPx = Math.round(DOT_GAP_DP * density);
         text.setTextSize(TypedValue.applyDimension(
                 TypedValue.COMPLEX_UNIT_SP, LABEL_SP, getResources().getDisplayMetrics()));
         heightPx = heightPx(context);
@@ -104,9 +120,9 @@ final class AppCell extends View {
      * is asked for again.
      */
     void bind(int index, String label, String packageName, String activity, long profile,
-            boolean available, boolean work) {
+            boolean available, boolean work, boolean isNew) {
         this.index = index;
-        boolean labelChanged = !label.equals(this.label);
+        boolean labelChanged = !label.equals(this.label) || isNew != this.isNew;
         boolean otherApp = profile != this.profile
                 || !Objects.equals(packageName, this.packageName)
                 || !Objects.equals(activity, this.activity);
@@ -118,18 +134,20 @@ final class AppCell extends View {
         this.activity = activity;
         this.profile = profile;
         this.available = available;
+        this.isNew = isNew;
         boolean app = packageName != null;
         setClickable(app);
         setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_YES);
-        setContentDescription(work
-                ? getResources().getString(R.string.app_work, label)
-                : label);
+        String description = work ? getResources().getString(R.string.app_work, label) : label;
+        setContentDescription(isNew
+                ? getResources().getString(R.string.app_new, description)
+                : description);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             setStateDescription(available
                     ? null
                     : getResources().getString(R.string.app_state_unavailable));
         }
-        setAlpha(available ? 1f : DIMMED_ALPHA);
+        applyAlpha();
         if (labelChanged) {
             labelLayout = null;
         }
@@ -154,12 +172,39 @@ final class AppCell extends View {
         return index;
     }
 
-    /** The theme's text and placeholder colours, as opaque ARGB. */
-    void setColours(int foreground, int dim) {
+    /** The theme's text, placeholder and new-app dot colours, as opaque ARGB. */
+    void setColours(int foreground, int dim, int accent) {
         text.setColor(foreground);
         // A faint plate in the secondary text colour.
         plate.setColor((dim & 0x00FFFFFF) | 0x33000000);
+        dot.setColor(accent);
         invalidate();
+    }
+
+    /**
+     * How the cell is drawn as the grid changes (ANIM-21): its scale and opacity, and how far it
+     * is from its place, in px.
+     */
+    void setMotion(float scale, float alpha, float dx, float dy) {
+        setScaleX(scale);
+        setScaleY(scale);
+        setTranslationX(dx);
+        setTranslationY(dy);
+        if (alpha != motionAlpha) {
+            motionAlpha = alpha;
+            applyAlpha();
+        }
+    }
+
+    /** Its cell left the grid: it shrinks away where it was, and can't be used (ANIM-21). */
+    void leave() {
+        leaving = true;
+        setClickable(false);
+        setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS);
+    }
+
+    private void applyAlpha() {
+        setAlpha((available ? 1f : DIMMED_ALPHA) * motionAlpha);
     }
 
     /** The icon's scale while it is pressed (ANIM-10). */
@@ -183,7 +228,7 @@ final class AppCell extends View {
     public void setPressed(boolean pressed) {
         boolean changed = pressed != isPressed();
         super.setPressed(pressed);
-        if (changed && packageName != null) {
+        if (changed && packageName != null && !leaving) {
             grid.pressChanged(this, pressed);
         }
     }
@@ -226,15 +271,33 @@ final class AppCell extends View {
         StaticLayout layout = labelLayout();
         if (layout != null) {
             canvas.save();
-            canvas.translate(sidePaddingPx, iconTop + iconPx + labelGapPx);
+            canvas.translate(sidePaddingPx + dotRoom(), iconTop + iconPx + labelGapPx);
             layout.draw(canvas);
+            if (isNew) {
+                drawDot(canvas, layout);
+            }
             canvas.restore();
         }
     }
 
+    /** The room kept at each side of a new app's label, so the label and its dot stay centred. */
+    private int dotRoom() {
+        return isNew ? dotPx + dotGapPx : 0;
+    }
+
+    /** The new-app dot, before the label's first letter, mid-height (APPS-07). */
+    private void drawDot(Canvas canvas, StaticLayout layout) {
+        float radius = dotPx / 2f;
+        float x = getLayoutDirection() == LAYOUT_DIRECTION_RTL
+                ? layout.getLineRight(0) + dotGapPx + radius
+                : layout.getLineLeft(0) - dotGapPx - radius;
+        float y = (layout.getLineTop(0) + layout.getLineBottom(0)) / 2f;
+        canvas.drawCircle(x, y, radius, dot);
+    }
+
     /** The label on one line, ellipsised to the cell's width (APPS-16). */
     private StaticLayout labelLayout() {
-        int width = getWidth() - 2 * sidePaddingPx;
+        int width = getWidth() - 2 * (sidePaddingPx + dotRoom());
         if (labelLayout == null && width > 0) {
             labelLayout = StaticLayout.Builder.obtain(label, 0, label.length(), text, width)
                     .setAlignment(Layout.Alignment.ALIGN_CENTER)

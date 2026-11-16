@@ -1,5 +1,5 @@
 //! [`AppsAdapter`] on Android: the app catalogue and launching (APPS-01, APPS-09, APPS-10,
-//! ANIM-08, ADR 0010).
+//! ANIM-08, ADR 0010), and the default apps the first grid starts with (APPS-05, ADR 0012).
 //!
 //! Questions go to the Java `Bridge` object, whose method names and signatures must stay in
 //! step with the ones looked up here. The catalogue arrives as flat records, parsed in
@@ -18,6 +18,9 @@ pub struct AndroidApps {
     launchable_apps: MethodId,
     /// `String[] profiles()`: records of [`catalogue::PROFILE_FIELDS`] fields.
     profiles: MethodId,
+    /// `String[] defaultApps()`: the default phone, messaging, browser and camera packages, in
+    /// that order, leaving out those the system doesn't identify.
+    default_apps: MethodId,
     /// `String launch(String package, String activity, long profile, int left, int top,
     /// int right, int bottom)`: `null`, or a short message when the system couldn't start it.
     launch: MethodId,
@@ -30,6 +33,7 @@ impl AndroidApps {
             vm: env.vm()?,
             launchable_apps: env.method_id(bridge, c"launchableApps", c"()[Ljava/lang/String;")?,
             profiles: env.method_id(bridge, c"profiles", c"()[Ljava/lang/String;")?,
+            default_apps: env.method_id(bridge, c"defaultApps", c"()[Ljava/lang/String;")?,
             launch: env.method_id(
                 bridge,
                 c"launch",
@@ -55,6 +59,22 @@ impl AppsAdapter for AndroidApps {
         match env.call_strings(&self.bridge, self.profiles, &[])? {
             Some(fields) => Ok(catalogue::profiles(&fields)),
             None => Err(unlisted()),
+        }
+    }
+
+    /// None if the system couldn't say: the grid then starts alphabetically (APPS-04).
+    fn default_apps(&self) -> Vec<String> {
+        let packages = self
+            .vm
+            .env()
+            .and_then(|env| env.call_strings(&self.bridge, self.default_apps, &[]));
+        match packages {
+            Ok(Some(packages)) => packages
+                .into_iter()
+                .flatten()
+                .filter(|package| !package.is_empty())
+                .collect(),
+            Ok(None) | Err(_) => Vec::new(),
         }
     }
 

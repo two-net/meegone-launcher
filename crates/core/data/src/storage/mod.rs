@@ -7,13 +7,17 @@
 //!   implementation that touches the file system; tests use `fakes::FakeStorage`.
 //! - [`format`]: the versioned, checksummed text format every store saves in, with forward
 //!   migrations. [`load`] gives the defaults for a file that is missing, damaged or from a newer
-//!   version, so a bad file never crashes MeeGone.
+//!   version, so a bad file never crashes MeeGone. [`read`] tells those cases apart, and
+//!   [`salvage`] recovers the records of a damaged file that still read (REL-02).
 
 mod files;
 pub mod format;
 
 pub use files::FileStorage;
-pub use format::{Decode, Encode, Format, Migration, Reader, Writer, decode, encode, load, save};
+pub use format::{
+    Decode, Encode, Format, Migration, Reader, Stored, Writer, decode, encode, load, read, salvage,
+    save,
+};
 
 use crate::model::DataError;
 
