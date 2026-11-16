@@ -1,15 +1,24 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <!-- Follows the device's dark theme. The home views draw the theme's solid background, so
-         the wallpaper isn't shown behind them (HOME-11, ADR 0006). -->
-    <style name="Theme.MeeGone" parent="@android:style/Theme.DeviceDefault.DayNight">
+         the wallpaper isn't shown behind them, and draw it edge to edge, behind the transparent
+         system bars and into any display cut-out (HOME-11, ADR 0006, ADR 0009). -->
+    <style name="Theme.MeeGone.Base" parent="@android:style/Theme.DeviceDefault.DayNight">
         <item name="android:windowNoTitle">true</item>
         <item name="android:windowActionBar">false</item>
         <item name="android:windowShowWallpaper">false</item>
         <item name="android:windowBackground">@color/home_background</item>
         <item name="android:statusBarColor">@android:color/transparent</item>
         <item name="android:navigationBarColor">@android:color/transparent</item>
+        <!-- The bar icons follow the background (HomeViews.matchSystemBars), so the system adds
+             no scrim of its own, even behind three-button navigation. -->
+        <item name="android:enforceStatusBarContrast">false</item>
+        <item name="android:enforceNavigationBarContrast">false</item>
         <item name="android:windowLightStatusBar">@bool/light_system_bars</item>
         <item name="android:windowLightNavigationBar">@bool/light_system_bars</item>
+        <!-- Android 10 knows only cut-outs on the short edges; values-v30 adds the long ones. -->
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
     </style>
+
+    <style name="Theme.MeeGone" parent="Theme.MeeGone.Base" />
 </resources>

@@ -39,16 +39,29 @@ fn notification(key: &str, package: &str) -> Notification {
     }
 }
 
-/// A launcher laid out on a phone, with the time at 0 ms.
-fn on_a_phone(fakes: &Fakes) -> (Launcher, u64) {
-    let mut launcher = Launcher::start(fakes.platform());
-    launcher.dispatch(ShellIntent::Layout(Layout {
+/// The home views laid out on that phone.
+fn phone() -> Layout {
+    Layout {
         width_px: WIDTH,
         density: 2.75,
         touch_slop_px: 22.0,
         rtl: false,
-    }));
+    }
+}
+
+/// A launcher laid out on a phone, with the time at 0 ms.
+fn on_a_phone(fakes: &Fakes) -> (Launcher, u64) {
+    let mut launcher = Launcher::start(fakes.platform());
+    launcher.dispatch(ShellIntent::Layout(phone()));
     (launcher, 0)
+}
+
+/// The display draws frames until nothing moves. `clock` is the time in ms.
+fn come_to_rest(launcher: &mut Launcher, clock: &mut u64) {
+    while launcher.frame().animating {
+        *clock += 8;
+        launcher.dispatch(ShellIntent::Frame(Duration::from_millis(*clock)));
+    }
 }
 
 /// A finger drags from `from` to `to` over `length` ms, rests for `pause` ms and lifts; then the
@@ -203,10 +216,7 @@ fn ac04_home_on_events_shows_applications_and_home_again_scrolls_it_to_the_top()
     launcher.frame();
     assert_eq!(launcher.shell().state().current, HomeView::Applications);
     assert_eq!(launcher.shell().apps().state().scroll_px, 600.0);
-    while launcher.frame().animating {
-        clock += 8;
-        launcher.dispatch(ShellIntent::Frame(Duration::from_millis(clock)));
-    }
+    come_to_rest(&mut launcher, &mut clock);
     assert_eq!(launcher.frame().pages, [-1080, 0, 1080]);
 
     launcher.dispatch(ShellIntent::Home);
@@ -317,6 +327,122 @@ fn home10_in_recent_a_long_press_enters_close_mode_instead() {
     assert_eq!(launcher.frame().menu, None);
     assert!(launcher.shell().recent().state().close_mode);
     assert_eq!(*fakes.system.haptic_ticks.lock().unwrap(), 1);
+}
+
+#[test]
+fn comp03_folding_or_unfolding_keeps_the_view_scroll_position_and_edit_mode() {
+    // Issue #8. Folded, the cover screen is the phone; unfolded, the inner screen is wider, at
+    // another density. Folders arrive with #14; `meegone-shell-state` checks that an open one
+    // is kept too.
+    let (mut launcher, mut clock) = on_a_phone(&Fakes::default());
+    launcher.view().apps().grid_scrolled(600.0);
+    long_press(&mut launcher, &mut clock, 540.0, 1800.0);
+    launcher.dispatch(ShellIntent::ChooseMenuItem(MenuItem::EditApplications));
+    launcher.frame();
+    let unfolded = Layout {
+        width_px: 2208.0,
+        density: 2.375,
+        touch_slop_px: 19.0,
+        rtl: false,
+    };
+
+    for (layout, width) in [(unfolded, 2208), (phone(), 1080)] {
+        launcher.dispatch(ShellIntent::Layout(layout));
+        let frame = launcher.frame();
+
+        assert_eq!(frame.current, HomeView::Applications);
+        assert_eq!(frame.pages, [-width, 0, width]);
+        let apps = launcher.shell().apps().state();
+        assert!(apps.edit_mode);
+        assert_eq!(apps.scroll_px, 600.0);
+    }
+}
+
+#[test]
+fn home12_rotating_a_tablet_adapts_the_layout_and_keeps_state() {
+    // Issue #8. A tablet 1600 × 2560 px at 2 px per dp, turned from portrait to landscape.
+    let mut launcher = Launcher::start(Fakes::default().platform());
+    let mut clock = 0;
+    let portrait = Layout {
+        width_px: 1600.0,
+        density: 2.0,
+        touch_slop_px: 16.0,
+        rtl: false,
+    };
+    launcher.dispatch(ShellIntent::Layout(portrait));
+    launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
+    come_to_rest(&mut launcher, &mut clock);
+    long_press(&mut launcher, &mut clock, 400.0, 2000.0);
+    assert_eq!(launcher.frame().menu.unwrap().anchor, Some((400, 2000)));
+
+    launcher.dispatch(ShellIntent::Layout(Layout {
+        width_px: 2560.0,
+        ..portrait
+    }));
+    let frame = launcher.frame();
+
+    // The views fill the new width, and Events still shows its menu, now centred.
+    assert_eq!(frame.current, HomeView::Events);
+    assert_eq!(frame.pages, [0, 2560, -2560]);
+    let menu = frame.menu.expect("the home menu is still open");
+    assert_eq!(
+        menu.items,
+        [MenuItem::LauncherSettings, MenuItem::LockScreenImage]
+    );
+    assert_eq!(menu.anchor, None);
+}
+
+#[test]
+fn comp02_home_and_back_behave_the_same_in_every_navigation_mode() {
+    // Issue #8. Only whether the system animates the return home depends on the navigation
+    // mode: it does with gestures, and doesn't with two or three buttons (ADR 0007).
+    let mut outcomes = Vec::new();
+    for gestures in [true, false] {
+        let fakes = Fakes::default();
+        *fakes.system.animates_return_home.lock().unwrap() = gestures;
+        let (mut launcher, mut clock) = on_a_phone(&fakes);
+        launcher.view().apps().grid_scrolled(600.0);
+        let mut steps = Vec::new();
+        let mut step = |launcher: &mut Launcher, intent| {
+            launcher.dispatch(intent);
+            let frame = launcher.frame();
+            let scroll_px = launcher.shell().apps().state().scroll_px;
+            steps.push((frame.current, frame.menu.is_some(), scroll_px));
+        };
+
+        // Back closes the home menu, then does nothing.
+        long_press(&mut launcher, &mut clock, 540.0, 1800.0);
+        step(&mut launcher, ShellIntent::Back);
+        step(&mut launcher, ShellIntent::Back);
+        // Home from Events shows Applications; again, it scrolls it to the top.
+        step(&mut launcher, ShellIntent::Swipe(Direction::Previous));
+        step(&mut launcher, ShellIntent::Home);
+        step(&mut launcher, ShellIntent::Home);
+        // Home from an app shows the view the user left.
+        step(&mut launcher, ShellIntent::Swipe(Direction::Next));
+        come_to_rest(&mut launcher, &mut clock);
+        launcher.dispatch(ShellIntent::Resumed);
+        step(&mut launcher, ShellIntent::Returned { home: true });
+
+        // The content comes back with MeeGone's own motion only with buttons (ANIM-09).
+        let frame = launcher.frame();
+        assert_eq!(frame.content_alpha == 255, gestures);
+        outcomes.push(steps);
+    }
+
+    assert_eq!(outcomes[0], outcomes[1]);
+    assert_eq!(
+        outcomes[0],
+        [
+            (HomeView::Applications, false, 600.0),
+            (HomeView::Applications, false, 600.0),
+            (HomeView::Events, false, 600.0),
+            (HomeView::Applications, false, 600.0),
+            (HomeView::Applications, false, 0.0),
+            (HomeView::Recent, false, 0.0),
+            (HomeView::Recent, false, 0.0),
+        ]
+    );
 }
 
 #[test]

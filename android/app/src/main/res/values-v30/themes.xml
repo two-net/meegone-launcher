@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- From Android 11 the home views also draw into cut-outs on the long edges (HOME-11). -->
+    <style name="Theme.MeeGone" parent="Theme.MeeGone.Base">
+        <item name="android:windowLayoutInDisplayCutoutMode">always</item>
+    </style>
+</resources>

@@ -2,8 +2,13 @@ package io.github.twonet.meegone;
 
 import android.app.Activity;
 import android.content.Intent;
+import android.content.pm.ActivityInfo;
+import android.content.res.Configuration;
+import android.graphics.Point;
+import android.graphics.Rect;
 import android.os.Build;
 import android.os.Bundle;
+import android.view.View;
 import android.window.OnBackInvokedDispatcher;
 
 /**
@@ -13,6 +18,11 @@ import android.window.OnBackInvokedDispatcher;
  *
  * <p>It tells the Rust app about Home, Back and coming back to the home (ADR 0007). Whether the
  * home was out of sight is tracked here, per instance; what each case does is decided in Rust.
+ *
+ * <p>It draws edge to edge on every Android version, stays in portrait on phones and turns with
+ * the device on large screens (HOME-11, HOME-12, ADR 0009). Size and orientation changes are
+ * handled in place; any other configuration change, such as a new density when a foldable
+ * changes screens, recreates it. Either way the shared launcher keeps everything (COMP-03).
  */
 public final class HomeActivity extends Activity {
     static {
@@ -23,6 +33,8 @@ public final class HomeActivity extends Activity {
     private static final String SAVED_VIEW = "io.github.twonet.meegone.view";
     private static final String SAVED_APPS_SCROLL = "io.github.twonet.meegone.appsScroll";
     private static final int NONE = -1;
+    /** From this smallest screen width, in dp, the home turns with the device (HOME-12). */
+    private static final int LARGE_SCREEN_DP = 600;
 
     private final int[] saved = new int[2];
     private Bridge bridge;
@@ -51,6 +63,8 @@ public final class HomeActivity extends Activity {
         // Saved state with a launcher this call started: the system had ended the process while
         // the user was elsewhere. A recreation after a configuration change finds it running.
         away = started && savedInstanceState != null;
+        drawEdgeToEdge();
+        followScreenSize();
         views = new HomeViews(this);
         setContentView(views);
         listenForBack();
@@ -107,6 +121,14 @@ public final class HomeActivity extends Activity {
     }
 
     @Override
+    public void onConfigurationChanged(Configuration newConfig) {
+        super.onConfigurationChanged(newConfig);
+        // Folding or unfolding can move the home to a screen of another size (HOME-12).
+        // HomeViews follows its own new size.
+        followScreenSize();
+    }
+
+    @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
         bridge.onActivityResult(this, requestCode, resultCode);
@@ -133,6 +155,56 @@ public final class HomeActivity extends Activity {
     private void back() {
         nativeBack();
         views.refresh();
+    }
+
+    /**
+     * Lays the home out behind the system bars, as Android 15 and later always do (HOME-11). Only
+     * the layout changes: the bars stay visible, the status bar on every view. {@link HomeViews}
+     * keeps content clear of them.
+     */
+    @SuppressWarnings("deprecation") // The flags are the only way on Android 10.
+    private void drawEdgeToEdge() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            getWindow().setDecorFitsSystemWindows(false);
+        } else {
+            // Android combines every view's flags, so HomeViews' bar colours still apply.
+            getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                    | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
+                    | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN);
+        }
+    }
+
+    /**
+     * Portrait on phones; every orientation on large screens (HOME-12). The screen decides, not
+     * the window: a split screen on a tablet is still a large screen. Android 16 also ignores
+     * orientation requests on large screens.
+     */
+    private void followScreenSize() {
+        int wanted = isLargeScreen()
+                ? ActivityInfo.SCREEN_ORIENTATION_FULL_USER
+                : ActivityInfo.SCREEN_ORIENTATION_PORTRAIT;
+        if (getRequestedOrientation() != wanted) {
+            setRequestedOrientation(wanted);
+        }
+    }
+
+    /** Whether the screen's smallest width is 600 dp or more: a tablet or an unfolded foldable. */
+    @SuppressWarnings("deprecation") // getRealSize is the only way on Android 10.
+    private boolean isLargeScreen() {
+        int width;
+        int height;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            Rect screen = getWindowManager().getMaximumWindowMetrics().getBounds();
+            width = screen.width();
+            height = screen.height();
+        } else {
+            Point screen = new Point();
+            getWindowManager().getDefaultDisplay().getRealSize(screen);
+            width = screen.x;
+            height = screen.y;
+        }
+        float density = getResources().getDisplayMetrics().density;
+        return Math.min(width, height) >= LARGE_SCREEN_DP * density;
     }
 
     private static boolean isHome(Intent intent) {

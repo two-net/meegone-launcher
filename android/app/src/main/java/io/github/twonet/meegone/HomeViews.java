@@ -1,8 +1,10 @@
 package io.github.twonet.meegone;
 
+import android.annotation.TargetApi;
 import android.content.Context;
 import android.content.res.ColorStateList;
 import android.graphics.Color;
+import android.graphics.Insets;
 import android.graphics.Matrix;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.GradientDrawable;
@@ -11,8 +13,10 @@ import android.os.Build;
 import android.os.Bundle;
 import android.util.TypedValue;
 import android.view.Choreographer;
+import android.view.DisplayCutout;
 import android.view.Gravity;
 import android.view.MotionEvent;
+import android.view.RoundedCorner;
 import android.view.View;
 import android.view.ViewConfiguration;
 import android.view.ViewGroup;
@@ -36,6 +40,11 @@ import android.widget.TextView;
  * empty space, then reads what to draw with {@link #nativeRead} and applies it. It keeps nothing
  * else. The frame slots below must stay in step with {@code frame_slots} in {@code
  * src/android.rs}.
+ *
+ * <p>The background fills the window edge to edge, behind the system bars. Everything else stays
+ * inside a safe area clear of the bars, display cut-outs and the screen's rounded corners: each
+ * page and Settings get it as padding, so their content lays out inside it (HOME-11, ADR 0009).
+ * Content that scrolls may draw under the bars by turning off {@code clipToPadding}.
  *
  * <p>An element inside a view that uses horizontal drags itself keeps them by calling {@link
  * #requestDisallowInterceptTouchEvent} before the carousel takes the gesture (HOME-03). An
@@ -125,7 +134,8 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private int menuShown;
     private int settingsShown;
     private int menuOffered = -1;
-    private int topInset;
+    /** How far content stays from each edge, in px (HOME-11). */
+    private Insets safe = Insets.NONE;
 
     HomeViews(Context context) {
         super(context);
@@ -263,24 +273,82 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         }
     }
 
-    /** Keeps the indicator and the menu below the status bar and any display cut-out. */
+    /**
+     * Keeps the pages' content, Settings, the indicator and the menu inside the safe area, as the
+     * bars, the cut-out or the window change: on rotation, folding or a new navigation mode
+     * (HOME-11, COMP-02, COMP-03).
+     */
     @Override
-    @SuppressWarnings("deprecation") // The only way on Android 10.
     public WindowInsets onApplyWindowInsets(WindowInsets insets) {
-        int top;
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            top = insets.getInsets(
-                    WindowInsets.Type.statusBars() | WindowInsets.Type.displayCutout()).top;
-        } else {
-            top = insets.getSystemWindowInsetTop();
+        safe = safeArea(insets);
+        for (FrameLayout page : pages) {
+            page.setPadding(safe.left, safe.top, safe.right, safe.bottom);
         }
-        topInset = top;
+        settings.setPadding(safe.left, safe.top, safe.right, safe.bottom);
         LayoutParams params = (LayoutParams) indicator.getLayoutParams();
-        if (params.topMargin != top + indicatorMargin) {
-            params.topMargin = top + indicatorMargin;
+        if (params.topMargin != safe.top + indicatorMargin) {
+            params.topMargin = safe.top + indicatorMargin;
             indicator.setLayoutParams(params);
         }
+        if (menu.getVisibility() == VISIBLE) {
+            placeMenu(frame[MENU_X], frame[MENU_Y]);
+        }
         return super.onApplyWindowInsets(insets);
+    }
+
+    /** The safe area: how far content stays from each edge, in px (HOME-11). */
+    @SuppressWarnings("deprecation") // The only way on Android 10.
+    private static Insets safeArea(WindowInsets insets) {
+        Insets bars;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            bars = insets.getInsets(
+                    WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout());
+        } else {
+            bars = insets.getSystemWindowInsets();
+            DisplayCutout cutout = insets.getDisplayCutout();
+            if (cutout != null) {
+                bars = Insets.max(bars, Insets.of(cutout.getSafeInsetLeft(),
+                        cutout.getSafeInsetTop(), cutout.getSafeInsetRight(),
+                        cutout.getSafeInsetBottom()));
+            }
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            return clearOfCorners(insets, bars);
+        }
+        return bars;
+    }
+
+    /**
+     * Moves the sides of {@code bars} in where a rounded corner of the screen would cut the safe
+     * area's corners: above gesture navigation, or in a window with no bar at an edge.
+     */
+    @TargetApi(Build.VERSION_CODES.S)
+    private static Insets clearOfCorners(WindowInsets insets, Insets bars) {
+        int left = Math.max(bars.left, Math.max(
+                cornerInset(insets.getRoundedCorner(RoundedCorner.POSITION_TOP_LEFT), bars.top),
+                cornerInset(insets.getRoundedCorner(RoundedCorner.POSITION_BOTTOM_LEFT),
+                        bars.bottom)));
+        int right = Math.max(bars.right, Math.max(
+                cornerInset(insets.getRoundedCorner(RoundedCorner.POSITION_TOP_RIGHT), bars.top),
+                cornerInset(insets.getRoundedCorner(RoundedCorner.POSITION_BOTTOM_RIGHT),
+                        bars.bottom)));
+        return Insets.of(left, bars.top, right, bars.bottom);
+    }
+
+    /**
+     * How far in from the side {@code corner}'s curve reaches at {@code across} px from the top
+     * or bottom edge: 0 past the curve, its full radius at the edge. It assumes the window
+     * reaches the screen's corner; when it doesn't, the answer is larger than needed, never
+     * smaller.
+     */
+    @TargetApi(Build.VERSION_CODES.S)
+    private static int cornerInset(RoundedCorner corner, int across) {
+        if (corner == null || across >= corner.getRadius()) {
+            return 0;
+        }
+        double radius = corner.getRadius();
+        double rise = radius - across;
+        return (int) Math.ceil(radius - Math.sqrt(radius * radius - rise * rise));
     }
 
     // Every touch reaches the carousel once, here; the content below gets it too until the
@@ -587,32 +655,31 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
 
     /**
      * Opens the menu where the finger was held: from there towards the end of the line, and
-     * above the finger if there is no room below. Without a finger, it is centred. Either way it
-     * stays inside the home views, below the status bar.
+     * above the finger if there is no room below. Without a finger, or after the layout
+     * changed, it is centred. Either way it stays inside the safe area (HOME-11).
      */
     private void placeMenu(int anchorX, int anchorY) {
-        int width = getWidth();
-        int height = getHeight();
+        int left = safe.left + menuMargin;
+        int top = safe.top + menuMargin;
+        int right = getWidth() - safe.right - menuMargin;
+        int bottom = getHeight() - safe.bottom - menuMargin;
         menu.measure(
-                MeasureSpec.makeMeasureSpec(Math.max(0, width - 2 * menuMargin),
-                        MeasureSpec.AT_MOST),
-                MeasureSpec.makeMeasureSpec(Math.max(0, height - 2 * menuMargin),
-                        MeasureSpec.AT_MOST));
+                MeasureSpec.makeMeasureSpec(Math.max(0, right - left), MeasureSpec.AT_MOST),
+                MeasureSpec.makeMeasureSpec(Math.max(0, bottom - top), MeasureSpec.AT_MOST));
         int menuWidth = menu.getMeasuredWidth();
         int menuHeight = menu.getMeasuredHeight();
         float x;
         float y;
         if (anchorX < 0 || anchorY < 0) {
-            x = (width - menuWidth) / 2f;
-            y = (height - menuHeight) / 2f;
+            x = (left + right - menuWidth) / 2f;
+            y = (top + bottom - menuHeight) / 2f;
         } else {
             boolean rtl = getLayoutDirection() == LAYOUT_DIRECTION_RTL;
             x = rtl ? anchorX - menuWidth : anchorX;
-            y = anchorY + menuHeight <= height - menuMargin ? anchorY : anchorY - menuHeight;
+            y = anchorY + menuHeight <= bottom ? anchorY : anchorY - menuHeight;
         }
-        menu.setTranslationX(within(x, menuMargin, width - menuWidth - menuMargin));
-        menu.setTranslationY(
-                within(y, topInset + menuMargin, height - menuHeight - menuMargin));
+        menu.setTranslationX(within(x, left, right - menuWidth));
+        menu.setTranslationY(within(y, top, bottom - menuHeight));
     }
 
     private static float within(float value, float low, float high) {

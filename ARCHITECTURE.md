@@ -64,7 +64,7 @@ AppsView.icon_tapped(mail)                       ui     sends AppsIntent::Launch
 
 - **State holders** implement `StateHolder`: `state()`, `handle(intent)` and `on_back()`. They take their adapters and stores as `Arc<dyn …>` traits, so tests drive them with the fakes in `meegone-core-data` (feature `fakes`), without any UI (MAINT-01).
 - **Constructors do no I/O.** Each feature loads on its first `Refresh` intent, which runs inside its store.
-- **Home and Back** ([ADR 0007](docs/adr/0007-home-back-and-returning.md)).
+- **Home and Back** ([ADR 0007](docs/adr/0007-home-back-and-returning.md)). They work the same in every navigation mode; only the return motion depends on it (COMP-02, ADR 0009).
   - Back closes Settings, then the home menu, then goes to the current view's `on_back`, which closes that feature's topmost open element, or does nothing (HOME-08).
   - Home on the home closes Settings, or the home menu and everything open in the current view, then moves to Applications, then scrolls it to the top (HOME-07).
   - Coming back from an app (`Returned`) shows the view the user left. With "Home button opens: Always Applications", Home from an app shows Applications with nothing open (HOME-06).
@@ -89,6 +89,8 @@ HomeViews (Java)                                       Rust
 - **Java pulls.** After every touch, frame or layout change, `HomeViews` reads the frame and applies it. It asks `Choreographer` for another frame only while the frame says something moves. Rust never calls Java to draw.
 - **Motion is state.** A moving element's position and velocity live in the state layer, and the motion specs, easing and spring physics in `meegone-core-state::motion`. Time comes in with each event, on the host's monotonic clock, so tests pass explicit times. The return-home motion (ANIM-09) scales and fades the pages, never the background.
 - **Touches.** Every touch reaches the carousel first. The content below keeps a gesture until the carousel takes it: sideways, past the platform's touch slop, from anywhere in the view (HOME-03, HOME-13). An element that uses horizontal drags itself calls `requestDisallowInterceptTouchEvent(true)` first.
+- **Edge to edge** ([ADR 0009](docs/adr/0009-edge-to-edge-screens-and-navigation-modes.md)). On every Android version the solid background fills the window behind the system bars, which stay visible (HOME-11). Content stays inside a safe area clear of the bars, cut-outs and rounded corners: each page and Settings get it as padding, so a view's content needs no inset code of its own. Phones stay in portrait; screens 600 dp or more across their smallest width turn freely (HOME-12).
+- **Size changes keep state** (COMP-03). Rotating, folding and resizing send a new `Layout`. It ends a drag but keeps the view, Settings, the home menu (now centred) and everything open in the views. Other configuration changes recreate the activity, and the shared launcher keeps everything.
 - **Long-press** (ADR 0008). The host times a finger held still and, on empty space, sends `LongPress`. Empty space is where no clickable or long-clickable element is under the finger, so an element with its own long-press only needs to be clickable. The shell takes it only while the finger is within the touch slop. The home menu and Settings cover the home views: while either is open, the carousel gets no new touches.
 - **Text** is in Android string resources (L10N-01). **Accessibility** comes from Android's views: the home views offer scroll, page and named actions, including "Home menu" (A11Y-05).
 
@@ -182,12 +184,13 @@ MeeGone keeps three persistent stores, each in its own file under one private fo
 
 ## Not built yet
 
-The skeleton is from issue #1; the Android host and the home-app role from #4; the carousel of home views from #5; Home, Back and coming back to the home from #6; the home menu from #7. The following arrive with later requirements:
+The skeleton is from issue #1; the Android host and the home-app role from #4; the carousel of home views from #5; Home, Back and coming back to the home from #6; the home menu from #7; edge to edge, screen sizes and navigation modes from #8. The following arrive with later requirements:
 
 - **Android adapters.** The home-app role, the clock and storage are built (ADR 0005), as are the navigation-mode check for the return-home motion (ADR 0007) and the haptic tick (ADR 0008). The app catalogue, notifications, usage, wallpaper, network, scheduling and the remaining device settings are stubs until their issues. The ticks on entering edit mode and on creating a folder (ANIM-24) come with #13 and #14.
 - **The daily image.** The Bing implementation of `ImageFeed` (#26) and the updater (SRS 7.5) come with the WALL requirements.
 - **Drawing.** The home views, their carousel, the view indicator, the return-home motion and the home menu are drawn (ADR 0006 to ADR 0008). Each view shows only its name until its content arrives (#9, #19, #22).
-  - The Applications grid (#9) will report its scroll position, follow `AppsState.scroll_px`, and lay out `AppsState::rows`, which ends with an empty row (HOME-14).
+  - The Applications grid (#9) will report its scroll position, follow `AppsState.scroll_px`, and lay out `AppsState::rows`, which ends with an empty row (HOME-14). When folding changes its columns or density, it keeps the same first visible item.
+  - Each view's content adapts to large screens when it is built: the Applications columns (APPS-02, #9) and Recent's cards (#22). Today the pages, the carousel, the safe area, the menu and Settings adapt (HOME-12).
   - Settings covers the home views with only its name, and its group's, until #34 draws it. "Home button opens", the home-app banner and first-run setup send intents but aren't drawn yet.
   - Edit mode and close mode change state but aren't drawn yet (#13, #24).
 - **First-run setup** comes with the ONB requirements. The lock-screen image step is provided as a `Slot`, like its Settings section.

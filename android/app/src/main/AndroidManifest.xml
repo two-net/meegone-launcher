@@ -13,7 +13,10 @@
         android:theme="@style/Theme.MeeGone">
 
         <!-- The home screen. singleTask keeps one home task; a Home press while it shows reaches
-             onNewIntent. Configuration changes that only resize are handled in place. -->
+             onNewIntent. Configuration changes that resize, rotate, fold or unfold are handled
+             in place; any other, such as a new density, recreates the activity, and the shared
+             launcher keeps all state (COMP-03, ADR 0009). The orientation follows the screen's
+             size at run time (HOME-12). -->
         <activity
             android:name=".HomeActivity"
             android:clearTaskOnLaunch="true"

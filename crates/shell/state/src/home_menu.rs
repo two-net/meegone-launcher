@@ -44,7 +44,8 @@ pub struct HomeMenu {
     /// What it offers, in order.
     pub items: &'static [MenuItem],
     /// Where the finger was held, in pixels from the home views' top left, so the menu opens
-    /// there. `None` when a screen reader opened it (A11Y-05), and the host centres it.
+    /// there. `None` when a screen reader opened it (A11Y-05) or the layout changed since
+    /// (COMP-03), and the host centres it.
     pub anchor: Option<(f64, f64)>,
 }
 

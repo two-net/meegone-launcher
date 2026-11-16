@@ -308,8 +308,12 @@ impl HomeShell {
             ShellIntent::Swipe(direction) => self.swipe(direction),
             ShellIntent::Layout(layout) => {
                 if layout != self.state.carousel.layout {
-                    // The menu opened where the finger was, which no longer fits.
-                    self.state.menu = None;
+                    // Folding, rotating or resizing keeps what is open (COMP-03). The menu
+                    // opened where the finger was, which means nothing in the new layout, so
+                    // it moves to the centre.
+                    if let Some(menu) = &mut self.state.menu {
+                        menu.anchor = None;
+                    }
                 }
                 let release = self.carousel.layout(layout, self.state.current);
                 self.settle(release);
@@ -1328,21 +1332,74 @@ mod tests {
     }
 
     #[test]
-    fn the_menu_closes_when_the_view_or_the_layout_changes() {
+    fn the_menu_closes_when_the_view_changes() {
         let mut shell = laid_out(&Fakes::default());
         shell.dispatch(ShellIntent::OpenMenu);
         shell.dispatch(ShellIntent::Swipe(Direction::Previous));
         assert_eq!(shell.state().menu, None);
+    }
 
-        shell.dispatch(ShellIntent::OpenMenu);
+    #[test]
+    fn the_menu_stays_open_and_centred_when_the_layout_changes() {
+        // COMP-03, issue #8: folding, rotating or resizing keeps it open, but the finger's
+        // place means nothing in the new layout.
+        let mut shell = laid_out(&Fakes::default());
+        hold(&mut shell, 300.0, 700.0);
+        lift(&mut shell);
         let layout = shell.state().carousel.layout;
+
         shell.dispatch(ShellIntent::Layout(layout));
-        assert!(shell.state().menu.is_some());
+        assert_eq!(
+            shell.state().menu.and_then(|menu| menu.anchor),
+            Some((300.0, 700.0))
+        );
+
         shell.dispatch(ShellIntent::Layout(Layout {
             width_px: 2000.0,
             ..layout
         }));
-        assert_eq!(shell.state().menu, None);
+        assert_eq!(
+            shell.state().menu,
+            Some(HomeMenu {
+                items: &MenuItem::ALL,
+                anchor: None,
+            })
+        );
+        assert_eq!(shell.state().current, HomeView::Applications);
+    }
+
+    #[test]
+    fn a_new_layout_keeps_the_open_folder_edit_mode_and_scroll_position() {
+        // COMP-03, issue #8: a foldable showing an open folder in edit mode is unfolded, then
+        // folded again.
+        let (_, mut shell) = with_a_folder();
+        let folded = Layout {
+            width_px: 1080.0,
+            density: 2.625,
+            touch_slop_px: 21.0,
+            rtl: false,
+        };
+        let unfolded = Layout {
+            width_px: 2208.0,
+            density: 2.375,
+            touch_slop_px: 19.0,
+            rtl: false,
+        };
+        shell.dispatch(ShellIntent::Layout(folded));
+        shell.dispatch(ShellIntent::Apps(AppsIntent::Scrolled(480.0)));
+        shell.dispatch(ShellIntent::Apps(AppsIntent::EnterEditMode));
+        shell.dispatch(ShellIntent::Apps(AppsIntent::OpenFolder(FolderId(1))));
+
+        for layout in [unfolded, folded] {
+            shell.dispatch(ShellIntent::Layout(layout));
+
+            assert_eq!(shell.state().carousel.layout, layout);
+            assert_eq!(shell.state().current, HomeView::Applications);
+            let apps = shell.apps().state();
+            assert_eq!(apps.open_folder, Some(FolderId(1)));
+            assert!(apps.edit_mode);
+            assert_eq!(apps.scroll_px, 480.0);
+        }
     }
 
     #[test]
