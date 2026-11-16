@@ -5,10 +5,17 @@
 //! cells do. The host then reads the [`AppsView::cells`] it draws, and refers to a cell by its
 //! place in them. Each cell says where it was in the cells before, so the host moves the same
 //! view, icon and all, to its new place (ANIM-21, ADR 0012).
+//!
+//! An app's long-press menu works the same way (ADR 0013): the frame says at which cell it is
+//! open and gives it a revision, the host reads its [`AppsView::menu_items`] when that changes,
+//! and refers to an item by its place in them.
 
 use std::sync::Arc;
 
-use meegone_apps_state::{AppsIntent, AppsState, FolderId, GridItem, GridLayout, previous_places};
+pub use meegone_apps_state::AppMenuItem;
+use meegone_apps_state::{
+    AppMenu, AppsIntent, AppsState, FolderId, GridItem, GridLayout, previous_places,
+};
 use meegone_core_state::{AppId, Rect};
 use meegone_core_ui::{Dispatch, Tokens, View};
 
@@ -24,6 +31,18 @@ pub struct AppsFrame {
     pub columns: u16,
     /// Rows, the last one always empty (HOME-14).
     pub rows: u16,
+    /// An app's long-press menu, while it is open (APPS-11).
+    pub menu: Option<AppMenuFrame>,
+}
+
+/// An app's long-press menu as the host draws it (APPS-11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AppMenuFrame {
+    /// Changes whenever its items do, so the host reads [`AppsView::menu_items`] again.
+    pub revision: u32,
+    /// The cell of the app it is for, which the host opens it at, or `None` when the app has
+    /// no cell of its own, such as inside a folder; the host then centres it.
+    pub cell: Option<usize>,
 }
 
 /// One cell as the host draws it.
@@ -51,6 +70,9 @@ pub struct AppsView {
     /// Where each of `cells` was in the cells before them.
     from: Vec<Option<usize>>,
     revision: u32,
+    /// The app menu the host was last told about.
+    menu: Option<Arc<AppMenu>>,
+    menu_revision: u32,
 }
 
 impl AppsView {
@@ -60,22 +82,36 @@ impl AppsView {
             cells: Arc::new([]),
             from: Vec::new(),
             revision: 0,
+            menu: None,
+            menu_revision: 0,
         }
     }
 
     /// What the host draws for the grid now. Takes on the state's cells if they changed, and
-    /// where each was in the cells the host drew before.
+    /// where each was in the cells the host drew before, and the app menu if it changed.
     pub fn frame(&mut self, state: &AppsState) -> AppsFrame {
         if !Arc::ptr_eq(&self.cells, &state.items) {
             self.from = previous_places(&self.cells, &state.items);
             self.cells = Arc::clone(&state.items);
             self.revision = self.revision.wrapping_add(1);
         }
+        let same_menu = match (&self.menu, &state.menu) {
+            (Some(shown), Some(menu)) => Arc::ptr_eq(shown, menu),
+            (shown, menu) => shown.is_none() && menu.is_none(),
+        };
+        if !same_menu {
+            self.menu = state.menu.clone();
+            self.menu_revision = self.menu_revision.wrapping_add(1);
+        }
         AppsFrame {
             revision: self.revision,
             scroll_px: state.scroll_px.round().clamp(0.0, f64::from(i32::MAX)) as i32,
             columns: u16::try_from(state.columns).unwrap_or(u16::MAX),
             rows: u16::try_from(state.rows()).unwrap_or(u16::MAX),
+            menu: self.menu.as_ref().map(|menu| AppMenuFrame {
+                revision: self.menu_revision,
+                cell: self.place_of(&menu.app),
+            }),
         }
     }
 
@@ -104,6 +140,47 @@ impl AppsView {
             })
     }
 
+    /// The app of cell `index` of the cells at `revision`, or `None` for a folder, or when the
+    /// cells changed since the host drew them: then the host can't know what it meant.
+    pub fn app_at(&self, revision: u32, index: usize) -> Option<&AppId> {
+        if revision != self.revision {
+            return None;
+        }
+        match self.cells.get(index)? {
+            GridItem::App { app, .. } => Some(&app.id),
+            GridItem::Folder { .. } => None,
+        }
+    }
+
+    /// The place of `app`'s own cell in the cells of the last [`AppsView::frame`], if it has
+    /// one: an app in a folder has none.
+    pub fn place_of(&self, app: &AppId) -> Option<usize> {
+        self.cells
+            .iter()
+            .position(|item| matches!(item, GridItem::App { app: shown, .. } if shown.id == *app))
+    }
+
+    /// The items of the app menu of the last [`AppsView::frame`], in order, or none while it is
+    /// closed (APPS-11).
+    pub fn menu_items(&self) -> &[AppMenuItem] {
+        self.menu.as_ref().map_or(&[], |menu| &menu.items)
+    }
+
+    /// Item `index` of the app menu at `revision` was chosen (APPS-11). Returns whether it does
+    /// anything: not when the menu changed or closed since the host drew it.
+    pub fn menu_item_chosen(&self, revision: u32, index: usize) -> bool {
+        if revision != self.menu_revision {
+            return false;
+        }
+        match self.menu_items().get(index) {
+            Some(item) => {
+                self.dispatch.send(AppsIntent::ChooseMenuItem(item.clone()));
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Cell `index` of the cells at `revision` was tapped. Its icon is at `from` on the screen,
     /// which the app's window grows from (APPS-10, ANIM-08). Returns whether it launches
     /// anything: not when the cells changed since the host drew them, nor for a folder until #14.
@@ -123,11 +200,6 @@ impl AppsView {
     /// APPS-10: launches `app`, growing its window from `from` (ANIM-08).
     pub fn icon_tapped(&self, app: AppId, from: Option<Rect>) {
         self.dispatch.send(AppsIntent::Launch { app, from });
-    }
-
-    /// Dragging after a long-press picks the icon up and enters edit mode (APPS-11).
-    pub fn icon_dragged(&self) {
-        self.dispatch.send(AppsIntent::EnterEditMode);
     }
 
     /// FOLD-04
@@ -355,6 +427,79 @@ mod tests {
         assert_eq!(from(&view), [Some(0), Some(1)]);
         view.frame(&after);
         assert_eq!(from(&view), [Some(0), Some(1)]);
+    }
+
+    #[test]
+    fn cells_are_named_by_revision_and_place() {
+        // APPS-11: a long-press on cells that have since changed means nothing.
+        let (mut view, _) = view();
+        let mail = app("mail", "Mail", true, false);
+        let maps = app("maps", "Maps", true, false);
+        let revision = view
+            .frame(&state(vec![
+                GridItem::Folder {
+                    id: FolderId(1),
+                    name: "Games".into(),
+                    apps: vec![maps.clone()],
+                },
+                cell(mail.clone()),
+            ]))
+            .revision;
+
+        assert_eq!(view.app_at(revision, 1), Some(&mail.id));
+        assert_eq!(view.app_at(revision, 0), None);
+        assert_eq!(view.app_at(revision, 2), None);
+        assert_eq!(view.app_at(revision.wrapping_add(1), 1), None);
+
+        assert_eq!(view.place_of(&mail.id), Some(1));
+        // An app in a folder has no cell of its own.
+        assert_eq!(view.place_of(&maps.id), None);
+    }
+
+    #[test]
+    fn the_app_menu_is_at_its_apps_cell_with_a_new_revision_for_each_menu() {
+        // APPS-11
+        let (mut view, sent) = view();
+        let mail = app("mail", "Mail", true, false);
+        let mut apps = state(vec![
+            cell(app("maps", "Maps", true, false)),
+            cell(mail.clone()),
+        ]);
+        assert_eq!(view.frame(&apps).menu, None);
+        assert!(view.menu_items().is_empty());
+
+        apps.menu = Some(Arc::new(AppMenu {
+            app: mail.id.clone(),
+            items: vec![AppMenuItem::AppInfo, AppMenuItem::Uninstall],
+        }));
+        let menu = view.frame(&apps).menu.expect("the menu is open");
+        assert_eq!(menu.cell, Some(1));
+        assert_eq!(
+            view.menu_items(),
+            [AppMenuItem::AppInfo, AppMenuItem::Uninstall]
+        );
+        // The same menu keeps its revision.
+        assert_eq!(view.frame(&apps).menu, Some(menu));
+
+        assert!(view.menu_item_chosen(menu.revision, 1));
+        assert!(!view.menu_item_chosen(menu.revision, 2));
+        assert!(matches!(
+            sent.borrow()[..],
+            [AppsIntent::ChooseMenuItem(AppMenuItem::Uninstall)]
+        ));
+
+        // Another menu, even with the same items, is new: a choice from the old one does
+        // nothing.
+        apps.menu = Some(Arc::new(AppMenu::clone(apps.menu.as_ref().unwrap())));
+        let again = view.frame(&apps).menu.unwrap();
+        assert_ne!(again.revision, menu.revision);
+        assert!(!view.menu_item_chosen(menu.revision, 0));
+
+        apps.menu = None;
+        assert_eq!(view.frame(&apps).menu, None);
+        assert!(view.menu_items().is_empty());
+        assert!(!view.menu_item_chosen(again.revision, 0));
+        assert_eq!(sent.borrow().len(), 1);
     }
 
     #[test]

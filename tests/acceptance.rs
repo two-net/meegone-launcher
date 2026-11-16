@@ -5,7 +5,7 @@
 //! - AC-01: first-run setup (#35)
 //! - AC-05's open folder, AC-08: folders (#14)
 //! - AC-07's drag and AC-09: edit mode (#13). AC-07's other half, the layout surviving a
-//!   restart, is automated.
+//!   restart, is automated, as is entering edit mode by dragging after a long-press (#12).
 //! - AC-12: Clear in Events (#20)
 //! - AC-13, AC-14: Recent density and close mode (#23, #24)
 //! - AC-15 to AC-17: the daily image (#27 to #30)
@@ -19,14 +19,14 @@ use std::time::Duration;
 use meegone_core_data::fakes::{Fakes, WORK_PROFILE, app, app_id, work_app};
 use meegone_core_data::storage::format::seal;
 use meegone_core_data::{
-    App, DataError, HomeTarget, Notification, Profile, ProfileId, RecentUse, Rect, Rgb, StoredFile,
-    ThemeChoice, accent,
+    App, DataError, HomeTarget, Notification, Profile, ProfileId, RecentUse, Rect, Rgb, Shortcut,
+    StoredFile, ThemeChoice, accent,
 };
 use meegone_core_state::{Access, Health, Theme};
 use meegone_core_ui::tokens;
 use meegone_launcher::{
-    Direction, HomeView, Launcher, Layout, MenuItem, PointerEvent, PointerKind, SettingsGroup,
-    ShellIntent,
+    AppMenuItem, Direction, HomeView, Launcher, Layout, LiftFrame, MenuItem, PointerEvent,
+    PointerKind, SettingsGroup, ShellIntent,
 };
 
 /// A phone 1080 × 2400 px at 2.75 px per dp.
@@ -1092,4 +1092,229 @@ fn apps17_recent_shows_the_accent_derived_from_the_icon_and_an_update_derives_it
     launcher.dispatch(ShellIntent::AppsChanged);
 
     assert_eq!(card(&launcher), Rgb::hex(0xEA4335));
+}
+
+/// A finger goes down on cell `index` of the grid at `(x, y)` and stays there until the host's
+/// long-press time passes; the host then reports it as `AppsGrid` does, by the cells' revision
+/// and the cell's place (APPS-11). Returns whether the long-press was taken. The finger stays
+/// down.
+fn long_press_cell(launcher: &mut Launcher, clock: &mut u64, index: usize, x: f64, y: f64) -> bool {
+    finger(launcher, clock, PointerKind::Down, x, y);
+    *clock += 400;
+    let revision = launcher.frame().apps.revision;
+    let Some(app) = launcher.view().apps().app_at(revision, index).cloned() else {
+        return false;
+    };
+    launcher.dispatch(ShellIntent::LongPressApp(app));
+    launcher.frame().apps.menu.is_some() && launcher.shell().state().carousel.held
+}
+
+fn finger(launcher: &mut Launcher, clock: &mut u64, kind: PointerKind, x: f64, y: f64) {
+    *clock += 16;
+    launcher.dispatch(ShellIntent::Pointer(PointerEvent {
+        kind,
+        x,
+        y,
+        at: Duration::from_millis(*clock),
+    }));
+    launcher.frame();
+}
+
+/// The open app menu's items, as the host reads them.
+fn app_menu(launcher: &mut Launcher) -> Vec<AppMenuItem> {
+    launcher.frame();
+    launcher.view().apps().menu_items().to_vec()
+}
+
+/// Item `index` of the app menu is tapped, as `HomeViews` reports it.
+fn choose(launcher: &mut Launcher, index: usize) {
+    let revision = launcher
+        .frame()
+        .apps
+        .menu
+        .expect("the menu is open")
+        .revision;
+    assert!(launcher.view().apps().menu_item_chosen(revision, index));
+    launcher.frame();
+}
+
+/// Mail, which the user installed, and Settings, a system app.
+fn mail_and_settings(fakes: &Fakes) {
+    *fakes.apps.apps.lock().unwrap() = vec![
+        app("mail", "Mail"),
+        App {
+            can_uninstall: false,
+            ..app("settings", "Settings")
+        },
+    ];
+}
+
+const FIXED: [AppMenuItem; 3] = [
+    AppMenuItem::AppInfo,
+    AppMenuItem::Uninstall,
+    AppMenuItem::EditApplications,
+];
+
+#[test]
+fn apps11_given_a_system_app_when_its_menu_opens_then_it_has_no_uninstall_item() {
+    // Issue #12, APPS-13, ANIM-24
+    let fakes = Fakes::default();
+    mail_and_settings(&fakes);
+    let (mut launcher, mut clock) = on_a_phone(&fakes);
+
+    assert!(long_press_cell(&mut launcher, &mut clock, 1, 400.0, 300.0));
+    assert_eq!(
+        app_menu(&mut launcher),
+        [AppMenuItem::AppInfo, AppMenuItem::EditApplications]
+    );
+    // The host opens it at Settings' cell, and the long-press ticked.
+    assert_eq!(launcher.frame().apps.menu.unwrap().cell, Some(1));
+    assert_eq!(*fakes.system.haptic_ticks.lock().unwrap(), 1);
+
+    // Lifting the finger launches nothing; the menu stays open.
+    finger(&mut launcher, &mut clock, PointerKind::Up, 400.0, 300.0);
+    assert!(fakes.apps.launched.lock().unwrap().is_empty());
+    assert!(launcher.frame().apps.menu.is_some());
+
+    // Mail, which the user installed, can be uninstalled.
+    launcher.dispatch(ShellIntent::Back);
+    assert!(long_press_cell(&mut launcher, &mut clock, 0, 150.0, 300.0));
+    assert_eq!(app_menu(&mut launcher), FIXED);
+}
+
+#[test]
+fn apps11_given_meegone_isnt_the_default_home_app_then_no_shortcuts_appear() {
+    // Issue #12: the system offers shortcuts only to the default home app (SRS 8.1).
+    let fakes = Fakes::default();
+    mail_and_settings(&fakes);
+    let compose = Shortcut {
+        app: app_id("mail"),
+        id: "compose".into(),
+        label: "Compose".into(),
+    };
+    fakes
+        .apps
+        .shortcuts
+        .lock()
+        .unwrap()
+        .insert(app_id("mail"), vec![compose.clone()]);
+    let (mut launcher, mut clock) = on_a_phone(&fakes);
+
+    assert!(long_press_cell(&mut launcher, &mut clock, 0, 150.0, 300.0));
+    assert_eq!(app_menu(&mut launcher), FIXED);
+    finger(&mut launcher, &mut clock, PointerKind::Up, 150.0, 300.0);
+    launcher.dispatch(ShellIntent::Back);
+
+    // As the default home app, they follow the fixed items, and one launches.
+    *fakes.system.default_home.lock().unwrap() = true;
+    *fakes.apps.shortcuts_allowed.lock().unwrap() = true;
+    assert!(long_press_cell(&mut launcher, &mut clock, 0, 150.0, 300.0));
+    let items = app_menu(&mut launcher);
+    assert_eq!(items[..3], FIXED);
+    assert_eq!(items[3..], [AppMenuItem::Shortcut(compose.clone())]);
+    finger(&mut launcher, &mut clock, PointerKind::Up, 150.0, 300.0);
+    choose(&mut launcher, 3);
+    assert_eq!(*fakes.apps.shortcuts_launched.lock().unwrap(), [compose]);
+    assert_eq!(launcher.frame().apps.menu, None);
+}
+
+#[test]
+fn apps11_given_a_long_press_followed_by_a_drag_then_the_icon_lifts_and_edit_mode_starts() {
+    // Issue #12. Dropping it elsewhere moves it with #13; here it goes back to its cell.
+    let fakes = Fakes::default();
+    mail_and_settings(&fakes);
+    let (mut launcher, mut clock) = on_a_phone(&fakes);
+    assert!(long_press_cell(&mut launcher, &mut clock, 1, 400.0, 300.0));
+
+    finger(&mut launcher, &mut clock, PointerKind::Move, 520.0, 450.0);
+
+    let frame = launcher.frame();
+    assert_eq!(frame.apps.menu, None);
+    assert!(launcher.shell().apps().state().edit_mode);
+    assert_eq!(
+        frame.lifted,
+        Some(LiftFrame {
+            cell: 1,
+            dx: 120,
+            dy: 150,
+            scale: 11_000,
+        })
+    );
+    // The views stay put, so the drag moves only the icon.
+    assert_eq!(frame.pages[HomeView::Applications.index()], 0);
+
+    finger(&mut launcher, &mut clock, PointerKind::Up, 520.0, 450.0);
+    assert_eq!(launcher.frame().lifted, None);
+    assert!(launcher.shell().apps().state().edit_mode);
+    assert!(fakes.apps.launched.lock().unwrap().is_empty());
+}
+
+#[test]
+fn apps13_uninstall_asks_the_system_and_the_app_leaves_only_when_the_system_removes_it() {
+    // Issue #12: MeeGone never uninstalls anything itself. App info opens the system screen.
+    let fakes = Fakes::default();
+    mail_and_settings(&fakes);
+    let (mut launcher, mut clock) = on_a_phone(&fakes);
+
+    long_press_cell(&mut launcher, &mut clock, 0, 150.0, 300.0);
+    finger(&mut launcher, &mut clock, PointerKind::Up, 150.0, 300.0);
+    choose(&mut launcher, 0);
+    assert_eq!(
+        *fakes.apps.app_info_opened.lock().unwrap(),
+        [app_id("mail")]
+    );
+
+    long_press_cell(&mut launcher, &mut clock, 0, 150.0, 300.0);
+    finger(&mut launcher, &mut clock, PointerKind::Up, 150.0, 300.0);
+    choose(&mut launcher, 1);
+    assert_eq!(
+        *fakes.apps.uninstall_requested.lock().unwrap(),
+        [app_id("mail")]
+    );
+    assert_eq!(grid(&launcher), ["Mail", "Settings"]);
+
+    // The user confirms in the system's dialog, and the system reports the removal.
+    fakes.apps.apps.lock().unwrap().remove(0);
+    launcher.dispatch(ShellIntent::AppsChanged);
+    assert_eq!(grid(&launcher), ["Settings"]);
+}
+
+#[test]
+fn home07_home08_back_or_home_closes_an_apps_menu() {
+    // Issue #12: Home goes no further than closing it.
+    let fakes = Fakes::default();
+    mail_and_settings(&fakes);
+    let (mut launcher, mut clock) = on_a_phone(&fakes);
+    launcher.view().apps().grid_scrolled(120.0);
+
+    long_press_cell(&mut launcher, &mut clock, 0, 150.0, 300.0);
+    finger(&mut launcher, &mut clock, PointerKind::Up, 150.0, 300.0);
+    launcher.dispatch(ShellIntent::Back);
+    assert_eq!(launcher.frame().apps.menu, None);
+
+    long_press_cell(&mut launcher, &mut clock, 0, 150.0, 300.0);
+    finger(&mut launcher, &mut clock, PointerKind::Up, 150.0, 300.0);
+    launcher.dispatch(ShellIntent::Home);
+    let frame = launcher.frame();
+    assert_eq!(frame.apps.menu, None);
+    assert_eq!(frame.apps.scroll_px, 120);
+    assert_eq!(frame.current, HomeView::Applications);
+}
+
+#[test]
+fn a11y05_a_screen_reader_opens_an_apps_menu_without_a_gesture() {
+    // Issue #12: as `AppsGrid` reports the action, by revision and place. No long-press, so
+    // no tick.
+    let fakes = Fakes::default();
+    mail_and_settings(&fakes);
+    let (mut launcher, _) = on_a_phone(&fakes);
+    let revision = launcher.frame().apps.revision;
+
+    let app = launcher.view().apps().app_at(revision, 1).cloned().unwrap();
+    launcher.dispatch(ShellIntent::OpenAppMenu(app));
+
+    let frame = launcher.frame();
+    assert_eq!(frame.apps.menu.map(|menu| menu.cell), Some(Some(1)));
+    assert!(!frame.menu_offered);
+    assert_eq!(*fakes.system.haptic_ticks.lock().unwrap(), 0);
 }

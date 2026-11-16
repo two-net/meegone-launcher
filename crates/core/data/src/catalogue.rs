@@ -1,13 +1,13 @@
-//! The app catalogue as Android's `Bridge` reports it (ADR 0010).
+//! The app catalogue as Android's `Bridge` reports it (ADR 0010, ADR 0013).
 //!
-//! `Bridge.launchableApps()` and `Bridge.profiles()` return flat `String[]` records, each a
-//! fixed number of fields, in the order below. The fields and flags must stay in step with
+//! `Bridge.launchableApps()`, `Bridge.profiles()` and `Bridge.shortcuts()` return flat
+//! `String[]` records, each a fixed number of fields, in the order below. The fields and flags must stay in step with
 //! `Bridge.java`, as the frame slots do with `HomeViews.java`. They are parsed here, apart from
 //! JNI, so the parsing is tested without a device. A record that doesn't parse is left out,
 //! never fatal.
 
 use crate::accent;
-use crate::model::{App, AppId, Profile, ProfileId, Rgb};
+use crate::model::{App, AppId, Profile, ProfileId, Rgb, Shortcut};
 
 /// `launchableApps()`: package, activity, label, profile serial number, [`app_flag`]s, the
 /// accent `AppAccents.java` derived from the icon as a decimal `0xRRGGBB`, empty until it has
@@ -16,6 +16,9 @@ use crate::model::{App, AppId, Profile, ProfileId, Rgb};
 pub(crate) const APP_FIELDS: usize = 8;
 /// `profiles()`: serial number, [`profile_flag`]s.
 pub(crate) const PROFILE_FIELDS: usize = 2;
+/// `shortcuts(…)`: id, short label, [`shortcut_flag`]s, and its rank among the shortcuts of
+/// its kind, from 0 (APPS-11).
+pub(crate) const SHORTCUT_FIELDS: usize = 4;
 
 /// The flags of one app.
 pub(crate) mod app_flag {
@@ -35,6 +38,12 @@ pub(crate) mod profile_flag {
     pub const LOCKED: u32 = 4;
 }
 
+/// The flags of one shortcut.
+pub(crate) mod shortcut_flag {
+    /// Declared in the app's manifest, rather than published while it runs.
+    pub const MANIFEST: u32 = 1;
+}
+
 /// The apps in `fields`, in order.
 pub(crate) fn apps(fields: &[Option<String>]) -> Vec<App> {
     fields.chunks_exact(APP_FIELDS).filter_map(app).collect()
@@ -46,6 +55,44 @@ pub(crate) fn profiles(fields: &[Option<String>]) -> Vec<Profile> {
         .chunks_exact(PROFILE_FIELDS)
         .filter_map(profile)
         .collect()
+}
+
+/// `app`'s shortcuts in `fields`, in the order the system's own launcher shows them: those from
+/// the app's manifest first, then those it published while running, each by rank (APPS-11).
+pub(crate) fn shortcuts(app: &AppId, fields: &[Option<String>]) -> Vec<Shortcut> {
+    let mut ranked: Vec<(bool, u32, Shortcut)> = fields
+        .chunks_exact(SHORTCUT_FIELDS)
+        .filter_map(|record| shortcut(app, record))
+        .collect();
+    // Stable, so shortcuts of the same kind and rank keep the system's order.
+    ranked.sort_by_key(|(manifest, rank, _)| (!manifest, *rank));
+    ranked
+        .into_iter()
+        .map(|(_, _, shortcut)| shortcut)
+        .collect()
+}
+
+fn shortcut(app: &AppId, record: &[Option<String>]) -> Option<(bool, u32, Shortcut)> {
+    let [id, label, flags, rank] = record else {
+        return None;
+    };
+    let id = id.as_deref().filter(|text| !text.is_empty())?;
+    // A shortcut with no label would be a blank line in the menu.
+    let label = label
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())?;
+    let flags: u32 = number(flags)?;
+    let shortcut = Shortcut {
+        app: app.clone(),
+        id: id.to_owned(),
+        label: label.to_owned(),
+    };
+    Some((
+        flags & shortcut_flag::MANIFEST != 0,
+        number(rank)?,
+        shortcut,
+    ))
 }
 
 fn app(record: &[Option<String>]) -> Option<App> {
@@ -278,6 +325,89 @@ mod tests {
         assert_eq!(hex(""), Some(Vec::new()));
         assert!(hex("0a").unwrap() < hex("0a01").unwrap());
         assert!(hex("0aff").unwrap() < hex("0b").unwrap());
+    }
+
+    #[test]
+    fn shortcuts_come_manifest_first_then_by_rank() {
+        // APPS-11: as the system's own launcher orders them.
+        let mail = AppId {
+            profile: ProfileId(10),
+            package: "com.example.mail".into(),
+            activity: "com.example.mail.Inbox".into(),
+        };
+        let records = fields(&[
+            Some("recent-anna"),
+            Some("Anna"),
+            Some("0"),
+            Some("0"),
+            Some("compose"),
+            Some("Compose"),
+            Some("1"),
+            Some("1"),
+            Some("recent-ben"),
+            Some("Ben"),
+            Some("0"),
+            Some("1"),
+            Some("inbox"),
+            Some(" Inbox "),
+            Some("1"),
+            Some("0"),
+        ]);
+
+        let shortcuts = shortcuts(&mail, &records);
+
+        let ids: Vec<&str> = shortcuts.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, ["inbox", "compose", "recent-anna", "recent-ben"]);
+        assert_eq!(
+            shortcuts[0],
+            Shortcut {
+                app: mail,
+                id: "inbox".into(),
+                label: "Inbox".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn shortcuts_that_dont_parse_are_left_out() {
+        let mail = AppId {
+            profile: ProfileId(0),
+            package: "mail".into(),
+            activity: "mail.Main".into(),
+        };
+        let records = fields(&[
+            // No id.
+            Some(""),
+            Some("Inbox"),
+            Some("1"),
+            Some("0"),
+            // No label.
+            Some("compose"),
+            Some(" "),
+            Some("1"),
+            Some("1"),
+            // Flags and rank that aren't numbers.
+            Some("anna"),
+            Some("Anna"),
+            Some("x"),
+            Some("0"),
+            Some("ben"),
+            Some("Ben"),
+            Some("0"),
+            Some("-1"),
+            Some("cleo"),
+            Some("Cleo"),
+            Some("0"),
+            Some("2"),
+            // An incomplete record at the end.
+            Some("dan"),
+            Some("Dan"),
+        ]);
+
+        let shortcuts = shortcuts(&mail, &records);
+
+        assert_eq!(shortcuts.len(), 1);
+        assert_eq!(shortcuts[0].label, "Cleo");
     }
 
     #[test]

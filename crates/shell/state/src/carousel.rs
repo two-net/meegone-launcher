@@ -327,17 +327,24 @@ impl Carousel {
         release
     }
 
-    /// The finger has stayed down on empty space for the platform's long-press time, as the
-    /// host measures it (HOME-10). It counts only while the gesture is still a press: down, not
-    /// past the touch slop, not dragging or catching the row. Returns where the finger went
-    /// down, and takes the rest of the gesture from the row and the content below.
+    /// Where the finger went down, while the gesture is still a press: down, not past the touch
+    /// slop, not dragging or catching the row. Only then can a long-press count.
+    pub fn pressed_at(&self) -> Option<(f64, f64)> {
+        match self.gesture {
+            Gesture::Pressed { x, y } => Some((x, y)),
+            _ => None,
+        }
+    }
+
+    /// The finger has stayed down for the platform's long-press time, as the host measures it,
+    /// on empty space (HOME-10) or on an app's icon (APPS-11). It counts only while the gesture
+    /// is still a press (see [`Carousel::pressed_at`]). Returns where the finger went down, and
+    /// takes the rest of the gesture from the row and the content below.
     pub fn long_press(&mut self) -> Option<(f64, f64)> {
-        let Gesture::Pressed { x, y } = self.gesture else {
-            return None;
-        };
+        let at = self.pressed_at()?;
         self.gesture = Gesture::Held;
         self.publish();
-        Some((x, y))
+        Some(at)
     }
 
     /// Follows the finger (HOME-03, ANIM-01). Returns where the row settles when a drag ends.

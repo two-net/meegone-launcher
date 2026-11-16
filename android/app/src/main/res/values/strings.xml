@@ -36,6 +36,18 @@
          (APPS-09). -->
     <string name="app_unavailable">This app can\'t open right now</string>
 
+    <!-- An app's long-press menu (APPS-11). Screen readers announce its title, e.g. "Mail
+         menu", where %1$s is the app's name, and open it with the action (A11Y-05). Edit
+         applications shares the home menu's text. -->
+    <string name="app_menu">%1$s menu</string>
+    <string name="action_app_menu">Open menu</string>
+    <string name="menu_app_info">App info</string>
+    <string name="menu_uninstall">Uninstall</string>
+    <!-- Shown briefly when the system refuses an item of the app menu. -->
+    <string name="app_info_unavailable">App info can\'t open right now</string>
+    <string name="uninstall_unavailable">This app can\'t be uninstalled right now</string>
+    <string name="shortcut_unavailable">This shortcut can\'t open right now</string>
+
     <!-- Settings' title (SET-01). -->
     <string name="settings_title">Launcher settings</string>
 </resources>

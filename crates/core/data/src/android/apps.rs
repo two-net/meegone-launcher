@@ -1,12 +1,13 @@
 //! [`AppsAdapter`] on Android: the app catalogue and launching (APPS-01, APPS-09, APPS-10,
-//! ANIM-08, ADR 0010), and the default apps the first grid starts with (APPS-05, ADR 0012).
+//! ANIM-08, ADR 0010), the default apps the first grid starts with (APPS-05, ADR 0012), and
+//! what the app long-press menu offers: shortcuts, App info and uninstall requests (APPS-11,
+//! APPS-13, ADR 0013).
 //!
 //! Questions go to the Java `Bridge` object, whose method names and signatures must stay in
-//! step with the ones looked up here. The catalogue arrives as flat records, parsed in
-//! [`crate::catalogue`]. Shortcuts arrive with #12; uninstalling and App info with #13.
+//! step with the ones looked up here. The catalogue and the shortcuts arrive as flat records,
+//! parsed in [`crate::catalogue`].
 
-use super::jni::{Env, GlobalRef, JValue, LocalRef, MethodId, Vm};
-use super::not_yet;
+use super::jni::{Env, GlobalRef, JValue, Local, LocalRef, MethodId, Vm};
 use crate::adapters::AppsAdapter;
 use crate::catalogue;
 use crate::model::{App, AppId, DataError, Profile, Rect, Shortcut};
@@ -24,6 +25,19 @@ pub struct AndroidApps {
     /// `String launch(String package, String activity, long profile, int left, int top,
     /// int right, int bottom)`: `null`, or a short message when the system couldn't start it.
     launch: MethodId,
+    /// `String[] shortcuts(String package, String activity, long profile)`: records of
+    /// [`catalogue::SHORTCUT_FIELDS`] fields, or `null` while MeeGone isn't the default home
+    /// app or the system can't say.
+    shortcuts: MethodId,
+    /// `String launchShortcut(String package, String id, long profile)`: `null`, or a short
+    /// message.
+    launch_shortcut: MethodId,
+    /// `String requestUninstall(String package, String activity, long profile)`: opens the
+    /// system's uninstall confirmation. `null`, or a short message.
+    request_uninstall: MethodId,
+    /// `String openAppInfo(String package, String activity, long profile)`: `null`, or a short
+    /// message.
+    open_app_info: MethodId,
 }
 
 impl AndroidApps {
@@ -39,9 +53,49 @@ impl AndroidApps {
                 c"launch",
                 c"(Ljava/lang/String;Ljava/lang/String;JIIII)Ljava/lang/String;",
             )?,
+            shortcuts: env.method_id(
+                bridge,
+                c"shortcuts",
+                c"(Ljava/lang/String;Ljava/lang/String;J)[Ljava/lang/String;",
+            )?,
+            launch_shortcut: env.method_id(bridge, c"launchShortcut", APP_REQUEST)?,
+            request_uninstall: env.method_id(bridge, c"requestUninstall", APP_REQUEST)?,
+            open_app_info: env.method_id(bridge, c"openAppInfo", APP_REQUEST)?,
             bridge: env.global_ref(bridge)?,
         })
     }
+}
+
+/// The signature of a request about one app: two strings and a profile serial number, answered
+/// with `null` or a short message.
+const APP_REQUEST: &std::ffi::CStr = c"(Ljava/lang/String;Ljava/lang/String;J)Ljava/lang/String;";
+
+impl AndroidApps {
+    /// Calls a bridge method of [`APP_REQUEST`]'s signature. A message back means the system
+    /// refused.
+    fn request(
+        &self,
+        method: MethodId,
+        first: &str,
+        second: &str,
+        profile: u32,
+    ) -> Result<(), DataError> {
+        let env = self.vm.env()?;
+        let (first, second) = (env.new_string(first)?, env.new_string(second)?);
+        let args = app_args(&first, &second, profile);
+        match env.call_string(&self.bridge, method, &args)? {
+            None => Ok(()),
+            Some(message) => Err(DataError::Failed(message)),
+        }
+    }
+}
+
+fn app_args(first: &Local, second: &Local, profile: u32) -> [JValue; 3] {
+    [
+        JValue::object(first),
+        JValue::object(second),
+        JValue::long(i64::from(profile)),
+    ]
 }
 
 impl AppsAdapter for AndroidApps {
@@ -99,20 +153,49 @@ impl AppsAdapter for AndroidApps {
         }
     }
 
-    fn shortcuts(&self, _app: &AppId) -> Result<Vec<Shortcut>, DataError> {
-        Err(not_yet()) // #12
+    /// `Unsupported` while MeeGone isn't the default home app: the system offers shortcuts only
+    /// to it, and the menu then shows none (APPS-11).
+    fn shortcuts(&self, app: &AppId) -> Result<Vec<Shortcut>, DataError> {
+        let env = self.vm.env()?;
+        let (package, activity) = (
+            env.new_string(&app.package)?,
+            env.new_string(&app.activity)?,
+        );
+        let args = app_args(&package, &activity, app.profile.0);
+        match env.call_strings(&self.bridge, self.shortcuts, &args)? {
+            Some(fields) => Ok(catalogue::shortcuts(app, &fields)),
+            None => Err(DataError::Unsupported(
+                "Shortcuts need MeeGone as the default home app".into(),
+            )),
+        }
     }
 
-    fn launch_shortcut(&self, _shortcut: &Shortcut) -> Result<(), DataError> {
-        Err(not_yet()) // #12
+    fn launch_shortcut(&self, shortcut: &Shortcut) -> Result<(), DataError> {
+        self.request(
+            self.launch_shortcut,
+            &shortcut.app.package,
+            &shortcut.id,
+            shortcut.app.profile.0,
+        )
     }
 
-    fn request_uninstall(&self, _app: &AppId) -> Result<(), DataError> {
-        Err(not_yet()) // #13
+    /// The system asks the user to confirm; MeeGone never uninstalls anything itself (APPS-13).
+    fn request_uninstall(&self, app: &AppId) -> Result<(), DataError> {
+        self.request(
+            self.request_uninstall,
+            &app.package,
+            &app.activity,
+            app.profile.0,
+        )
     }
 
-    fn open_app_info(&self, _app: &AppId) -> Result<(), DataError> {
-        Err(not_yet()) // #12
+    fn open_app_info(&self, app: &AppId) -> Result<(), DataError> {
+        self.request(
+            self.open_app_info,
+            &app.package,
+            &app.activity,
+            app.profile.0,
+        )
     }
 }
 

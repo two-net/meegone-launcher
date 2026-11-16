@@ -1,5 +1,6 @@
-//! Applications state (SRS 4.2): the grid, its layout and scroll position, edit mode and the
-//! open folder. [`reconcile`] keeps the layout in step with the installed apps (ADR 0012).
+//! Applications state (SRS 4.2): the grid, its layout and scroll position, an app's long-press
+//! menu, edit mode and the open folder. [`reconcile`] keeps the layout in step with the
+//! installed apps (ADR 0012).
 
 mod reconcile;
 
@@ -7,7 +8,7 @@ use std::sync::Arc;
 
 use meegone_apps_data::{Layout, LayoutStore, SavedLayout};
 use meegone_core_data::{AppsAdapter, DataError, Profile};
-use meegone_core_state::{App, AppId, Rect, StateHolder};
+use meegone_core_state::{App, AppId, Rect, Shortcut, StateHolder};
 
 pub use meegone_apps_data::FolderId;
 use reconcile::{Start, grid, reconcile};
@@ -31,6 +32,40 @@ pub fn columns_for(width_dp: f64) -> usize {
         return PHONE_COLUMNS;
     }
     PHONE_COLUMNS.max((width_dp / MAX_CELL_DP).ceil() as usize)
+}
+
+/// An app's long-press menu lists at most this many of its shortcuts, as the system's own
+/// launcher does (APPS-11, ADR 0013).
+pub const MAX_SHORTCUTS: usize = 4;
+
+/// One item of an app's long-press menu (APPS-11), in the order it shows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppMenuItem {
+    /// Opens the system's App info screen.
+    AppInfo,
+    /// Opens the system's uninstall confirmation (APPS-13). Only for apps the user can
+    /// uninstall.
+    Uninstall,
+    /// Enters edit mode. Not offered while edit mode is on.
+    EditApplications,
+    /// Starts one of the app's shortcuts. Offered only while MeeGone is the default home app.
+    Shortcut(Shortcut),
+}
+
+/// An app's long-press menu (APPS-11). It covers the home views while it is open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppMenu {
+    /// The app it is for. The host opens it at this app's icon.
+    pub app: AppId,
+    /// What it offers, in order: App info, Uninstall, Edit applications, then the shortcuts.
+    pub items: Vec<AppMenuItem>,
+}
+
+impl AppMenu {
+    /// Whether the menu offers `item`.
+    pub fn offers(&self, item: &AppMenuItem) -> bool {
+        self.items.contains(item)
+    }
 }
 
 /// One cell of the grid, ready to render.
@@ -95,6 +130,9 @@ pub struct AppsState {
     /// it back to 0 (HOME-07), and it is kept when the system ends MeeGone's process (REL-05).
     /// The host scrolls its grid to this position whenever it differs from its own (ADR 0007).
     pub scroll_px: f64,
+    /// An app's long-press menu, while it is open (APPS-11). Shared, so the UI can tell when it
+    /// changed.
+    pub menu: Option<Arc<AppMenu>>,
     pub edit_mode: bool,
     pub open_folder: Option<FolderId>,
     /// The last problem, in plain words. The grid keeps working (REL-01).
@@ -107,6 +145,7 @@ impl Default for AppsState {
             items: Arc::new([]),
             columns: PHONE_COLUMNS,
             scroll_px: 0.0,
+            menu: None,
             edit_mode: false,
             open_folder: None,
             problem: None,
@@ -134,6 +173,14 @@ pub enum AppsIntent {
     },
     /// The host laid the grid out, at start or after a size, density or font change.
     Layout(GridLayout),
+    /// Opens `app`'s long-press menu (APPS-11).
+    OpenMenu(AppId),
+    /// Closes the app menu, if it is open.
+    CloseMenu,
+    /// An item of the app menu was chosen. The menu closes, then does what the item says. An
+    /// item it doesn't offer is ignored.
+    ChooseMenuItem(AppMenuItem),
+    /// Enters edit mode (APPS-12). An open app menu closes.
     EnterEditMode,
     OpenFolder(FolderId),
     /// The host scrolled the grid to this many pixels from its top, or MeeGone restores where
@@ -215,6 +262,11 @@ impl AppsHolder {
         }
         self.show(&layout, &installed);
         self.layout = Some(layout);
+        // The menu of an app that was just removed closes.
+        let gone = |menu: &Arc<AppMenu>| self.app(&menu.app).is_none();
+        if self.state.menu.as_ref().is_some_and(gone) {
+            self.state.menu = None;
+        }
     }
 
     fn catalogue(&self) -> Result<(Vec<App>, Vec<Profile>), DataError> {
@@ -300,6 +352,58 @@ impl AppsHolder {
             self.state.open_folder = Some(folder);
         }
     }
+
+    /// The grid's app `id`, in a cell of its own or in a folder.
+    fn app(&self, id: &AppId) -> Option<&App> {
+        self.state.items.iter().find_map(|item| match item {
+            GridItem::App { app, .. } => (app.id == *id).then_some(app),
+            GridItem::Folder { apps, .. } => apps.iter().find(|app| app.id == *id),
+        })
+    }
+
+    /// APPS-11: App info, Uninstall when the user can uninstall the app (APPS-13), Edit
+    /// applications unless edit mode is on, then the app's first shortcuts. The system offers
+    /// shortcuts only while MeeGone is the default home app; otherwise, or if it can't say, the
+    /// menu has none.
+    fn open_menu(&mut self, id: AppId) {
+        let Some(app) = self.app(&id) else {
+            return;
+        };
+        let mut items = vec![AppMenuItem::AppInfo];
+        if app.can_uninstall {
+            items.push(AppMenuItem::Uninstall);
+        }
+        if !self.state.edit_mode {
+            items.push(AppMenuItem::EditApplications);
+        }
+        let shortcuts = self.apps.shortcuts(&id).unwrap_or_default();
+        items.extend(
+            shortcuts
+                .into_iter()
+                .take(MAX_SHORTCUTS)
+                .map(AppMenuItem::Shortcut),
+        );
+        self.state.menu = Some(Arc::new(AppMenu { app: id, items }));
+    }
+
+    /// Closes the menu, then does what `item` says. Leaving MeeGone for a system screen or a
+    /// shortcut can fail; the failure is the problem, shown briefly.
+    fn choose(&mut self, item: AppMenuItem) {
+        let Some(menu) = self.state.menu.take_if(|menu| menu.offers(&item)) else {
+            return;
+        };
+        let done = match item {
+            AppMenuItem::AppInfo => self.apps.open_app_info(&menu.app),
+            // MeeGone never uninstalls anything itself: the system asks the user (APPS-13).
+            AppMenuItem::Uninstall => self.apps.request_uninstall(&menu.app),
+            AppMenuItem::EditApplications => {
+                self.state.edit_mode = true;
+                Ok(())
+            }
+            AppMenuItem::Shortcut(shortcut) => self.apps.launch_shortcut(&shortcut),
+        };
+        self.state.problem = done.err().map(|error| error.to_string());
+    }
 }
 
 impl StateHolder for AppsHolder {
@@ -315,7 +419,13 @@ impl StateHolder for AppsHolder {
             AppsIntent::Refresh => self.refresh(),
             AppsIntent::Launch { app, from } => self.launch(&app, from),
             AppsIntent::Layout(grid) => self.lay_out(grid),
-            AppsIntent::EnterEditMode => self.state.edit_mode = true,
+            AppsIntent::OpenMenu(app) => self.open_menu(app),
+            AppsIntent::CloseMenu => self.state.menu = None,
+            AppsIntent::ChooseMenuItem(item) => self.choose(item),
+            AppsIntent::EnterEditMode => {
+                self.state.menu = None;
+                self.state.edit_mode = true;
+            }
             AppsIntent::OpenFolder(folder) => self.open_folder(folder),
             AppsIntent::Scrolled(px) => {
                 if px.is_finite() {
@@ -326,8 +436,9 @@ impl StateHolder for AppsHolder {
         }
     }
 
+    /// HOME-08: the app menu, then the open folder, then edit mode.
     fn on_back(&mut self) -> bool {
-        if self.state.open_folder.take().is_some() {
+        if self.state.menu.take().is_some() || self.state.open_folder.take().is_some() {
             return true;
         }
         std::mem::take(&mut self.state.edit_mode)
@@ -703,6 +814,255 @@ mod tests {
         assert!(holder.on_back());
         assert!(!holder.state().edit_mode);
         assert!(!holder.on_back());
+    }
+
+    fn shortcut(package: &str, id: &str) -> Shortcut {
+        Shortcut {
+            app: app_id(package),
+            id: id.into(),
+            label: id.to_uppercase(),
+        }
+    }
+
+    fn menu(holder: &AppsHolder) -> Option<Vec<AppMenuItem>> {
+        holder.state().menu.as_ref().map(|menu| menu.items.clone())
+    }
+
+    #[test]
+    fn an_apps_menu_offers_app_info_uninstall_and_edit_applications() {
+        // APPS-11, APPS-13: a system app can't be uninstalled, so its menu doesn't offer it.
+        let fakes = Fakes::default();
+        *fakes.apps.apps.lock().unwrap() = vec![
+            app("mail", "Mail"),
+            App {
+                can_uninstall: false,
+                ..app("settings", "Settings")
+            },
+        ];
+        let mut holder = holder(&fakes, &layout_store());
+        assert_eq!(holder.state().menu, None);
+
+        holder.handle(AppsIntent::OpenMenu(app_id("mail")));
+        assert_eq!(
+            holder.state().menu.as_deref(),
+            Some(&AppMenu {
+                app: app_id("mail"),
+                items: vec![
+                    AppMenuItem::AppInfo,
+                    AppMenuItem::Uninstall,
+                    AppMenuItem::EditApplications,
+                ],
+            })
+        );
+
+        holder.handle(AppsIntent::OpenMenu(app_id("settings")));
+        assert_eq!(
+            menu(&holder),
+            Some(vec![AppMenuItem::AppInfo, AppMenuItem::EditApplications])
+        );
+
+        // An app that isn't in the grid has no menu.
+        holder.handle(AppsIntent::CloseMenu);
+        holder.handle(AppsIntent::OpenMenu(app_id("gone")));
+        assert_eq!(holder.state().menu, None);
+    }
+
+    #[test]
+    fn shortcuts_appear_only_while_meegone_is_the_default_home_app() {
+        // APPS-11: at most four, after the fixed items.
+        let fakes = Fakes::default();
+        install(&fakes, &[("mail", "Mail")]);
+        let ids = ["inbox", "compose", "anna", "ben", "cleo"];
+        fakes.apps.shortcuts.lock().unwrap().insert(
+            app_id("mail"),
+            ids.iter().map(|id| shortcut("mail", id)).collect(),
+        );
+        let mut holder = holder(&fakes, &layout_store());
+
+        holder.handle(AppsIntent::OpenMenu(app_id("mail")));
+        assert_eq!(menu(&holder).unwrap().len(), 3);
+
+        *fakes.apps.shortcuts_allowed.lock().unwrap() = true;
+        holder.handle(AppsIntent::OpenMenu(app_id("mail")));
+        let items = menu(&holder).unwrap();
+        assert_eq!(
+            items[..3],
+            [
+                AppMenuItem::AppInfo,
+                AppMenuItem::Uninstall,
+                AppMenuItem::EditApplications
+            ]
+        );
+        assert_eq!(
+            items[3..],
+            ids[..MAX_SHORTCUTS]
+                .iter()
+                .map(|id| AppMenuItem::Shortcut(shortcut("mail", id)))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn each_menu_item_does_what_it_says() {
+        // APPS-11, APPS-13: App info, the system's uninstall confirmation, edit mode and a
+        // shortcut, each through the data layer. Choosing closes the menu.
+        let fakes = Fakes::default();
+        install(&fakes, &[("mail", "Mail")]);
+        *fakes.apps.shortcuts_allowed.lock().unwrap() = true;
+        fakes
+            .apps
+            .shortcuts
+            .lock()
+            .unwrap()
+            .insert(app_id("mail"), vec![shortcut("mail", "compose")]);
+        let mut holder = holder(&fakes, &layout_store());
+        let choose = |holder: &mut AppsHolder, item: AppMenuItem| {
+            holder.handle(AppsIntent::OpenMenu(app_id("mail")));
+            holder.handle(AppsIntent::ChooseMenuItem(item));
+            assert_eq!(holder.state().menu, None);
+        };
+
+        choose(&mut holder, AppMenuItem::AppInfo);
+        assert_eq!(
+            *fakes.apps.app_info_opened.lock().unwrap(),
+            [app_id("mail")]
+        );
+
+        choose(&mut holder, AppMenuItem::Uninstall);
+        assert_eq!(
+            *fakes.apps.uninstall_requested.lock().unwrap(),
+            [app_id("mail")]
+        );
+        // MeeGone uninstalls nothing itself: Mail stays until the system reports it gone.
+        assert_eq!(labels(holder.state()), ["Mail"]);
+
+        choose(
+            &mut holder,
+            AppMenuItem::Shortcut(shortcut("mail", "compose")),
+        );
+        assert_eq!(
+            *fakes.apps.shortcuts_launched.lock().unwrap(),
+            [shortcut("mail", "compose")]
+        );
+
+        assert!(!holder.state().edit_mode);
+        choose(&mut holder, AppMenuItem::EditApplications);
+        assert!(holder.state().edit_mode);
+        assert_eq!(holder.state().problem, None);
+    }
+
+    #[test]
+    fn an_item_the_menu_doesnt_offer_or_with_no_menu_open_does_nothing() {
+        // APPS-13: a system app's menu never uninstalls it.
+        let fakes = Fakes::default();
+        *fakes.apps.apps.lock().unwrap() = vec![App {
+            can_uninstall: false,
+            ..app("settings", "Settings")
+        }];
+        let mut holder = holder(&fakes, &layout_store());
+
+        holder.handle(AppsIntent::ChooseMenuItem(AppMenuItem::AppInfo));
+        holder.handle(AppsIntent::OpenMenu(app_id("settings")));
+        holder.handle(AppsIntent::ChooseMenuItem(AppMenuItem::Uninstall));
+        holder.handle(AppsIntent::ChooseMenuItem(AppMenuItem::Shortcut(shortcut(
+            "settings", "wifi",
+        ))));
+
+        assert!(holder.state().menu.is_some());
+        assert!(fakes.apps.app_info_opened.lock().unwrap().is_empty());
+        assert!(fakes.apps.uninstall_requested.lock().unwrap().is_empty());
+        assert!(fakes.apps.shortcuts_launched.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_menu_item_the_system_refuses_becomes_a_short_message() {
+        let fakes = Fakes::default();
+        install(&fakes, &[("mail", "Mail")]);
+        let mut holder = holder(&fakes, &layout_store());
+        holder.handle(AppsIntent::OpenMenu(app_id("mail")));
+        *fakes.apps.error.lock().unwrap() =
+            Some(DataError::Failed("App info can't open right now".into()));
+
+        holder.handle(AppsIntent::ChooseMenuItem(AppMenuItem::AppInfo));
+
+        assert_eq!(holder.state().menu, None);
+        assert_eq!(
+            holder.state().problem.as_deref(),
+            Some("App info can't open right now")
+        );
+    }
+
+    #[test]
+    fn back_closes_the_menu_then_the_folder_then_edit_mode() {
+        // HOME-08: the menu is on top.
+        let fakes = Fakes::default();
+        let layout = layout_store();
+        layout
+            .save(&Layout {
+                entries: vec![
+                    LayoutEntry::Folder {
+                        id: FolderId(1),
+                        name: "Folder".into(),
+                        apps: vec![app_id("maps"), app_id("mail")],
+                    },
+                    LayoutEntry::App(app_id("phone")),
+                ],
+                ..Layout::default()
+            })
+            .unwrap();
+        install(
+            &fakes,
+            &[("maps", "Maps"), ("mail", "Mail"), ("phone", "Phone")],
+        );
+        let mut holder = holder(&fakes, &layout);
+        holder.handle(AppsIntent::EnterEditMode);
+        holder.handle(AppsIntent::OpenFolder(FolderId(1)));
+        // An app inside a folder has a menu too.
+        holder.handle(AppsIntent::OpenMenu(app_id("maps")));
+        assert!(holder.state().menu.is_some());
+
+        assert!(holder.on_back());
+        assert_eq!(holder.state().menu, None);
+        assert_eq!(holder.state().open_folder, Some(FolderId(1)));
+        assert!(holder.on_back());
+        assert!(holder.on_back());
+        assert!(!holder.state().edit_mode);
+        assert!(!holder.on_back());
+    }
+
+    #[test]
+    fn the_menu_of_an_app_that_was_removed_closes() {
+        // APPS-08: another app's removal leaves it open.
+        let fakes = Fakes::default();
+        install(&fakes, &[("mail", "Mail"), ("maps", "Maps")]);
+        let mut holder = holder(&fakes, &layout_store());
+        holder.handle(AppsIntent::OpenMenu(app_id("mail")));
+
+        install(&fakes, &[("mail", "Mail")]);
+        holder.handle(AppsIntent::Refresh);
+        assert!(holder.state().menu.is_some());
+
+        install(&fakes, &[]);
+        holder.handle(AppsIntent::Refresh);
+        assert_eq!(holder.state().menu, None);
+    }
+
+    #[test]
+    fn in_edit_mode_the_menu_has_no_edit_applications() {
+        // APPS-11, APPS-12: entering edit mode closes the menu.
+        let fakes = Fakes::default();
+        install(&fakes, &[("mail", "Mail")]);
+        let mut holder = holder(&fakes, &layout_store());
+        holder.handle(AppsIntent::OpenMenu(app_id("mail")));
+
+        holder.handle(AppsIntent::EnterEditMode);
+        assert_eq!(holder.state().menu, None);
+
+        holder.handle(AppsIntent::OpenMenu(app_id("mail")));
+        assert_eq!(
+            menu(&holder),
+            Some(vec![AppMenuItem::AppInfo, AppMenuItem::Uninstall])
+        );
     }
 
     #[test]

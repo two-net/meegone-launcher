@@ -31,6 +31,10 @@ import java.util.Set;
  * #requestDisallowInterceptTouchEvent}, as {@link HomeViews} expects. A tap launches the app at
  * once (PERF-06), and a pressed icon shrinks (ANIM-10).
  *
+ * <p>{@link HomeViews} times a long-press: on an app's icon, it asks this grid to open the app's
+ * menu (APPS-11, ADR 0013). Dragging on picks the icon up, and the frame says how far it has
+ * moved from its cell; it lifts above the other cells and is never cut off at the grid's edges.
+ *
  * <p>Each cell says where it was in the cells before, so its view, icon and all, moves to its
  * new place instead of another app being drawn there (ADR 0012). As apps come and go, new cells
  * grow and fade in, the views no cell took shrink away at their old places, and the others slide
@@ -84,6 +88,8 @@ final class AppsGrid extends ScrollView {
     /** The width last reported to the Rust app, or {@link #NONE}. */
     private int reportedWidth = NONE;
     private int pressed = NONE;
+    /** The picked-up icon's view, or null (APPS-11). */
+    private AppCell lifted;
     private int foreground;
     private int dim;
     private int accent;
@@ -98,6 +104,8 @@ final class AppsGrid extends ScrollView {
         setVerticalScrollBarEnabled(false);
         icons = new AppIcons(context, AppCell.iconPx(context), this::refreshIcons);
         cells = new Cells(context);
+        // A picked-up icon may be dragged anywhere on the page.
+        cells.setClipChildren(false);
         addView(cells, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
     }
 
@@ -264,6 +272,21 @@ final class AppsGrid extends ScrollView {
         }
     }
 
+    /**
+     * Draws the picked-up icon: cell {@code index}, {@code dx} and {@code dy} px from its place,
+     * at {@code scale} ten-thousandths (APPS-11). -1 puts every icon back in its cell.
+     */
+    void lift(int index, int dx, int dy, int scale) {
+        AppCell cell = index >= 0 && index < shown.size() ? shown.get(index) : null;
+        if (lifted != null && lifted != cell) {
+            lifted.setLift(0f, 0f, 1f, false);
+        }
+        lifted = cell;
+        if (cell != null) {
+            cell.setLift(dx, dy, scale / WHOLE, true);
+        }
+    }
+
     private void press(int index, float scale) {
         if (pressed != index && pressed >= 0 && pressed < cells.getChildCount()) {
             cell(pressed).setIconScale(1f);
@@ -315,6 +338,32 @@ final class AppsGrid extends ScrollView {
             // The system gave no explanation of its own (APPS-09).
             Toast.makeText(getContext(), message, Toast.LENGTH_SHORT).show();
         }
+    }
+
+    /**
+     * The finger has been held on an app's cell for the system's long-press time: its menu opens
+     * (APPS-11). Returns whether the long-press was taken, so the cell gets no more of the
+     * gesture and lifting the finger launches nothing.
+     */
+    boolean longPressed(AppCell cell) {
+        return nativeAppLongPressed(revision, cell.index());
+    }
+
+    /** A screen reader asked for an app's menu (A11Y-05). Returns whether it opened. */
+    boolean menuRequested(AppCell cell) {
+        boolean opened = nativeAppMenuRequested(revision, cell.index());
+        redraw.run();
+        return opened;
+    }
+
+    /** Cell {@code index}'s view, or null if there is none. */
+    View cellView(int index) {
+        return index >= 0 && index < shown.size() ? shown.get(index) : null;
+    }
+
+    /** Cell {@code index}'s label, or null if there is none. */
+    String label(int index) {
+        return index >= 0 && index < shown.size() ? shown.get(index).label() : null;
     }
 
     /** A finger went down on a cell or left it (ANIM-10). */
@@ -476,4 +525,16 @@ final class AppsGrid extends ScrollView {
      */
     private native String nativeAppTapped(
             int revision, int index, int left, int top, int right, int bottom);
+
+    /**
+     * The finger has been held on cell {@code index} of the cells at {@code revision} for the
+     * system's long-press time. Returns whether the long-press was taken.
+     */
+    private native boolean nativeAppLongPressed(int revision, int index);
+
+    /**
+     * Opens the menu of cell {@code index} of the cells at {@code revision} without a gesture.
+     * Returns whether it opened.
+     */
+    private native boolean nativeAppMenuRequested(int revision, int index);
 }

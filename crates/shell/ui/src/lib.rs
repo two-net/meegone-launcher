@@ -4,8 +4,9 @@
 //!
 //! It also tells the host what to draw for the home views in each frame, as a [`HomeFrame`]:
 //! where the carousel's views are, how the view indicator looks, how the content comes back
-//! from an app, the home menu, the Applications grid, the pressed icon, and the grid's cells as
-//! apps come and go (ADR 0006 to ADR 0008, ADR 0010, ADR 0012).
+//! from an app, the home menu, the Applications grid, the pressed icon, the grid's cells as
+//! apps come and go, an app's long-press menu and the picked-up icon (ADR 0006 to ADR 0008,
+//! ADR 0010, ADR 0012, ADR 0013).
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -13,7 +14,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use meegone_apps_ui::AppsView;
-pub use meegone_apps_ui::{AppsFrame, Cell};
+pub use meegone_apps_ui::{AppMenuFrame, AppMenuItem, AppsFrame, Cell};
 use meegone_core_ui::{Dispatch, Latest, Rgb, Slot, View, tokens};
 use meegone_events_ui::EventsView;
 use meegone_lockimage_ui::{ImageCard, ImageSettingsSection};
@@ -51,6 +52,18 @@ pub struct GridChangeFrame {
     pub shift: u16,
 }
 
+/// The app icon a drag after a long-press picked up, as the host draws it (APPS-11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiftFrame {
+    /// Its place in the Applications grid's cells.
+    pub cell: usize,
+    /// How far it is drawn from its place, in whole pixels: as far as the finger has moved.
+    pub dx: i32,
+    pub dy: i32,
+    /// Its scale in ten-thousandths: 11 000 while lifted (ANIM-13).
+    pub scale: u16,
+}
+
 /// What the host draws for the home views in one frame (ADR 0006).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HomeFrame {
@@ -70,7 +83,7 @@ pub struct HomeFrame {
     /// The home content's opacity, from 0 to 255: 255 at rest (ANIM-09). The background stays
     /// opaque.
     pub content_alpha: u8,
-    /// The Applications grid (APPS-01, APPS-02).
+    /// The Applications grid (APPS-01, APPS-02), with an app's long-press menu (APPS-11).
     pub apps: AppsFrame,
     /// The item of the current view under the finger, by its place in the view's cells
     /// (ANIM-10).
@@ -79,6 +92,8 @@ pub struct HomeFrame {
     pub press_scale: u16,
     /// The grid's cells as apps come and go (ANIM-21).
     pub grid_change: GridChangeFrame,
+    /// The picked-up icon, while one is (APPS-11).
+    pub lifted: Option<LiftFrame>,
     /// Something is still moving or fading, so the host should draw another frame.
     pub animating: bool,
     /// The home menu, while it is open (HOME-10).
@@ -161,6 +176,15 @@ impl ShellView {
     pub fn frame(&mut self, shell: &HomeShell) -> HomeFrame {
         let tokens = tokens(shell.theme().state().theme);
         let state = shell.state();
+        let apps = self.apps.frame(&shell.apps().state());
+        let lifted = state.lift.app.as_ref().and_then(|app| {
+            Some(LiftFrame {
+                cell: self.apps.place_of(app)?,
+                dx: state.lift.dx.round() as i32,
+                dy: state.lift.dy.round() as i32,
+                scale: (state.lift.scale.clamp(0.0, 1.5) * 10_000.0).round() as u16,
+            })
+        });
         HomeFrame {
             pages: HomeView::ALL.map(|view| state.page_offset_px(view).round() as i32),
             indicator_alpha: (state.carousel.indicator.clamp(0.0, 1.0) * 255.0).round() as u8,
@@ -168,7 +192,7 @@ impl ShellView {
             current: state.current,
             content_scale: (state.return_home.scale.clamp(0.0, 1.0) * 10_000.0).round() as u16,
             content_alpha: (state.return_home.alpha.clamp(0.0, 1.0) * 255.0).round() as u8,
-            apps: self.apps.frame(&shell.apps().state()),
+            apps,
             pressed: state.press.item,
             // A spring back overshoots full size a little.
             press_scale: (state.press.scale.clamp(0.0, 1.5) * 10_000.0).round() as u16,
@@ -179,6 +203,7 @@ impl ShellView {
                 leave_alpha: ten_thousandths(state.grid_change.leave_alpha),
                 shift: ten_thousandths(state.grid_change.shift),
             },
+            lifted,
             animating: state.carousel.animating
                 || state.return_home.animating
                 || state.press.animating

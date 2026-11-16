@@ -6,11 +6,13 @@ import android.content.res.ColorStateList;
 import android.graphics.Color;
 import android.graphics.Insets;
 import android.graphics.Matrix;
+import android.graphics.Rect;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
 import android.os.Build;
 import android.os.Bundle;
+import android.text.TextUtils;
 import android.util.TypedValue;
 import android.view.Choreographer;
 import android.view.DisplayCutout;
@@ -28,16 +30,21 @@ import android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
+import android.widget.Toast;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * The three home views, Events, Applications and Recent, in a wrap-around carousel (HOME-02 to
  * HOME-04), drawn with Android's own views (ADR 0006). They come back from an app with a short
  * scale and fade (ANIM-09, ADR 0007). A long-press on empty space opens the home menu, or enters
- * close mode in Recent (HOME-10, ADR 0008).
+ * close mode in Recent (HOME-10, ADR 0008). A long-press on an app's icon opens the app's menu,
+ * and dragging on picks the icon up (APPS-11, ADR 0013).
  *
- * <p>The Rust app owns the gesture, the motion, the view indicator and the home menu. This view
+ * <p>The Rust app owns the gesture, the motion, the view indicator and the menus. This view
  * passes it every touch, frame time and layout change, says when a finger has been held on
- * empty space, then reads what to draw with {@link #nativeRead} and applies it. It keeps nothing
+ * empty space or on an app's icon, then reads what to draw with {@link #nativeRead} and applies
+ * it. It keeps nothing
  * else. The frame slots below must stay in step with {@code frame_slots} in {@code
  * src/android.rs}. Applications is an {@link AppsGrid}, which draws the frame's Applications
  * slots (ADR 0010); Events and Recent show their names until #19 and #22.
@@ -51,7 +58,7 @@ import android.widget.TextView;
  * <p>An element inside a view that uses horizontal drags itself keeps them by calling {@link
  * #requestDisallowInterceptTouchEvent} before the carousel takes the gesture (HOME-03). An
  * element with its own long-press is clickable or long-clickable, so a long-press on it never
- * opens the home menu.
+ * opens the home menu. An app's cell is the one such element whose long-press is timed here.
  */
 final class HomeViews extends FrameLayout implements Choreographer.FrameCallback {
     // The slots of the frame that nativeRead fills.
@@ -84,7 +91,15 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private static final int LEAVE_ALPHA = 27;
     private static final int SHIFT = 28; // how far the others are from their old places
     private static final int ACCENT = 29; // ARGB: the new-app dot (APPS-07)
-    private static final int FRAME_SIZE = 30;
+    // An app's long-press menu (APPS-11):
+    private static final int APP_MENU = 30; // the cell it is at, -1 to centre it, -2 if closed
+    private static final int APP_MENU_REVISION = 31; // changes when its items change
+    // The picked-up icon (APPS-11):
+    private static final int LIFTED = 32; // its cell, or -1
+    private static final int LIFT_X = 33; // px from its place
+    private static final int LIFT_Y = 34;
+    private static final int LIFT_SCALE = 35; // ten-thousandths
+    private static final int FRAME_SIZE = 36;
 
     private static final int VIEWS = 3;
     private static final int APPLICATIONS = 1;
@@ -99,6 +114,16 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     };
     /** Passed to {@link #nativeMenu} for a touch outside the menu. */
     private static final int CLOSE_MENU = -1;
+    /** The app menu's slot while it is closed. */
+    private static final int APP_MENU_CLOSED = -2;
+    // The fields of one item in nativeAppMenu, mirrored in menu_item_fields in src/android.rs:
+    // its kind, then a shortcut's label.
+    private static final int APP_MENU_FIELDS = 2;
+    private static final int APP_MENU_SHORTCUT = 3;
+    /** The text of the app menu's other kinds of item: App info, Uninstall, Edit applications. */
+    private static final int[] APP_MENU_ITEMS = {
+        R.string.menu_app_info, R.string.menu_uninstall, R.string.menu_edit_applications
+    };
     private static final int SETTINGS_AT_LOCK_SCREEN_IMAGE = 2;
 
     private final int[] frame = new int[FRAME_SIZE];
@@ -119,10 +144,16 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private final LinearLayout settings;
     private final TextView settingsTitle;
     private final TextView settingsGroup;
-    /** The home menu (HOME-10): a card at the finger, over the home views. */
+    /**
+     * The home menu (HOME-10), a card at the finger, or an app's menu (APPS-11), a card at its
+     * icon: over the home views. Its items are made for the menu that opens.
+     */
     private final LinearLayout menu;
     private final GradientDrawable menuCard;
-    private final TextView[] menuItems = new TextView[MENU_ITEMS.length];
+    private final List<TextView> menuItems = new ArrayList<>();
+    private final List<View> menuDividers = new ArrayList<>();
+    /** Where an app's cell is, for opening its menu there. */
+    private final Rect anchor = new Rect();
     private final int indicatorMargin;
     private final int menuMargin;
     private final int touchSlop;
@@ -149,7 +180,10 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private int surface;
     private int foreground;
     private int dim;
+    /** The home menu's items as shown, as in {@link #MENU}, or 0. */
     private int menuShown;
+    /** The app menu's revision as shown, from 0, or -1 while it is closed. */
+    private long appMenuShown = -1;
     private int settingsShown;
     private int menuOffered = -1;
     /** How far content stays from each edge, in px (HOME-11). */
@@ -241,25 +275,8 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         menu.setClipToOutline(true);
         menu.setElevation(dp(8));
         menu.setVisibility(GONE);
-        menu.setAccessibilityPaneTitle(getResources().getString(R.string.home_menu));
-        for (int i = 0; i < MENU_ITEMS.length; i++) {
-            TextView item = new TextView(context);
-            item.setText(MENU_ITEMS[i]);
-            item.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
-            item.setGravity(Gravity.CENTER_VERTICAL | Gravity.START);
-            item.setMinHeight(dp(48));
-            item.setMinWidth(dp(200));
-            item.setPaddingRelative(dp(24), 0, dp(24), 0);
-            int index = i;
-            item.setOnClickListener(view -> {
-                nativeMenu(index);
-                apply();
-            });
-            menu.addView(item, new LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT,
-                    LinearLayout.LayoutParams.WRAP_CONTENT));
-            menuItems[i] = item;
-        }
+        // Touches on the card, between its items, stay there: none reaches an icon behind it.
+        menu.setClickable(true);
         // Placed from the left whatever the layout direction; placeMenu mirrors it.
         addView(menu, new LayoutParams(
                 LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT, Gravity.TOP | Gravity.LEFT));
@@ -319,7 +336,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             indicator.setLayoutParams(params);
         }
         if (menu.getVisibility() == VISIBLE) {
-            placeMenu(frame[MENU_X], frame[MENU_Y]);
+            placeMenu();
         }
         return super.onApplyWindowInsets(insets);
     }
@@ -379,14 +396,23 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         return (int) Math.ceil(radius - Math.sqrt(radius * radius - rise * rise));
     }
 
+    @Override
+    protected void onLayout(boolean changed, int left, int top, int right, int bottom) {
+        super.onLayout(changed, left, top, right, bottom);
+        // An app's menu stays at its icon, wherever the grid has just laid it out (COMP-03).
+        if (menu.getVisibility() == VISIBLE) {
+            placeMenu();
+        }
+    }
+
     // Every touch reaches the carousel once, here; the content below gets it too until the
-    // carousel or a long-press takes the gesture. While the home menu is open, a touch outside
-    // it closes it and goes nowhere.
+    // carousel or a long-press takes the gesture. While a menu is open, a touch outside it
+    // closes it and goes nowhere.
     @Override
     public boolean dispatchTouchEvent(MotionEvent event) {
         if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
             childClaimed = false;
-            swallowing = frame[MENU] != 0 && !isOver(menu, event.getX(), event.getY());
+            swallowing = menuOpen() && !isOver(menu, event.getX(), event.getY());
             if (swallowing) {
                 nativeMenu(CLOSE_MENU);
                 apply();
@@ -472,7 +498,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         switch (event.getActionMasked()) {
             case MotionEvent.ACTION_DOWN:
                 removeCallbacks(longPress);
-                if (!claimed && frame[MENU] == 0 && frame[SETTINGS] == 0) {
+                if (!claimed && !menuOpen() && frame[SETTINGS] == 0) {
                     downX = event.getX();
                     downY = event.getY();
                     postDelayed(longPress, ViewConfiguration.getLongPressTimeout());
@@ -490,25 +516,33 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
 
     /**
      * The finger has been held long enough. On empty space, the Rust app decides: the home menu
-     * or close mode (HOME-10). If it takes the long-press, the content gets no more of the
-     * gesture, so lifting the finger taps nothing.
+     * or close mode (HOME-10). On an app's icon, it decides whether its menu opens (APPS-11).
+     * Any other element handles touches itself. If the Rust app takes the long-press, the
+     * content gets no more of the gesture, so lifting the finger taps nothing.
      */
     private void longPressed() {
-        if (claimed || childClaimed || handlesTouch(this, pages[frame[CURRENT]], downX, downY)) {
+        if (claimed || childClaimed) {
             return;
         }
-        claimed = nativeLongPress();
+        View target = touchTarget(this, pages[frame[CURRENT]], downX, downY);
+        if (target == null) {
+            claimed = nativeLongPress();
+        } else if (target instanceof AppCell && frame[CURRENT] == APPLICATIONS) {
+            claimed = apps.longPressed((AppCell) target);
+        } else {
+            return;
+        }
         apply();
     }
 
     /**
-     * Whether {@code child}, or anything inside it, handles touches itself at ({@code x}, {@code
-     * y}) in {@code parent}'s coordinates: an element that is clickable or long-clickable. Any
-     * other point is empty space (HOME-10).
+     * The element inside {@code child}, or {@code child} itself, that handles touches at ({@code
+     * x}, {@code y}) in {@code parent}'s coordinates: one that is clickable or long-clickable.
+     * Null at any other point, which is empty space (HOME-10).
      */
-    private boolean handlesTouch(ViewGroup parent, View child, float x, float y) {
+    private View touchTarget(ViewGroup parent, View child, float x, float y) {
         if (child.getVisibility() != VISIBLE) {
-            return false;
+            return null;
         }
         point[0] = x + parent.getScrollX() - child.getLeft();
         point[1] = y + parent.getScrollY() - child.getTop();
@@ -520,21 +554,22 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         float localY = point[1];
         if (localX < 0 || localY < 0 || localX >= child.getWidth()
                 || localY >= child.getHeight()) {
-            return false;
+            return null;
         }
         // The page itself is the empty space.
         if (parent != this && (child.isClickable() || child.isLongClickable())) {
-            return true;
+            return child;
         }
         if (child instanceof ViewGroup) {
             ViewGroup group = (ViewGroup) child;
             for (int i = group.getChildCount() - 1; i >= 0; i--) {
-                if (handlesTouch(group, group.getChildAt(i), localX, localY)) {
-                    return true;
+                View target = touchTarget(group, group.getChildAt(i), localX, localY);
+                if (target != null) {
+                    return target;
                 }
             }
         }
-        return false;
+        return null;
     }
 
     /** Whether ({@code x}, {@code y}) in this view's coordinates falls on {@code child}. */
@@ -605,14 +640,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             settingsTitle.setTextColor(foreground);
             settingsGroup.setTextColor(dim);
             menuCard.setColor(surface);
-            // A pressed item shows a light wash of the text colour.
-            ColorStateList pressed = ColorStateList.valueOf(
-                    (foreground & 0x00FFFFFF) | 0x1F000000);
-            for (TextView item : menuItems) {
-                item.setTextColor(foreground);
-                item.setBackground(
-                        new RippleDrawable(pressed, null, new ColorDrawable(Color.WHITE)));
-            }
+            colourMenu();
         }
         if (coloursChanged || frame[INDICATOR_SELECTED] != selected) {
             selected = frame[INDICATOR_SELECTED];
@@ -627,6 +655,8 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
                 frame[PRESS_SCALE], foreground, dim, frame[ACCENT]);
         apps.move(frame[APPEAR_SCALE], frame[APPEAR_ALPHA], frame[LEAVE_SCALE],
                 frame[LEAVE_ALPHA], frame[SHIFT]);
+        apps.lift(current == APPLICATIONS ? frame[LIFTED] : -1, frame[LIFT_X], frame[LIFT_Y],
+                frame[LIFT_SCALE]);
         if (current != announced) {
             announced = current;
             status.setText(getResources().getString(R.string.view_position,
@@ -657,43 +687,170 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         hidePagesFromScreenReaders();
     }
 
-    /** Shows the home menu with the items it offers, where the Rust app says (HOME-10). */
+    /** Whether the home menu or an app's menu is open, as of the last frame. */
+    private boolean menuOpen() {
+        return frame[MENU] != 0 || frame[APP_MENU] != APP_MENU_CLOSED;
+    }
+
+    /**
+     * Shows the home menu with the items it offers (HOME-10), or an app's menu with its items
+     * (APPS-11), where the Rust app says. Its items are made again whenever they change.
+     */
     private void applyMenu() {
-        int items = frame[MENU];
-        if (items != 0) {
-            for (int i = 0; i < menuItems.length; i++) {
-                menuItems[i].setVisibility((items & (1 << i)) != 0 ? VISIBLE : GONE);
+        int homeItems = frame[MENU];
+        // The revision is unsigned in Rust; any value of it means the menu is open.
+        long appMenu = frame[APP_MENU] != APP_MENU_CLOSED
+                ? frame[APP_MENU_REVISION] & 0xFFFF_FFFFL
+                : -1;
+        boolean wasOpen = menuShown != 0 || appMenuShown >= 0;
+        if (homeItems != menuShown || appMenu != appMenuShown) {
+            menuShown = homeItems;
+            appMenuShown = appMenu;
+            if (homeItems != 0) {
+                fillHomeMenu(homeItems);
+            } else if (appMenu >= 0) {
+                fillAppMenu(frame[APP_MENU_REVISION]);
             }
+            hidePagesFromScreenReaders();
+            if (!wasOpen && menuOpen() && !menuItems.isEmpty()) {
+                // A screen reader moves to the first item (A11Y-05).
+                TextView first = menuItems.get(0);
+                menu.post(() -> first.performAccessibilityAction(
+                        AccessibilityNodeInfo.ACTION_ACCESSIBILITY_FOCUS, null));
+            }
+        }
+        if (menuOpen()) {
             menu.setVisibility(VISIBLE);
-            placeMenu(frame[MENU_X], frame[MENU_Y]);
+            placeMenu();
         } else {
             menu.setVisibility(GONE);
         }
-        if (items != menuShown) {
-            boolean opened = menuShown == 0;
-            menuShown = items;
-            hidePagesFromScreenReaders();
-            if (opened) {
-                // A screen reader moves to the first item (A11Y-05).
-                menu.post(() -> {
-                    for (TextView item : menuItems) {
-                        if (item.getVisibility() == VISIBLE) {
-                            item.performAccessibilityAction(
-                                    AccessibilityNodeInfo.ACTION_ACCESSIBILITY_FOCUS, null);
-                            return;
-                        }
-                    }
+    }
+
+    /** The home menu's items, as bits {@code 1 << item} (HOME-10). */
+    private void fillHomeMenu(int items) {
+        clearMenu();
+        menu.setAccessibilityPaneTitle(getResources().getString(R.string.home_menu));
+        for (int i = 0; i < MENU_ITEMS.length; i++) {
+            if ((items & (1 << i)) != 0) {
+                int index = i;
+                addMenuItem(getResources().getText(MENU_ITEMS[i]), view -> {
+                    nativeMenu(index);
+                    apply();
                 });
             }
+        }
+        colourMenu();
+    }
+
+    /**
+     * An app's menu at {@code revision} (APPS-11): App info, Uninstall and Edit applications as
+     * it offers them, then its shortcuts below a divider. Its pane title names the app.
+     */
+    private void fillAppMenu(int revision) {
+        clearMenu();
+        String app = apps.label(frame[APP_MENU]);
+        menu.setAccessibilityPaneTitle(app != null
+                ? getResources().getString(R.string.app_menu, app)
+                : getResources().getString(R.string.action_app_menu));
+        String[] fields = nativeAppMenu();
+        int count = fields == null ? 0 : fields.length / APP_MENU_FIELDS;
+        boolean divided = false;
+        for (int i = 0; i < count; i++) {
+            int kind = parseKind(fields[i * APP_MENU_FIELDS]);
+            CharSequence text;
+            if (kind == APP_MENU_SHORTCUT) {
+                text = fields[i * APP_MENU_FIELDS + 1];
+                if (!divided && i > 0) {
+                    addMenuDivider();
+                }
+                divided = true;
+            } else if (kind >= 0 && kind < APP_MENU_ITEMS.length) {
+                text = getResources().getText(APP_MENU_ITEMS[kind]);
+            } else {
+                continue;
+            }
+            int index = i;
+            addMenuItem(text == null ? "" : text, view -> chooseAppMenuItem(revision, index));
+        }
+        colourMenu();
+    }
+
+    private static int parseKind(String field) {
+        try {
+            return Integer.parseInt(field);
+        } catch (NumberFormatException e) {
+            return -1;
         }
     }
 
     /**
-     * Opens the menu where the finger was held: from there towards the end of the line, and
-     * above the finger if there is no room below. Without a finger, or after the layout
-     * changed, it is centred. Either way it stays inside the safe area (HOME-11).
+     * Item {@code index} of the app menu at {@code revision} was chosen. The system may refuse,
+     * such as an App info screen that can't open: its message shows briefly.
      */
-    private void placeMenu(int anchorX, int anchorY) {
+    private void chooseAppMenuItem(int revision, int index) {
+        String message = nativeAppMenuChosen(revision, index);
+        apply();
+        if (message != null) {
+            Toast.makeText(getContext(), message, Toast.LENGTH_SHORT).show();
+        }
+    }
+
+    private void clearMenu() {
+        menu.removeAllViews();
+        menuItems.clear();
+        menuDividers.clear();
+    }
+
+    /** One item: 16 sp on one line, at least 48 dp tall (A11Y-02) and 200 dp wide. */
+    private void addMenuItem(CharSequence text, OnClickListener chosen) {
+        TextView item = new TextView(getContext());
+        item.setText(text);
+        item.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
+        item.setSingleLine(true);
+        item.setEllipsize(TextUtils.TruncateAt.END);
+        item.setGravity(Gravity.CENTER_VERTICAL | Gravity.START);
+        item.setMinHeight(dp(48));
+        item.setMinWidth(dp(200));
+        item.setPaddingRelative(dp(24), 0, dp(24), 0);
+        item.setOnClickListener(chosen);
+        menu.addView(item, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+        menuItems.add(item);
+    }
+
+    /** A thin line between an app menu's own items and its shortcuts. */
+    private void addMenuDivider() {
+        View divider = new View(getContext());
+        divider.setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO);
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, Math.max(1, dp(1)));
+        params.topMargin = dp(8);
+        params.bottomMargin = dp(8);
+        menu.addView(divider, params);
+        menuDividers.add(divider);
+    }
+
+    /** The menu's items in the theme's text colour, with a light wash when pressed. */
+    private void colourMenu() {
+        ColorStateList pressed = ColorStateList.valueOf((foreground & 0x00FFFFFF) | 0x1F000000);
+        for (TextView item : menuItems) {
+            item.setTextColor(foreground);
+            item.setBackground(new RippleDrawable(pressed, null, new ColorDrawable(Color.WHITE)));
+        }
+        for (View divider : menuDividers) {
+            divider.setBackgroundColor((dim & 0x00FFFFFF) | 0x66000000);
+        }
+    }
+
+    /**
+     * Opens the home menu where the finger was held: from there towards the end of the line,
+     * and above the finger if there is no room below. An app's menu opens at its icon: from the
+     * cell's start, below it, or above it if there is no room below. Without a finger or a
+     * cell, or after the layout changed, the menu is centred. Either way it stays inside the
+     * safe area (HOME-11).
+     */
+    private void placeMenu() {
         int left = safe.left + menuMargin;
         int top = safe.top + menuMargin;
         int right = getWidth() - safe.right - menuMargin;
@@ -703,27 +860,46 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
                 MeasureSpec.makeMeasureSpec(Math.max(0, bottom - top), MeasureSpec.AT_MOST));
         int menuWidth = menu.getMeasuredWidth();
         int menuHeight = menu.getMeasuredHeight();
+        boolean rtl = getLayoutDirection() == LAYOUT_DIRECTION_RTL;
         float x;
         float y;
-        if (anchorX < 0 || anchorY < 0) {
-            x = (left + right - menuWidth) / 2f;
-            y = (top + bottom - menuHeight) / 2f;
-        } else {
-            boolean rtl = getLayoutDirection() == LAYOUT_DIRECTION_RTL;
+        if (frame[MENU] == 0 && appCellBounds(frame[APP_MENU], anchor)) {
+            x = rtl ? anchor.right - menuWidth : anchor.left;
+            y = anchor.bottom + menuHeight <= bottom ? anchor.bottom : anchor.top - menuHeight;
+        } else if (frame[MENU] != 0 && frame[MENU_X] >= 0 && frame[MENU_Y] >= 0) {
+            int anchorX = frame[MENU_X];
+            int anchorY = frame[MENU_Y];
             x = rtl ? anchorX - menuWidth : anchorX;
             y = anchorY + menuHeight <= bottom ? anchorY : anchorY - menuHeight;
+        } else {
+            x = (left + right - menuWidth) / 2f;
+            y = (top + bottom - menuHeight) / 2f;
         }
         menu.setTranslationX(within(x, left, right - menuWidth));
         menu.setTranslationY(within(y, top, bottom - menuHeight));
+    }
+
+    /**
+     * Fills {@code bounds} with where cell {@code index} of the grid is, in this view's
+     * coordinates. Returns false if it has no laid-out view.
+     */
+    private boolean appCellBounds(int index, Rect bounds) {
+        View cell = apps.cellView(index);
+        if (cell == null || !cell.isLaidOut()) {
+            return false;
+        }
+        bounds.set(0, 0, cell.getWidth(), cell.getHeight());
+        offsetDescendantRectToMyCoords(cell, bounds);
+        return true;
     }
 
     private static float within(float value, float low, float high) {
         return Math.max(low, Math.min(value, high));
     }
 
-    /** While the menu or Settings covers the home views, screen readers skip them. */
+    /** While a menu or Settings covers the home views, screen readers skip them. */
     private void hidePagesFromScreenReaders() {
-        int importance = menuShown != 0 || settingsShown != 0
+        int importance = menuShown != 0 || appMenuShown >= 0 || settingsShown != 0
                 ? IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
                 : IMPORTANT_FOR_ACCESSIBILITY_AUTO;
         for (FrameLayout page : pages) {
@@ -843,8 +1019,20 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     /** Opens the home menu without a gesture. Returns false if the current view has none. */
     private native boolean nativeOpenMenu();
 
-    /** An item of the home menu was chosen, 0 to 2, or {@link #CLOSE_MENU}. */
+    /**
+     * An item of the home menu was chosen, 0 to 2, or {@link #CLOSE_MENU} for a touch outside
+     * the home menu or an app's menu.
+     */
     private native void nativeMenu(int item);
+
+    /** The app menu's items as of the last frame, each in {@link #APP_MENU_FIELDS} fields. */
+    private native String[] nativeAppMenu();
+
+    /**
+     * Item {@code item} of the app menu at {@code revision} was chosen. Returns null, or a short
+     * message to show.
+     */
+    private native String nativeAppMenuChosen(int revision, int item);
 
     /** Fills {@code frame} with what to draw now, in the slots above. */
     private native void nativeRead(int[] frame);

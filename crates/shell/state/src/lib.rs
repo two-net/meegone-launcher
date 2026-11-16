@@ -1,5 +1,6 @@
-//! Home shell state (SRS 4.1): the carousel of views, the home menu, Home and Back, coming back
-//! to the home, the icon press, the grid's motion as apps come and go, and the theme.
+//! Home shell state (SRS 4.1): the carousel of views, the home menu, which long-press counts,
+//! Home and Back, coming back to the home, the icon press, the picked-up icon, the grid's motion
+//! as apps come and go, and the theme.
 //!
 //! [`HomeShell::compose`] is the only place features are put together (ARCH-03). Each feature
 //! runs in its own [`Store`], so a failing feature never takes down the shell (ARCH-09).
@@ -7,6 +8,7 @@
 mod carousel;
 mod grid_change;
 mod home_menu;
+mod lift;
 mod press;
 mod return_home;
 
@@ -18,7 +20,7 @@ use meegone_apps_state::{AppsHolder, AppsIntent, cells_came_or_went};
 use meegone_core_data::{
     HomeTarget, PersistentSettingsStore, Platform, SettingsStore, SystemConfigAdapter,
 };
-use meegone_core_state::{Store, ThemeHolder, ThemeIntent};
+use meegone_core_state::{AppId, Health, Store, ThemeHolder, ThemeIntent};
 use meegone_events_state::{EventsHolder, EventsIntent};
 use meegone_lockimage_data::PersistentImageCache;
 use meegone_lockimage_state::{LockImageHolder, LockImageIntent, LockImageState};
@@ -30,6 +32,8 @@ pub use carousel::{CarouselState, Layout, PointerEvent, PointerKind};
 use grid_change::GridChange;
 pub use grid_change::GridChangeState;
 pub use home_menu::{HomeMenu, MenuItem};
+use lift::Lift;
+pub use lift::LiftState;
 pub use meegone_settings_state::SettingsGroup;
 use press::Press;
 pub use press::PressState;
@@ -101,6 +105,9 @@ pub struct ShellState {
     /// The home menu, open over the current view (HOME-10). It covers the home views: they get
     /// no touches while it is open.
     pub menu: Option<HomeMenu>,
+    /// An app's long-press menu is open over Applications (APPS-11). Its content is
+    /// Applications' own. It covers the home views as the home menu does.
+    pub app_menu_open: bool,
     pub carousel: CarouselState,
     /// The home content's scale and opacity while it comes back from an app (ANIM-09).
     pub return_home: ReturnHomeState,
@@ -108,6 +115,8 @@ pub struct ShellState {
     pub press: PressState,
     /// How far the Applications grid has come in showing apps that came and went (ANIM-21).
     pub grid_change: GridChangeState,
+    /// The app icon a drag after a long-press picked up, which follows the finger (APPS-11).
+    pub lift: LiftState,
 }
 
 impl ShellState {
@@ -125,7 +134,10 @@ impl ShellState {
     /// Whether the current view offers the home menu now, which it can open without a gesture
     /// (A11Y-05): Events and Applications do, while nothing covers them.
     pub fn menu_offered(&self) -> bool {
-        !self.settings_open && self.menu.is_none() && HomeMenu::items_for(self.current).is_some()
+        !self.settings_open
+            && self.menu.is_none()
+            && !self.app_menu_open
+            && HomeMenu::items_for(self.current).is_some()
     }
 }
 
@@ -168,9 +180,17 @@ pub enum ShellIntent {
     /// Events and Applications it opens the home menu, and in Recent it enters close mode
     /// (REC-07).
     LongPress,
+    /// The finger that is down has stayed on `app`'s icon in Applications for the platform's
+    /// long-press time (APPS-11). The shell takes it only if the finger hasn't moved past the
+    /// touch slop and nothing covers the views: the app's menu opens and ticks (ANIM-24), and
+    /// the rest of the gesture is the shell's. Lifting the finger then taps nothing, and
+    /// dragging on picks the icon up and enters edit mode.
+    LongPressApp(AppId),
     /// Opens the home menu without a gesture, from a screen-reader action (A11Y-05).
     OpenMenu,
-    /// A touch outside the home menu closes it.
+    /// Opens `app`'s menu without a gesture, from a screen-reader action (A11Y-05).
+    OpenAppMenu(AppId),
+    /// A touch outside the home menu or an app's menu closes it.
     CloseMenu,
     /// An item of the home menu was chosen (HOME-10).
     ChooseMenuItem(MenuItem),
@@ -215,6 +235,7 @@ pub struct HomeShell {
     carousel: Carousel,
     return_home: ReturnHome,
     press: Press,
+    lift: Lift,
     grid_change: GridChange,
     theme: Store<ThemeHolder>,
     apps: Store<AppsHolder>,
@@ -236,6 +257,7 @@ impl HomeShell {
             carousel: Carousel::new(true, 1.0),
             return_home: ReturnHome::default(),
             press: Press::default(),
+            lift: Lift::default(),
             grid_change: GridChange::default(),
             theme: Store::new(ThemeHolder::new(
                 settings_store.clone(),
@@ -333,10 +355,12 @@ impl HomeShell {
                 if layout != self.state.carousel.layout {
                     // Folding, rotating or resizing keeps what is open (COMP-03). The menu
                     // opened where the finger was, which means nothing in the new layout, so
-                    // it moves to the centre.
+                    // it moves to the centre. An app's menu stays at its icon. A lifted icon
+                    // goes back to its cell, since the finger's place means nothing either.
                     if let Some(menu) = &mut self.state.menu {
                         menu.anchor = None;
                     }
+                    self.lift.cancel();
                 }
                 let release = self.carousel.layout(layout, self.state.current);
                 self.settle(release);
@@ -346,10 +370,16 @@ impl HomeShell {
                     // A touch never waits for the return motion (ANIM-03).
                     self.return_home.finish();
                 }
-                // Settings and the home menu cover the home views, but a finger that was
-                // already down may still lift.
-                let covered = self.state.settings_open || self.state.menu.is_some();
-                if !covered || matches!(event.kind, PointerKind::Up | PointerKind::Cancel) {
+                // A long-press on an app's icon keeps the rest of its gesture, even under the
+                // app's menu: dragging on picks the icon up and enters edit mode, which closes
+                // the menu (APPS-11).
+                let slop = self.carousel.state().layout.touch_slop_px;
+                if self.lift.pointer(&event, slop) {
+                    self.apps.dispatch(AppsIntent::EnterEditMode);
+                }
+                // Settings and the menus cover the home views, but a finger that was already
+                // down may still lift.
+                if !self.covered() || matches!(event.kind, PointerKind::Up | PointerKind::Cancel) {
                     let release = self.carousel.pointer(event, self.state.current);
                     self.settle(release);
                 }
@@ -372,8 +402,13 @@ impl HomeShell {
             ShellIntent::Home => self.home(),
             ShellIntent::Back => self.back(),
             ShellIntent::LongPress => self.long_press(),
+            ShellIntent::LongPressApp(app) => self.long_press_app(app),
             ShellIntent::OpenMenu => self.open_menu(None),
-            ShellIntent::CloseMenu => self.state.menu = None,
+            ShellIntent::OpenAppMenu(app) => self.open_app_menu(app),
+            ShellIntent::CloseMenu => {
+                self.state.menu = None;
+                self.close_app_menu();
+            }
             ShellIntent::ChooseMenuItem(item) => self.choose(item),
             ShellIntent::OpenSettings => self.open_settings(None),
             ShellIntent::Resumed => {
@@ -398,10 +433,46 @@ impl HomeShell {
                 self.configure_carousel();
             }
         }
+        self.keep_lift_in_step();
         self.state.carousel = self.carousel.state();
         self.state.return_home = self.return_home.state();
         self.state.press = self.press.state();
+        self.state.lift = self.lift.state();
         self.state.grid_change = self.grid_change.state();
+        self.state.app_menu_open = self.app_menu_shown();
+    }
+
+    /// Whether Settings or a menu covers the home views, so they get no new touches.
+    fn covered(&self) -> bool {
+        self.state.settings_open || self.state.menu.is_some() || self.app_menu_shown()
+    }
+
+    /// Whether an app's menu is open. A failed Applications can't close its menu, so it never
+    /// counts: the home must never be left covered for good (ARCH-09).
+    fn app_menu_shown(&self) -> bool {
+        *self.apps.health() == Health::Ready && self.apps.state().menu.is_some()
+    }
+
+    fn close_app_menu(&mut self) {
+        if self.app_menu_shown() {
+            self.apps.dispatch(AppsIntent::CloseMenu);
+        }
+    }
+
+    /// A long-press can pick its icon up only while the app's menu it opened is still open, and
+    /// a lifted icon stays lifted only in edit mode. Otherwise, such as after Back, the icon is
+    /// back in its cell at once.
+    fn keep_lift_in_step(&mut self) {
+        let apps = self.apps.state();
+        let in_step = match self.lift.armed() {
+            Some(app) => {
+                self.app_menu_shown() && apps.menu.as_ref().is_some_and(|menu| menu.app == *app)
+            }
+            None => !self.lift.is_lifted() || apps.edit_mode,
+        };
+        if !in_step {
+            self.lift.cancel();
+        }
     }
 
     /// APPS-06, APPS-08: the grid and Recent take on the system's change. If apps came or went,
@@ -412,7 +483,9 @@ impl HomeShell {
         self.recent.dispatch(RecentIntent::Refresh);
         if cells_came_or_went(&before.items, &self.apps.state().items) {
             // A pressed item is named by its place, which may now hold another cell (ANIM-10).
+            // A lifted icon goes back to its cell, which may have moved under it.
             self.press.finish();
+            self.lift.cancel();
             self.grid_change.start(self.carousel.animation_scale());
         }
     }
@@ -435,8 +508,7 @@ impl HomeShell {
     /// ANIM-10: an item of the current view shrinks under the finger, unless the views are
     /// moving or something covers them.
     fn press_item(&mut self, item: usize, at: Duration) {
-        let covered = self.state.settings_open || self.state.menu.is_some();
-        if covered || self.carousel.state().dragging {
+        if self.covered() || self.carousel.state().dragging {
             return;
         }
         self.press.press(item, at, self.carousel.animation_scale());
@@ -465,7 +537,7 @@ impl HomeShell {
     /// HOME-10: a long-press on empty space opens the home menu where the finger is, or, in
     /// Recent, enters close mode (REC-07). Either way it ticks (ANIM-24).
     fn long_press(&mut self) {
-        if self.state.settings_open || self.state.menu.is_some() {
+        if self.covered() {
             return;
         }
         let Some(at) = self.carousel.long_press() else {
@@ -478,9 +550,44 @@ impl HomeShell {
         self.system.haptic_tick();
     }
 
+    /// APPS-11: a long-press on an app's icon opens its menu and ticks (ANIM-24). It counts only
+    /// on Applications, while the gesture is still a press and nothing covers the views, and
+    /// only if the app has a menu. Then the rest of the gesture is the shell's, so lifting the
+    /// finger launches nothing, and dragging on picks the icon up.
+    fn long_press_app(&mut self, app: AppId) {
+        if self.covered()
+            || self.state.current != HomeView::Applications
+            || self.carousel.pressed_at().is_none()
+        {
+            return;
+        }
+        self.apps.dispatch(AppsIntent::OpenMenu(app.clone()));
+        if !self.app_menu_shown() {
+            return;
+        }
+        let Some(origin) = self.carousel.long_press() else {
+            return;
+        };
+        // The menu covers the views, so the pressed icon lets go.
+        self.press.finish();
+        self.lift.arm(app, origin);
+        self.system.haptic_tick();
+    }
+
+    /// A11Y-05: opens `app`'s menu without a gesture, so with no tick, and nothing to pick up.
+    fn open_app_menu(&mut self, app: AppId) {
+        if self.covered() || self.state.current != HomeView::Applications {
+            return;
+        }
+        let release = self.carousel.end_gesture(self.state.current);
+        self.settle(release);
+        self.press.finish();
+        self.apps.dispatch(AppsIntent::OpenMenu(app));
+    }
+
     /// Opens the current view's home menu at `anchor`, or centred, if it has one (HOME-10).
     fn open_menu(&mut self, anchor: Option<(f64, f64)>) {
-        if self.state.settings_open || self.state.menu.is_some() {
+        if self.covered() {
             return;
         }
         let Some(items) = HomeMenu::items_for(self.state.current) else {
@@ -508,12 +615,14 @@ impl HomeShell {
 
     /// Opens Settings over the home views, at `group` or at its top.
     fn open_settings(&mut self, group: Option<SettingsGroup>) {
-        // Settings covers the home views, so a drag on them ends, the menu closes and a pressed
-        // icon lets go.
+        // Settings covers the home views, so a drag on them ends, the menus close and a pressed
+        // or lifted icon lets go.
         let release = self.carousel.end_gesture(self.state.current);
         self.settle(release);
         self.press.finish();
+        self.lift.cancel();
         self.state.menu = None;
+        self.close_app_menu();
         self.settings.dispatch(SettingsIntent::Refresh);
         self.state.settings_open = true;
         self.state.settings_group = group;
@@ -613,9 +722,11 @@ impl HomeShell {
 
     fn show(&mut self, view: HomeView) {
         self.state.current = view;
-        // The menu and the pressed item belong to the view they were in.
+        // The menus and the pressed or lifted item belong to the view they were in.
         self.state.menu = None;
+        self.close_app_menu();
         self.press.finish();
+        self.lift.cancel();
         // Recent refreshes whenever it becomes visible (REC-09); Events does too, to stay live.
         match view {
             HomeView::Events => self.events.dispatch(EventsIntent::Refresh),
@@ -1602,6 +1713,325 @@ mod tests {
         press(&mut shell);
         shell.dispatch(ShellIntent::Swipe(Direction::Next));
         assert_eq!(shell.state().press, PressState::default());
+    }
+
+    /// A phone 1000 px wide, laid out, with Mail and Maps in Applications.
+    fn with_mail(fakes: &Fakes) -> HomeShell {
+        *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail"), app("maps", "Maps")];
+        laid_out(fakes)
+    }
+
+    /// A finger held still on `package`'s icon at `(x, y)` until the host's long-press time has
+    /// passed (APPS-11).
+    fn hold_app(shell: &mut HomeShell, package: &str, x: f64, y: f64) {
+        shell.dispatch(ShellIntent::Pointer(PointerEvent {
+            kind: PointerKind::Down,
+            x,
+            y,
+            at: ms(10_000),
+        }));
+        shell.dispatch(ShellIntent::LongPressApp(app_id(package)));
+    }
+
+    fn finger(shell: &mut HomeShell, kind: PointerKind, x: f64, y: f64) {
+        shell.dispatch(ShellIntent::Pointer(PointerEvent {
+            kind,
+            x,
+            y,
+            at: ms(10_200),
+        }));
+    }
+
+    fn app_menu_of(shell: &HomeShell) -> Option<AppId> {
+        shell
+            .apps()
+            .state()
+            .menu
+            .as_ref()
+            .map(|menu| menu.app.clone())
+    }
+
+    #[test]
+    fn a_long_press_on_an_app_opens_its_menu_and_ticks() {
+        // APPS-11, ANIM-24
+        let fakes = Fakes::default();
+        let mut shell = with_mail(&fakes);
+        shell.dispatch(ShellIntent::Press {
+            item: 0,
+            at: ms(10_000),
+        });
+
+        hold_app(&mut shell, "mail", 300.0, 400.0);
+
+        assert_eq!(app_menu_of(&shell), Some(app_id("mail")));
+        let state = shell.state();
+        assert!(state.app_menu_open);
+        assert_eq!(state.menu, None);
+        assert!(!state.menu_offered());
+        assert_eq!(state.press, PressState::default());
+        assert_eq!(ticks(&fakes), 1);
+        // The rest of the gesture is the shell's, so lifting the finger launches nothing.
+        assert!(state.carousel.held);
+        lift(&mut shell);
+        assert!(!shell.state().carousel.held);
+        assert!(shell.state().app_menu_open);
+        assert!(fakes.apps.launched.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_long_press_on_an_app_counts_only_while_nothing_covers_applications() {
+        // APPS-11: no menu, no tick, and the gesture stays the content's.
+        let not_taken = |shell: &HomeShell, fakes: &Fakes| {
+            assert_eq!(app_menu_of(shell), None);
+            assert!(!shell.state().carousel.held);
+            assert_eq!(ticks(fakes), 0);
+        };
+        let fakes = Fakes::default();
+        let mut shell = with_mail(&fakes);
+
+        // The finger moved past the touch slop: a scroll that stopped.
+        finger(&mut shell, PointerKind::Down, 300.0, 400.0);
+        finger(&mut shell, PointerKind::Move, 300.0, 480.0);
+        shell.dispatch(ShellIntent::LongPressApp(app_id("mail")));
+        not_taken(&shell, &fakes);
+        lift(&mut shell);
+
+        // Under Settings or the home menu.
+        shell.dispatch(ShellIntent::OpenSettings);
+        hold_app(&mut shell, "mail", 300.0, 400.0);
+        not_taken(&shell, &fakes);
+        lift(&mut shell);
+        shell.dispatch(ShellIntent::Back);
+        shell.dispatch(ShellIntent::OpenMenu);
+        hold_app(&mut shell, "mail", 300.0, 400.0);
+        not_taken(&shell, &fakes);
+        lift(&mut shell);
+        shell.dispatch(ShellIntent::CloseMenu);
+
+        // An app that isn't in the grid has no menu.
+        hold_app(&mut shell, "gone", 300.0, 400.0);
+        not_taken(&shell, &fakes);
+        lift(&mut shell);
+
+        // Only Applications has app menus.
+        go(&mut shell, Direction::Previous);
+        hold_app(&mut shell, "mail", 300.0, 400.0);
+        not_taken(&shell, &fakes);
+    }
+
+    #[test]
+    fn dragging_after_a_long_press_lifts_the_icon_and_enters_edit_mode() {
+        // APPS-11: the menu closes, edit mode starts, and the icon follows the finger. The
+        // views stay put, even for a sideways drag.
+        let fakes = Fakes::default();
+        let mut shell = with_mail(&fakes);
+        hold_app(&mut shell, "mail", 300.0, 400.0);
+
+        // Within the touch slop, it is still a long-press.
+        finger(&mut shell, PointerKind::Move, 310.0, 410.0);
+        assert!(shell.state().app_menu_open);
+        assert_eq!(shell.state().lift, LiftState::default());
+
+        finger(&mut shell, PointerKind::Move, 520.0, 380.0);
+        let state = shell.state();
+        assert!(!state.app_menu_open);
+        assert!(shell.apps().state().edit_mode);
+        assert_eq!(
+            state.lift,
+            LiftState {
+                app: Some(app_id("mail")),
+                dx: 220.0,
+                dy: -20.0,
+                scale: meegone_core_state::motion::DRAG_LIFT_SCALE,
+            }
+        );
+        assert_eq!(state.carousel.offset, 0.0);
+        assert!(!state.carousel.dragging);
+
+        finger(&mut shell, PointerKind::Move, 700.0, 900.0);
+        assert_eq!(
+            (shell.state().lift.dx, shell.state().lift.dy),
+            (400.0, 500.0)
+        );
+
+        // Lifting the finger puts the icon back in its cell; edit mode stays.
+        lift(&mut shell);
+        assert_eq!(shell.state().lift, LiftState::default());
+        assert!(shell.apps().state().edit_mode);
+        assert!(!shell.state().carousel.held);
+        assert!(fakes.apps.launched.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn once_the_menu_is_closed_a_drag_picks_nothing_up() {
+        // HOME-08: Back closes the menu while the finger is still down.
+        let mut shell = with_mail(&Fakes::default());
+        hold_app(&mut shell, "mail", 300.0, 400.0);
+
+        shell.dispatch(ShellIntent::Back);
+        finger(&mut shell, PointerKind::Move, 600.0, 400.0);
+
+        assert_eq!(shell.state().lift, LiftState::default());
+        assert!(!shell.apps().state().edit_mode);
+    }
+
+    #[test]
+    fn a_lifted_icon_goes_back_on_back_a_new_layout_or_apps_coming_and_going() {
+        let fakes = Fakes::default();
+        let pick_up = |shell: &mut HomeShell| {
+            hold_app(shell, "mail", 300.0, 400.0);
+            finger(shell, PointerKind::Move, 300.0, 600.0);
+            assert!(shell.state().lift.app.is_some());
+        };
+
+        let mut shell = with_mail(&fakes);
+        pick_up(&mut shell);
+        // Back ends edit mode, and the icon goes back.
+        shell.dispatch(ShellIntent::Back);
+        assert!(!shell.apps().state().edit_mode);
+        assert_eq!(shell.state().lift, LiftState::default());
+        lift(&mut shell);
+
+        pick_up(&mut shell);
+        let layout = shell.state().carousel.layout;
+        shell.dispatch(ShellIntent::Layout(Layout {
+            width_px: 2000.0,
+            ..layout
+        }));
+        assert_eq!(shell.state().lift, LiftState::default());
+        lift(&mut shell);
+
+        pick_up(&mut shell);
+        fakes.apps.apps.lock().unwrap().push(app("atlas", "Atlas"));
+        shell.dispatch(ShellIntent::AppsChanged);
+        assert_eq!(shell.state().lift, LiftState::default());
+        // A later move picks nothing up.
+        finger(&mut shell, PointerKind::Move, 300.0, 700.0);
+        assert_eq!(shell.state().lift, LiftState::default());
+    }
+
+    #[test]
+    fn back_and_home_close_the_app_menu() {
+        // HOME-07, HOME-08: Home goes no further than closing it.
+        let mut shell = with_mail(&Fakes::default());
+        shell.dispatch(ShellIntent::Apps(AppsIntent::Scrolled(480.0)));
+        hold_app(&mut shell, "mail", 300.0, 400.0);
+        lift(&mut shell);
+
+        shell.dispatch(ShellIntent::Back);
+        assert!(!shell.state().app_menu_open);
+        assert_eq!(shell.state().current, HomeView::Applications);
+
+        hold_app(&mut shell, "mail", 300.0, 400.0);
+        lift(&mut shell);
+        shell.dispatch(ShellIntent::Home);
+        assert!(!shell.state().app_menu_open);
+        assert_eq!(shell.apps().state().scroll_px, 480.0);
+        shell.dispatch(ShellIntent::Home);
+        assert_eq!(shell.apps().state().scroll_px, 0.0);
+    }
+
+    #[test]
+    fn a_touch_outside_another_view_or_settings_close_the_app_menu() {
+        let mut shell = with_mail(&Fakes::default());
+        let open = |shell: &mut HomeShell| {
+            shell.dispatch(ShellIntent::OpenAppMenu(app_id("maps")));
+            assert!(shell.state().app_menu_open);
+        };
+
+        open(&mut shell);
+        shell.dispatch(ShellIntent::CloseMenu);
+        assert!(!shell.state().app_menu_open);
+
+        open(&mut shell);
+        shell.dispatch(ShellIntent::OpenSettings);
+        assert!(!shell.state().app_menu_open);
+        shell.dispatch(ShellIntent::Back);
+
+        // A screen reader can still switch views while it is open.
+        open(&mut shell);
+        shell.dispatch(ShellIntent::Swipe(Direction::Next));
+        assert!(!shell.state().app_menu_open);
+        assert_eq!(app_menu_of(&shell), None);
+    }
+
+    #[test]
+    fn a_screen_reader_opens_an_apps_menu_without_a_tick() {
+        // A11Y-05: in Applications only, and with nothing to pick up.
+        let fakes = Fakes::default();
+        let mut shell = with_mail(&fakes);
+
+        shell.dispatch(ShellIntent::OpenAppMenu(app_id("mail")));
+        assert_eq!(app_menu_of(&shell), Some(app_id("mail")));
+        assert_eq!(ticks(&fakes), 0);
+        assert!(!shell.state().carousel.held);
+        // Another app's menu doesn't replace an open one.
+        shell.dispatch(ShellIntent::OpenAppMenu(app_id("maps")));
+        assert_eq!(app_menu_of(&shell), Some(app_id("mail")));
+        shell.dispatch(ShellIntent::CloseMenu);
+
+        go(&mut shell, Direction::Next);
+        shell.dispatch(ShellIntent::OpenAppMenu(app_id("mail")));
+        assert_eq!(app_menu_of(&shell), None);
+    }
+
+    #[test]
+    fn while_an_apps_menu_is_open_the_views_get_no_touches() {
+        // It covers the home views, as the home menu does.
+        let fakes = Fakes::default();
+        let mut shell = with_mail(&fakes);
+        shell.dispatch(ShellIntent::OpenAppMenu(app_id("mail")));
+
+        finger(&mut shell, PointerKind::Down, 800.0, 900.0);
+        finger(&mut shell, PointerKind::Move, 300.0, 900.0);
+        assert!(!shell.state().carousel.dragging);
+        assert_eq!(shell.state().carousel.offset, 0.0);
+        shell.dispatch(ShellIntent::Press { item: 1, at: ms(0) });
+        assert_eq!(shell.state().press, PressState::default());
+        shell.dispatch(ShellIntent::LongPress);
+        shell.dispatch(ShellIntent::OpenMenu);
+        assert_eq!(shell.state().menu, None);
+        assert_eq!(ticks(&fakes), 0);
+    }
+
+    #[test]
+    fn the_app_menu_stays_open_when_the_layout_changes() {
+        // COMP-03: it is drawn at its icon, wherever that is now.
+        let mut shell = with_mail(&Fakes::default());
+        hold_app(&mut shell, "mail", 300.0, 400.0);
+        lift(&mut shell);
+        let layout = shell.state().carousel.layout;
+
+        shell.dispatch(ShellIntent::Layout(Layout {
+            width_px: 2000.0,
+            ..layout
+        }));
+
+        assert_eq!(app_menu_of(&shell), Some(app_id("mail")));
+    }
+
+    #[test]
+    fn a_failing_applications_never_leaves_the_home_covered() {
+        // ARCH-09: a menu Applications can no longer close doesn't count.
+        let fakes = Fakes::default();
+        let mut platform = fakes.platform();
+        let broken = FakeApps::default();
+        broken.apps.lock().unwrap().push(app("mail", "Mail"));
+        platform.apps = Arc::new(BrokenLauncher(broken));
+        let mut shell = HomeShell::compose(platform);
+        shell.dispatch(ShellIntent::OpenAppMenu(app_id("mail")));
+        assert!(shell.state().app_menu_open);
+
+        shell.dispatch(ShellIntent::Apps(AppsIntent::Launch {
+            app: app_id("mail"),
+            from: None,
+        }));
+
+        assert!(matches!(shell.apps().health(), Health::Failed(_)));
+        assert!(!shell.state().app_menu_open);
+        assert!(shell.state().menu_offered());
+        shell.dispatch(ShellIntent::OpenMenu);
+        assert!(shell.state().menu.is_some());
     }
 
     #[test]

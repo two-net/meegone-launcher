@@ -10,7 +10,8 @@
 //! and its layout in, then reads what to draw with `nativeRead`, whose slots are listed in
 //! [`frame_slots`] and mirrored in `HomeViews.java`. Its Applications grid, `AppsGrid`, reads
 //! its cells with `nativeAppsCells` whenever their revision changes, in the fields of
-//! [`cell_fields`] (ADR 0010).
+//! [`cell_fields`] (ADR 0010). An app's long-press menu is read the same way, with
+//! `nativeAppMenu`, in the fields of [`menu_item_fields`] (ADR 0013).
 //!
 //! A bug in MeeGone becomes a Java `RuntimeException` instead of an abort, so its message
 //! reaches logcat. Containing it keeps `panic = "unwind"`, as ARCH-09 already requires.
@@ -23,11 +24,11 @@ use std::panic::{self, AssertUnwindSafe};
 use std::time::Duration;
 
 use meegone_core_data::android::{self, Env, JObject, LocalRef, RawEnv};
-use meegone_core_data::{Rect, Rgb, accent};
+use meegone_core_data::{AppId, Rect, Rgb, accent};
 
 use crate::{
-    Cell, Direction, HomeFrame, HomeView, Launcher, Layout, MenuItem, PointerEvent, PointerKind,
-    SavedHome, SettingsGroup, ShellIntent,
+    AppMenuItem, Cell, Direction, HomeFrame, HomeView, Launcher, Layout, MenuItem, PointerEvent,
+    PointerKind, SavedHome, SettingsGroup, ShellIntent,
 };
 
 /// JNI's `jboolean`.
@@ -387,6 +388,103 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeMenu
     });
 }
 
+/// `String[] nativeAppMenu()`: the items of the app menu as of the last frame, in order, each in
+/// the fields of [`menu_item_fields`] (APPS-11). Empty while it is closed.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeAppMenu(
+    env: RawEnv,
+    _views: JObject,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    let mut items = std::ptr::null_mut();
+    guarded(env, || {
+        LAUNCHER.with_borrow(|launcher| {
+            let launcher = launcher.as_ref().ok_or("MeeGone hasn't started")?;
+            let fields: Vec<String> = launcher
+                .view()
+                .apps()
+                .menu_items()
+                .iter()
+                .flat_map(menu_item_fields)
+                .collect();
+            let array = env
+                .new_string_array(fields.iter().map(String::as_str))
+                .map_err(|error| format!("Couldn't pass the menu: {error}"))?;
+            items = array.into_raw();
+            Ok(())
+        })
+    });
+    items
+}
+
+/// The fields of one item of the app menu in `nativeAppMenu`, mirrored in `HomeViews.java`: its
+/// kind, 0 App info, 1 Uninstall, 2 Edit applications or 3 a shortcut, then the shortcut's
+/// label, or nothing for the others, whose text is in Android's string resources (L10N-01).
+fn menu_item_fields(item: &AppMenuItem) -> [String; 2] {
+    let (kind, label) = match item {
+        AppMenuItem::AppInfo => (0, ""),
+        AppMenuItem::Uninstall => (1, ""),
+        AppMenuItem::EditApplications => (2, ""),
+        AppMenuItem::Shortcut(shortcut) => (3, shortcut.label.as_str()),
+    };
+    [kind.to_string(), label.to_owned()]
+}
+
+/// `String nativeAppMenuChosen(int revision, int item)`: item `item` of the app menu at
+/// `revision` was chosen (APPS-11). Returns `null`, or a short message to show when the system
+/// refused, such as an App info screen that couldn't open.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeAppMenuChosen(
+    env: RawEnv,
+    _views: JObject,
+    revision: i32,
+    item: i32,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    let Ok(item) = usize::try_from(item) else {
+        return std::ptr::null_mut();
+    };
+    let mut message = std::ptr::null_mut();
+    guarded(env, || {
+        LAUNCHER.with_borrow_mut(|launcher| {
+            let launcher = launcher.as_mut().ok_or("MeeGone hasn't started")?;
+            // The revision travels as Java's `int`.
+            if !launcher
+                .view()
+                .apps()
+                .menu_item_chosen(revision as u32, item)
+            {
+                return Ok(());
+            }
+            launcher.frame();
+            message = problem(env, launcher)?;
+            Ok(())
+        })
+    });
+    message
+}
+
+/// Applications' problem as a Java string, or `null` if there is none.
+fn problem(env: Env, launcher: &Launcher) -> Result<JObject, String> {
+    match &launcher.shell().apps().state().problem {
+        Some(problem) => env
+            .new_string(problem)
+            .map(|text| text.into_raw())
+            .map_err(|error| format!("Couldn't pass the message: {error}")),
+        None => Ok(std::ptr::null_mut()),
+    }
+}
+
 /// `void nativeFrame(long frameTimeNanos)`: the display is about to draw a frame (ANIM-04).
 ///
 /// # Safety
@@ -601,6 +699,73 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_AppsGrid_nativeAppRe
     });
 }
 
+/// `boolean nativeAppLongPressed(int revision, int index)`: the finger that is down has stayed on
+/// cell `index` of the cells at `revision` for the platform's long-press time (APPS-11). Returns
+/// whether the long-press was taken: the app's menu opened, and the rest of the gesture is the
+/// shell's, so lifting the finger launches nothing. A folder, or cells that changed since the
+/// host drew them, take nothing.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_AppsGrid_nativeAppLongPressed(
+    env: RawEnv,
+    _grid: JObject,
+    revision: i32,
+    index: i32,
+) -> JBoolean {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    let mut taken = false;
+    with_launcher(env, |launcher| {
+        if let Some(app) = app_at(launcher, revision, index) {
+            launcher.dispatch(ShellIntent::LongPressApp(app));
+            launcher.frame();
+            taken = launcher.shell().state().carousel.held;
+        }
+    });
+    JBoolean::from(taken)
+}
+
+/// `boolean nativeAppMenuRequested(int revision, int index)`: opens the menu of cell `index` of
+/// the cells at `revision` without a gesture, for screen readers (A11Y-05). Returns whether it
+/// opened.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_AppsGrid_nativeAppMenuRequested(
+    env: RawEnv,
+    _grid: JObject,
+    revision: i32,
+    index: i32,
+) -> JBoolean {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    let mut opened = false;
+    with_launcher(env, |launcher| {
+        if let Some(app) = app_at(launcher, revision, index) {
+            launcher.dispatch(ShellIntent::OpenAppMenu(app));
+            launcher.frame();
+            opened = launcher.shell().state().app_menu_open;
+        }
+    });
+    JBoolean::from(opened)
+}
+
+/// The app of cell `index` of the cells at `revision`, if it is still that cell's.
+fn app_at(launcher: &Launcher, revision: i32, index: i32) -> Option<AppId> {
+    let index = usize::try_from(index).ok()?;
+    // The revision travels as Java's `int`.
+    launcher
+        .view()
+        .apps()
+        .app_at(revision as u32, index)
+        .cloned()
+}
+
 /// `String nativeAppTapped(int revision, int index, int left, int top, int right, int bottom)`:
 /// cell `index` of the cells at `revision` was tapped, and its icon is at that rect on the
 /// screen (APPS-10, ANIM-08). Launches its app at once (PERF-06). Returns `null`, or a short
@@ -646,12 +811,7 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_AppsGrid_nativeAppTa
                 return Ok(());
             }
             launcher.frame();
-            if let Some(problem) = &launcher.shell().apps().state().problem {
-                let text = env
-                    .new_string(problem)
-                    .map_err(|error| format!("Couldn't pass the message: {error}"))?;
-                message = text.into_raw();
-            }
+            message = problem(env, launcher)?;
             Ok(())
         })
     });
@@ -709,7 +869,12 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRead
 /// | 26–27 | The scale and opacity of cells that left the grid, in ten-thousandths (ANIM-21) |
 /// | 28 | How far the other cells have come from their old places, in ten-thousandths (ANIM-21) |
 /// | 29 | The new-app dot's colour, as opaque ARGB (APPS-07) |
-fn frame_slots(frame: &HomeFrame) -> [i32; 30] {
+/// | 30 | The cell the app menu is open at, or -1: centred, or -2 while it is closed (APPS-11) |
+/// | 31 | The app menu's revision: when it changes, `HomeViews` reads its items again |
+/// | 32 | The picked-up icon's cell, or -1 (APPS-11) |
+/// | 33–34 | How far the picked-up icon is from its cell, in px |
+/// | 35 | The picked-up icon's scale in ten-thousandths, 11 000 while lifted (ANIM-13) |
+fn frame_slots(frame: &HomeFrame) -> [i32; 36] {
     let [events, applications, recent] = frame.pages;
     let menu_items = frame.menu.map_or(0, |menu| {
         menu.items
@@ -722,6 +887,14 @@ fn frame_slots(frame: &HomeFrame) -> [i32; 30] {
         (true, None) => 1,
         (true, Some(SettingsGroup::LockScreenImage)) => 2,
     };
+    let place = |cell: usize| i32::try_from(cell).unwrap_or(-1);
+    let (app_menu, app_menu_revision) = frame.apps.menu.map_or((-2, 0), |menu| {
+        // The revision wraps around; the host only compares it.
+        (menu.cell.map_or(-1, place), menu.revision as i32)
+    });
+    let (lifted, lift_dx, lift_dy, lift_scale) = frame.lifted.map_or((-1, 0, 0, 10_000), |lift| {
+        (place(lift.cell), lift.dx, lift.dy, i32::from(lift.scale))
+    });
     [
         events,
         applications,
@@ -757,6 +930,12 @@ fn frame_slots(frame: &HomeFrame) -> [i32; 30] {
         i32::from(frame.grid_change.leave_alpha),
         i32::from(frame.grid_change.shift),
         argb(frame.accent),
+        app_menu,
+        app_menu_revision,
+        lifted,
+        lift_dx,
+        lift_dy,
+        lift_scale,
     ]
 }
 

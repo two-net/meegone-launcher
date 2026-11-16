@@ -15,6 +15,7 @@ import android.content.pm.LauncherApps;
 import android.content.pm.LauncherUserInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
+import android.content.pm.ShortcutInfo;
 import android.graphics.Insets;
 import android.graphics.Rect;
 import android.icu.text.Collator;
@@ -61,6 +62,8 @@ final class Bridge {
     private static final int PROFILE_WORK = 1;
     private static final int PROFILE_PAUSED = 2;
     private static final int PROFILE_LOCKED = 4;
+    // A shortcut (ADR 0013): id, short label, flags, rank.
+    private static final int SHORTCUT_MANIFEST = 1;
     /**
      * The system's broadcasts about the work profile, and about the language, which changes the
      * apps' labels and their alphabetical order (L10N-04). Sent only to registered receivers.
@@ -436,6 +439,118 @@ final class Bridge {
             Log.w(TAG, "Couldn't launch an app: " + e.getClass().getSimpleName());
             return context.getString(R.string.app_unavailable);
         }
+    }
+
+    /**
+     * The enabled shortcuts of one app, for its long-press menu (APPS-11, ADR 0013). One record
+     * per shortcut: id, short label, flags and rank. The system offers shortcuts only to the
+     * default home app: returns null otherwise, or if the system couldn't answer, such as while
+     * a work profile is locked. Rust orders them. Called from Rust.
+     */
+    String[] shortcuts(String packageName, String activityName, long profile) {
+        try {
+            LauncherApps launcher = context.getSystemService(LauncherApps.class);
+            UserHandle user = user(profile);
+            if (user == null || !launcher.hasShortcutHostPermission()) {
+                return null;
+            }
+            LauncherApps.ShortcutQuery query = new LauncherApps.ShortcutQuery()
+                    .setPackage(packageName)
+                    .setActivity(new ComponentName(packageName, activityName))
+                    .setQueryFlags(LauncherApps.ShortcutQuery.FLAG_MATCH_MANIFEST
+                            | LauncherApps.ShortcutQuery.FLAG_MATCH_DYNAMIC);
+            List<ShortcutInfo> found = launcher.getShortcuts(query, user);
+            if (found == null) {
+                return null;
+            }
+            List<String> fields = new ArrayList<>();
+            for (ShortcutInfo shortcut : found) {
+                if (!shortcut.isEnabled()) {
+                    continue;
+                }
+                CharSequence label = shortcut.getShortLabel();
+                fields.add(shortcut.getId());
+                fields.add(label == null ? "" : label.toString());
+                fields.add(Integer.toString(
+                        shortcut.isDeclaredInManifest() ? SHORTCUT_MANIFEST : 0));
+                fields.add(Integer.toString(Math.max(0, shortcut.getRank())));
+            }
+            return fields.toArray(new String[0]);
+        } catch (RuntimeException e) {
+            // SecurityException without the home role, IllegalStateException while the profile
+            // is locked.
+            Log.w(TAG, "Couldn't list shortcuts: " + e.getClass().getSimpleName());
+            return null;
+        }
+    }
+
+    /**
+     * Starts one of an app's shortcuts (APPS-11). Returns null, or a short message if the
+     * system couldn't start it, such as when the app disabled it meanwhile. Called from Rust.
+     */
+    String launchShortcut(String packageName, String id, long profile) {
+        try {
+            UserHandle user = user(profile);
+            if (user == null) {
+                return context.getString(R.string.shortcut_unavailable);
+            }
+            context.getSystemService(LauncherApps.class)
+                    .startShortcut(packageName, id, null, null, user);
+            return null;
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Couldn't start a shortcut: " + e.getClass().getSimpleName());
+            return context.getString(R.string.shortcut_unavailable);
+        }
+    }
+
+    /**
+     * Opens the system's confirmation to uninstall an app, in its own profile (APPS-13).
+     * MeeGone never uninstalls anything itself: the user confirms, and the system reports the
+     * removal like any other. It needs REQUEST_DELETE_PACKAGES, granted at install (SEC-03).
+     * Returns null, or a short message if the system refused. Called from Rust.
+     */
+    String requestUninstall(String packageName, String activityName, long profile) {
+        try {
+            UserHandle user = user(profile);
+            if (user == null) {
+                return context.getString(R.string.uninstall_unavailable);
+            }
+            Intent intent = new Intent(Intent.ACTION_DELETE,
+                    Uri.fromParts("package", packageName, activityName))
+                    .putExtra(Intent.EXTRA_USER, user)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK
+                            | Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS);
+            Activity current = activity;
+            (current != null ? current : context).startActivity(intent);
+            return null;
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Couldn't ask to uninstall: " + e.getClass().getSimpleName());
+            return context.getString(R.string.uninstall_unavailable);
+        }
+    }
+
+    /**
+     * Opens the system's App info screen for an app, in its own profile (APPS-11). Returns null,
+     * or a short message if the system couldn't open it. Called from Rust.
+     */
+    String openAppInfo(String packageName, String activityName, long profile) {
+        try {
+            UserHandle user = user(profile);
+            if (user == null) {
+                return context.getString(R.string.app_info_unavailable);
+            }
+            context.getSystemService(LauncherApps.class).startAppDetailsActivity(
+                    new ComponentName(packageName, activityName), user, null, null);
+            return null;
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Couldn't open App info: " + e.getClass().getSimpleName());
+            return context.getString(R.string.app_info_unavailable);
+        }
+    }
+
+    /** The profile with this serial number, or null if it is gone. */
+    private UserHandle user(long profile) {
+        return context.getSystemService(UserManager.class).getUserForSerialNumber(profile);
     }
 
     /** The window grows from {@code icon}, a rect on the screen (ANIM-08), or null for none. */

@@ -4,17 +4,22 @@ import android.content.Context;
 import android.graphics.Canvas;
 import android.graphics.ColorMatrix;
 import android.graphics.ColorMatrixColorFilter;
+import android.graphics.Outline;
 import android.graphics.Paint;
 import android.graphics.Rect;
 import android.graphics.RectF;
 import android.graphics.drawable.Drawable;
 import android.os.Build;
+import android.os.Bundle;
 import android.text.Layout;
 import android.text.StaticLayout;
 import android.text.TextPaint;
 import android.text.TextUtils;
 import android.util.TypedValue;
 import android.view.View;
+import android.view.ViewOutlineProvider;
+import android.view.accessibility.AccessibilityNodeInfo;
+import android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction;
 import java.util.Objects;
 
 /**
@@ -28,10 +33,12 @@ import java.util.Objects;
  * of overlapping, and its 8 dp above and below leave 16 dp between rows. A pressed icon shrinks
  * (ANIM-10). An unavailable app is drawn greyed and at half opacity (APPS-09). A new app has a
  * small dot in the accent colour before its label (APPS-07). As apps come and go, the grid
- * scales, fades and slides the whole cell (ANIM-21).
+ * scales, fades and slides the whole cell (ANIM-21). A picked-up icon lifts above the other
+ * cells and follows the finger (APPS-11); the two never undo each other.
  *
  * <p>Screen readers read its label, "work" for a work-profile app (A11Y-01), and "new" for a
- * new one.
+ * new one. An app's cell offers "Open menu", which opens its long-press menu (A11Y-05). The
+ * view itself isn't long-clickable: {@link HomeViews} times long-presses.
  */
 final class AppCell extends View {
     private static final float ICON_DP = 56f;
@@ -43,6 +50,8 @@ final class AppCell extends View {
     private static final float DOT_DP = 6f;
     private static final float DOT_GAP_DP = 4f;
     private static final float DIMMED_ALPHA = 0.5f;
+    /** How far a picked-up icon rises above the other cells. */
+    private static final float LIFT_DP = 8f;
     private static final ColorMatrixColorFilter GREYED;
 
     static {
@@ -64,6 +73,7 @@ final class AppCell extends View {
     private final int sidePaddingPx;
     private final int dotPx;
     private final int dotGapPx;
+    private final int liftPx;
 
     /** Its place in the grid's cells. */
     private int index;
@@ -79,6 +89,14 @@ final class AppCell extends View {
     private boolean leaving;
     /** Its opacity as the grid changes, on top of the dimming of an unavailable app. */
     private float motionAlpha = 1f;
+    /** Its scale and distance from its place as the grid changes (ANIM-21). */
+    private float motionScale = 1f;
+    private float motionDx;
+    private float motionDy;
+    /** Its scale and distance from its place while it is picked up (APPS-11). */
+    private float liftScale = 1f;
+    private float liftDx;
+    private float liftDy;
     private Drawable icon;
     private StaticLayout labelLayout;
     private float iconScale = 1f;
@@ -93,10 +111,20 @@ final class AppCell extends View {
         sidePaddingPx = Math.round(SIDE_PADDING_DP * density);
         dotPx = Math.round(DOT_DP * density);
         dotGapPx = Math.round(DOT_GAP_DP * density);
+        liftPx = Math.round(LIFT_DP * density);
         text.setTextSize(TypedValue.applyDimension(
                 TypedValue.COMPLEX_UNIT_SP, LABEL_SP, getResources().getDisplayMetrics()));
         heightPx = heightPx(context);
         setOnClickListener(view -> grid.tapped(this));
+        // A picked-up icon's shadow takes the icons' shape (APPS-15).
+        setOutlineProvider(new ViewOutlineProvider() {
+            @Override
+            public void getOutline(View view, Outline outline) {
+                int left = Math.round(view.getWidth() / 2f - iconPx / 2f);
+                outline.setRoundRect(left, verticalPaddingPx, left + iconPx,
+                        verticalPaddingPx + iconPx, iconPx * AppIcons.CORNER);
+            }
+        });
     }
 
     /** The height of every cell: the same for every label, so rows line up. */
@@ -172,6 +200,10 @@ final class AppCell extends View {
         return index;
     }
 
+    String label() {
+        return label;
+    }
+
     /** The theme's text, placeholder and new-app dot colours, as opaque ARGB. */
     void setColours(int foreground, int dim, int accent) {
         text.setColor(foreground);
@@ -186,14 +218,33 @@ final class AppCell extends View {
      * is from its place, in px.
      */
     void setMotion(float scale, float alpha, float dx, float dy) {
-        setScaleX(scale);
-        setScaleY(scale);
-        setTranslationX(dx);
-        setTranslationY(dy);
+        motionScale = scale;
+        motionDx = dx;
+        motionDy = dy;
+        applyTransform();
         if (alpha != motionAlpha) {
             motionAlpha = alpha;
             applyAlpha();
         }
+    }
+
+    /**
+     * How the cell is drawn while it is picked up (APPS-11): its scale, and how far it is from
+     * its place, in px. {@code lifted} raises it above the other cells, with a shadow.
+     */
+    void setLift(float dx, float dy, float scale, boolean lifted) {
+        liftScale = scale;
+        liftDx = dx;
+        liftDy = dy;
+        applyTransform();
+        setTranslationZ(lifted ? liftPx : 0f);
+    }
+
+    private void applyTransform() {
+        setScaleX(motionScale * liftScale);
+        setScaleY(motionScale * liftScale);
+        setTranslationX(motionDx + liftDx);
+        setTranslationY(motionDy + liftDy);
     }
 
     /** Its cell left the grid: it shrinks away where it was, and can't be used (ANIM-21). */
@@ -222,6 +273,31 @@ final class AppCell extends View {
         int left = at[0] + (getWidth() - iconPx) / 2;
         int top = at[1] + verticalPaddingPx;
         return new Rect(left, top, left + iconPx, top + iconPx);
+    }
+
+    /** Whether it is an app's cell that can be used: not a folder, and not leaving. */
+    private boolean hasMenu() {
+        return packageName != null && !leaving;
+    }
+
+    // Screen readers open the app's menu with "double-tap and hold", or from their actions
+    // (A11Y-05). Only the accessibility node is long-clickable.
+    @Override
+    public void onInitializeAccessibilityNodeInfo(AccessibilityNodeInfo info) {
+        super.onInitializeAccessibilityNodeInfo(info);
+        if (hasMenu()) {
+            info.setLongClickable(true);
+            info.addAction(new AccessibilityAction(AccessibilityNodeInfo.ACTION_LONG_CLICK,
+                    getResources().getString(R.string.action_app_menu)));
+        }
+    }
+
+    @Override
+    public boolean performAccessibilityAction(int action, Bundle arguments) {
+        if (action == AccessibilityNodeInfo.ACTION_LONG_CLICK && hasMenu()) {
+            return grid.menuRequested(this);
+        }
+        return super.performAccessibilityAction(action, arguments);
     }
 
     @Override
