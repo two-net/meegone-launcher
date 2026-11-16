@@ -49,6 +49,7 @@ mod env_slot {
     pub const NEW_OBJECT_ARRAY: usize = 172;
     pub const GET_OBJECT_ARRAY_ELEMENT: usize = 173;
     pub const SET_OBJECT_ARRAY_ELEMENT: usize = 174;
+    pub const GET_INT_ARRAY_REGION: usize = 203;
     pub const SET_INT_ARRAY_REGION: usize = 211;
     pub const GET_JAVA_VM: usize = 219;
     pub const EXCEPTION_CHECK: usize = 228;
@@ -520,6 +521,30 @@ impl Env {
             );
             Ok(text)
         }
+    }
+
+    /// Every element of `array`, a Java `int[]` passed to the running native method.
+    pub fn int_array(&self, array: &LocalRef) -> Result<Vec<i32>, DataError> {
+        type GetArrayLength = unsafe extern "system" fn(RawEnv, JObject) -> JInt;
+        type GetIntArrayRegion = unsafe extern "system" fn(RawEnv, JObject, JInt, JInt, *mut JInt);
+        // SAFETY: the signature matches `jni.h`, and `array` is a live array reference.
+        let length =
+            unsafe { self.function::<GetArrayLength>(env_slot::GET_ARRAY_LENGTH)(self.0, array.0) };
+        self.check()?;
+        let mut values = vec![0; usize::try_from(length).unwrap_or(0)];
+        // SAFETY: the signature matches `jni.h`; `array` is a live `int[]` of `length` ints, and
+        // `values` has room for all of them.
+        unsafe {
+            self.function::<GetIntArrayRegion>(env_slot::GET_INT_ARRAY_REGION)(
+                self.0,
+                array.0,
+                0,
+                length,
+                values.as_mut_ptr(),
+            );
+        }
+        self.check()?;
+        Ok(values)
     }
 
     /// Copies `values` into the start of `array`, a Java `int[]` passed to the running native

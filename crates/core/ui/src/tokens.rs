@@ -46,23 +46,18 @@ pub fn tokens(theme: Theme) -> &'static Tokens {
     }
 }
 
-/// The WCAG 2.2 contrast ratio between two colours, from 1 to 21 (R8).
-pub fn contrast_ratio(a: Rgb, b: Rgb) -> f64 {
-    let (a, b) = (luminance(a), luminance(b));
-    let (lighter, darker) = if a > b { (a, b) } else { (b, a) };
-    (lighter + 0.05) / (darker + 0.05)
-}
+/// The least contrast an app's accent keeps against the home views' background, as a
+/// meaningful graphic (THEME-07, A11Y-03).
+pub const APP_ACCENT_CONTRAST: f64 = 3.0;
 
-fn luminance(colour: Rgb) -> f64 {
-    fn channel(value: u8) -> f64 {
-        let c = f64::from(value) / 255.0;
-        if c <= 0.04045 {
-            c / 12.92
-        } else {
-            ((c + 0.055) / 1.055).powf(2.4)
-        }
+impl Tokens {
+    /// An app's accent as this theme draws it: the colour derived from its icon, made darker or
+    /// lighter, keeping its hue, until it has at least 3:1 contrast against the background
+    /// (APPS-17, THEME-07). The Events group marker and the Recent card fill use it (EVT-09,
+    /// REC-04).
+    pub fn app_accent(&self, accent: Rgb) -> Rgb {
+        accent.with_contrast(self.background, APP_ACCENT_CONTRAST)
     }
-    0.2126 * channel(colour.r) + 0.7152 * channel(colour.g) + 0.0722 * channel(colour.b)
 }
 
 #[cfg(test)]
@@ -78,7 +73,7 @@ mod tests {
             let t = tokens(theme);
             for text in [t.text_primary, t.text_secondary] {
                 for behind in [t.background, t.surface] {
-                    let ratio = contrast_ratio(text, behind);
+                    let ratio = text.contrast_ratio(behind);
                     assert!(
                         ratio >= 4.5,
                         "{theme:?}: {text:?} on {behind:?} is {ratio:.2}"
@@ -94,7 +89,7 @@ mod tests {
         for theme in THEMES {
             let t = tokens(theme);
             for behind in [t.background, t.surface] {
-                let ratio = contrast_ratio(t.accent, behind);
+                let ratio = t.accent.contrast_ratio(behind);
                 assert!(
                     ratio >= 3.0,
                     "{theme:?}: accent on {behind:?} is {ratio:.2}"
@@ -110,8 +105,26 @@ mod tests {
     }
 
     #[test]
-    fn black_on_white_is_21_to_1() {
-        let ratio = contrast_ratio(Rgb::hex(0x000000), Rgb::hex(0xFFFFFF));
-        assert!((ratio - 21.0).abs() < 1e-9);
+    fn app_accents_reach_3_to_1_against_the_background_in_both_themes() {
+        // THEME-07: white and black icons, and colours a theme's background washes out.
+        for theme in THEMES {
+            let t = tokens(theme);
+            for accent in [0xFFFFFF, 0xF8F8F8, 0xFFEB3B, 0x000000, 0x0A0A0A, 0x1A237E] {
+                let drawn = t.app_accent(Rgb::hex(accent));
+                let ratio = drawn.contrast_ratio(t.background);
+                assert!(
+                    ratio >= APP_ACCENT_CONTRAST,
+                    "{theme:?}: {accent:06X} is drawn {drawn:?}, {ratio:.2}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_accent_with_enough_contrast_is_drawn_as_derived() {
+        let blue = Rgb::hex(0x1877F2);
+
+        assert_eq!(LIGHT.app_accent(blue), blue);
+        assert_eq!(DARK.app_accent(blue), blue);
     }
 }

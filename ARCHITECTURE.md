@@ -24,7 +24,7 @@ Each crate is `crates/<area>/<layer>`, with the package name `meegone-<area>-<la
 
 | Area | data | state | ui | Owns |
 |---|---|---|---|---|
-| **core** | Models, platform adapter traits and fakes, storage and the saved-file format, the settings store | `StateHolder`, `Store`, theme resolution, motion specs and spring physics | Colour tokens, `View`, `Slot`, `Dispatch` | Nothing persistent |
+| **core** | Models, platform adapter traits and fakes, storage and the saved-file format, the settings store, app accents and colour contrast | `StateHolder`, `Store`, theme resolution, motion specs and spring physics | Colour tokens, each app's accent per theme, `View`, `Slot`, `Dispatch` | Nothing persistent |
 | **apps** | Layout store | Grid, its columns and scroll position, edit mode, folders | `AppsView` | Layout store |
 | **events** | – | Notifications grouped by app | `EventsView` | Nothing (memory only) |
 | **recent** | – | Filtering, ordering, close mode | `RecentView` | Removed-apps list (in the settings store) |
@@ -73,7 +73,7 @@ AppsView.cell_tapped(revision, 4, icon)          ui     sends AppsIntent::Launch
 
 ## Drawing (ADR 0006)
 
-Android's own views draw MeeGone, and the Rust app decides what they show. The decisions are in [ADR 0006](docs/adr/0006-android-views-and-the-carousel.md).
+Android's own views draw MeeGone, and the Rust app decides what they show. The decisions are in [ADR 0006](docs/adr/0006-android-views-and-the-carousel.md) and the ADRs after it.
 
 ```
 HomeViews (Java)                                       Rust
@@ -92,6 +92,7 @@ HomeViews (Java)                                       Rust
 - **Edge to edge** ([ADR 0009](docs/adr/0009-edge-to-edge-screens-and-navigation-modes.md)). On every Android version the solid background fills the window behind the system bars, which stay visible (HOME-11). Content stays inside a safe area clear of the bars, cut-outs and rounded corners: each page and Settings get it as padding, so a view's content needs no inset code of its own. Phones stay in portrait; screens 600 dp or more across their smallest width turn freely (HOME-12).
 - **Size changes keep state** (COMP-03). Rotating, folding and resizing send a new `Layout`. It ends a drag but keeps the view, Settings, the home menu (now centred) and everything open in the views. Other configuration changes recreate the activity, and the shared launcher keeps everything.
 - **Applications** ([ADR 0010](docs/adr/0010-the-applications-grid.md)). `AppsGrid`, a `ScrollView`, draws the frame's Applications slots: the columns and rows (the last one empty, HOME-14), the scroll position and the pressed icon. It reads the cells with `nativeAppsCells` only when their revision changes, and names a tapped cell by revision and index. It reports its width and row height, and the Rust app picks the columns (APPS-02) and keeps the same first visible item when they change. Icons stay in Java: `AppIcons` loads them off the main thread.
+- **Icons and accents** ([ADR 0011](docs/adr/0011-icon-shape-and-app-accents.md)). Every icon is one rounded square: adaptive icons are masked to it, and legacy ones sit on a white plate of that shape (APPS-15). Each app's accent comes from its icon once per process: `AppAccents` samples the icon on a background thread, and the Rust app's pure `nativeAccent` picks the colour (APPS-17). It reaches Rust in the app catalogue, and a theme draws it with `Tokens::app_accent`, at 3:1 or more against its background (THEME-07).
 - **Long-press** (ADR 0008). The host times a finger held still and, on empty space, sends `LongPress`. Empty space is where no clickable or long-clickable element is under the finger, so an element with its own long-press only needs to be clickable. The shell takes it only while the finger is within the touch slop. The home menu and Settings cover the home views: while either is open, the carousel gets no new touches.
 - **Text** is in Android string resources (L10N-01). **Accessibility** comes from Android's views: the home views offer scroll, page and named actions, including "Home menu" (A11Y-05).
 
@@ -185,13 +186,13 @@ MeeGone keeps three persistent stores, each in its own file under one private fo
 
 ## Not built yet
 
-The skeleton is from issue #1; the Android host and the home-app role from #4; the carousel of home views from #5; Home, Back and coming back to the home from #6; the home menu from #7; edge to edge, screen sizes and navigation modes from #8; the Applications grid and the app catalogue from #9. The following arrive with later requirements:
+The skeleton is from issue #1; the Android host and the home-app role from #4; the carousel of home views from #5; Home, Back and coming back to the home from #6; the home menu from #7; edge to edge, screen sizes and navigation modes from #8; the Applications grid and the app catalogue from #9; one icon shape and each app's accent from #10. The following arrive with later requirements:
 
 - **Android adapters.** The home-app role, the clock and storage are built (ADR 0005), as are the navigation-mode check for the return-home motion (ADR 0007), the haptic tick (ADR 0008) and the app catalogue (ADR 0010). Shortcuts, uninstalling and App info (#12, #13), notifications, usage, wallpaper, network, scheduling and the remaining device settings are stubs until their issues. The ticks on entering edit mode and on creating a folder (ANIM-24) come with #13 and #14.
 - **The daily image.** The Bing implementation of `ImageFeed` (#26) and the updater (SRS 7.5) come with the WALL requirements.
 - **Drawing.** The home views, their carousel, the view indicator, the return-home motion, the home menu and the Applications grid are drawn (ADR 0006 to ADR 0008, ADR 0010). Events and Recent show only their names until their content arrives (#19, #22).
   - Recent's cards adapt to large screens when #22 builds them. Today the pages, the carousel, the safe area, the menu, Settings and the Applications columns adapt (HOME-12, APPS-02).
-  - Icons are the system's until #10 gives them one shape and derives each app's accent colour. Folders show as a plain cell with their name until #14 draws them.
+  - Events' group marker and Recent's card fill draw each app's accent with `Tokens::app_accent` when #19 and #22 draw them. Folders show as a plain cell with their name until #14 draws them.
   - Settings covers the home views with only its name, and its group's, until #34 draws it. "Home button opens", the home-app banner and first-run setup send intents but aren't drawn yet.
   - Edit mode and close mode change state but aren't drawn yet (#13, #24).
 - **First-run setup** comes with the ONB requirements. The lock-screen image step is provided as a `Slot`, like its Settings section.

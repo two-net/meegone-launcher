@@ -18,6 +18,7 @@ meegone-shell-ui.workspace = true
 [dev-dependencies]
 meegone-core-data = { workspace = true, features = ["fakes"] }
 meegone-core-state.workspace = true
+meegone-core-ui.workspace = true
 
 [workspace]
 members = ["crates/*/*", "tools/*"]

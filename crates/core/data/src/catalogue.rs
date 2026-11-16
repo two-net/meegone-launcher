@@ -6,10 +6,13 @@
 //! JNI, so the parsing is tested without a device. A record that doesn't parse is left out,
 //! never fatal.
 
+use crate::accent;
 use crate::model::{App, AppId, Profile, ProfileId, Rgb};
 
-/// `launchableApps()`: package, activity, label, profile serial number, [`app_flag`]s.
-pub(crate) const APP_FIELDS: usize = 5;
+/// `launchableApps()`: package, activity, label, profile serial number, [`app_flag`]s, and the
+/// accent `AppAccents.java` derived from the icon as a decimal `0xRRGGBB`, empty until it has
+/// (ADR 0011).
+pub(crate) const APP_FIELDS: usize = 6;
 /// `profiles()`: serial number, [`profile_flag`]s.
 pub(crate) const PROFILE_FIELDS: usize = 2;
 
@@ -29,9 +32,6 @@ pub(crate) mod profile_flag {
     pub const PAUSED: u32 = 2;
 }
 
-/// Every app's accent colour until #10 derives it from the app's icon (APPS-17).
-const NEUTRAL_ACCENT: Rgb = Rgb::hex(0x808080);
-
 /// The apps in `fields`, in order.
 pub(crate) fn apps(fields: &[Option<String>]) -> Vec<App> {
     fields.chunks_exact(APP_FIELDS).filter_map(app).collect()
@@ -46,7 +46,7 @@ pub(crate) fn profiles(fields: &[Option<String>]) -> Vec<Profile> {
 }
 
 fn app(record: &[Option<String>]) -> Option<App> {
-    let [package, activity, label, serial, flags] = record else {
+    let [package, activity, label, serial, flags, accent] = record else {
         return None;
     };
     let package = package.as_deref().filter(|text| !text.is_empty())?;
@@ -65,7 +65,7 @@ fn app(record: &[Option<String>]) -> Option<App> {
             activity: activity.to_owned(),
         },
         label: label.to_owned(),
-        accent: NEUTRAL_ACCENT,
+        accent: accent_of(accent),
         available: flags & app_flag::AVAILABLE != 0,
         work: flags & app_flag::WORK != 0,
         can_uninstall: flags & app_flag::CAN_UNINSTALL != 0,
@@ -90,6 +90,14 @@ fn number(field: &Option<String>) -> Option<u32> {
     field.as_deref()?.parse().ok()
 }
 
+/// The app's accent (APPS-17), or the neutral one until its icon has been read. An accent that
+/// doesn't parse never drops the app.
+fn accent_of(field: &Option<String>) -> Rgb {
+    number(field)
+        .filter(|rgb| *rgb <= 0x00FF_FFFF)
+        .map_or(accent::NEUTRAL, Rgb::hex)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,11 +118,13 @@ mod tests {
             Some("Mail"),
             Some("0"),
             Some("3"),
+            Some("15352629"),
             Some("com.example.docs"),
             Some("com.example.docs.Main"),
             Some("Docs"),
             Some("10"),
             Some("4"),
+            Some(""),
         ]);
 
         let apps = apps(&records);
@@ -129,7 +139,8 @@ mod tests {
                         activity: "com.example.mail.Inbox".into(),
                     },
                     label: "Mail".into(),
-                    accent: NEUTRAL_ACCENT,
+                    // APPS-17: 0xEA4335, from its icon.
+                    accent: Rgb::hex(0xEA4335),
                     available: true,
                     work: false,
                     can_uninstall: true,
@@ -142,7 +153,8 @@ mod tests {
                         activity: "com.example.docs.Main".into(),
                     },
                     label: "Docs".into(),
-                    accent: NEUTRAL_ACCENT,
+                    // Its icon hasn't been read yet.
+                    accent: accent::NEUTRAL,
                     available: false,
                     work: true,
                     can_uninstall: false,
@@ -161,6 +173,7 @@ mod tests {
                 label,
                 Some("0"),
                 Some("1"),
+                Some(""),
             ]);
 
             assert_eq!(apps(&records)[0].label, "com.example.tool");
@@ -175,14 +188,50 @@ mod tests {
             Some("Mail"),
             Some("0"),
             Some("1"),
+            Some(""),
         ];
         let mut values: Vec<Option<&str>> = Vec::new();
         for broken in [
-            [None, Some("a.Main"), Some("A"), Some("0"), Some("1")],
-            [Some("a"), Some(""), Some("A"), Some("0"), Some("1")],
-            [Some("a"), Some("a.Main"), Some("A"), Some("-1"), Some("1")],
-            [Some("a"), Some("a.Main"), Some("A"), Some("0"), Some("x")],
-            [Some("a"), Some("a.Main"), Some("A"), None, Some("1")],
+            [
+                None,
+                Some("a.Main"),
+                Some("A"),
+                Some("0"),
+                Some("1"),
+                Some(""),
+            ],
+            [
+                Some("a"),
+                Some(""),
+                Some("A"),
+                Some("0"),
+                Some("1"),
+                Some(""),
+            ],
+            [
+                Some("a"),
+                Some("a.Main"),
+                Some("A"),
+                Some("-1"),
+                Some("1"),
+                Some(""),
+            ],
+            [
+                Some("a"),
+                Some("a.Main"),
+                Some("A"),
+                Some("0"),
+                Some("x"),
+                Some(""),
+            ],
+            [
+                Some("a"),
+                Some("a.Main"),
+                Some("A"),
+                None,
+                Some("1"),
+                Some(""),
+            ],
         ] {
             values.extend(broken);
         }
@@ -194,6 +243,35 @@ mod tests {
 
         assert_eq!(apps.len(), 1);
         assert_eq!(apps[0].label, "Mail");
+    }
+
+    #[test]
+    fn an_accent_that_doesnt_parse_is_neutral_and_keeps_the_app() {
+        // APPS-17
+        for accent in [None, Some(""), Some("x"), Some("-1"), Some("16777216")] {
+            let records = fields(&[
+                Some("mail"),
+                Some("mail.Main"),
+                Some("Mail"),
+                Some("0"),
+                Some("1"),
+                accent,
+            ]);
+
+            let apps = apps(&records);
+
+            assert_eq!(apps.len(), 1);
+            assert_eq!(apps[0].accent, accent::NEUTRAL, "{accent:?}");
+        }
+        let white = fields(&[
+            Some("mail"),
+            Some("mail.Main"),
+            Some("Mail"),
+            Some("0"),
+            Some("1"),
+            Some("16777215"),
+        ]);
+        assert_eq!(apps(&white)[0].accent, Rgb::WHITE);
     }
 
     #[test]

@@ -11,13 +11,14 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use crate::accent;
 use crate::adapters::{
     AppsAdapter, NetworkAdapter, NotificationsAdapter, Platform, SchedulerAdapter,
     SystemConfigAdapter, UsageAdapter, WallpaperAdapter,
 };
 use crate::model::{
     Access, App, AppId, DataError, ImageJob, NetworkState, Notification, Profile, ProfileId,
-    RecentUse, Rect, Rgb, Shortcut, Size,
+    RecentUse, Rect, Shortcut, Size,
 };
 use crate::storage::{MAX_STORED_BYTES, StorageAdapter, StoredFile, check_budget};
 
@@ -66,7 +67,7 @@ pub fn app(package: &str, label: &str) -> App {
     App {
         id: app_id(package),
         label: label.to_owned(),
-        accent: Rgb::hex(0x808080),
+        accent: accent::NEUTRAL,
         available: true,
         work: false,
         can_uninstall: true,

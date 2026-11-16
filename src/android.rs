@@ -1,5 +1,6 @@
 //! The native methods of `HomeActivity` (ADR 0005, ADR 0007) and `HomeViews` (ADR 0006,
-//! ADR 0008), called by Android on the main thread.
+//! ADR 0008), called by Android on the main thread. The one exception is `AppAccents`'
+//! `nativeAccent`, which is pure and runs on its own thread (ADR 0011).
 //!
 //! The process has one [`Launcher`], kept on the main thread. Every `HomeActivity` shares it:
 //! the one opened from the app drawer and the one Home starts can be alive at once, and two
@@ -22,7 +23,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::time::Duration;
 
 use meegone_core_data::android::{self, Env, JObject, LocalRef, RawEnv};
-use meegone_core_data::{Rect, Rgb};
+use meegone_core_data::{Rect, Rgb, accent};
 
 use crate::{
     Cell, Direction, HomeFrame, HomeView, Launcher, Layout, MenuItem, PointerEvent, PointerKind,
@@ -195,6 +196,38 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeActivity_nativeA
         launcher.dispatch(ShellIntent::AppsChanged);
         launcher.frame();
     });
+}
+
+/// `static int nativeAccent(int[] argb)`: the accent colour of an app's icon, drawn in
+/// MeeGone's shape, from its pixels as `0xAARRGGBB`. Returns `0xRRGGBB` (APPS-17, ADR 0011).
+///
+/// Unlike every other native method, `AppAccents` calls it on its own background thread, once
+/// per icon. It is pure: it reads only its argument and never touches the [`Launcher`], which
+/// belongs to the main thread.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_AppAccents_nativeAccent(
+    env: RawEnv,
+    _class: JObject,
+    icon: JObject,
+) -> i32 {
+    // SAFETY: the JVM passes this thread's environment and a live local reference to an
+    // `int[]`, used only during this call.
+    let (env, icon) = unsafe { (Env::from_raw(env), LocalRef::from_raw(icon)) };
+    let mut rgb = 0;
+    guarded(env, || {
+        let pixels = env
+            .int_array(&icon)
+            .map_err(|error| format!("Couldn't read the icon: {error}"))?;
+        // Android's `int` pixels are `0xAARRGGBB` bit for bit.
+        let pixels: Vec<u32> = pixels.into_iter().map(|pixel| pixel as u32).collect();
+        rgb = argb(accent::derive(&pixels)) & 0x00FF_FFFF;
+        Ok(())
+    });
+    rgb
 }
 
 /// `void nativeRequestDefaultHome()`: in debug builds, taps the banner's "make default" button,

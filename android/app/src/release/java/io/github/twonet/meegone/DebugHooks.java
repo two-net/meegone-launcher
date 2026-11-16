@@ -9,4 +9,10 @@ final class DebugHooks {
     static boolean requestsHomeRole(Intent intent) {
         return false;
     }
+
+    static void readIconExtras(Intent intent) {}
+
+    static boolean legacyIcons() {
+        return false;
+    }
 }

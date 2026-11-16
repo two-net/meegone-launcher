@@ -80,6 +80,7 @@ version = "0.1.0"
 dependencies = [
  "meegone-core-data",
  "meegone-core-state",
+ "meegone-core-ui",
  "meegone-shell-state",
  "meegone-shell-ui",
 ]

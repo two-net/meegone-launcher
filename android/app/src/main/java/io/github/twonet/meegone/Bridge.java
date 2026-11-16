@@ -46,7 +46,7 @@ final class Bridge {
     private static final String TAG = "MeeGone";
 
     // The app catalogue's records (ADR 0010), mirrored in crates/core/data/src/catalogue.rs.
-    // An app: package, activity, label, profile serial number, flags.
+    // An app: package, activity, label, profile serial number, flags, accent (ADR 0011).
     private static final int APP_AVAILABLE = 1;
     private static final int APP_CAN_UNINSTALL = 2;
     private static final int APP_WORK = 4;
@@ -76,6 +76,8 @@ final class Bridge {
     private final Handler main = new Handler(Looper.getMainLooper());
     /** Tells the Rust app about a burst of app and profile changes once (ADR 0010). */
     private final Runnable reportAppsChanged = () -> HomeActivity.appsChanged(this.activity);
+    /** Each app's accent colour, derived from its icon (APPS-17, ADR 0011). */
+    private final AppAccents accents;
     /** The resumed activity, which can start the system's screens; null while none is. */
     private Activity activity;
     private long roleRequestedAt;
@@ -83,6 +85,8 @@ final class Bridge {
 
     private Bridge(Context context) {
         this.context = context.getApplicationContext();
+        // New accents change the catalogue, as an install would.
+        accents = new AppAccents(this.context, this::appsChanged);
     }
 
     /** The one bridge of this process, shared by every activity. */
@@ -224,10 +228,11 @@ final class Bridge {
 
     /**
      * Every launchable app in every profile, except MeeGone itself, which is already on screen
-     * (APPS-01, ADR 0010). One record per app: package, activity, label, profile serial number
-     * and flags. An app is unavailable while its profile is paused or it is suspended (APPS-09).
-     * Returns null if the system couldn't answer, so the saved layout keeps its apps. Called
-     * from Rust.
+     * (APPS-01, ADR 0010). One record per app: package, activity, label, profile serial number,
+     * flags and accent. An app is unavailable while its profile is paused or it is suspended
+     * (APPS-09). Its accent is empty until it has been derived from its icon, in the background;
+     * the catalogue then changes (APPS-17, ADR 0011). Returns null if the system couldn't
+     * answer, so the saved layout keeps its apps. Called from Rust.
      */
     String[] launchableApps() {
         try {
@@ -236,7 +241,8 @@ final class Bridge {
             List<String> fields = new ArrayList<>();
             for (UserHandle user : launcher.getProfiles()) {
                 int profile = profileFlags(launcher, users, user);
-                String serial = Long.toString(users.getSerialNumberForUser(user));
+                long serialNumber = users.getSerialNumberForUser(user);
+                String serial = Long.toString(serialNumber);
                 for (LauncherActivityInfo info : launcher.getActivityList(null, user)) {
                     ComponentName component = info.getComponentName();
                     if (context.getPackageName().equals(component.getPackageName())) {
@@ -260,8 +266,10 @@ final class Bridge {
                     fields.add(label == null ? "" : label.toString());
                     fields.add(serial);
                     fields.add(Integer.toString(flags));
+                    fields.add(accents.field(serialNumber, info));
                 }
             }
+            accents.deriveWaiting();
             return fields.toArray(new String[0]);
         } catch (RuntimeException e) {
             Log.w(TAG, "Couldn't list the apps", e);
@@ -401,26 +409,35 @@ final class Bridge {
         main.post(reportAppsChanged);
     }
 
-    /** Every change to the apps of any profile. */
+    /**
+     * Every change to the apps of any profile. A package that is added, removed, changed or
+     * becomes available again may have a new icon, so its accents are derived again (ADR 0011).
+     */
     private final class AppsCallback extends LauncherApps.Callback {
         @Override
         public void onPackageAdded(String packageName, UserHandle user) {
+            accents.forget(packageName, user);
             appsChanged();
         }
 
         @Override
         public void onPackageRemoved(String packageName, UserHandle user) {
+            accents.forget(packageName, user);
             appsChanged();
         }
 
         @Override
         public void onPackageChanged(String packageName, UserHandle user) {
+            accents.forget(packageName, user);
             appsChanged();
         }
 
         @Override
         public void onPackagesAvailable(String[] packageNames, UserHandle user,
                 boolean replacing) {
+            for (String packageName : packageNames) {
+                accents.forget(packageName, user);
+            }
             appsChanged();
         }
 

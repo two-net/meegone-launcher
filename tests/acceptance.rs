@@ -17,9 +17,11 @@ use std::time::Duration;
 
 use meegone_core_data::fakes::{Fakes, WORK_PROFILE, app, app_id, work_app};
 use meegone_core_data::{
-    DataError, HomeTarget, Notification, Profile, ProfileId, RecentUse, Rect, ThemeChoice,
+    App, DataError, HomeTarget, Notification, Profile, ProfileId, RecentUse, Rect, Rgb,
+    ThemeChoice, accent,
 };
 use meegone_core_state::{Access, Health, Theme};
+use meegone_core_ui::tokens;
 use meegone_launcher::{
     Direction, HomeView, Launcher, Layout, MenuItem, PointerEvent, PointerKind, SettingsGroup,
     ShellIntent,
@@ -684,4 +686,89 @@ fn apps_changed_while_open_reach_the_grid() {
 
     assert_ne!(launcher.frame().apps.revision, before);
     assert_eq!(cells(&mut launcher), [("Mail".to_owned(), true, true)]);
+}
+
+/// Recent with Mail used a minute ago, its accent derived from an icon of these pixels.
+fn mail_in_recent(fakes: &Fakes, icon: &[u32]) -> Launcher {
+    let mail = App {
+        accent: accent::derive(icon),
+        ..app("mail", "Mail")
+    };
+    *fakes.apps.apps.lock().unwrap() = vec![mail];
+    *fakes.usage.access.lock().unwrap() = Access::Granted;
+    *fakes.system.now_ms.lock().unwrap() = 10_000_000;
+    *fakes.usage.uses.lock().unwrap() = vec![RecentUse {
+        app: app_id("mail"),
+        last_used_ms: 9_940_000,
+    }];
+    let mut launcher = Launcher::start(fakes.platform());
+    launcher.dispatch(ShellIntent::Swipe(Direction::Next));
+    launcher
+}
+
+/// The accent of Recent's first card, as the current theme draws it, and that theme's
+/// background (THEME-07).
+fn drawn_accent(launcher: &Launcher) -> (Rgb, Rgb) {
+    let theme = tokens::tokens(launcher.shell().theme().state().theme);
+    let card = &launcher.shell().recent().state().cards[0];
+    (theme.app_accent(card.app.accent), theme.background)
+}
+
+/// A 48 × 48 icon in one opaque colour, with the shape's four corners transparent.
+fn icon_of(rgb: u32) -> Vec<u32> {
+    let mut icon = vec![0xFF00_0000 | rgb; 48 * 48];
+    for corner in [0, 47, 48 * 47, 48 * 48 - 1] {
+        icon[corner] = 0;
+    }
+    icon
+}
+
+#[test]
+fn apps17_given_a_near_white_icon_its_light_accent_reaches_3_to_1_against_the_background() {
+    // Issue #10, THEME-07
+    let fakes = Fakes::default();
+    let launcher = mail_in_recent(&fakes, &icon_of(0xFAFAFA));
+    assert_eq!(launcher.shell().theme().state().theme, Theme::Light);
+
+    let (accent, background) = drawn_accent(&launcher);
+
+    assert_eq!(background, Rgb::hex(0xF2F2F2));
+    assert!(
+        accent.contrast_ratio(background) >= 3.0,
+        "{accent:?} is {:.2}",
+        accent.contrast_ratio(background)
+    );
+}
+
+#[test]
+fn apps17_given_a_near_black_icon_its_dark_accent_reaches_3_to_1_against_the_background() {
+    // Issue #10, THEME-07
+    let fakes = Fakes::default();
+    *fakes.system.dark.lock().unwrap() = true;
+    let launcher = mail_in_recent(&fakes, &icon_of(0x080808));
+    assert_eq!(launcher.shell().theme().state().theme, Theme::Dark);
+
+    let (accent, background) = drawn_accent(&launcher);
+
+    assert_eq!(background, Rgb::hex(0x000000));
+    assert!(
+        accent.contrast_ratio(background) >= 3.0,
+        "{accent:?} is {:.2}",
+        accent.contrast_ratio(background)
+    );
+}
+
+#[test]
+fn apps17_recent_shows_the_accent_derived_from_the_icon_and_an_update_derives_it_again() {
+    // Issue #10: one accent per app, from the catalogue, so every view shows the same one.
+    let fakes = Fakes::default();
+    let mut launcher = mail_in_recent(&fakes, &icon_of(0x1877F2));
+    let card = |launcher: &Launcher| launcher.shell().recent().state().cards[0].app.accent;
+    assert_eq!(card(&launcher), Rgb::hex(0x1877F2));
+
+    // An update changes Mail's icon; the host derives its accent again and reports the change.
+    fakes.apps.apps.lock().unwrap()[0].accent = accent::derive(&icon_of(0xEA4335));
+    launcher.dispatch(ShellIntent::AppsChanged);
+
+    assert_eq!(card(&launcher), Rgb::hex(0xEA4335));
 }

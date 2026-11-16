@@ -22,11 +22,11 @@ import java.util.Objects;
  * It is a single view that draws both, so a grid of a few hundred apps lays out quickly
  * (PERF-04).
  *
- * <p>The icon is 56 dp, with a placeholder plate until it loads. The label sits 4 dp below it,
- * at 12 sp in the theme's text colour, on one line and ellipsised (APPS-16). The cell's height
- * follows the font, so it grows with the system font size instead of overlapping, and its
- * 8 dp above and below leave 16 dp between rows. A pressed icon shrinks (ANIM-10). An
- * unavailable app is drawn greyed and at half opacity (APPS-09).
+ * <p>The icon is 56 dp, with a placeholder plate in the icons' shape until it loads (APPS-15).
+ * The label sits 4 dp below it, at 12 sp in the theme's text colour, on one line and ellipsised
+ * (APPS-16). The cell's height follows the font, so it grows with the system font size instead
+ * of overlapping, and its 8 dp above and below leave 16 dp between rows. A pressed icon shrinks
+ * (ANIM-10). An unavailable app is drawn greyed and at half opacity (APPS-09).
  *
  * <p>Screen readers read its label, and "work" for a work-profile app (A11Y-01).
  */
@@ -37,7 +37,6 @@ final class AppCell extends View {
     /** Above the icon and below the label: half the 16 dp between rows. */
     private static final float VERTICAL_PADDING_DP = 8f;
     private static final float SIDE_PADDING_DP = 4f;
-    private static final float PLATE_CORNER = 0.24f;
     private static final float DIMMED_ALPHA = 0.5f;
     private static final ColorMatrixColorFilter GREYED;
 
@@ -219,7 +218,7 @@ final class AppCell extends View {
             icon.draw(canvas);
         } else {
             plateBounds.set(iconLeft, iconTop, iconLeft + iconPx, iconTop + iconPx);
-            float corner = iconPx * PLATE_CORNER;
+            float corner = iconPx * AppIcons.CORNER;
             canvas.drawRoundRect(plateBounds, corner, corner, plate);
         }
         canvas.restore();

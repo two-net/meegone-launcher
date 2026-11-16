@@ -59,6 +59,8 @@ public final class HomeActivity extends Activity {
             savedView = savedInstanceState.getInt(SAVED_VIEW, NONE);
             savedAppsScroll = savedInstanceState.getInt(SAVED_APPS_SCROLL, 0);
         }
+        // Before MeeGone starts, so no icon or accent is drawn without it.
+        DebugHooks.readIconExtras(getIntent());
         boolean started = nativeStart(bridge, getFilesDir().getPath(), savedView, savedAppsScroll);
         // Applications follows the system's app and profile changes (ADR 0010).
         bridge.watchApps();
