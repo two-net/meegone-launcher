@@ -5,8 +5,9 @@
 //! ([`jni`]), and keep MeeGone's files in the folder the activity passes in, its private
 //! `Context.getFilesDir()` (PRIV-05). Only `jni.rs` contains `unsafe` code.
 //!
-//! - [`system`]: the home-app role and the clock (HOME-01, ONB-04).
-//! - [`apps`]: the app catalogue and launching (APPS-01, APPS-10, ADR 0010).
+//! - [`system`]: the home-app role, the clock, and web search (HOME-01, ONB-04, SRCH-05).
+//! - [`apps`]: the app catalogue, launching and search keys (APPS-01, APPS-10, SRCH-02,
+//!   ADR 0010).
 //! - [`stubs`]: every adapter not built yet, answering with its "if unavailable" value.
 
 mod apps;

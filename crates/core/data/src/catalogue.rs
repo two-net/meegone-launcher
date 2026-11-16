@@ -11,9 +11,10 @@ use crate::model::{App, AppId, Profile, ProfileId, Rgb, Shortcut};
 
 /// `launchableApps()`: package, activity, label, profile serial number, [`app_flag`]s, the
 /// accent `AppAccents.java` derived from the icon as a decimal `0xRRGGBB`, empty until it has
-/// (ADR 0011), the label's collation key in lowercase hex (L10N-04), and the first install time
-/// in decimal milliseconds since the Unix epoch (ADR 0012).
-pub(crate) const APP_FIELDS: usize = 8;
+/// (ADR 0011), the label's collation key in lowercase hex (L10N-04), the first install time
+/// in decimal milliseconds since the Unix epoch (ADR 0012), and the label folded for search
+/// (SRCH-02, ADR 0016).
+pub(crate) const APP_FIELDS: usize = 9;
 /// `profiles()`: serial number, [`profile_flag`]s.
 pub(crate) const PROFILE_FIELDS: usize = 2;
 /// `shortcuts(…)`: id, short label, [`shortcut_flag`]s, and its rank among the shortcuts of
@@ -105,6 +106,7 @@ fn app(record: &[Option<String>]) -> Option<App> {
         accent,
         sort_key,
         installed,
+        search_key,
     ] = record
     else {
         return None;
@@ -126,6 +128,7 @@ fn app(record: &[Option<String>]) -> Option<App> {
         },
         label: label.to_owned(),
         sort_key: hex(sort_key.as_deref()?)?,
+        search_key: search_key.clone()?,
         accent: accent_of(accent),
         available: flags & app_flag::AVAILABLE != 0,
         work: flags & app_flag::WORK != 0,
@@ -197,6 +200,7 @@ mod tests {
             Some(""),
             Some("2b"),
             Some("0"),
+            Some("mail"),
         ];
         record[field] = value;
         record
@@ -204,7 +208,7 @@ mod tests {
 
     #[test]
     fn apps_are_read_field_by_field() {
-        // APPS-01, APPS-09, APPS-20, L10N-04
+        // APPS-01, APPS-09, APPS-20, L10N-04, SRCH-02
         let records = fields(&[
             Some("com.example.mail"),
             Some("com.example.mail.Inbox"),
@@ -214,14 +218,16 @@ mod tests {
             Some("15352629"),
             Some("2b3d00"),
             Some("1763251200000"),
+            Some("mail"),
             Some("com.example.docs"),
             Some("com.example.docs.Main"),
-            Some("Docs"),
+            Some("Café Docs"),
             Some("10"),
             Some("4"),
             Some(""),
             Some(""),
             Some("0"),
+            Some("cafe docs"),
         ]);
 
         let apps = apps(&records);
@@ -237,6 +243,7 @@ mod tests {
                     },
                     label: "Mail".into(),
                     sort_key: vec![0x2B, 0x3D, 0x00],
+                    search_key: "mail".into(),
                     // APPS-17: 0xEA4335, from its icon.
                     accent: Rgb::hex(0xEA4335),
                     available: true,
@@ -250,8 +257,10 @@ mod tests {
                         package: "com.example.docs".into(),
                         activity: "com.example.docs.Main".into(),
                     },
-                    label: "Docs".into(),
+                    label: "Café Docs".into(),
                     sort_key: Vec::new(),
+                    // SRCH-02: folded by the platform.
+                    search_key: "cafe docs".into(),
                     // Its icon hasn't been read yet.
                     accent: accent::NEUTRAL,
                     available: false,
@@ -290,6 +299,8 @@ mod tests {
             (7, None),
             (7, Some("-5")),
             (7, Some("soon")),
+            // No search key (SRCH-02).
+            (8, None),
         ] {
             values.extend(with(field, broken));
         }

@@ -7,7 +7,9 @@
 //! the same view, icon and all, to its new place (ANIM-21, ADR 0012).
 //!
 //! The open folder's panel is a second [`Surface`] drawn the same way, with cells of its own and
-//! their own revision (ADR 0015). A cell's long-press menu works alike (ADR 0013): the frame says
+//! their own revision (ADR 0015), and search's results are a third (ADR 0016). The host owns the
+//! search field's text while the user types, sends each change, and reads [`AppsView::query`]
+//! back only when it has to show the field again, such as after a theme change. A cell's long-press menu works alike (ADR 0013): the frame says
 //! at which cell, on which surface, it is open and gives it a revision, the host reads its
 //! [`AppsView::menu_items`] when that changes, and refers to an item by its place in them. In edit
 //! mode, the host names a cell the same way when its ✕ is tapped or a screen reader moves it
@@ -21,7 +23,7 @@ pub use meegone_apps_state::{AppMenuItem, Bounds, CellKey, FolderId, GridLayout,
 use meegone_core_state::{App, AppId, Rect};
 use meegone_core_ui::{Dispatch, Tokens, View};
 
-/// What the host draws for the grid, and the open folder's cells, in one frame.
+/// What the host draws for the grid, the open folder's cells and search's results, in one frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AppsFrame {
     /// Changes whenever the cells change, so the host reads [`AppsView::cells`] again.
@@ -34,14 +36,23 @@ pub struct AppsFrame {
     /// Rows, the last one always empty (HOME-14).
     pub rows: u16,
     /// The open folder's cells (FOLD-04): the same, for its panel.
-    pub folder: FolderCellsFrame,
+    pub folder: SurfaceCellsFrame,
     /// A cell's long-press menu, while it is open (APPS-11).
     pub menu: Option<AppMenuFrame>,
+    /// Search's results (SRCH-02): the same, for the results grid.
+    pub results: SurfaceCellsFrame,
+    /// Search is open with something typed, so its results show instead of the grid.
+    pub has_query: bool,
+    /// Nothing matches what was typed (SRCH-05).
+    pub nothing_found: bool,
+    /// A query nothing matches offers a web search: a browser is installed (SRCH-05).
+    pub web_search_offered: bool,
 }
 
-/// The open folder's cells as the host draws them in its panel (FOLD-04).
+/// The cells of the open folder's panel (FOLD-04), or of search's results (SRCH-02), as the host
+/// draws them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FolderCellsFrame {
+pub struct SurfaceCellsFrame {
     /// Changes whenever its cells change, so the host reads them again.
     pub revision: u32,
     /// How far its grid is scrolled, in whole pixels.
@@ -162,6 +173,9 @@ pub struct AppsView {
     dispatch: Dispatch<AppsIntent>,
     grid: CellSet,
     folder: CellSet,
+    results: CellSet,
+    /// The query as of the last frame, while search is open.
+    query: Option<String>,
     /// The menu the host was last told about.
     menu: Option<Arc<AppMenu>>,
     menu_revision: u32,
@@ -173,6 +187,8 @@ impl AppsView {
             dispatch,
             grid: CellSet::new(),
             folder: CellSet::new(),
+            results: CellSet::new(),
+            query: None,
             menu: None,
             menu_revision: 0,
         }
@@ -182,15 +198,20 @@ impl AppsView {
         match surface {
             Surface::Grid => &self.grid,
             Surface::Folder => &self.folder,
+            Surface::Search => &self.results,
         }
     }
 
-    /// What the host draws for the grid and the open folder now. Takes on the state's cells if
-    /// they changed, and where each was in the cells the host last read, and the menu if it
-    /// changed.
+    /// What the host draws for the grid, the open folder and search's results now. Takes on the
+    /// state's cells if they changed, and where each was in the cells the host last read, and
+    /// the menu and the query if they changed.
     pub fn frame(&mut self, state: &AppsState) -> AppsFrame {
         self.grid.take(&state.items);
         self.folder.take(&state.folder_items);
+        self.results.take(&state.results);
+        if self.query != state.search {
+            self.query.clone_from(&state.search);
+        }
         let same_menu = match (&self.menu, &state.menu) {
             (Some(shown), Some(menu)) => Arc::ptr_eq(shown, menu),
             (shown, menu) => shown.is_none() && menu.is_none(),
@@ -216,13 +237,26 @@ impl AppsView {
             scroll_px: whole_px(state.scroll_px),
             columns: u16::try_from(state.columns).unwrap_or(u16::MAX),
             rows: u16::try_from(state.rows()).unwrap_or(u16::MAX),
-            folder: FolderCellsFrame {
+            folder: SurfaceCellsFrame {
                 revision: self.folder.revision,
                 scroll_px: whole_px(state.folder_scroll_px),
                 rows: u16::try_from(state.folder_rows()).unwrap_or(u16::MAX),
             },
             menu,
+            results: SurfaceCellsFrame {
+                revision: self.results.revision,
+                scroll_px: whole_px(state.results_scroll_px),
+                rows: u16::try_from(state.results_rows()).unwrap_or(u16::MAX),
+            },
+            has_query: state.has_query(),
+            nothing_found: state.has_query() && state.results.is_empty(),
+            web_search_offered: state.web_search_offered,
         }
+    }
+
+    /// The query as of the last [`AppsView::frame`], while search is open (SRCH-01).
+    pub fn query(&self) -> Option<&str> {
+        self.query.as_deref()
     }
 
     /// The cells of `surface` as of the last [`AppsView::frame`], in order. The host reads them
@@ -379,6 +413,7 @@ impl AppsView {
         self.dispatch.send(match surface {
             Surface::Grid => AppsIntent::Scrolled(px),
             Surface::Folder => AppsIntent::FolderScrolled(px),
+            Surface::Search => AppsIntent::ResultsScrolled(px),
         });
     }
 
@@ -391,6 +426,33 @@ impl AppsView {
     pub fn folder_laid_out(&self, layout: GridLayout, bounds: Bounds) {
         self.dispatch
             .send(AppsIntent::FolderLayout { layout, bounds });
+    }
+
+    /// The results grid was laid out, below the search field's `band` on screen (ANIM-16).
+    pub fn search_laid_out(&self, layout: GridLayout, band: Bounds) {
+        self.dispatch
+            .send(AppsIntent::SearchLayout { layout, band });
+    }
+
+    /// A screen reader's "Search apps": search opens without a pull (A11Y-05).
+    pub fn open_search(&self) {
+        self.dispatch.send(AppsIntent::OpenSearch);
+    }
+
+    /// The user typed: the field now says `query` (SRCH-02).
+    pub fn search_changed(&self, query: String) {
+        self.dispatch.send(AppsIntent::Search(query));
+    }
+
+    /// The keyboard's action key: the first result launches from its icon at `from`, or with
+    /// no results the web is searched (SRCH-03, SRCH-05).
+    pub fn search_submitted(&self, from: Option<Rect>) {
+        self.dispatch.send(AppsIntent::SubmitSearch { from });
+    }
+
+    /// "Search the web for '…'" (SRCH-05).
+    pub fn search_web(&self) {
+        self.dispatch.send(AppsIntent::SearchWeb);
     }
 }
 

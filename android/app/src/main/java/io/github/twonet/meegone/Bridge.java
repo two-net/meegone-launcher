@@ -2,6 +2,7 @@ package io.github.twonet.meegone;
 
 import android.app.Activity;
 import android.app.ActivityOptions;
+import android.app.SearchManager;
 import android.app.role.RoleManager;
 import android.content.ActivityNotFoundException;
 import android.content.BroadcastReceiver;
@@ -18,6 +19,7 @@ import android.content.pm.ResolveInfo;
 import android.content.pm.ShortcutInfo;
 import android.graphics.Insets;
 import android.graphics.Rect;
+import android.icu.lang.UCharacter;
 import android.icu.text.Collator;
 import android.net.Uri;
 import android.os.Build;
@@ -36,10 +38,12 @@ import android.util.Log;
 import android.view.HapticFeedbackConstants;
 import android.view.View;
 import android.view.WindowInsets;
+import java.text.Normalizer;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.TimeZone;
 import java.util.function.Supplier;
+import java.util.regex.Pattern;
 
 /**
  * What the Rust platform adapters ask of Android (ADR 0005).
@@ -54,7 +58,7 @@ final class Bridge {
 
     // The app catalogue's records (ADR 0010), mirrored in crates/core/data/src/catalogue.rs.
     // An app: package, activity, label, profile serial number, flags, accent (ADR 0011),
-    // collation key and first install time (ADR 0012).
+    // collation key and first install time (ADR 0012), and search key (ADR 0016).
     private static final int APP_AVAILABLE = 1;
     private static final int APP_CAN_UNINSTALL = 2;
     private static final int APP_WORK = 4;
@@ -77,6 +81,10 @@ final class Bridge {
         Intent.ACTION_LOCALE_CHANGED,
     };
     private static final char[] HEX = "0123456789abcdef".toCharArray();
+    /** Accents and other marks that sit on a letter, removed for search (L10N-04). */
+    private static final Pattern MARKS = Pattern.compile("\\p{Mn}+");
+    /** Runs of spaces of any kind, collapsed to one for search. */
+    private static final Pattern SPACES = Pattern.compile("[\\s\\p{Z}]+");
     private static final int REQUEST_HOME_ROLE = 1;
     /**
      * A role dialog that closes this fast was never shown: the system refuses after "Don't ask
@@ -244,14 +252,74 @@ final class Bridge {
     }
 
     /**
+     * Whether anything opens an {@code https:} link, so web search can be offered (SRCH-05).
+     * The manifest's queries let MeeGone see browsers. Called from Rust.
+     */
+    boolean hasBrowser() {
+        try {
+            Intent browse = new Intent(Intent.ACTION_VIEW, Uri.parse("https://"))
+                    .addCategory(Intent.CATEGORY_BROWSABLE);
+            return context.getPackageManager()
+                    .resolveActivity(browse, PackageManager.MATCH_DEFAULT_ONLY) != null;
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Couldn't look for a browser: " + e.getClass().getSimpleName());
+            return false;
+        }
+    }
+
+    /**
+     * Searches the web for {@code query} with the device's default search handler (SRCH-05,
+     * ADR 0016). Returns null, or a short message if nothing could search. The query is never
+     * logged. Called from Rust.
+     */
+    String webSearch(String query) {
+        try {
+            Intent search = new Intent(Intent.ACTION_WEB_SEARCH)
+                    .putExtra(SearchManager.QUERY, query)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            Activity current = activity;
+            (current != null ? current : context).startActivity(search);
+            return null;
+        } catch (RuntimeException e) {
+            // ActivityNotFoundException: nothing handles web searches.
+            Log.w(TAG, "Couldn't search the web: " + e.getClass().getSimpleName());
+            return context.getString(R.string.web_search_unavailable);
+        }
+    }
+
+    /**
+     * {@code text} folded for search (SRCH-02, L10N-04, ADR 0016). Called from Rust for each
+     * query, and folds labels exactly as the catalogue does, so the two always agree.
+     */
+    String searchKey(String text) {
+        try {
+            return fold(text);
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    /**
+     * Compatibility-decomposed, without the marks that sit on letters, case-folded and with runs
+     * of spaces collapsed to one: "Café" and " CAFE " are both "cafe", and "ﬁle" is "file".
+     */
+    private static String fold(String text) {
+        String bare = MARKS.matcher(Normalizer.normalize(text, Normalizer.Form.NFKD))
+                .replaceAll("");
+        return SPACES.matcher(UCharacter.foldCase(bare, true)).replaceAll(" ").trim();
+    }
+
+    /**
      * Every launchable app in every profile, except MeeGone itself, which is already on screen
      * (APPS-01, ADR 0010). One record per app: package, activity, label, profile serial number,
-     * flags, accent, collation key and first install time. An app is unavailable while its
-     * profile is paused or it is suspended (APPS-09). Its accent is empty until it has been
-     * derived from its icon, in the background; the catalogue then changes (APPS-17, ADR 0011).
+     * flags, accent, collation key, first install time and search key. An app is unavailable
+     * while its profile is paused or it is suspended (APPS-09). Its accent is empty until it has
+     * been derived from its icon, in the background; the catalogue then changes (APPS-17,
+     * ADR 0011).
      * The collation key orders labels as the device's language does, ignoring case and accents
-     * (L10N-04, ADR 0012). Returns null if the system couldn't answer, so the saved layout keeps
-     * its apps. Called from Rust.
+     * (L10N-04, ADR 0012). The search key is the label folded for search (SRCH-02, ADR 0016).
+     * Returns null if the system couldn't answer, so the saved layout keeps its apps. Called
+     * from Rust.
      */
     String[] launchableApps() {
         try {
@@ -290,10 +358,12 @@ final class Bridge {
                     fields.add(serial);
                     fields.add(Integer.toString(flags));
                     fields.add(accents.field(serialNumber, info));
-                    // An app without a label is named by its package in Rust; sort it so too.
-                    fields.add(hex(collator.getCollationKey(
-                            text.isEmpty() ? component.getPackageName() : text).toByteArray()));
+                    // An app without a label is named by its package in Rust; sort and find it
+                    // so too.
+                    String name = text.isEmpty() ? component.getPackageName() : text;
+                    fields.add(hex(collator.getCollationKey(name).toByteArray()));
                     fields.add(Long.toString(Math.max(0, info.getFirstInstallTime())));
+                    fields.add(fold(name));
                 }
             }
             accents.deriveWaiting();

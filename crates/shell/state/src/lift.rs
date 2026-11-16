@@ -163,6 +163,8 @@ impl DragSurfaces {
         match surface {
             Surface::Grid => Some(&self.grid),
             Surface::Folder => self.folder.as_ref(),
+            // Search's results are never dragged (ADR 0016).
+            Surface::Search => None,
         }
     }
 
@@ -734,7 +736,7 @@ impl Drag {
                 app: app.clone(),
                 to,
             }),
-            (Surface::Folder, CellKey::Folder(_)) => None,
+            (Surface::Folder, CellKey::Folder(_)) | (Surface::Search, _) => None,
         }
     }
 

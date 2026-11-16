@@ -90,6 +90,19 @@
     <string name="app_grouped">%1$s moved into a folder</string>
     <string name="app_moved_out">%1$s moved out of the folder</string>
 
+    <!-- App search in Applications (SRCH-01 to SRCH-05). The field's hint, and the
+         screen-reader action and pane title that open it without pulling it down (A11Y-05). -->
+    <string name="search_hint">Search apps</string>
+    <string name="search_action">Search apps</string>
+    <!-- Shown, and read by screen readers, when no app's name matches what was typed
+         (SRCH-05). -->
+    <string name="search_none">No apps found</string>
+    <!-- Offered when no app matches: searches the web with the device's default search app
+         (SRCH-05). %1$s is what was typed, e.g. "Search the web for “zebra”". -->
+    <string name="search_web">Search the web for “%1$s”</string>
+    <!-- Shown briefly when nothing on the device can search the web (SRCH-05). -->
+    <string name="web_search_unavailable">Web search isn\'t available</string>
+
     <!-- Settings' title (SET-01). -->
     <string name="settings_title">Launcher settings</string>
 </resources>

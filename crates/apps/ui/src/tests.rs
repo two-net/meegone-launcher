@@ -14,6 +14,7 @@ fn app(package: &str, label: &str, available: bool, work: bool) -> App {
         },
         label: label.into(),
         sort_key: label.to_lowercase().into_bytes(),
+        search_key: label.to_lowercase(),
         accent: Rgb::hex(0x808080),
         available,
         work,
@@ -441,4 +442,102 @@ fn in_the_open_folder_apps_move_within_it_and_out_of_it() {
         AppsIntent::RenameFolder { folder: FolderId(1), name } if name == "Games"
     ));
     assert!(matches!(sent[5], AppsIntent::CancelRename));
+}
+
+#[test]
+fn searchs_results_have_their_own_revision_and_launch_when_tapped() {
+    // SRCH-02, SRCH-03, APPS-10
+    let (mut view, sent) = view();
+    let mail = app("mail", "Mail", true, false);
+    let maps = app("maps", "Maps", true, false);
+    let mut apps = state(vec![cell(mail.clone()), cell(maps.clone())]);
+    let closed = view.frame(&apps);
+    assert_eq!(view.query(), None);
+    assert!(!closed.has_query && !closed.nothing_found);
+
+    apps.search = Some("ma".into());
+    apps.results = vec![cell(maps.clone()), cell(mail.clone())].into();
+    apps.results_scroll_px = 40.4;
+    let open = view.frame(&apps);
+
+    assert_eq!(open.revision, closed.revision);
+    assert_ne!(open.results.revision, closed.results.revision);
+    assert_eq!((open.results.rows, open.results.scroll_px), (1, 40));
+    assert!(open.has_query && !open.nothing_found);
+    assert_eq!(view.query(), Some("ma"));
+    let labels: Vec<&str> = view.cells(Surface::Search).map(|cell| cell.label).collect();
+    assert_eq!(labels, ["Maps", "Mail"]);
+
+    assert!(view.cell_tapped(Surface::Search, open.results.revision, 0, ICON));
+    // A stale revision launches nothing, and results can't be moved.
+    assert!(!view.cell_tapped(Surface::Search, closed.results.revision, 0, ICON));
+    assert!(!view.moved(Surface::Search, open.results.revision, 0, 1));
+    let sent = sent.borrow();
+    assert_eq!(sent.len(), 1);
+    assert!(matches!(
+        &sent[0],
+        AppsIntent::Launch { app, from: Some(ICON) } if *app == maps.id
+    ));
+}
+
+#[test]
+fn a_query_nothing_matches_says_so_and_whether_the_web_is_offered() {
+    // SRCH-05
+    let (mut view, _) = view();
+    let mut apps = state(vec![cell(app("mail", "Mail", true, false))]);
+    apps.search = Some(String::new());
+    apps.web_search_offered = true;
+    let empty = view.frame(&apps);
+    assert!(!empty.has_query && !empty.nothing_found && empty.web_search_offered);
+
+    apps.search = Some("zebra".into());
+    let none = view.frame(&apps);
+
+    assert!(none.has_query && none.nothing_found);
+    assert_eq!(none.results.rows, 0);
+}
+
+#[test]
+fn search_input_becomes_intents() {
+    // SRCH-01 to SRCH-05, A11Y-05
+    let (view, sent) = view();
+    let layout = GridLayout {
+        width_px: 1000.0,
+        row_height_px: 300.0,
+        density: 2.75,
+        top_px: 300.0,
+        bottom_px: 50.0,
+        height_px: 2000.0,
+        left_px: 0.0,
+        view_top_px: 0.0,
+        icon_px: 140.0,
+        icon_top_px: 20.0,
+    };
+    let band = Bounds {
+        left: 0.0,
+        top: 100.0,
+        right: 1000.0,
+        bottom: 300.0,
+    };
+
+    view.open_search();
+    view.search_changed("Ma".into());
+    view.search_submitted(Some(ICON));
+    view.search_web();
+    view.search_laid_out(layout, band);
+    view.scrolled(Surface::Search, 25.0);
+
+    let sent = sent.borrow();
+    assert!(matches!(sent[0], AppsIntent::OpenSearch));
+    assert!(matches!(&sent[1], AppsIntent::Search(query) if query == "Ma"));
+    assert!(matches!(
+        sent[2],
+        AppsIntent::SubmitSearch { from: Some(ICON) }
+    ));
+    assert!(matches!(sent[3], AppsIntent::SearchWeb));
+    assert!(matches!(
+        sent[4],
+        AppsIntent::SearchLayout { layout: l, band: b } if l == layout && b == band
+    ));
+    assert!(matches!(sent[5], AppsIntent::ResultsScrolled(25.0)));
 }

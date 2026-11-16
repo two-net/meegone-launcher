@@ -13,7 +13,8 @@
 //! [`cell_fields`] (ADR 0010). An app's long-press menu is read the same way, with
 //! `nativeAppMenu`, in the fields of [`menu_item_fields`] (ADR 0013). In edit mode, the grid
 //! names a cell by revision and place when its ✕ is tapped or a screen reader moves it
-//! (ADR 0014).
+//! (ADR 0014). Search's field sends each change of its text, and its results are a third grid
+//! (ADR 0016).
 //!
 //! A bug in MeeGone becomes a Java `RuntimeException` instead of an abort, so its message
 //! reaches logcat. Containing it keeps `panic = "unwind"`, as ARCH-09 already requires.
@@ -282,8 +283,9 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeLayo
 }
 
 /// `boolean nativePointer(int action, float x, float y, long timeNanos)`: the first finger on
-/// the home views, with `MotionEvent`'s action. Returns whether the carousel or a long-press
-/// has taken the gesture, so the content below gets no more of it (HOME-03, HOME-10).
+/// the home views, with `MotionEvent`'s action. Returns whether the carousel, a long-press or
+/// the search field's pull has taken the gesture, so the content below gets no more of it
+/// (HOME-03, HOME-10, SRCH-01).
 ///
 /// # Safety
 ///
@@ -316,8 +318,8 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativePoin
             at: uptime(time_nanos),
         }));
         launcher.frame();
-        let carousel = launcher.shell().state().carousel;
-        taken = carousel.dragging || carousel.held;
+        let state = launcher.shell().state();
+        taken = state.carousel.dragging || state.carousel.held || state.search.pulling;
     });
     JBoolean::from(taken)
 }
@@ -544,6 +546,7 @@ fn surface(code: i32) -> Option<Surface> {
     match code {
         0 => Some(Surface::Grid),
         1 => Some(Surface::Folder),
+        2 => Some(Surface::Search),
         _ => None,
     }
 }
@@ -641,8 +644,8 @@ fn cell_fields(cell: Cell<'_>) -> [String; 8] {
 }
 
 /// `void nativeAppsLayout(int surface, float density, int[] layout, int[] grid)`: the
-/// Applications grid, or the open folder's, was laid out (APPS-02, APPS-16, ADR 0014,
-/// ADR 0015). `layout` holds, in px:
+/// Applications grid, the open folder's or search's results were laid out (APPS-02, APPS-16,
+/// ADR 0014 to ADR 0016). `layout` holds, in px:
 /// 0. the cells' width inside the margins;
 /// 1. the row height;
 /// 2. and 3. the room above and below the cells, inside the grid: the safe area;
@@ -650,7 +653,8 @@ fn cell_fields(cell: Cell<'_>) -> [String; 8] {
 /// 5. where the cells start, from the home views' left;
 /// 6. where the grid's top is, from the home views' top;
 /// 7. and 8. each icon's size, and how far below its cell's top it starts;
-/// 9. to 12. for a folder, its panel's left, top, right and bottom on screen.
+/// 9. to 12. for a folder, its panel's left, top, right and bottom on screen; for the results,
+///    the search field's band's (ANIM-16).
 ///
 /// Fills `grid` with the columns and rows the grid now has, so it lays them out in the same
 /// pass.
@@ -696,25 +700,25 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_AppsGrid_nativeAppsL
             icon_px: value(7),
             icon_top_px: value(8),
         };
+        let panel = Bounds {
+            left: value(9),
+            top: value(10),
+            right: value(11),
+            bottom: value(12),
+        };
         LAUNCHER.with_borrow_mut(|launcher| {
             let launcher = launcher.as_mut().ok_or("MeeGone hasn't started")?;
             let apps = launcher.view().apps();
             match surface {
                 Surface::Grid => apps.grid_laid_out(laid_out),
-                Surface::Folder => apps.folder_laid_out(
-                    laid_out,
-                    Bounds {
-                        left: value(9),
-                        top: value(10),
-                        right: value(11),
-                        bottom: value(12),
-                    },
-                ),
+                Surface::Folder => apps.folder_laid_out(laid_out, panel),
+                Surface::Search => apps.search_laid_out(laid_out, panel),
             }
             let apps = launcher.frame().apps;
             let (columns, rows) = match surface {
                 Surface::Grid => (i32::from(apps.columns), i32::from(apps.rows)),
                 Surface::Folder => (FOLDER_COLUMNS as i32, i32::from(apps.folder.rows)),
+                Surface::Search => (laid_out.columns() as i32, i32::from(apps.results.rows)),
             };
             env.set_int_array(&grid, &[columns, rows])
                 .map_err(|error| format!("Couldn't pass the grid: {error}"))
@@ -1119,6 +1123,149 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRena
     });
 }
 
+/// `void nativeOpenSearch()`: a screen reader's "Search apps" opens search without a pull
+/// (SRCH-01, A11Y-05).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeOpenSearch(
+    env: RawEnv,
+    _views: JObject,
+) {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_launcher(env, |launcher| {
+        launcher.view().apps().open_search();
+        launcher.frame();
+    });
+}
+
+/// `void nativeSearchChanged(String query)`: the user typed, and the field now says `query`
+/// (SRCH-02).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeSearchChanged(
+    env: RawEnv,
+    _views: JObject,
+    query: JObject,
+) {
+    // SAFETY: the JVM passes this thread's environment and a live local reference to a
+    // `String`, used only during this call.
+    let (env, query) = unsafe { (Env::from_raw(env), LocalRef::from_raw(query)) };
+    guarded(env, || {
+        let query = env
+            .string(&query)
+            .map_err(|error| format!("Couldn't read the query: {error}"))?;
+        LAUNCHER.with_borrow_mut(|launcher| {
+            let launcher = launcher.as_mut().ok_or("MeeGone hasn't started")?;
+            launcher.view().apps().search_changed(query);
+            launcher.frame();
+            Ok(())
+        })
+    });
+}
+
+/// `String nativeSearchSubmitted(int left, int top, int right, int bottom)`: the keyboard's
+/// action key. The first result launches at once, its window growing from its icon at that
+/// rect on the screen, or empty for none (SRCH-03, ANIM-08, PERF-06); with no results, the web
+/// is searched if that is offered (SRCH-05). Returns `null`, or a short message to show when
+/// the system couldn't do it.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeSearchSubmitted(
+    env: RawEnv,
+    _views: JObject,
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    let from = Rect {
+        left,
+        top,
+        right,
+        bottom,
+    };
+    with_message(env, |launcher| {
+        launcher
+            .view()
+            .apps()
+            .search_submitted(Some(from).filter(|from| !from.is_empty()));
+    })
+}
+
+/// `String nativeSearchWeb()`: "Search the web for '…'" (SRCH-05). Returns `null`, or a short
+/// message to show when nothing could search.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeSearchWeb(
+    env: RawEnv,
+    _views: JObject,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_message(env, |launcher| launcher.view().apps().search_web())
+}
+
+/// `String nativeSearchQuery()`: what the search field says while search is open, or `null`.
+/// The host asks only when it shows the field again, such as after a theme change recreated
+/// it (THEME-06).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeSearchQuery(
+    env: RawEnv,
+    _views: JObject,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    let mut query = std::ptr::null_mut();
+    guarded(env, || {
+        LAUNCHER.with_borrow(|launcher| {
+            let launcher = launcher.as_ref().ok_or("MeeGone hasn't started")?;
+            if let Some(text) = launcher.view().apps().query() {
+                query = env
+                    .new_string(text)
+                    .map(|text| text.into_raw())
+                    .map_err(|error| format!("Couldn't pass the query: {error}"))?;
+            }
+            Ok(())
+        })
+    });
+    query
+}
+
+/// Asks something of the views with `step`, applies it, and returns Applications' `problem`
+/// as a message for the host to show, or `null`.
+fn with_message(env: Env, step: impl FnOnce(&Launcher)) -> JObject {
+    let mut message = std::ptr::null_mut();
+    guarded(env, || {
+        LAUNCHER.with_borrow_mut(|launcher| {
+            let launcher = launcher.as_mut().ok_or("MeeGone hasn't started")?;
+            step(launcher);
+            launcher.frame();
+            message = problem(env, launcher)?;
+            Ok(())
+        })
+    });
+    message
+}
+
 /// What cell `index` of the cells at `revision`, on the surface `surface_code` names, shows, if
 /// it is still that cell's.
 fn key_at(
@@ -1223,7 +1370,7 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRead
 }
 
 /// How many slots the frame has.
-const FRAME_SLOTS: usize = 73;
+const FRAME_SLOTS: usize = 78;
 
 /// A `HomeFrame` as the `int[]` that `HomeViews.java` reads, slot by slot:
 ///
@@ -1265,7 +1412,7 @@ const FRAME_SLOTS: usize = 73;
 /// | 52 | The dragged icon's surface: 0 the grid, 1 the open folder |
 /// | 53 | The dragged icon's opacity, 0 to 255 |
 /// | 54 | 1 while an icon is dragged, settling or going into a folder, so the host draws it; otherwise 0 |
-/// | 55 | The pressed cell's surface: 0 the grid, 1 the open folder |
+/// | 55 | The pressed cell's surface: 0 the grid, 1 the open folder, 2 search's results |
 /// | 56 | The grid cell a dragged app is held over, or -1 (ANIM-14) |
 /// | 57 | Its icon's scale in ten-thousandths |
 /// | 58 | The grid cell of a folder taking in a dropped app, or -1 (ANIM-14) |
@@ -1283,6 +1430,11 @@ const FRAME_SLOTS: usize = 73;
 /// | 70 | Its grid cell, whose name the dialog starts with, or -1 |
 /// | 71 | The menu's surface: 0 the grid, 1 the open folder |
 /// | 72 | The opacity of the black scrim behind an open folder, 0 to 255 |
+/// | 73 | Search, as bits: 1 open, so the field has the keyboard (SRCH-01); 2 its results show instead of the grid (SRCH-02); 4 nothing matches; 8 a web search is offered (SRCH-05); 16 a finger pulls the field; 32 Applications offers search to screen readers (A11Y-05) |
+/// | 74 | How much of the search field's band shows, in px (ANIM-16) |
+/// | 75 | Search's results revision: when it changes, the results grid reads its cells again |
+/// | 76 | How far the results grid is scrolled, in px |
+/// | 77 | The results grid's rows |
 fn frame_slots(frame: &HomeFrame) -> [i32; FRAME_SLOTS] {
     let [events, applications, recent] = frame.pages;
     let menu_items = frame.menu.map_or(0, |menu| {
@@ -1301,6 +1453,7 @@ fn frame_slots(frame: &HomeFrame) -> [i32; FRAME_SLOTS] {
     let code = |surface: Surface| match surface {
         Surface::Grid => 0,
         Surface::Folder => 1,
+        Surface::Search => 2,
     };
     // Ids and revisions travel as Java's `int`; the host only compares them.
     let id = |folder: FolderId| folder.0 as i32;
@@ -1314,6 +1467,18 @@ fn frame_slots(frame: &HomeFrame) -> [i32; FRAME_SLOTS] {
     let merge = frame.merge;
     let folder = frame.folder;
     let renaming = frame.renaming;
+    let search = frame.search;
+    let search_bits = [
+        search.open,
+        search.results_shown,
+        search.nothing_found,
+        search.web_offered,
+        search.pulling,
+        search.offered,
+    ]
+    .iter()
+    .enumerate()
+    .fold(0, |bits, (bit, on)| bits | i32::from(*on) << bit);
     let mut slots = [0; FRAME_SLOTS];
     let fixed = [
         events,
@@ -1383,6 +1548,11 @@ fn frame_slots(frame: &HomeFrame) -> [i32; FRAME_SLOTS] {
         renaming.map_or(-1, |renaming| maybe(renaming.cell)),
         app_menu_surface,
         i32::from(frame.scrim),
+        search_bits,
+        search.reveal_px,
+        frame.apps.results.revision as i32,
+        frame.apps.results.scroll_px,
+        i32::from(frame.apps.results.rows),
     ];
     slots[40 + BADGE_ROWS..].copy_from_slice(&rest);
     slots

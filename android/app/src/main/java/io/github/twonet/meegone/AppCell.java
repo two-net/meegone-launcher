@@ -441,9 +441,12 @@ final class AppCell extends View {
         return new Rect(left, top, left + iconPx, top + iconPx);
     }
 
-    /** Whether it is a cell that can be used, with a menu: not leaving. */
+    /**
+     * Whether it is a cell that can be used, with a menu: not leaving, and not one of search's
+     * results, which have none (ADR 0016).
+     */
     private boolean hasMenu() {
-        return !leaving;
+        return !leaving && grid.surface() != AppsGrid.SEARCH;
     }
 
     /** Whether it has a ✕ in edit mode (APPS-12, APPS-13): an app the user can uninstall. */

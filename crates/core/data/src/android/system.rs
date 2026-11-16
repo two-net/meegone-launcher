@@ -1,9 +1,10 @@
 //! [`SystemConfigAdapter`] on Android: the home-app role, the clock (HOME-01, ONB-04), whether
-//! the system animates the return home (ANIM-09) and the haptic tick (ANIM-24).
+//! the system animates the return home (ANIM-09), the haptic tick (ANIM-24), whether a browser
+//! is installed and web search (SRCH-05, ADR 0016).
 //!
 //! Questions go to the Java `Bridge` object (`android/app/src/main/java/…/Bridge.java`), whose
 //! method names and signatures must stay in step with the ones looked up here. The device
-//! settings, the next alarm and the browser answer with their "if unavailable" values until
+//! settings, the next alarm and opening links answer with their "if unavailable" values until
 //! their issues build them.
 
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -27,6 +28,10 @@ pub struct AndroidSystem {
     animates_return_home: MethodId,
     /// `boolean hapticTick()`: whether a view could play it.
     haptic_tick: MethodId,
+    /// `boolean hasBrowser()`: whether anything opens an `https:` link.
+    has_browser: MethodId,
+    /// `String webSearch(String query)`: `null`, or a short message when nothing could search.
+    web_search: MethodId,
 }
 
 impl AndroidSystem {
@@ -43,6 +48,12 @@ impl AndroidSystem {
             utc_offset_ms: env.method_id(bridge, c"utcOffsetMs", c"(J)J")?,
             animates_return_home: env.method_id(bridge, c"animatesReturnHome", c"()Z")?,
             haptic_tick: env.method_id(bridge, c"hapticTick", c"()Z")?,
+            has_browser: env.method_id(bridge, c"hasBrowser", c"()Z")?,
+            web_search: env.method_id(
+                bridge,
+                c"webSearch",
+                c"(Ljava/lang/String;)Ljava/lang/String;",
+            )?,
             bridge: env.global_ref(bridge)?,
         })
     }
@@ -117,15 +128,26 @@ impl SystemConfigAdapter for AndroidSystem {
             .and_then(|env| env.call_bool(&self.bridge, self.haptic_tick, &[]));
     }
 
+    /// If the bridge can't answer, there is taken to be none, so nothing offers a link that
+    /// can't open.
     fn has_browser(&self) -> bool {
-        false // Links and web search arrive with #30 and #15.
+        self.vm
+            .env()
+            .and_then(|env| env.call_bool(&self.bridge, self.has_browser, &[]))
+            .unwrap_or(false)
     }
 
     fn open_in_browser(&self, _https_url: &str) -> Result<(), DataError> {
-        Err(not_yet())
+        Err(not_yet()) // Links arrive with #30.
     }
 
-    fn web_search(&self, _query: &str) -> Result<(), DataError> {
-        Err(not_yet())
+    /// Hands the query to the device's default search handler, `ACTION_WEB_SEARCH` (SRCH-05).
+    fn web_search(&self, query: &str) -> Result<(), DataError> {
+        let env = self.vm.env()?;
+        let query = env.new_string(query)?;
+        match env.call_string(&self.bridge, self.web_search, &[JValue::object(&query)])? {
+            None => Ok(()),
+            Some(message) => Err(DataError::Unsupported(message)),
+        }
     }
 }

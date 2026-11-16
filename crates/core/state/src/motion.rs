@@ -111,6 +111,10 @@ pub const VIEW_FLING_VELOCITY_DP: f64 = 500.0;
 pub const VIEW_EDGE_RESISTANCE: f64 = 1.0 / 3.0;
 /// …and never stretches further than this fraction of the width.
 pub const VIEW_EDGE_STRETCH: f64 = 0.12;
+/// Pulled past the whole search field, the field follows the finger this much (ANIM-16)…
+pub const SEARCH_PULL_RESISTANCE: f64 = 1.0 / 3.0;
+/// …and never stretches further than this fraction of the field's band.
+pub const SEARCH_PULL_STRETCH: f64 = 0.5;
 
 /// Motion closer to its target than this, in pixels, and slower than [`REST_SPEED_PX`] has
 /// finished: what is left would move less than half a pixel per 60 Hz frame.

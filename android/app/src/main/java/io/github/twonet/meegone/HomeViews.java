@@ -46,15 +46,16 @@ import java.util.List;
  * its menu, and dragging on picks the icon up (APPS-11, ADR 0013), which {@link DragShadow}
  * draws above the pages. A tap on a folder opens it in a {@link FolderPanel} inside the
  * Applications page, with its own {@link AppsGrid}; renaming it asks for the name in a dialog
- * (FOLD-03, FOLD-04, ADR 0015).
+ * (FOLD-03, FOLD-04, ADR 0015). Pulling down at the top of Applications reveals the search field
+ * of a {@link SearchPanel}, whose results are a third {@link AppsGrid} (SRCH-01, ADR 0016).
  *
  * <p>The Rust app owns the gesture, the motion, the view indicator and the menus. This view
  * passes it every touch, frame time and layout change, says when a finger has been held on
  * empty space or on an app's icon, then reads what to draw with {@link #nativeRead} and applies
  * it. It keeps nothing else. The frame slots below must stay in step with {@code frame_slots}
  * in {@code src/android.rs}. Applications is an {@link AppsGrid}, which draws the frame's
- * Applications slots (ADR 0010), as the open folder's grid draws its own; both share one {@link
- * AppIcons}. Events and Recent show their names until #19 and #22.
+ * Applications slots (ADR 0010), as the open folder's grid and search's results draw their own;
+ * all three share one {@link AppIcons}. Events and Recent show their names until #19 and #22.
  *
  * <p>The background fills the window edge to edge, behind the system bars. Everything else stays
  * inside a safe area clear of the bars, display cut-outs and the screen's rounded corners: each
@@ -137,7 +138,18 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private static final int RENAMING_CELL = 70; // its grid cell, or -1
     private static final int APP_MENU_SURFACE = 71;
     private static final int SCRIM = 72; // the open folder's scrim's opacity, 0 to 255
-    private static final int FRAME_SIZE = 73;
+    // Search (SRCH-01 to SRCH-05, ANIM-16, ADR 0016):
+    private static final int SEARCH = 73; // the bits below
+    private static final int SEARCH_REVEAL = 74; // how much of the field's band shows, in px
+    private static final int RESULTS_REVISION = 75; // changes when the results change
+    private static final int RESULTS_SCROLL = 76; // px from the top
+    private static final int RESULTS_ROWS = 77;
+    private static final int FRAME_SIZE = 78;
+    private static final int SEARCH_OPEN = 1; // the field has the keyboard
+    private static final int SEARCH_RESULTS = 2; // the results show instead of the grid
+    private static final int SEARCH_NOTHING = 4; // nothing matches
+    private static final int SEARCH_WEB = 8; // a web search is offered
+    private static final int SEARCH_OFFERED = 32; // screen readers can open search
     /** An open folder's columns, as {@code FOLDER_COLUMNS} in the Rust app. */
     private static final int FOLDER_COLUMNS = 4;
     /** The longest name a folder takes, as {@code MAX_FOLDER_NAME} in the Rust app. */
@@ -180,9 +192,12 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     /** The open folder's grid, in its panel (FOLD-04). */
     private final AppsGrid folderApps;
     private final FolderPanel folderPanel;
+    /** Search's results (SRCH-02), in its panel with the field. */
+    private final AppsGrid results;
+    private final SearchPanel searchPanel;
     /** The dragged icon, above the pages (ADR 0015). */
     private final DragShadow shadow;
-    /** Both grids' icons. */
+    /** Every grid's icons. */
     private final AppIcons icons;
     /** Ends edit mode (APPS-12): a flat pill at the bottom of Applications. */
     private final TextView done;
@@ -250,6 +265,10 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private long appMenuShown = -1;
     private int settingsShown;
     private int menuOffered = -1;
+    /** Whether screen readers can open search, as last told, or -1 before the first frame. */
+    private int searchOffered = -1;
+    /** Whether search was open as last drawn: the field has the keyboard. */
+    private boolean searchOpen;
     /** Whether the open folder covers the grid for screen readers, or -1 before the first frame. */
     private int folderCovering = -1;
     /** The folder the rename dialog is for, or -1, and the dialog while it shows (FOLD-03). */
@@ -279,6 +298,17 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             apply();
         });
         folderPanel.setScreen(this);
+        results = new AppsGrid(context, AppsGrid.SEARCH, icons, this::apply, this::announce);
+        results.setScreen(this);
+        searchPanel = new SearchPanel(context, results, query -> {
+            nativeSearchChanged(query);
+            apply();
+        }, this::submitSearch, () -> {
+            String message = nativeSearchWeb();
+            apply();
+            toast(message);
+        });
+        searchPanel.setScreen(this);
         doneMargin = dp(16);
         done = new TextView(context);
         done.setText(R.string.edit_done);
@@ -295,6 +325,9 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             FrameLayout page = new FrameLayout(context);
             if (i == APPLICATIONS) {
                 page.addView(apps, new LayoutParams(
+                        LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
+                // Search's field above the grid, and its results instead of it (SRCH-01).
+                page.addView(searchPanel, new LayoutParams(
                         LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
                 // Over the grid's last row, which is always empty (HOME-14).
                 page.addView(done, new LayoutParams(LayoutParams.WRAP_CONTENT,
@@ -433,6 +466,8 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         // The grid scrolls under the bars, so it takes the safe area as its own padding.
         apps.setSafeArea(safe);
         folderPanel.setSafeArea(safe);
+        // Only search's results make room for the keyboard (ADR 0016).
+        searchPanel.setInsets(safe, keyboardHeight(insets));
         LayoutParams doneParams = (LayoutParams) done.getLayoutParams();
         if (doneParams.bottomMargin != safe.bottom + doneMargin) {
             doneParams.bottomMargin = safe.bottom + doneMargin;
@@ -458,7 +493,10 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             bars = insets.getInsets(
                     WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout());
         } else {
-            bars = insets.getSystemWindowInsets();
+            // With the keyboard up, the bottom inset holds it too: the safe area leaves it out.
+            Insets system = insets.getSystemWindowInsets();
+            bars = Insets.of(system.left, system.top, system.right,
+                    system.bottom - keyboardHeight(insets));
             DisplayCutout cutout = insets.getDisplayCutout();
             if (cutout != null) {
                 bars = Insets.max(bars, Insets.of(cutout.getSafeInsetLeft(),
@@ -470,6 +508,18 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             return clearOfCorners(insets, bars);
         }
         return bars;
+    }
+
+    /**
+     * How tall the keyboard is, in px from the window's bottom, or 0 while it is hidden. Android
+     * 10 reports it only as the part of the bottom inset that the bars don't account for.
+     */
+    @SuppressWarnings("deprecation") // The only way on Android 10.
+    private static int keyboardHeight(WindowInsets insets) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            return insets.getInsets(WindowInsets.Type.ime()).bottom;
+        }
+        return Math.max(0, insets.getSystemWindowInsetBottom() - insets.getStableInsetBottom());
     }
 
     /**
@@ -718,10 +768,11 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         super.onDetachedFromWindow();
     }
 
-    /** The icons arrived or changed: both grids, and the dragged icon, draw them again. */
+    /** The icons arrived or changed: every grid, and the dragged icon, draw them again. */
     private void refreshIcons() {
         apps.refreshIcons();
         folderApps.refreshIcons();
+        results.refreshIcons();
         shadow.invalidate();
     }
 
@@ -792,6 +843,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
                 BADGE_ROWS);
         folderApps.edit(frame[EDITING] != 0, frame[EDIT_SCALE], 0, frame, BADGES, BADGE_ROWS);
         applyFolder();
+        applySearch(applications);
         applyDone();
         if (current != announced) {
             announced = current;
@@ -810,9 +862,11 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         applySettings();
         applyMenu();
         applyRename();
-        if (frame[MENU_OFFERED] != menuOffered) {
+        int offered = (frame[SEARCH] & SEARCH_OFFERED) != 0 ? 1 : 0;
+        if (frame[MENU_OFFERED] != menuOffered || offered != searchOffered) {
             // Screen readers ask again which actions the home views offer.
             menuOffered = frame[MENU_OFFERED];
+            searchOffered = offered;
             sendAccessibilityEvent(AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED);
         }
         if (frame[ANIMATING] != 0 && !framePosted && isAttachedToWindow()) {
@@ -864,6 +918,57 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             apps.setImportantForAccessibility(covering != 0
                     ? IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
                     : IMPORTANT_FOR_ACCESSIBILITY_AUTO);
+        }
+    }
+
+    /**
+     * Draws search (SRCH-01 to SRCH-05, ANIM-16): the field as far as its band is pulled down,
+     * with the Applications grid moved down below it, or the results instead of the grid once
+     * something is typed. When search opens, the field takes the keyboard, with the query the
+     * Rust app kept if this view is new; when it closes, the keyboard goes.
+     */
+    private void applySearch(boolean applications) {
+        int flags = frame[SEARCH];
+        boolean open = (flags & SEARCH_OPEN) != 0;
+        boolean resultsShown = (flags & SEARCH_RESULTS) != 0;
+        int reveal = frame[SEARCH_REVEAL];
+        // As wide as the grid, so in its columns.
+        results.apply(frame[RESULTS_REVISION], frame[RESULTS_SCROLL], frame[APPS_COLUMNS],
+                frame[RESULTS_ROWS],
+                applications && frame[PRESSED_SURFACE] == AppsGrid.SEARCH ? frame[PRESSED] : -1,
+                frame[PRESS_SCALE], foreground, dim, frame[ACCENT], surface);
+        results.move(frame[APPEAR_SCALE], frame[APPEAR_ALPHA], frame[LEAVE_SCALE],
+                frame[LEAVE_ALPHA], frame[SHIFT]);
+        apps.setTranslationY(resultsShown ? 0 : reveal);
+        // Hidden from touches and screen readers while the results take its place, but still
+        // laid out, at the same scroll position (SRCH-04).
+        apps.setVisibility(resultsShown ? INVISIBLE : VISIBLE);
+        searchPanel.apply(open, reveal, resultsShown, (flags & SEARCH_NOTHING) != 0,
+                (flags & SEARCH_WEB) != 0, foreground, dim, surface, frame[ACCENT]);
+        if (open != searchOpen) {
+            searchOpen = open;
+            if (open) {
+                searchPanel.focus(nativeSearchQuery());
+            } else {
+                searchPanel.dismiss();
+            }
+        }
+    }
+
+    /**
+     * The keyboard's action key: the first result launches from its icon, or the web is
+     * searched (SRCH-03, SRCH-05). If the system refuses, its message shows briefly.
+     */
+    private void submitSearch() {
+        Rect icon = searchPanel.firstIcon();
+        String message = nativeSearchSubmitted(icon.left, icon.top, icon.right, icon.bottom);
+        apply();
+        toast(message);
+    }
+
+    private void toast(String message) {
+        if (message != null) {
+            Toast.makeText(getContext(), message, Toast.LENGTH_SHORT).show();
         }
     }
 
@@ -1226,8 +1331,8 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         }
     }
 
-    // Screen readers switch views and open the home menu with actions instead of gestures
-    // (A11Y-05).
+    // Screen readers switch views, open the home menu and open search with actions instead of
+    // gestures (A11Y-05).
     @Override
     public void onInitializeAccessibilityNodeInfo(AccessibilityNodeInfo info) {
         super.onInitializeAccessibilityNodeInfo(info);
@@ -1244,6 +1349,10 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             info.addAction(new AccessibilityAction(
                     R.id.action_home_menu, getResources().getString(R.string.action_home_menu)));
         }
+        if ((frame[SEARCH] & SEARCH_OFFERED) != 0) {
+            info.addAction(new AccessibilityAction(
+                    R.id.action_search, getResources().getString(R.string.search_action)));
+        }
     }
 
     @Override
@@ -1252,6 +1361,11 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             boolean opened = nativeOpenMenu();
             apply();
             return opened;
+        }
+        if (action == R.id.action_search) {
+            nativeOpenSearch();
+            apply();
+            return (frame[SEARCH] & SEARCH_OPEN) != 0;
         }
         boolean rtl = getLayoutDirection() == LAYOUT_DIRECTION_RTL;
         Boolean next = null;
@@ -1297,8 +1411,8 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
 
     /**
      * The driving finger, with a {@code MotionEvent} action and a time in the {@code
-     * System.nanoTime()} base. Returns whether the carousel or a long-press has taken the
-     * gesture.
+     * System.nanoTime()} base. Returns whether the carousel, a long-press or the search field's
+     * pull has taken the gesture.
      */
     private native boolean nativePointer(int action, float x, float y, long timeNanos);
 
@@ -1346,6 +1460,24 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
      * message to show.
      */
     private native String nativeAppMenuChosen(int revision, int item);
+
+    /** Opens search without a pull, for a screen reader. */
+    private native void nativeOpenSearch();
+
+    /** The user typed: the search field now says {@code query}. */
+    private native void nativeSearchChanged(String query);
+
+    /**
+     * The keyboard's action key, with the first result's icon at this rect on the screen, or an
+     * empty one. Returns null, or a short message to show.
+     */
+    private native String nativeSearchSubmitted(int left, int top, int right, int bottom);
+
+    /** "Search the web for '…'". Returns null, or a short message to show. */
+    private native String nativeSearchWeb();
+
+    /** What the search field says while search is open, or null. */
+    private native String nativeSearchQuery();
 
     /** Fills {@code frame} with what to draw now, in the slots above. */
     private native void nativeRead(int[] frame);

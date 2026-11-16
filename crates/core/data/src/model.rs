@@ -57,6 +57,10 @@ pub struct App {
     /// locale's alphabetical order, ignoring case and accents (L10N-04). The platform makes it,
     /// because only it knows the locale's rules.
     pub sort_key: Vec<u8>,
+    /// The label folded for search: its accents removed, its case folded and its spaces
+    /// collapsed, so "Café" is `cafe` (SRCH-02, L10N-04). The platform makes it, and folds a
+    /// query the same way with `AppsAdapter::search_key`, because only it knows Unicode's rules.
+    pub search_key: String,
     /// Derived once from the icon and reused in Events and Recent (APPS-17).
     pub accent: Rgb,
     /// False while the profile is paused, the app is suspended or its storage is missing

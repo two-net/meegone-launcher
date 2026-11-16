@@ -1812,3 +1812,248 @@ fn ac05_given_theme_system_and_an_open_folder_the_app_turns_dark_with_the_folder
     // …and 60 % in Dark.
     assert_eq!(frame.scrim, 153);
 }
+
+/// The search field's band on that phone: 176 px tall, below the 82 px status bar.
+const SEARCH_BAND: Bounds = Bounds {
+    left: 0.0,
+    top: 82.0,
+    right: WIDTH,
+    bottom: 258.0,
+};
+
+/// Gmail, Mail, Maps and Café, on a phone with the grid and search's results laid out.
+fn ready_to_search(fakes: &Fakes) -> (Launcher, u64) {
+    *fakes.apps.apps.lock().unwrap() = vec![
+        app("gmail", "Gmail"),
+        app("mail", "Mail"),
+        app("maps", "Maps"),
+        app("cafe", "Café"),
+    ];
+    let (mut launcher, clock) = on_a_phone(fakes);
+    grid_on_a_phone(&mut launcher);
+    launcher.view().apps().search_laid_out(
+        GridLayout {
+            top_px: SEARCH_BAND.bottom,
+            ..PHONE_GRID
+        },
+        SEARCH_BAND,
+    );
+    launcher.frame();
+    (launcher, clock)
+}
+
+/// A finger drags down from `from` to `to` px over 320 ms in the middle of the screen, rests
+/// and lifts; then the display draws frames until nothing moves. Returns whether the shell had
+/// the gesture, so the grid got none of it.
+fn pull(launcher: &mut Launcher, clock: &mut u64, from: f64, to: f64) -> bool {
+    let mut taken = false;
+    let mut touch = |launcher: &mut Launcher, kind, y, at| {
+        launcher.dispatch(ShellIntent::Pointer(PointerEvent {
+            kind,
+            x: 540.0,
+            y,
+            at: Duration::from_millis(at),
+        }));
+        taken |= launcher.frame().search.pulling;
+    };
+    touch(launcher, PointerKind::Down, from, *clock);
+    for step in 1..=40u32 {
+        let y = from + (to - from) * f64::from(step) / 40.0;
+        touch(launcher, PointerKind::Move, y, *clock + u64::from(step) * 8);
+    }
+    *clock += 320 + 100;
+    touch(launcher, PointerKind::Up, to, *clock);
+    come_to_rest(launcher, clock);
+    taken
+}
+
+/// Pulls the search field open, past its whole band.
+fn open_search(launcher: &mut Launcher, clock: &mut u64) {
+    pull(launcher, clock, 600.0, 600.0 + 22.0 + 176.0 + 60.0);
+}
+
+/// Types `query` one character at a time, as the host sends each change of the field.
+fn type_in(launcher: &mut Launcher, query: &str) {
+    let mut typed = String::new();
+    for character in query.chars() {
+        typed.push(character);
+        launcher.view().apps().search_changed(typed.clone());
+        launcher.frame();
+    }
+}
+
+/// Search's results as the host draws them.
+fn results(launcher: &Launcher) -> Vec<String> {
+    launcher
+        .view()
+        .apps()
+        .cells(Surface::Search)
+        .map(|cell| cell.label.to_owned())
+        .collect()
+}
+
+#[test]
+fn srch01_pulling_down_at_the_top_of_applications_reveals_search() {
+    // Issue #15: SRCH-01, ANIM-16. The field shows in step with the pull, and past its whole
+    // band it springs open: the field takes the keyboard.
+    let fakes = Fakes::default();
+    let (mut launcher, mut clock) = ready_to_search(&fakes);
+
+    let taken = pull(&mut launcher, &mut clock, 600.0, 600.0 + 22.0 + 100.0);
+    assert!(taken);
+    assert!(!launcher.frame().search.open);
+    assert_eq!(launcher.frame().search.reveal_px, 0);
+
+    open_search(&mut launcher, &mut clock);
+    let search = launcher.frame().search;
+    assert!(search.open && !search.results_shown);
+    assert_eq!(search.reveal_px, 176);
+    assert_eq!(launcher.view().apps().query(), Some(""));
+}
+
+#[test]
+fn srch01_a_pull_counts_only_at_the_top_of_the_grid() {
+    // Issue #15: SRCH-01. Further down, the grid scrolls instead.
+    let fakes = Fakes::default();
+    let (mut launcher, mut clock) = ready_to_search(&fakes);
+    launcher.view().apps().scrolled(Surface::Grid, 300.0);
+
+    let taken = pull(&mut launcher, &mut clock, 600.0, 1200.0);
+
+    assert!(!taken);
+    assert!(!launcher.frame().search.open);
+}
+
+#[test]
+fn srch02_given_mail_maps_and_gmail_when_the_user_types_ma_then_mail_and_maps_come_before_gmail() {
+    // Issue #15: SRCH-02, the issue's first acceptance criterion. Matches at a word's start
+    // come first, each group alphabetically.
+    let fakes = Fakes::default();
+    let (mut launcher, mut clock) = ready_to_search(&fakes);
+    open_search(&mut launcher, &mut clock);
+
+    type_in(&mut launcher, "m");
+    assert_eq!(results(&launcher), ["Mail", "Maps", "Gmail"]);
+    type_in(&mut launcher, "ma");
+
+    assert_eq!(results(&launcher), ["Mail", "Maps", "Gmail"]);
+    let frame = launcher.frame();
+    assert!(frame.search.results_shown && !frame.search.nothing_found);
+    assert_eq!(frame.apps.results.rows, 1);
+}
+
+#[test]
+fn srch02_given_an_app_labelled_cafe_when_the_user_types_cafe_then_it_matches() {
+    // Issue #15: SRCH-02, L10N-04, the issue's second acceptance criterion: case and accents
+    // are folded by the platform, here the fake's stand-in.
+    let fakes = Fakes::default();
+    let (mut launcher, mut clock) = ready_to_search(&fakes);
+    open_search(&mut launcher, &mut clock);
+
+    type_in(&mut launcher, "cafe");
+    assert_eq!(results(&launcher), ["Café"]);
+    type_in(&mut launcher, "CAFÉ");
+    assert_eq!(results(&launcher), ["Café"]);
+}
+
+#[test]
+fn srch03_given_results_when_the_user_presses_the_action_key_then_the_first_result_launches() {
+    // Issue #15: SRCH-03, the issue's third acceptance criterion, from the result's icon
+    // (ANIM-08). Coming back shows the grid, not the old query (SRCH-04).
+    let fakes = Fakes::default();
+    let (mut launcher, mut clock) = ready_to_search(&fakes);
+    open_search(&mut launcher, &mut clock);
+    type_in(&mut launcher, "ma");
+    let icon = Rect {
+        left: 44,
+        top: 280,
+        right: 198,
+        bottom: 434,
+    };
+
+    launcher.view().apps().search_submitted(Some(icon));
+    launcher.frame();
+
+    assert_eq!(*fakes.apps.launched.lock().unwrap(), [app_id("mail")]);
+    assert_eq!(*fakes.apps.launched_from.lock().unwrap(), [Some(icon)]);
+    assert!(!launcher.frame().search.open);
+    come_to_rest(&mut launcher, &mut clock);
+    assert_eq!(launcher.frame().search.reveal_px, 0);
+    assert_eq!(launcher.view().apps().query(), None);
+}
+
+#[test]
+fn srch04_back_or_home_close_search_and_restore_the_grid_where_it_was() {
+    // Issue #15: SRCH-04, HOME-07, HOME-08. A screen reader opens search anywhere in the grid
+    // (A11Y-05); closing it leaves the grid where it was.
+    for close in [ShellIntent::Back, ShellIntent::Home] {
+        let fakes = Fakes::default();
+        let (mut launcher, mut clock) = ready_to_search(&fakes);
+        launcher.view().apps().scrolled(Surface::Grid, 300.0);
+        assert!(launcher.frame().search.offered);
+        launcher.view().apps().open_search();
+        type_in(&mut launcher, "ma");
+        assert!(launcher.frame().search.results_shown);
+
+        launcher.dispatch(close);
+
+        let frame = launcher.frame();
+        assert!(!frame.search.open && !frame.search.results_shown);
+        assert_eq!(frame.apps.scroll_px, 300);
+        assert_eq!(frame.current, HomeView::Applications);
+        come_to_rest(&mut launcher, &mut clock);
+        assert_eq!(launcher.frame().search.reveal_px, 0);
+    }
+}
+
+#[test]
+fn srch04_pushing_the_empty_field_away_closes_search() {
+    // Issue #15: SRCH-04, "scrolling down past the field".
+    let fakes = Fakes::default();
+    let (mut launcher, mut clock) = ready_to_search(&fakes);
+    open_search(&mut launcher, &mut clock);
+
+    let taken = pull(
+        &mut launcher,
+        &mut clock,
+        1200.0,
+        1200.0 - 22.0 - 176.0 - 40.0,
+    );
+
+    assert!(taken);
+    assert!(!launcher.frame().search.open);
+    assert_eq!(launcher.frame().search.reveal_px, 0);
+}
+
+#[test]
+fn srch05_given_no_match_then_a_web_search_is_offered_and_runs() {
+    // Issue #15: SRCH-05, with the device's default search handler.
+    let fakes = Fakes::default();
+    let (mut launcher, mut clock) = ready_to_search(&fakes);
+    open_search(&mut launcher, &mut clock);
+    type_in(&mut launcher, "zebra");
+
+    let search = launcher.frame().search;
+    assert!(search.nothing_found && search.web_offered);
+    launcher.view().apps().search_web();
+    launcher.frame();
+
+    assert_eq!(*fakes.system.web_searches.lock().unwrap(), ["zebra"]);
+    assert!(!launcher.frame().search.open);
+}
+
+#[test]
+fn srch05_without_a_browser_nothing_is_offered() {
+    // Issue #15: SRCH-05, SRS 8.1: "has_browser is false: link hidden".
+    let fakes = Fakes::default();
+    *fakes.system.browser.lock().unwrap() = false;
+    let (mut launcher, mut clock) = ready_to_search(&fakes);
+    open_search(&mut launcher, &mut clock);
+    type_in(&mut launcher, "zebra");
+
+    let search = launcher.frame().search;
+    assert!(search.nothing_found && !search.web_offered);
+    launcher.view().apps().search_submitted(None);
+    launcher.frame();
+    assert!(fakes.system.web_searches.lock().unwrap().is_empty());
+}

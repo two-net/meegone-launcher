@@ -39,7 +39,9 @@
              onNewIntent. Configuration changes that resize, rotate, fold or unfold are handled
              in place; any other, such as a new density, recreates the activity, and the shared
              launcher keeps all state (COMP-03, ADR 0009). The orientation follows the screen's
-             size at run time (HOME-12). -->
+             size at run time (HOME-12). adjustResize hands the keyboard's height to HomeViews as
+             an inset, which only search's results take (ADR 0016); edge to edge, the window
+             itself never resizes. -->
         <activity
             android:name=".HomeActivity"
             android:clearTaskOnLaunch="true"
@@ -48,7 +50,7 @@
             android:launchMode="singleTask"
             android:resizeableActivity="true"
             android:stateNotNeeded="true"
-            android:windowSoftInputMode="adjustPan">
+            android:windowSoftInputMode="adjustResize">
 
             <!-- A home app: offered in the system's home-app choice (HOME-01). -->
             <intent-filter>

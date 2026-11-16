@@ -239,7 +239,7 @@ impl<'a> Key<'a> {
 
 /// The locale's alphabetical order by label, from the platform's collation keys (L10N-04).
 /// Equal labels put the personal app first; the id makes the order total.
-fn alphabetical(a: &App, b: &App) -> Ordering {
+pub(crate) fn alphabetical(a: &App, b: &App) -> Ordering {
     (&a.sort_key, &a.label, a.work, &a.id).cmp(&(&b.sort_key, &b.label, b.work, &b.id))
 }
 

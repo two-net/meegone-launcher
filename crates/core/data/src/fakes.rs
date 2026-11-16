@@ -63,12 +63,14 @@ pub fn app_id(package: &str) -> AppId {
 pub const WORK_PROFILE: ProfileId = ProfileId(10);
 
 /// An available app in the personal profile that the user can uninstall. Its sort key is its
-/// lowercased label, a simple stand-in for the platform's collation key (L10N-04).
+/// lowercased label, a simple stand-in for the platform's collation key, and its search key is
+/// the label's [`fold`] (L10N-04).
 pub fn app(package: &str, label: &str) -> App {
     App {
         id: app_id(package),
         label: label.to_owned(),
         sort_key: label.to_lowercase().into_bytes(),
+        search_key: fold(label),
         accent: accent::NEUTRAL,
         available: true,
         work: false,
@@ -88,6 +90,29 @@ pub fn work_app(package: &str, label: &str) -> App {
         work: true,
         ..personal
     }
+}
+
+/// A stand-in for the platform's search folding (SRCH-02, L10N-04): lowercase, the accents of
+/// Latin-1 letters removed, and runs of spaces collapsed to one, without spaces at either end.
+/// The platform folds every script; this is enough for tests.
+pub fn fold(text: &str) -> String {
+    let mut folded = String::with_capacity(text.len());
+    for c in text.chars().flat_map(char::to_lowercase) {
+        match c {
+            'à'..='å' => folded.push('a'),
+            'ç' => folded.push('c'),
+            'è'..='ë' => folded.push('e'),
+            'ì'..='ï' => folded.push('i'),
+            'ñ' => folded.push('n'),
+            'ò'..='ö' => folded.push('o'),
+            'ù'..='ü' => folded.push('u'),
+            'ý' | 'ÿ' => folded.push('y'),
+            // Case folding, as the platform's, turns ß into ss.
+            'ß' => folded.push_str("ss"),
+            c => folded.push(c),
+        }
+    }
+    folded.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Fails with the error a fake was set to fail with, if any.
@@ -115,6 +140,8 @@ pub struct FakeApps {
     pub shortcuts_launched: Mutex<Vec<Shortcut>>,
     pub uninstall_requested: Mutex<Vec<AppId>>,
     pub app_info_opened: Mutex<Vec<AppId>>,
+    /// Every text folded with `search_key`, such as each query typed (SRCH-02).
+    pub search_keys: Mutex<Vec<String>>,
     pub error: Mutex<Option<DataError>>,
 }
 
@@ -136,6 +163,7 @@ impl Default for FakeApps {
             shortcuts_launched: Mutex::default(),
             uninstall_requested: Mutex::default(),
             app_info_opened: Mutex::default(),
+            search_keys: Mutex::default(),
             error: Mutex::default(),
         }
     }
@@ -154,6 +182,11 @@ impl AppsAdapter for FakeApps {
 
     fn default_apps(&self) -> Vec<String> {
         self.default_apps.lock().unwrap().clone()
+    }
+
+    fn search_key(&self, text: &str) -> String {
+        record(&self.search_keys, text.to_owned());
+        fold(text)
     }
 
     fn launch(&self, app: &AppId, from: Option<Rect>) -> Result<(), DataError> {
@@ -589,5 +622,19 @@ impl StorageAdapter for FakeStorage {
         check(&self.error)?;
         self.files.lock().unwrap().remove(&file);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_fake_folding_ignores_case_accents_and_extra_spaces() {
+        // SRCH-02, L10N-04, as the platform's folding does.
+        assert_eq!(fold("  Café  Crème "), "cafe creme");
+        assert_eq!(fold("STRASSE Straße"), "strasse strasse");
+        assert_eq!(app("cafe", "Café").search_key, "cafe");
+        assert_eq!(FakeApps::default().search_key("CAFÉ"), "cafe");
     }
 }

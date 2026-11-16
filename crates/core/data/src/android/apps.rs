@@ -1,7 +1,7 @@
 //! [`AppsAdapter`] on Android: the app catalogue and launching (APPS-01, APPS-09, APPS-10,
 //! ANIM-08, ADR 0010), the default apps the first grid starts with (APPS-05, ADR 0012), and
 //! what the app long-press menu offers: shortcuts, App info and uninstall requests (APPS-11,
-//! APPS-13, ADR 0013).
+//! APPS-13, ADR 0013), and the folding search matches with (SRCH-02, ADR 0016).
 //!
 //! Questions go to the Java `Bridge` object, whose method names and signatures must stay in
 //! step with the ones looked up here. The catalogue and the shortcuts arrive as flat records,
@@ -38,6 +38,9 @@ pub struct AndroidApps {
     /// `String openAppInfo(String package, String activity, long profile)`: `null`, or a short
     /// message.
     open_app_info: MethodId,
+    /// `String searchKey(String text)`: the text folded as the catalogue folds each label
+    /// (SRCH-02, L10N-04).
+    search_key: MethodId,
 }
 
 impl AndroidApps {
@@ -61,6 +64,11 @@ impl AndroidApps {
             launch_shortcut: env.method_id(bridge, c"launchShortcut", APP_REQUEST)?,
             request_uninstall: env.method_id(bridge, c"requestUninstall", APP_REQUEST)?,
             open_app_info: env.method_id(bridge, c"openAppInfo", APP_REQUEST)?,
+            search_key: env.method_id(
+                bridge,
+                c"searchKey",
+                c"(Ljava/lang/String;)Ljava/lang/String;",
+            )?,
             bridge: env.global_ref(bridge)?,
         })
     }
@@ -129,6 +137,19 @@ impl AppsAdapter for AndroidApps {
                 .filter(|package| !package.is_empty())
                 .collect(),
             Ok(None) | Err(_) => Vec::new(),
+        }
+    }
+
+    /// If the bridge can't answer, the text is only lowercased, so a search still finds the
+    /// labels that need no folding.
+    fn search_key(&self, text: &str) -> String {
+        let folded = self.vm.env().and_then(|env| {
+            let text = env.new_string(text)?;
+            env.call_string(&self.bridge, self.search_key, &[JValue::object(&text)])
+        });
+        match folded {
+            Ok(Some(key)) => key,
+            Ok(None) | Err(_) => text.to_lowercase(),
         }
     }
 

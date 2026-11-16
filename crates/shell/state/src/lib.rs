@@ -1,6 +1,7 @@
 //! Home shell state (SRS 4.1): the carousel of views, the home menu, which long-press counts,
 //! Home and Back, coming back to the home, the icon press, the dragged icon, the grid's motion
-//! as apps come, go and move, edit mode's motion, the open folder's motion, and the theme.
+//! as apps come, go and move, edit mode's motion, the open folder's motion, the search field's
+//! pull, and the theme.
 //!
 //! [`HomeShell::compose`] is the only place features are put together (ARCH-03). Each feature
 //! runs in its own [`Store`], so a failing feature never takes down the shell (ARCH-09).
@@ -13,6 +14,7 @@ mod lift;
 mod mode;
 mod press;
 mod return_home;
+mod search;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,7 +24,7 @@ use meegone_apps_state::{AppsHolder, AppsIntent, CellKey, FolderId, Surface, cel
 use meegone_core_data::{
     HomeTarget, PersistentSettingsStore, Platform, SettingsStore, SystemConfigAdapter,
 };
-use meegone_core_state::motion::MODE_SCALE;
+use meegone_core_state::motion::{MODE_SCALE, VIEW_FLING_VELOCITY_DP};
 use meegone_core_state::{Health, Store, ThemeHolder, ThemeIntent};
 use meegone_events_state::{EventsHolder, EventsIntent};
 use meegone_lockimage_data::PersistentImageCache;
@@ -47,6 +49,8 @@ use press::Press;
 pub use press::PressState;
 use return_home::ReturnHome;
 pub use return_home::ReturnHomeState;
+pub use search::SearchState;
+use search::{Change, Geometry, Pull, SearchMotion};
 
 /// The three home views, left to right (HOME-02).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -142,6 +146,10 @@ pub struct ShellState {
     /// The folder whose new name the host asks the user for (FOLD-03). A failed Applications
     /// never asks (ARCH-09).
     pub renaming: Option<FolderId>,
+    /// The search field, pulled down or springing open or away (SRCH-01, ANIM-16). While it is
+    /// open the carousel stays put, and only the results, or the grid below an empty field,
+    /// take touches. A failed Applications never shows it (ARCH-09).
+    pub search: SearchState,
 }
 
 impl ShellState {
@@ -163,7 +171,21 @@ impl ShellState {
             && self.menu.is_none()
             && !self.app_menu_open
             && !self.folder_open
+            && !self.search.open
             && HomeMenu::items_for(self.current, false).is_some()
+    }
+
+    /// Whether Applications offers search now, which a screen reader can open without a pull
+    /// (A11Y-05): on Applications, with nothing covering it or open over it, outside edit mode,
+    /// and search not open already.
+    pub fn search_offered(&self) -> bool {
+        self.current == HomeView::Applications
+            && !self.settings_open
+            && self.menu.is_none()
+            && !self.app_menu_open
+            && !self.folder_open
+            && !self.mode.on
+            && !self.search.open
     }
 }
 
@@ -281,6 +303,7 @@ pub struct HomeShell {
     seen_folder: (Option<FolderId>, Arc<[GridItem]>),
     /// How many folders Applications had made as of the last intent (ANIM-24).
     seen_folders_made: u32,
+    search: SearchMotion,
     theme: Store<ThemeHolder>,
     apps: Store<AppsHolder>,
     events: Store<EventsHolder>,
@@ -310,12 +333,14 @@ impl HomeShell {
             folder: FolderMotion::default(),
             seen_folder: (None, Arc::new([])),
             seen_folders_made: 0,
+            search: SearchMotion::default(),
             theme: Store::new(ThemeHolder::new(
                 settings_store.clone(),
                 platform.system.clone(),
             )),
             apps: Store::new(AppsHolder::new(
                 platform.apps.clone(),
+                platform.system.clone(),
                 Arc::new(PersistentLayoutStore::new(platform.storage.clone())),
             )),
             events: Store::new(EventsHolder::new(platform.notifications.clone())),
@@ -414,6 +439,7 @@ impl HomeShell {
                         menu.anchor = None;
                     }
                     self.lift.cancel();
+                    self.search.end_gesture();
                 }
                 let release = self.carousel.layout(layout, self.state.current);
                 self.settle(release);
@@ -427,10 +453,14 @@ impl HomeShell {
                 // dragging on picks the icon up and enters edit mode, which closes the menu
                 // (APPS-11). Lifting the finger drops it (APPS-12, FOLD-01, FOLD-05).
                 self.drag(&event);
+                // At the top of Applications, pulling down reveals the search field, and with
+                // nothing typed, pushing up puts it away (SRCH-01, SRCH-04).
+                self.pull(event);
                 // Settings and the menus cover the home views, but a finger that was already
-                // down may still lift. An open folder takes touches itself: the row stays put,
-                // but a press there can still become a long-press (FOLD-04).
-                self.carousel.lock(self.folder_shown());
+                // down may still lift. An open folder or search takes touches itself: the row
+                // stays put, but a press there can still become a long-press (FOLD-04).
+                self.carousel
+                    .lock(self.folder_shown() || self.search_shown());
                 if !self.covered() || matches!(event.kind, PointerKind::Up | PointerKind::Cancel) {
                     let release = self.carousel.pointer(event, self.state.current);
                     self.settle(release);
@@ -448,6 +478,7 @@ impl HomeShell {
                 self.grid_change.frame(at);
                 self.mode.frame(at);
                 self.folder.frame(at);
+                self.search.frame(at);
                 self.drag_frame(at);
             }
             ShellIntent::Press { surface, item, at } => self.press_item(surface, item, at),
@@ -476,6 +507,7 @@ impl HomeShell {
             ShellIntent::SystemThemeChanged => self.theme.dispatch(ThemeIntent::Refresh),
             ShellIntent::AppsChanged => self.apps_changed(),
             ShellIntent::NotificationsChanged => self.events.dispatch(EventsIntent::Refresh),
+            ShellIntent::Apps(AppsIntent::OpenSearch) => self.open_search(),
             ShellIntent::Apps(intent) => self.apps.dispatch(intent),
             ShellIntent::Events(intent) => self.events.dispatch(intent),
             ShellIntent::Recent(intent) => self.recent.dispatch(intent),
@@ -489,6 +521,7 @@ impl HomeShell {
             }
         }
         self.keep_folder_in_step();
+        self.keep_search_in_step();
         self.keep_lift_in_step();
         self.keep_mode_in_step();
         self.keep_cells_in_step();
@@ -507,6 +540,7 @@ impl HomeShell {
         self.state.renaming = (*self.apps.health() == Health::Ready)
             .then(|| self.apps.state().renaming)
             .flatten();
+        self.state.search = self.search.state();
     }
 
     /// Whether Settings or a menu covers the home views, so they get no new touches.
@@ -542,6 +576,84 @@ impl HomeShell {
     /// never counts (ARCH-09).
     fn folder_shown(&self) -> bool {
         *self.apps.health() == Health::Ready && self.apps.state().open_folder.is_some()
+    }
+
+    /// Whether search is open on Applications. A failed Applications can't close it, so it
+    /// never counts (ARCH-09).
+    fn search_shown(&self) -> bool {
+        *self.apps.health() == Health::Ready && self.apps.state().search.is_some()
+    }
+
+    fn close_search(&mut self) {
+        if self.search_shown() {
+            self.apps.dispatch(AppsIntent::CloseSearch);
+        }
+    }
+
+    /// A11Y-05: opens search without a pull, only where it is offered: on Applications, with
+    /// nothing covering it or open over it.
+    fn open_search(&mut self) {
+        if self.state.current != HomeView::Applications
+            || self.covered()
+            || self.folder_shown()
+            || self.editing_shown()
+        {
+            return;
+        }
+        self.apps.dispatch(AppsIntent::OpenSearch);
+    }
+
+    /// What a vertical drag on the home views may do now (SRCH-01, SRCH-04). Only on
+    /// Applications at rest, with nothing covering it, open over it or lifted, once the host
+    /// has laid the field out: pull search open at the top of the grid, or push it away while
+    /// nothing is typed.
+    fn pull_offer(&self) -> Pull {
+        let apps = self.apps.state();
+        let carousel = self.carousel.state();
+        let calm = self.state.current == HomeView::Applications
+            && *self.apps.health() == Health::Ready
+            && !self.covered()
+            && !self.folder_shown()
+            && !self.editing_shown()
+            && self.lift.armed().is_none()
+            && self.lift.held().is_none()
+            && !carousel.dragging
+            && carousel.offset == 0.0
+            && apps.search_band_px().is_some();
+        match &apps.search {
+            _ if !calm => Pull::None,
+            // Within a pixel of the top, as the host rounds its scroll position.
+            None if apps.scroll_px < 1.0 => Pull::Open,
+            Some(_) if !apps.has_query() => Pull::Away,
+            _ => Pull::None,
+        }
+    }
+
+    /// Follows the finger on the search field (ANIM-16). A release that opens or closes search
+    /// tells Applications, and a pull lets the pressed icon go (ANIM-10).
+    fn pull(&mut self, event: PointerEvent) {
+        let layout = self.carousel.state().layout;
+        let size = Geometry {
+            slop_px: layout.touch_slop_px,
+            fling_px_per_s: VIEW_FLING_VELOCITY_DP * layout.density,
+        };
+        match self.search.pointer(event, self.pull_offer(), size) {
+            Some(Change::Opened) => self.apps.dispatch(AppsIntent::OpenSearch),
+            Some(Change::Closed) => self.apps.dispatch(AppsIntent::CloseSearch),
+            None => {}
+        }
+        if self.search.pulling() {
+            self.press
+                .release(event.at, self.carousel.animation_scale());
+        }
+    }
+
+    /// The field follows search as Applications has it: open, or closed by Back, Home, a
+    /// launch or a screen reader (SRCH-01, SRCH-04).
+    fn keep_search_in_step(&mut self) {
+        let band = self.apps.state().search_band_px().unwrap_or(0.0);
+        self.search
+            .set(self.search_shown(), band, self.carousel.animation_scale());
     }
 
     /// The panel follows the open folder (ANIM-15), and a folder made ticks (ANIM-24).
@@ -717,7 +829,7 @@ impl HomeShell {
         match step.scroll_to {
             Some((Surface::Grid, px)) => self.apps.dispatch(AppsIntent::Scrolled(px)),
             Some((Surface::Folder, px)) => self.apps.dispatch(AppsIntent::FolderScrolled(px)),
-            None => {}
+            Some((Surface::Search, _)) | None => {}
         }
         match step.arrange {
             Some(DropAt::Grid { key, to }) => {
@@ -781,10 +893,17 @@ impl HomeShell {
             .press(surface, item, at, self.carousel.animation_scale());
     }
 
-    /// Whether `surface` takes touches: the open folder's panel while it is open, and the grid
-    /// only while it isn't (FOLD-04).
+    /// Whether `surface` takes touches: the open folder's panel while it is open (FOLD-04);
+    /// while search is open, its results, or the grid below an empty field; otherwise the grid.
     fn touchable(&self, surface: Surface) -> bool {
-        (surface == Surface::Folder) == self.folder_shown()
+        if self.folder_shown() {
+            surface == Surface::Folder
+        } else if self.search_shown() {
+            surface == Surface::Search
+                || (surface == Surface::Grid && !self.apps.state().has_query())
+        } else {
+            surface == Surface::Grid
+        }
     }
 
     /// A drag ended: settle on the view it chose.
@@ -810,7 +929,7 @@ impl HomeShell {
     /// HOME-10: a long-press on empty space opens the home menu where the finger is, or, in
     /// Recent, enters close mode (REC-07). Either way it ticks (ANIM-24).
     fn long_press(&mut self) {
-        if self.covered() || self.folder_shown() {
+        if self.covered() || self.folder_shown() || self.search_shown() {
             return;
         }
         let Some(at) = self.carousel.long_press() else {
@@ -830,8 +949,10 @@ impl HomeShell {
     /// launches nothing, and dragging on picks the icon up.
     fn long_press_cell(&mut self, surface: Surface, key: CellKey) {
         let opening = surface == Surface::Folder && !self.folder.fully_open();
+        // Search's cells have no menu, and neither does the grid below its field.
         if self.covered()
             || !self.touchable(surface)
+            || self.search_shown()
             || opening
             || self.state.current != HomeView::Applications
             || self.carousel.pressed_at().is_none()
@@ -865,7 +986,7 @@ impl HomeShell {
 
     /// Opens the current view's home menu at `anchor`, or centred, if it has one (HOME-10).
     fn open_menu(&mut self, anchor: Option<(f64, f64)>) {
-        if self.covered() {
+        if self.covered() || self.search_shown() {
             return;
         }
         let editing = self.editing_shown();
@@ -900,9 +1021,11 @@ impl HomeShell {
         self.settle(release);
         self.press.finish();
         self.lift.cancel();
+        self.search.end_gesture();
         self.state.menu = None;
         self.close_app_menu();
         self.close_folder();
+        self.close_search();
         self.settings.dispatch(SettingsIntent::Refresh);
         self.state.settings_open = true;
         self.state.settings_group = group;
@@ -1009,6 +1132,7 @@ impl HomeShell {
         self.lift.cancel();
         if view != HomeView::Applications {
             self.close_folder();
+            self.close_search();
             if self.editing_shown() {
                 self.apps.dispatch(AppsIntent::ExitEditMode);
             }
@@ -1025,7 +1149,7 @@ impl HomeShell {
 #[cfg(test)]
 mod tests {
     use meegone_apps_data::{Layout as SavedLayout, LayoutEntry, LayoutStore};
-    use meegone_apps_state::{FolderId, GridItem, GridLayout};
+    use meegone_apps_state::{Bounds, FolderId, GridItem, GridLayout};
     use meegone_core_data::fakes::{FakeApps, Fakes, app, app_id};
     use meegone_core_data::{
         App, AppId, AppsAdapter, DataError, Profile, RecentUse, Rect, Shortcut,
@@ -1266,6 +1390,10 @@ mod tests {
 
         fn default_apps(&self) -> Vec<String> {
             self.0.default_apps()
+        }
+
+        fn search_key(&self, text: &str) -> String {
+            self.0.search_key(text)
         }
 
         fn launch(&self, _app: &AppId, _from: Option<Rect>) -> Result<(), DataError> {
@@ -2850,5 +2978,377 @@ mod tests {
         assert!(matches!(shell.apps().health(), Health::Failed(_)));
         assert!(!shell.state().folder_open);
         assert!(shell.state().menu_offered());
+    }
+
+    /// The search field's band: 160 px tall, below 100 px of safe area.
+    const BAND: Bounds = Bounds {
+        left: 0.0,
+        top: 100.0,
+        right: 1000.0,
+        bottom: 260.0,
+    };
+
+    /// Camera, Mail, Maps and Phone in [`GRID`], with the search field laid out above them.
+    fn ready_to_search(fakes: &Fakes) -> HomeShell {
+        let mut shell = with_four(fakes);
+        shell.dispatch(ShellIntent::Apps(AppsIntent::SearchLayout {
+            layout: GRID,
+            band: BAND,
+        }));
+        shell
+    }
+
+    /// A slow drag from `from` to `to` px down the views from `start` ms, without lifting.
+    /// Returns when it ended.
+    fn drag_down(shell: &mut HomeShell, from: f64, to: f64, start: u64) -> u64 {
+        pointer_at(shell, PointerKind::Down, 500.0, from, start);
+        let mut t = start;
+        for step in 1..=20 {
+            t += 16;
+            let y = from + (to - from) * f64::from(step) / 20.0;
+            pointer_at(shell, PointerKind::Move, 500.0, y, t);
+        }
+        t
+    }
+
+    /// [`drag_down`], then a pause, so the finger carries no speed, and lifting it.
+    fn pull_field(shell: &mut HomeShell, from: f64, to: f64, start: u64) -> u64 {
+        let t = drag_down(shell, from, to, start);
+        pointer_at(shell, PointerKind::Move, 500.0, to, t + 50);
+        pointer_at(shell, PointerKind::Up, 500.0, to, t + 100);
+        t + 100
+    }
+
+    /// Draws frames every 8 ms from `from_ms` until the search field rests.
+    fn field_rests(shell: &mut HomeShell, from_ms: u64) -> u64 {
+        let mut t = from_ms;
+        while shell.state().search.animating {
+            t += 8;
+            shell.dispatch(ShellIntent::Frame(ms(t)));
+            assert!(t < from_ms + 5_000, "the field never rested");
+        }
+        t
+    }
+
+    fn query(shell: &HomeShell) -> Option<String> {
+        shell.apps().state().search.clone()
+    }
+
+    #[test]
+    fn pulling_down_at_the_top_of_applications_opens_search() {
+        // SRCH-01, ANIM-16: the field shows in step with the pull, and the gesture is the
+        // shell's, so the grid below gets none of it.
+        let fakes = Fakes::default();
+        let mut shell = ready_to_search(&fakes);
+        assert_eq!(shell.state().search, SearchState::default());
+
+        let t = drag_down(&mut shell, 400.0, 400.0 + 16.0 + 100.0, 0);
+        assert!(shell.state().search.pulling);
+        assert!((shell.state().search.reveal_px - 100.0).abs() < 1e-9);
+        assert_eq!(query(&shell), None);
+        pointer_at(
+            &mut shell,
+            PointerKind::Move,
+            500.0,
+            400.0 + 16.0 + 200.0,
+            t + 16,
+        );
+        pointer_at(
+            &mut shell,
+            PointerKind::Move,
+            500.0,
+            400.0 + 16.0 + 200.0,
+            t + 66,
+        );
+        pointer_at(
+            &mut shell,
+            PointerKind::Up,
+            500.0,
+            400.0 + 16.0 + 200.0,
+            t + 116,
+        );
+
+        let state = shell.state();
+        assert!(state.search.open && !state.search.pulling && state.search.animating);
+        assert_eq!(query(&shell).as_deref(), Some(""));
+        field_rests(&mut shell, t + 116);
+        assert_eq!(shell.state().search.reveal_px, 160.0);
+        // Neither the views nor a long-press moved.
+        assert_eq!(shell.state().carousel.offset, 0.0);
+        assert!(shell.state().menu.is_none());
+    }
+
+    #[test]
+    fn a_pull_short_of_the_whole_field_springs_back_and_opens_nothing() {
+        let fakes = Fakes::default();
+        let mut shell = ready_to_search(&fakes);
+
+        let t = pull_field(&mut shell, 400.0, 400.0 + 16.0 + 120.0, 0);
+
+        assert!(!shell.state().search.open);
+        field_rests(&mut shell, t);
+        assert_eq!(shell.state().search.reveal_px, 0.0);
+        assert_eq!(query(&shell), None);
+    }
+
+    #[test]
+    fn a_pull_counts_only_at_the_top_of_applications_with_nothing_open() {
+        // SRCH-01
+        let cases: [fn(&mut HomeShell); 5] = [
+            |shell| shell.dispatch(ShellIntent::Apps(AppsIntent::Scrolled(300.0))),
+            |shell| shell.dispatch(ShellIntent::Apps(AppsIntent::EnterEditMode)),
+            |shell| shell.dispatch(ShellIntent::OpenMenu),
+            |shell| shell.dispatch(ShellIntent::OpenSettings),
+            |shell| go(shell, Direction::Next),
+        ];
+        for case in cases {
+            let fakes = Fakes::default();
+            let mut shell = ready_to_search(&fakes);
+            case(&mut shell);
+
+            drag_down(&mut shell, 400.0, 800.0, 0);
+
+            assert!(!shell.state().search.pulling);
+            assert_eq!(shell.state().search.reveal_px, 0.0);
+        }
+
+        // Nor before the host has laid the field out.
+        let fakes = Fakes::default();
+        let mut shell = with_four(&fakes);
+        drag_down(&mut shell, 400.0, 800.0, 0);
+        assert!(!shell.state().search.pulling);
+    }
+
+    #[test]
+    fn a_pull_lets_the_pressed_icon_go_and_no_long_press_follows() {
+        // ANIM-10, HOME-10
+        let fakes = Fakes::default();
+        let mut shell = ready_to_search(&fakes);
+        pointer_at(&mut shell, PointerKind::Down, 500.0, 400.0, 0);
+        shell.dispatch(ShellIntent::Press {
+            surface: Surface::Grid,
+            item: 2,
+            at: ms(0),
+        });
+        assert_eq!(shell.state().press.item, Some(2));
+
+        pointer_at(&mut shell, PointerKind::Move, 500.0, 450.0, 16);
+        shell.dispatch(ShellIntent::LongPress);
+
+        assert!(shell.state().search.pulling);
+        assert!(shell.state().press.animating);
+        assert!(shell.state().menu.is_none());
+    }
+
+    #[test]
+    fn open_search_keeps_the_views_still_and_offers_no_menus() {
+        // SRCH-01: a sideways drag over the field or the results never swipes the views.
+        let fakes = Fakes::default();
+        let mut shell = ready_to_search(&fakes);
+        shell.dispatch(ShellIntent::Apps(AppsIntent::OpenSearch));
+        assert!(!shell.state().menu_offered());
+
+        pointer_at(&mut shell, PointerKind::Down, 300.0, 600.0, 0);
+        pointer_at(&mut shell, PointerKind::Move, 700.0, 600.0, 50);
+        assert!(!shell.state().carousel.dragging);
+        assert_eq!(shell.state().carousel.offset, 0.0);
+        pointer_at(&mut shell, PointerKind::Up, 700.0, 600.0, 100);
+
+        pointer_at(&mut shell, PointerKind::Down, 300.0, 600.0, 1_000);
+        shell.dispatch(ShellIntent::LongPress);
+        assert!(shell.state().menu.is_none());
+        shell.dispatch(ShellIntent::LongPressCell {
+            surface: Surface::Grid,
+            key: CellKey::App(app_id("mail")),
+        });
+        assert!(!shell.state().app_menu_open);
+        shell.dispatch(ShellIntent::OpenMenu);
+        assert!(shell.state().menu.is_none());
+    }
+
+    #[test]
+    fn while_search_is_open_its_results_take_presses_or_the_grid_below_an_empty_field() {
+        let fakes = Fakes::default();
+        let mut shell = ready_to_search(&fakes);
+        shell.dispatch(ShellIntent::Apps(AppsIntent::OpenSearch));
+        let press = |shell: &mut HomeShell, surface: Surface| {
+            shell.dispatch(ShellIntent::Release(ms(0)));
+            come_to_rest(shell, 0);
+            shell.dispatch(ShellIntent::Press {
+                surface,
+                item: 0,
+                at: ms(2_000),
+            });
+            shell.state().press.item.is_some()
+        };
+
+        assert!(press(&mut shell, Surface::Grid));
+        shell.dispatch(ShellIntent::Apps(AppsIntent::Search("ma".into())));
+        assert!(!press(&mut shell, Surface::Grid));
+        assert!(press(&mut shell, Surface::Search));
+        assert!(!press(&mut shell, Surface::Folder));
+    }
+
+    #[test]
+    fn back_and_home_close_search_and_the_field_springs_away() {
+        // SRCH-04, HOME-07, HOME-08
+        let ends: [fn(&mut HomeShell); 4] = [
+            |shell| shell.dispatch(ShellIntent::Back),
+            |shell| shell.dispatch(ShellIntent::Home),
+            |shell| shell.dispatch(ShellIntent::Swipe(Direction::Next)),
+            |shell| shell.dispatch(ShellIntent::OpenSettings),
+        ];
+        for end in ends {
+            let fakes = Fakes::default();
+            let mut shell = ready_to_search(&fakes);
+            shell.dispatch(ShellIntent::Apps(AppsIntent::OpenSearch));
+            shell.dispatch(ShellIntent::Apps(AppsIntent::Search("ma".into())));
+            let t = field_rests(&mut shell, 0);
+            assert_eq!(shell.state().search.reveal_px, 160.0);
+
+            end(&mut shell);
+
+            assert_eq!(query(&shell), None);
+            assert!(!shell.state().search.open && shell.state().search.animating);
+            field_rests(&mut shell, t);
+            assert_eq!(shell.state().search.reveal_px, 0.0);
+        }
+    }
+
+    #[test]
+    fn home_closes_search_first_then_scrolls_to_the_top() {
+        // HOME-07, SRCH-04: a screen reader can open search anywhere in the grid, and closing it
+        // leaves the grid where it was.
+        let fakes = Fakes::default();
+        let mut shell = ready_to_search(&fakes);
+        shell.dispatch(ShellIntent::Apps(AppsIntent::Scrolled(600.0)));
+        shell.dispatch(ShellIntent::Apps(AppsIntent::OpenSearch));
+        assert!(shell.state().search.open);
+
+        shell.dispatch(ShellIntent::Home);
+        assert_eq!(query(&shell), None);
+        assert_eq!(shell.apps().state().scroll_px, 600.0);
+        assert_eq!(shell.state().current, HomeView::Applications);
+
+        shell.dispatch(ShellIntent::Home);
+        assert_eq!(shell.apps().state().scroll_px, 0.0);
+    }
+
+    #[test]
+    fn pushing_the_field_away_with_nothing_typed_closes_search() {
+        // SRCH-04: "scrolling down past the field".
+        let fakes = Fakes::default();
+        let mut shell = ready_to_search(&fakes);
+        let t = pull_field(&mut shell, 400.0, 400.0 + 16.0 + 200.0, 0);
+        let t = field_rests(&mut shell, t);
+        assert_eq!(query(&shell).as_deref(), Some(""));
+
+        let t = pull_field(&mut shell, 900.0, 900.0 - 16.0 - 200.0, t + 100);
+
+        assert_eq!(query(&shell), None);
+        field_rests(&mut shell, t);
+        assert_eq!(shell.state().search.reveal_px, 0.0);
+    }
+
+    #[test]
+    fn with_a_query_typed_the_results_scroll_and_the_field_stays() {
+        let fakes = Fakes::default();
+        let mut shell = ready_to_search(&fakes);
+        shell.dispatch(ShellIntent::Apps(AppsIntent::OpenSearch));
+        shell.dispatch(ShellIntent::Apps(AppsIntent::Search("ma".into())));
+        let t = field_rests(&mut shell, 0);
+
+        drag_down(&mut shell, 900.0, 500.0, t);
+
+        assert!(!shell.state().search.pulling);
+        assert_eq!(shell.state().search.reveal_px, 160.0);
+        assert_eq!(query(&shell).as_deref(), Some("ma"));
+    }
+
+    #[test]
+    fn launching_from_search_springs_the_field_away() {
+        // SRCH-03
+        let fakes = Fakes::default();
+        let mut shell = ready_to_search(&fakes);
+        shell.dispatch(ShellIntent::Apps(AppsIntent::OpenSearch));
+        shell.dispatch(ShellIntent::Apps(AppsIntent::Search("ma".into())));
+
+        shell.dispatch(ShellIntent::Apps(AppsIntent::SubmitSearch { from: None }));
+
+        assert_eq!(*fakes.apps.launched.lock().unwrap(), [app_id("mail")]);
+        assert!(!shell.state().search.open);
+    }
+
+    #[test]
+    fn a_new_layout_keeps_search_open_and_ends_a_pull() {
+        // COMP-03
+        let fakes = Fakes::default();
+        let mut shell = ready_to_search(&fakes);
+        shell.dispatch(ShellIntent::Apps(AppsIntent::OpenSearch));
+        shell.dispatch(ShellIntent::Apps(AppsIntent::Search("ma".into())));
+        shell.dispatch(ShellIntent::Layout(Layout {
+            width_px: 1600.0,
+            density: 2.0,
+            touch_slop_px: 16.0,
+            rtl: false,
+        }));
+        assert_eq!(query(&shell).as_deref(), Some("ma"));
+
+        let fakes = Fakes::default();
+        let mut shell = ready_to_search(&fakes);
+        drag_down(&mut shell, 400.0, 600.0, 0);
+        assert!(shell.state().search.pulling);
+        shell.dispatch(ShellIntent::Layout(Layout {
+            width_px: 1600.0,
+            density: 2.0,
+            touch_slop_px: 16.0,
+            rtl: false,
+        }));
+        assert!(!shell.state().search.pulling);
+        assert!(!shell.state().search.open);
+    }
+
+    #[test]
+    fn a_failing_applications_never_leaves_search_open() {
+        // ARCH-09
+        let fakes = Fakes::default();
+        let mut platform = fakes.platform();
+        let broken = FakeApps::default();
+        *broken.apps.lock().unwrap() = vec![app("maps", "Maps"), app("mail", "Mail")];
+        platform.apps = Arc::new(BrokenLauncher(broken));
+        let mut shell = HomeShell::compose(platform);
+        shell.dispatch(ShellIntent::Apps(AppsIntent::OpenSearch));
+        shell.dispatch(ShellIntent::Apps(AppsIntent::Search("ma".into())));
+        assert!(shell.state().search.open);
+        assert!(!shell.state().menu_offered());
+
+        shell.dispatch(ShellIntent::Apps(AppsIntent::SubmitSearch { from: None }));
+
+        assert!(matches!(shell.apps().health(), Health::Failed(_)));
+        assert!(!shell.state().search.open);
+        assert!(shell.state().menu_offered());
+    }
+
+    #[test]
+    fn a_screen_reader_opens_search_only_where_it_is_offered() {
+        // A11Y-05
+        let fakes = Fakes::default();
+        let mut shell = ready_to_search(&fakes);
+        assert!(shell.state().search_offered());
+
+        go(&mut shell, Direction::Next);
+        assert!(!shell.state().search_offered());
+        shell.dispatch(ShellIntent::Apps(AppsIntent::OpenSearch));
+        assert_eq!(query(&shell), None);
+
+        go(&mut shell, Direction::Previous);
+        shell.dispatch(ShellIntent::OpenSettings);
+        shell.dispatch(ShellIntent::Apps(AppsIntent::OpenSearch));
+        assert_eq!(query(&shell), None);
+
+        shell.dispatch(ShellIntent::Back);
+        shell.dispatch(ShellIntent::Apps(AppsIntent::OpenSearch));
+        assert_eq!(query(&shell).as_deref(), Some(""));
+        assert!(!shell.state().search_offered());
     }
 }

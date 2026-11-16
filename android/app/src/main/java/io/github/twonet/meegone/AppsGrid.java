@@ -20,9 +20,10 @@ import java.util.function.Consumer;
 
 /**
  * A grid of cells that scrolls vertically: the Applications view, with every app and folder and
- * no pages and no dock (APPS-01 to APPS-03, ADR 0010), or an open folder's apps in its panel
- * (FOLD-04, ADR 0015). One class draws both; each is built for its surface, and names it to the
- * Rust app in every call.
+ * no pages and no dock (APPS-01 to APPS-03, ADR 0010), an open folder's apps in its panel
+ * (FOLD-04, ADR 0015), or search's results (SRCH-02, ADR 0016). One class draws all three; each
+ * is built for its surface, and names it to the Rust app in every call. Search's results have
+ * no menus and are never dragged.
  *
  * <p>The Rust app decides what it shows, as for the rest of the home views (ADR 0006). {@link
  * HomeViews} passes it the frame's slots for its surface. When the cells' revision changes, it
@@ -59,6 +60,7 @@ final class AppsGrid extends ScrollView {
     /** The surfaces, as the Rust app numbers them. */
     static final int GRID = 0;
     static final int FOLDER = 1;
+    static final int SEARCH = 2;
 
     // The fields of one cell in nativeAppsCells, mirrored in cell_fields in src/android.rs.
     private static final int CELL_FIELDS = 8;
@@ -109,7 +111,10 @@ final class AppsGrid extends ScrollView {
     private final int iconPx;
     private final int iconTopPx;
     private final int[] laidOut = new int[2];
-    /** For the open folder's grid: where its panel is, from the screen's top left. */
+    /**
+     * For the open folder's grid: where its panel is, from the screen's top left. For search's
+     * results: where the search field's band is (ANIM-16).
+     */
     private final Rect panel = new Rect();
 
     private boolean loaded;
@@ -175,7 +180,7 @@ final class AppsGrid extends ScrollView {
         reportAgain();
     }
 
-    /** The open folder's panel is at {@code bounds} on screen. */
+    /** The open folder's panel, or the search field's band, is at {@code bounds} on screen. */
     void setPanel(Rect bounds) {
         if (!bounds.equals(panel)) {
             panel.set(bounds);
@@ -454,10 +459,10 @@ final class AppsGrid extends ScrollView {
         agreedScroll = scrollPx;
         if (!isLaidOut() || cells.getHeight() == 0) {
             pendingScroll = scrollPx;
-        } else if (scrollPx == 0 && lifted == null && isShown()
+        } else if (scrollPx == 0 && lifted == null && surface != SEARCH && isShown()
                 && ValueAnimator.areAnimatorsEnabled()) {
             // Home scrolls back to the top (HOME-07). A dragged icon's auto-scroll reaching it
-            // follows the frame exactly instead.
+            // follows the frame exactly instead, and a new query's results start at their top.
             smoothScrollTo(0, 0);
         } else {
             scrollTo(0, scrollPx);

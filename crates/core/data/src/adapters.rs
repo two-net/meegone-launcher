@@ -31,6 +31,9 @@ pub trait AppsAdapter: Send + Sync {
     /// The packages of the default phone, messaging, browser and camera apps, in that order,
     /// leaving out any the system doesn't identify (APPS-05).
     fn default_apps(&self) -> Vec<String>;
+    /// `text` folded for search exactly as the catalogue folds each label into
+    /// [`App::search_key`]: accents removed, case folded, spaces collapsed (SRCH-02, L10N-04).
+    fn search_key(&self, text: &str) -> String;
     /// Starts or resumes an app (APPS-10, REC-06). Its window grows from `from`, the tapped icon
     /// or card, with the platform's launch-from-bounds transition (ANIM-08).
     ///

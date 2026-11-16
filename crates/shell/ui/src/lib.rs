@@ -5,8 +5,8 @@
 //! It also tells the host what to draw for the home views in each frame, as a [`HomeFrame`]:
 //! where the carousel's views are, how the view indicator looks, how the content comes back
 //! from an app, the home menu, the Applications grid, the pressed icon, the grid's cells as
-//! apps come, go and move, a cell's long-press menu, the dragged icon, edit mode and the open
-//! folder (ADR 0006 to ADR 0008, ADR 0010, ADR 0012 to ADR 0015).
+//! apps come, go and move, a cell's long-press menu, the dragged icon, edit mode, the open
+//! folder and search (ADR 0006 to ADR 0008, ADR 0010, ADR 0012 to ADR 0016).
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -15,8 +15,8 @@ use std::sync::Arc;
 
 use meegone_apps_ui::AppsView;
 pub use meegone_apps_ui::{
-    AppMenuFrame, AppMenuItem, AppsFrame, Bounds, Cell, CellKey, FolderCellsFrame, FolderId,
-    GridLayout, Surface,
+    AppMenuFrame, AppMenuItem, AppsFrame, Bounds, Cell, CellKey, FolderId, GridLayout, Surface,
+    SurfaceCellsFrame,
 };
 use meegone_core_ui::{Dispatch, Latest, Rgb, Slot, View, tokens};
 use meegone_events_ui::EventsView;
@@ -115,6 +115,29 @@ pub struct FolderFrame {
     pub progress: u16,
 }
 
+/// The search field, and whether its results show (SRCH-01 to SRCH-05, ANIM-16). The results'
+/// cells are in [`AppsFrame::results`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SearchFrame {
+    /// Search is open, or springing open: the field takes the keyboard (SRCH-01). When it turns
+    /// false the keyboard goes and the field empties.
+    pub open: bool,
+    /// How much of the field's band shows, in whole pixels: 0 hidden, the band's height open,
+    /// and a little more while a pull stretches it (ANIM-16). The grid below an empty field
+    /// moves down with it.
+    pub reveal_px: i32,
+    /// A finger is pulling the field, so the content below gets none of the gesture.
+    pub pulling: bool,
+    /// Something is typed: the results show instead of the grid (SRCH-02).
+    pub results_shown: bool,
+    /// Nothing matches what is typed: the host says so (SRCH-05)…
+    pub nothing_found: bool,
+    /// …and offers "Search the web for '…'" if this is set.
+    pub web_offered: bool,
+    /// Applications offers search, so screen readers can open it with an action (A11Y-05).
+    pub offered: bool,
+}
+
 /// The folder whose new name the host asks the user for (FOLD-03).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RenameFrame {
@@ -182,6 +205,8 @@ pub struct HomeFrame {
     pub renaming: Option<RenameFrame>,
     /// Edit mode and its motion (APPS-12, ANIM-12).
     pub edit: EditFrame,
+    /// The search field and its results (SRCH-01, ANIM-16).
+    pub search: SearchFrame,
     /// Something is still moving or fading, so the host should draw another frame.
     pub animating: bool,
     /// The home menu, while it is open (HOME-10).
@@ -310,6 +335,17 @@ impl ShellView {
             cell: in_grid(&CellKey::Folder(folder)),
         });
         let mode = &state.mode;
+        // A failed Applications never shows search (ARCH-09): the shell's field closes with it.
+        let open = state.search.open;
+        let search = SearchFrame {
+            open,
+            reveal_px: state.search.reveal_px.round() as i32,
+            pulling: state.search.pulling,
+            results_shown: open && apps.has_query,
+            nothing_found: open && apps.nothing_found,
+            web_offered: open && apps.nothing_found && apps.web_search_offered,
+            offered: state.search_offered(),
+        };
         HomeFrame {
             pages: HomeView::ALL.map(|view| state.page_offset_px(view).round() as i32),
             indicator_alpha: (state.carousel.indicator.clamp(0.0, 1.0) * 255.0).round() as u8,
@@ -341,13 +377,15 @@ impl ShellView {
                 first_row: u16::try_from(mode.first_row).unwrap_or(u16::MAX),
                 badges: mode.badges.map(scale),
             },
+            search,
             animating: state.carousel.animating
                 || state.return_home.animating
                 || state.press.animating
                 || state.grid_change.animating
                 || state.lift.animating
                 || mode.animating
-                || state.folder.animating,
+                || state.folder.animating
+                || state.search.animating,
             menu: state.menu.map(|menu| MenuFrame {
                 items: menu.items,
                 anchor: menu

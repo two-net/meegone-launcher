@@ -1,15 +1,17 @@
 //! Applications state (SRS 4.2): the grid, its layout and scroll position, an app's or a folder's
-//! long-press menu, edit mode with the drag's draft, and the open folder. [`reconcile`] keeps
-//! the layout in step with the installed apps (ADR 0012), and [`folders`] holds the pure edits a
-//! drag and the folder rules make (ADR 0014, ADR 0015).
+//! long-press menu, edit mode with the drag's draft, the open folder, and search. [`reconcile`]
+//! keeps the layout in step with the installed apps (ADR 0012), [`folders`] holds the pure edits
+//! a drag and the folder rules make (ADR 0014, ADR 0015), and [`search`] ranks the apps that
+//! match a query (ADR 0016).
 
 pub mod folders;
 mod reconcile;
+pub mod search;
 
 use std::sync::Arc;
 
 use meegone_apps_data::{Layout, LayoutStore, SavedLayout};
-use meegone_core_data::{AppsAdapter, DataError, Profile};
+use meegone_core_data::{AppsAdapter, DataError, Profile, SystemConfigAdapter};
 use meegone_core_state::{App, AppId, Rect, Shortcut, StateHolder};
 
 pub use meegone_apps_data::FolderId;
@@ -76,12 +78,14 @@ pub enum CellKey {
     Folder(FolderId),
 }
 
-/// Where cells are drawn: the grid, or the open folder's panel (FOLD-04).
+/// Where cells are drawn: the grid, the open folder's panel (FOLD-04), or search's results
+/// (SRCH-02).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Surface {
     #[default]
     Grid,
     Folder,
+    Search,
 }
 
 /// One item of a cell's long-press menu (APPS-11), in the order it shows.
@@ -340,6 +344,20 @@ pub struct AppsState {
     /// How many folders have been made since MeeGone started, so the shell can tick for each
     /// (ANIM-24).
     pub folders_made: u32,
+    /// The query while search is open, as the user typed it, or `None` while it is closed
+    /// (SRCH-01). It is never saved.
+    pub search: Option<String>,
+    /// The apps that match the query, best first, as the results grid shows them (SRCH-02).
+    /// None while the query is empty: the grid shows below the field instead.
+    pub results: Arc<[GridItem]>,
+    /// How the host laid the results grid out, and the band the search field takes above it,
+    /// on screen. The field shows as far as the band is pulled down (ANIM-16).
+    pub results_layout: Option<GridLayout>,
+    pub search_band: Option<Bounds>,
+    /// How far the results grid is scrolled, in pixels. Each new query starts at its top.
+    pub results_scroll_px: f64,
+    /// Whether a query nothing matches offers a web search: a browser is installed (SRCH-05).
+    pub web_search_offered: bool,
     /// The last problem, in plain words. The grid keeps working (REL-01).
     pub problem: Option<String>,
 }
@@ -360,6 +378,12 @@ impl Default for AppsState {
             folder_scroll_px: 0.0,
             renaming: None,
             folders_made: 0,
+            search: None,
+            results: Arc::new([]),
+            results_layout: None,
+            search_band: None,
+            results_scroll_px: 0.0,
+            web_search_offered: false,
             problem: None,
         }
     }
@@ -377,11 +401,35 @@ impl AppsState {
         self.folder_items.len().div_ceil(FOLDER_COLUMNS)
     }
 
+    /// How many rows the results grid lays out: as many as its apps need, in the grid's columns
+    /// (SRCH-02).
+    pub fn results_rows(&self) -> usize {
+        let columns = self
+            .results_layout
+            .map_or(self.columns, |layout| layout.columns());
+        self.results.len().div_ceil(columns.max(1))
+    }
+
+    /// Whether search is open with something typed, so its results show instead of the grid.
+    pub fn has_query(&self) -> bool {
+        self.search
+            .as_deref()
+            .is_some_and(|query| !query.trim().is_empty())
+    }
+
+    /// How tall the search field's band is, in px, once the host has laid it out (ANIM-16).
+    pub fn search_band_px(&self) -> Option<f64> {
+        self.search_band
+            .map(|band| band.bottom - band.top)
+            .filter(|height| *height > 0.0)
+    }
+
     /// The cells `surface` shows.
     pub fn cells(&self, surface: Surface) -> &Arc<[GridItem]> {
         match surface {
             Surface::Grid => &self.items,
             Surface::Folder => &self.folder_items,
+            Surface::Search => &self.results,
         }
     }
 
@@ -390,6 +438,7 @@ impl AppsState {
         match surface {
             Surface::Grid => self.layout,
             Surface::Folder => self.folder_layout,
+            Surface::Search => self.results_layout,
         }
     }
 
@@ -398,6 +447,7 @@ impl AppsState {
         match surface {
             Surface::Grid => self.scroll_px,
             Surface::Folder => self.folder_scroll_px,
+            Surface::Search => self.results_scroll_px,
         }
     }
 
@@ -406,6 +456,7 @@ impl AppsState {
         match surface {
             Surface::Grid => self.rows(),
             Surface::Folder => self.folder_rows(),
+            Surface::Search => self.results_rows(),
         }
     }
 
@@ -500,10 +551,29 @@ pub enum AppsIntent {
     FolderScrolled(f64),
     /// Home on Applications with nothing open (HOME-07).
     ScrollToTop,
+    /// Opens search with nothing typed, as pulling the field down far enough or a screen
+    /// reader's "Search apps" does (SRCH-01, A11Y-05). Not in edit mode or with a folder open.
+    /// An open menu closes.
+    OpenSearch,
+    /// The user typed: the results follow (SRCH-02). Ignored while search is closed.
+    Search(String),
+    /// The keyboard's action key: launches the first result, its window growing from `from`,
+    /// its icon (SRCH-03). With no results, it searches the web if that is offered (SRCH-05).
+    SubmitSearch { from: Option<Rect> },
+    /// "Search the web for '…'", offered when nothing matches (SRCH-05).
+    SearchWeb,
+    /// Closes search: the grid shows again, where it was (SRCH-04).
+    CloseSearch,
+    /// The host laid the results grid out, below the search field's `band` (ANIM-16).
+    SearchLayout { layout: GridLayout, band: Bounds },
+    /// The results grid was scrolled to this many pixels from its top.
+    ResultsScrolled(f64),
 }
 
 pub struct AppsHolder {
     apps: Arc<dyn AppsAdapter>,
+    /// Whether a browser is installed, and web search (SRCH-05).
+    system: Arc<dyn SystemConfigAdapter>,
     store: Arc<dyn LayoutStore>,
     /// The layout, kept once the store has been read. Applications is its only writer, so the
     /// file is read at start, or until a read succeeds, and written after each change.
@@ -515,18 +585,26 @@ pub struct AppsHolder {
     /// In edit mode, the layout as the drag in progress has changed it, shown but not saved
     /// until it is dropped (APPS-12, FOLD-05). A refresh keeps it.
     draft: Option<Layout>,
+    /// The query, folded by the platform as the labels are (SRCH-02, L10N-04).
+    query_key: String,
     state: AppsState,
 }
 
 impl AppsHolder {
-    pub fn new(apps: Arc<dyn AppsAdapter>, layout: Arc<dyn LayoutStore>) -> Self {
+    pub fn new(
+        apps: Arc<dyn AppsAdapter>,
+        system: Arc<dyn SystemConfigAdapter>,
+        layout: Arc<dyn LayoutStore>,
+    ) -> Self {
         Self {
             apps,
+            system,
             store: layout,
             layout: None,
             unsaved: false,
             installed: Vec::new(),
             draft: None,
+            query_key: String::new(),
             state: AppsState::default(),
         }
     }
@@ -621,7 +699,8 @@ impl AppsHolder {
         self.show_cells(items);
     }
 
-    /// Takes on `items`, and the open folder's apps among them. A folder that has gone closes.
+    /// Takes on `items`, the open folder's apps among them, and the results among them. A
+    /// folder that has gone closes.
     fn show_cells(&mut self, items: Vec<GridItem>) {
         if *self.state.items != *items {
             self.state.items = items.into();
@@ -652,6 +731,95 @@ impl AppsHolder {
         {
             self.state.renaming = None;
         }
+        self.show_results();
+    }
+
+    /// Ranks the grid's apps for the query (SRCH-02). Installs and removals reach the results
+    /// with the cells. They are replaced only when they change.
+    fn show_results(&mut self) {
+        let results = match self.state.search {
+            Some(_) => search::rank(&self.state.items, &self.query_key),
+            None => Vec::new(),
+        };
+        if *self.state.results != *results {
+            self.state.results = results.into();
+        }
+    }
+
+    /// SRCH-01: opens search with nothing typed, unless edit mode or a folder is open. It reads
+    /// whether a browser is installed each time, for the web search offer (SRCH-05).
+    fn open_search(&mut self) {
+        if self.state.edit_mode || self.state.open_folder.is_some() || self.state.search.is_some() {
+            return;
+        }
+        self.state.menu = None;
+        self.state.search = Some(String::new());
+        self.state.results_scroll_px = 0.0;
+        self.state.web_search_offered = self.system.has_browser();
+        self.query_key.clear();
+        self.show_results();
+    }
+
+    /// SRCH-02: the platform folds the query as it folded the labels, and the results follow,
+    /// from their top. Ignored while search is closed.
+    fn search(&mut self, query: String) {
+        if self
+            .state
+            .search
+            .as_ref()
+            .is_none_or(|typed| *typed == query)
+        {
+            return;
+        }
+        self.query_key = self.apps.search_key(&query);
+        self.state.search = Some(query);
+        self.state.results_scroll_px = 0.0;
+        self.show_results();
+    }
+
+    /// SRCH-04: the grid shows again, where it was; search never moves it. Returns whether
+    /// search was open.
+    fn close_search(&mut self) -> bool {
+        let was_open = self.state.search.take().is_some();
+        if was_open {
+            self.query_key.clear();
+            self.state.results_scroll_px = 0.0;
+            self.show_results();
+        }
+        was_open
+    }
+
+    /// SRCH-03: the first result launches. With none, the web is searched if that is offered
+    /// (SRCH-05).
+    fn submit_search(&mut self, from: Option<Rect>) {
+        if self.state.search.is_none() {
+            return;
+        }
+        match self.state.results.first() {
+            Some(GridItem::App { app, .. }) => {
+                let id = app.id.clone();
+                self.launch(&id, from);
+            }
+            _ => self.search_web(),
+        }
+    }
+
+    /// SRCH-05: only when the query matches nothing and a browser is installed. The device's
+    /// default search handler takes the query; search closes, as after a launch.
+    fn search_web(&mut self) {
+        let Some(query) = self.state.search.as_deref().map(str::trim) else {
+            return;
+        };
+        if query.is_empty() || !self.state.results.is_empty() || !self.state.web_search_offered {
+            return;
+        }
+        match self.system.web_search(query) {
+            Ok(()) => {
+                self.state.problem = None;
+                self.close_search();
+            }
+            Err(error) => self.state.problem = Some(error.to_string()),
+        }
     }
 
     /// Whether the grid shows `key`, in a cell of its own or, for an app, in a folder.
@@ -674,6 +842,8 @@ impl AppsHolder {
             .map(|error| error.to_string());
         if self.state.problem.is_none() {
             self.opened(app);
+            // Coming back shows the grid, not an old query (SRCH-04).
+            self.close_search();
         }
     }
 
@@ -724,6 +894,8 @@ impl AppsHolder {
         if self.state.open_folder != Some(folder) {
             self.state.folder_scroll_px = 0.0;
         }
+        // A folder tapped in the grid below an empty search field opens instead.
+        self.close_search();
         self.state.open_folder = Some(folder);
         self.show();
     }
@@ -767,6 +939,7 @@ impl AppsHolder {
                     .map(AppMenuItem::Shortcut),
             );
         }
+        self.close_search();
         self.state.menu = Some(Arc::new(AppMenu { item: key, items }));
     }
 
@@ -920,6 +1093,7 @@ impl StateHolder for AppsHolder {
             AppsIntent::ChooseMenuItem(item) => self.choose(item),
             AppsIntent::EnterEditMode => {
                 self.state.menu = None;
+                self.close_search();
                 self.state.edit_mode = true;
             }
             AppsIntent::ExitEditMode => {
@@ -989,12 +1163,30 @@ impl StateHolder for AppsHolder {
                 }
             }
             AppsIntent::ScrollToTop => self.state.scroll_px = 0.0,
+            AppsIntent::OpenSearch => self.open_search(),
+            AppsIntent::Search(query) => self.search(query),
+            AppsIntent::SubmitSearch { from } => self.submit_search(from),
+            AppsIntent::SearchWeb => self.search_web(),
+            AppsIntent::CloseSearch => {
+                self.close_search();
+            }
+            AppsIntent::SearchLayout { layout, band } => {
+                if layout.is_valid() && band.is_valid() {
+                    self.state.results_layout = Some(layout);
+                    self.state.search_band = Some(band);
+                }
+            }
+            AppsIntent::ResultsScrolled(px) => {
+                if px.is_finite() {
+                    self.state.results_scroll_px = px.max(0.0);
+                }
+            }
         }
     }
 
-    /// HOME-08: the menu, then the open folder, then edit mode.
+    /// HOME-08: the menu, then the open folder, then search (SRCH-04), then edit mode.
     fn on_back(&mut self) -> bool {
-        if self.state.menu.take().is_some() || self.close_folder() {
+        if self.state.menu.take().is_some() || self.close_folder() || self.close_search() {
             return true;
         }
         self.exit_edit_mode()
@@ -1011,7 +1203,7 @@ mod tests {
     use super::*;
 
     fn holder(fakes: &Fakes, layout: &Arc<PersistentLayoutStore>) -> AppsHolder {
-        let mut holder = AppsHolder::new(fakes.apps.clone(), layout.clone());
+        let mut holder = AppsHolder::new(fakes.apps.clone(), fakes.system.clone(), layout.clone());
         holder.handle(AppsIntent::Refresh);
         holder
     }
@@ -2627,5 +2819,355 @@ mod tests {
             let cell = width_dp / columns_for(width_dp) as f64;
             assert_eq!(columns_for(4.0 * cell), FOLDER_COLUMNS, "{width_dp} dp");
         }
+    }
+
+    fn searching(fakes: &Fakes) -> AppsHolder {
+        install(
+            fakes,
+            &[
+                ("gmail", "Gmail"),
+                ("mail", "Mail"),
+                ("maps", "Maps"),
+                ("cafe", "Café"),
+            ],
+        );
+        let mut holder = holder(fakes, &layout_store());
+        holder.handle(AppsIntent::OpenSearch);
+        holder
+    }
+
+    fn results(state: &AppsState) -> Vec<&str> {
+        state.results.iter().map(GridItem::label).collect()
+    }
+
+    #[test]
+    fn search_opens_empty_and_its_results_follow_each_keystroke() {
+        // SRCH-01, SRCH-02
+        let fakes = Fakes::default();
+        let mut holder = searching(&fakes);
+        assert_eq!(holder.state().search.as_deref(), Some(""));
+        assert!(!holder.state().has_query());
+        assert!(holder.state().results.is_empty());
+
+        holder.handle(AppsIntent::Search("M".into()));
+        assert_eq!(results(holder.state()), ["Mail", "Maps", "Gmail"]);
+        holder.handle(AppsIntent::Search("Ma".into()));
+        assert_eq!(results(holder.state()), ["Mail", "Maps", "Gmail"]);
+        holder.handle(AppsIntent::Search("Map".into()));
+        assert_eq!(results(holder.state()), ["Maps"]);
+        assert!(holder.state().has_query());
+
+        // The platform folded each query as it folds the labels (L10N-04).
+        assert_eq!(*fakes.apps.search_keys.lock().unwrap(), ["M", "Ma", "Map"]);
+        holder.handle(AppsIntent::Search("CAFE".into()));
+        assert_eq!(results(holder.state()), ["Café"]);
+    }
+
+    #[test]
+    fn the_same_query_again_changes_nothing() {
+        let fakes = Fakes::default();
+        let mut holder = searching(&fakes);
+        holder.handle(AppsIntent::Search("ma".into()));
+        holder.handle(AppsIntent::ResultsScrolled(300.0));
+        let before = holder.state().results.clone();
+
+        holder.handle(AppsIntent::Search("ma".into()));
+
+        assert!(Arc::ptr_eq(&before, &holder.state().results));
+        assert_eq!(holder.state().results_scroll_px, 300.0);
+        assert_eq!(fakes.apps.search_keys.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn each_new_query_shows_its_results_from_the_top() {
+        let fakes = Fakes::default();
+        let mut holder = searching(&fakes);
+        holder.handle(AppsIntent::Search("m".into()));
+        holder.handle(AppsIntent::ResultsScrolled(300.0));
+        holder.handle(AppsIntent::ResultsScrolled(f64::NAN));
+        assert_eq!(holder.state().scroll_of(Surface::Search), 300.0);
+
+        holder.handle(AppsIntent::Search("ma".into()));
+
+        assert_eq!(holder.state().results_scroll_px, 0.0);
+    }
+
+    #[test]
+    fn typing_with_search_closed_does_nothing() {
+        let fakes = Fakes::default();
+        install(&fakes, &[("mail", "Mail")]);
+        let mut holder = holder(&fakes, &layout_store());
+
+        holder.handle(AppsIntent::Search("ma".into()));
+        holder.handle(AppsIntent::SubmitSearch { from: None });
+
+        assert_eq!(holder.state().search, None);
+        assert!(holder.state().results.is_empty());
+        assert!(fakes.apps.launched.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_results_follow_apps_that_come_and_go() {
+        // APPS-06, APPS-08: a refresh while search is open ranks again.
+        let fakes = Fakes::default();
+        let mut holder = searching(&fakes);
+        holder.handle(AppsIntent::Search("ma".into()));
+        install(&fakes, &[("maps", "Maps"), ("matter", "Matter")]);
+
+        holder.handle(AppsIntent::Refresh);
+
+        assert_eq!(results(holder.state()), ["Maps", "Matter"]);
+    }
+
+    #[test]
+    fn apps_in_folders_are_found_too() {
+        let fakes = Fakes::default();
+        let (_, _, mut holder) = folder_of_two(&fakes);
+        holder.handle(AppsIntent::ExitEditMode);
+        holder.handle(AppsIntent::OpenSearch);
+
+        holder.handle(AppsIntent::Search("ma".into()));
+
+        assert_eq!(results(holder.state()), ["Mail", "Maps"]);
+    }
+
+    #[test]
+    fn the_action_key_launches_the_first_result_from_its_icon_and_closes_search() {
+        // SRCH-03, SRCH-04, ANIM-08: coming back shows the grid where it was.
+        let fakes = Fakes::default();
+        let mut holder = searching(&fakes);
+        holder.handle(AppsIntent::Scrolled(0.0));
+        holder.handle(AppsIntent::Search("ma".into()));
+
+        holder.handle(AppsIntent::SubmitSearch { from: Some(ICON) });
+
+        assert_eq!(*fakes.apps.launched.lock().unwrap(), [app_id("mail")]);
+        assert_eq!(*fakes.apps.launched_from.lock().unwrap(), [Some(ICON)]);
+        assert_eq!(holder.state().search, None);
+        assert!(holder.state().results.is_empty());
+    }
+
+    #[test]
+    fn launching_a_result_closes_search_and_keeps_the_grids_scroll() {
+        // SRCH-04: search never moves the grid, even opened by a screen reader mid-grid.
+        let fakes = Fakes::default();
+        let mut holder = searching(&fakes);
+        holder.handle(AppsIntent::CloseSearch);
+        holder.handle(AppsIntent::Scrolled(640.0));
+        holder.handle(AppsIntent::OpenSearch);
+        holder.handle(AppsIntent::Search("gm".into()));
+
+        holder.handle(AppsIntent::Launch {
+            app: app_id("gmail"),
+            from: None,
+        });
+
+        assert_eq!(holder.state().search, None);
+        assert_eq!(holder.state().scroll_px, 640.0);
+    }
+
+    #[test]
+    fn a_launch_the_system_refuses_keeps_search_open() {
+        let fakes = Fakes::default();
+        let mut holder = searching(&fakes);
+        holder.handle(AppsIntent::Search("ma".into()));
+        *fakes.apps.error.lock().unwrap() = Some(DataError::Failed("Can't open".into()));
+
+        holder.handle(AppsIntent::SubmitSearch { from: None });
+
+        assert_eq!(holder.state().problem.as_deref(), Some("Can't open"));
+        assert_eq!(holder.state().search.as_deref(), Some("ma"));
+    }
+
+    #[test]
+    fn with_nothing_typed_the_action_key_does_nothing() {
+        let fakes = Fakes::default();
+        let mut holder = searching(&fakes);
+        holder.handle(AppsIntent::Search("   ".into()));
+
+        holder.handle(AppsIntent::SubmitSearch { from: None });
+        holder.handle(AppsIntent::SearchWeb);
+
+        assert!(fakes.apps.launched.lock().unwrap().is_empty());
+        assert!(fakes.system.web_searches.lock().unwrap().is_empty());
+        assert!(holder.state().search.is_some());
+    }
+
+    #[test]
+    fn a_query_nothing_matches_offers_a_web_search() {
+        // SRCH-05: the action key and the offer both search with the device's default handler.
+        for intent in [
+            AppsIntent::SubmitSearch { from: None },
+            AppsIntent::SearchWeb,
+        ] {
+            let fakes = Fakes::default();
+            let mut holder = searching(&fakes);
+            assert!(holder.state().web_search_offered);
+            holder.handle(AppsIntent::Search(" zebra crossing ".into()));
+            assert!(holder.state().results.is_empty());
+
+            holder.handle(intent);
+
+            assert_eq!(
+                *fakes.system.web_searches.lock().unwrap(),
+                ["zebra crossing"]
+            );
+            assert_eq!(holder.state().search, None);
+        }
+    }
+
+    #[test]
+    fn the_web_is_searched_only_when_nothing_matches_and_a_browser_is_installed() {
+        // SRCH-05
+        let fakes = Fakes::default();
+        let mut holder = searching(&fakes);
+        holder.handle(AppsIntent::Search("ma".into()));
+        holder.handle(AppsIntent::SearchWeb);
+        assert!(fakes.system.web_searches.lock().unwrap().is_empty());
+
+        let fakes = Fakes::default();
+        *fakes.system.browser.lock().unwrap() = false;
+        let mut holder = searching(&fakes);
+        assert!(!holder.state().web_search_offered);
+        holder.handle(AppsIntent::Search("zebra".into()));
+        holder.handle(AppsIntent::SubmitSearch { from: None });
+        holder.handle(AppsIntent::SearchWeb);
+        assert!(fakes.system.web_searches.lock().unwrap().is_empty());
+        assert_eq!(holder.state().search.as_deref(), Some("zebra"));
+    }
+
+    #[test]
+    fn a_web_search_the_system_refuses_becomes_a_short_message() {
+        let fakes = Fakes::default();
+        let mut holder = searching(&fakes);
+        holder.handle(AppsIntent::Search("zebra".into()));
+        *fakes.system.error.lock().unwrap() = Some(DataError::Unsupported("No search".into()));
+
+        holder.handle(AppsIntent::SearchWeb);
+
+        assert_eq!(holder.state().problem.as_deref(), Some("No search"));
+        assert_eq!(holder.state().search.as_deref(), Some("zebra"));
+    }
+
+    #[test]
+    fn back_closes_the_menu_then_search() {
+        // HOME-08, SRCH-04
+        let fakes = Fakes::default();
+        let mut holder = searching(&fakes);
+        holder.handle(AppsIntent::Search("ma".into()));
+
+        assert!(holder.on_back());
+        assert_eq!(holder.state().search, None);
+        assert!(holder.state().results.is_empty());
+        assert!(!holder.on_back());
+    }
+
+    #[test]
+    fn search_doesnt_open_in_edit_mode_or_over_an_open_folder() {
+        let fakes = Fakes::default();
+        let (_, _, mut holder) = folder_of_two(&fakes);
+        holder.handle(AppsIntent::OpenSearch);
+        assert_eq!(holder.state().search, None);
+
+        holder.handle(AppsIntent::ExitEditMode);
+        let folder = folder_id(holder.state());
+        holder.handle(AppsIntent::OpenFolder(folder));
+        holder.handle(AppsIntent::OpenSearch);
+        assert_eq!(holder.state().search, None);
+    }
+
+    #[test]
+    fn opening_a_folder_a_menu_or_edit_mode_closes_search() {
+        let fakes = Fakes::default();
+        let (_, _, mut holder) = folder_of_two(&fakes);
+        holder.handle(AppsIntent::ExitEditMode);
+        let folder = folder_id(holder.state());
+        let opens: [AppsIntent; 3] = [
+            AppsIntent::OpenFolder(folder),
+            AppsIntent::OpenMenu(CellKey::App(app_id("camera"))),
+            AppsIntent::EnterEditMode,
+        ];
+        for open in opens {
+            holder.handle(AppsIntent::OpenSearch);
+            holder.handle(AppsIntent::Search("ca".into()));
+            assert!(holder.state().search.is_some());
+
+            holder.handle(open);
+
+            assert_eq!(holder.state().search, None);
+            assert!(holder.state().results.is_empty());
+            holder.on_back();
+        }
+    }
+
+    #[test]
+    fn opening_search_closes_the_menu_and_opening_it_again_keeps_the_query() {
+        let fakes = Fakes::default();
+        install(&fakes, &[("mail", "Mail")]);
+        let mut holder = holder(&fakes, &layout_store());
+        holder.handle(AppsIntent::OpenMenu(CellKey::App(app_id("mail"))));
+
+        holder.handle(AppsIntent::OpenSearch);
+        assert!(holder.state().menu.is_none());
+        holder.handle(AppsIntent::Search("ma".into()));
+        holder.handle(AppsIntent::OpenSearch);
+
+        assert_eq!(holder.state().search.as_deref(), Some("ma"));
+        assert_eq!(results(holder.state()), ["Mail"]);
+    }
+
+    #[test]
+    fn the_results_grid_is_reported_with_the_fields_band() {
+        // ANIM-16
+        let fakes = Fakes::default();
+        let mut holder = holder(&fakes, &layout_store());
+        assert_eq!(holder.state().search_band_px(), None);
+        let band = Bounds {
+            left: 0.0,
+            top: 100.0,
+            right: 1080.0,
+            bottom: 298.0,
+        };
+
+        holder.handle(AppsIntent::SearchLayout {
+            layout: phone_grid(),
+            band,
+        });
+
+        let state = holder.state();
+        assert_eq!(state.layout_of(Surface::Search), Some(phone_grid()));
+        assert_eq!(state.search_band_px(), Some(198.0));
+        // Bounds turned inside out change nothing.
+        holder.handle(AppsIntent::SearchLayout {
+            layout: phone_grid(),
+            band: Bounds {
+                bottom: 0.0,
+                ..band
+            },
+        });
+        assert_eq!(holder.state().search_band, Some(band));
+    }
+
+    #[test]
+    fn the_results_grid_has_no_empty_last_row() {
+        let fakes = Fakes::default();
+        let mut holder = searching(&fakes);
+        holder.handle(AppsIntent::SearchLayout {
+            layout: phone_grid(),
+            band: Bounds::default(),
+        });
+        assert_eq!(holder.state().rows_of(Surface::Search), 0);
+
+        holder.handle(AppsIntent::Search("a".into()));
+
+        // Café, Gmail, Mail and Maps fill one row of four.
+        assert_eq!(holder.state().results.len(), 4);
+        assert_eq!(holder.state().rows_of(Surface::Search), 1);
+        assert_eq!(
+            holder
+                .state()
+                .place_of(Surface::Search, &CellKey::App(app_id("maps"))),
+            Some(3)
+        );
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "meegone-apps-state"
-description = "Applications state: the grid, edit mode and folders."
+description = "Applications state: the grid, edit mode, folders and search."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
