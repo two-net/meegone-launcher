@@ -1,4 +1,5 @@
-//! [`SystemConfigAdapter`] on Android: the home-app role and the clock (HOME-01, ONB-04).
+//! [`SystemConfigAdapter`] on Android: the home-app role, the clock (HOME-01, ONB-04) and
+//! whether the system animates the return home (ANIM-09).
 //!
 //! Questions go to the Java `Bridge` object (`android/app/src/main/java/…/Bridge.java`), whose
 //! method names and signatures must stay in step with the ones looked up here. The device
@@ -21,6 +22,8 @@ pub struct AndroidSystem {
     request_default_home: MethodId,
     /// `long utcOffsetMs(long atMs)`
     utc_offset_ms: MethodId,
+    /// `boolean animatesReturnHome()`
+    animates_return_home: MethodId,
 }
 
 impl AndroidSystem {
@@ -35,6 +38,7 @@ impl AndroidSystem {
                 c"()Ljava/lang/String;",
             )?,
             utc_offset_ms: env.method_id(bridge, c"utcOffsetMs", c"(J)J")?,
+            animates_return_home: env.method_id(bridge, c"animatesReturnHome", c"()Z")?,
             bridge: env.global_ref(bridge)?,
         })
     }
@@ -51,6 +55,14 @@ impl SystemConfigAdapter for AndroidSystem {
 
     fn animation_scale(&self) -> f64 {
         1.0 // The system animation speed arrives with #33.
+    }
+
+    /// If the bridge can't answer, the system is taken to animate, so the two never double up.
+    fn animates_return_home(&self) -> bool {
+        self.vm
+            .env()
+            .and_then(|env| env.call_bool(&self.bridge, self.animates_return_home, &[]))
+            .unwrap_or(true)
     }
 
     fn now_ms(&self) -> u64 {

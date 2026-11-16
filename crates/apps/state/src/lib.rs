@@ -1,4 +1,4 @@
-//! Applications state (SRS 4.2): the grid, edit mode and the open folder.
+//! Applications state (SRS 4.2): the grid, its scroll position, edit mode and the open folder.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -31,9 +31,13 @@ impl GridItem {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct AppsState {
     pub items: Vec<GridItem>,
+    /// How far the grid is scrolled from its top, in pixels, as the host reports it. Home sets
+    /// it back to 0 (HOME-07), and it is kept when the system ends MeeGone's process (REL-05).
+    /// The host scrolls its grid to this position whenever it differs from its own (ADR 0007).
+    pub scroll_px: f64,
     pub edit_mode: bool,
     pub open_folder: Option<FolderId>,
     /// The last problem, in plain words. The grid keeps working (REL-01).
@@ -47,6 +51,11 @@ pub enum AppsIntent {
     Launch(AppId),
     EnterEditMode,
     OpenFolder(FolderId),
+    /// The host scrolled the grid to this many pixels from its top, or MeeGone restores where
+    /// it was (REL-05).
+    Scrolled(f64),
+    /// Home on Applications with nothing open (HOME-07).
+    ScrollToTop,
 }
 
 pub struct AppsHolder {
@@ -113,6 +122,12 @@ impl StateHolder for AppsHolder {
             AppsIntent::Launch(app) => self.launch(&app),
             AppsIntent::EnterEditMode => self.state.edit_mode = true,
             AppsIntent::OpenFolder(folder) => self.open_folder(folder),
+            AppsIntent::Scrolled(px) => {
+                if px.is_finite() {
+                    self.state.scroll_px = px.max(0.0);
+                }
+            }
+            AppsIntent::ScrollToTop => self.state.scroll_px = 0.0,
         }
     }
 
@@ -337,5 +352,46 @@ mod tests {
         assert!(holder.on_back());
         assert!(!holder.state().edit_mode);
         assert!(!holder.on_back());
+    }
+
+    #[test]
+    fn the_grid_keeps_the_scroll_position_the_host_reports() {
+        // HOME-07, REL-05
+        let fakes = Fakes::default();
+        let mut holder = holder(&fakes, &layout_store());
+
+        holder.handle(AppsIntent::Scrolled(640.0));
+        assert_eq!(holder.state().scroll_px, 640.0);
+        holder.handle(AppsIntent::Scrolled(f64::NAN));
+        assert_eq!(holder.state().scroll_px, 640.0);
+        holder.handle(AppsIntent::Scrolled(-12.0));
+        assert_eq!(holder.state().scroll_px, 0.0);
+
+        holder.handle(AppsIntent::Scrolled(300.0));
+        holder.handle(AppsIntent::ScrollToTop);
+        assert_eq!(holder.state().scroll_px, 0.0);
+    }
+
+    #[test]
+    fn closing_a_folder_keeps_the_scroll_position() {
+        // HOME-07: the folder closes and Applications stays where it was.
+        let fakes = Fakes::default();
+        let layout = layout_store();
+        layout
+            .save(&Layout {
+                entries: vec![LayoutEntry::Folder {
+                    id: FolderId(1),
+                    name: "Folder".into(),
+                    apps: vec![app_id("maps"), app_id("mail")],
+                }],
+            })
+            .unwrap();
+        install(&fakes, &[("maps", "Maps"), ("mail", "Mail")]);
+        let mut holder = holder(&fakes, &layout);
+        holder.handle(AppsIntent::Scrolled(480.0));
+        holder.handle(AppsIntent::OpenFolder(FolderId(1)));
+
+        assert!(holder.on_back());
+        assert_eq!(holder.state().scroll_px, 480.0);
     }
 }

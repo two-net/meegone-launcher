@@ -27,6 +27,11 @@ impl AppsView {
     pub fn folder_tapped(&self, folder: FolderId) {
         self.dispatch.send(AppsIntent::OpenFolder(folder));
     }
+
+    /// The grid scrolled to `px` from its top (HOME-07, REL-05).
+    pub fn grid_scrolled(&self, px: f64) {
+        self.dispatch.send(AppsIntent::Scrolled(px));
+    }
 }
 
 impl View for AppsView {

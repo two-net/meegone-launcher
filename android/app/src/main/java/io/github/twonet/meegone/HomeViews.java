@@ -21,7 +21,8 @@ import android.widget.TextView;
 
 /**
  * The three home views, Events, Applications and Recent, in a wrap-around carousel (HOME-02 to
- * HOME-04), drawn with Android's own views (ADR 0006).
+ * HOME-04), drawn with Android's own views (ADR 0006). They come back from an app with a short
+ * scale and fade (ANIM-09, ADR 0007).
  *
  * <p>The Rust app owns the gesture, the motion and the view indicator. This view passes it every
  * touch, frame time and layout change, then reads what to draw with {@link #nativeRead} and
@@ -41,7 +42,9 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private static final int BACKGROUND = 7; // ARGB
     private static final int FOREGROUND = 8; // ARGB
     private static final int DIM = 9; // ARGB
-    private static final int FRAME_SIZE = 10;
+    private static final int CONTENT_SCALE = 10; // ten-thousandths; 10 000 at rest
+    private static final int CONTENT_ALPHA = 11; // 0 to 255
+    private static final int FRAME_SIZE = 12;
 
     private static final int VIEWS = 3;
     private static final int[] NAMES = {
@@ -130,6 +133,11 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     /** MeeGone came to the foreground; another activity may have moved the carousel. */
     void onResumed() {
         sendLayout();
+        apply();
+    }
+
+    /** The Rust app changed what shows without a touch or a frame, such as after Home. */
+    void refresh() {
         apply();
     }
 
@@ -272,9 +280,16 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private void apply() {
         nativeRead(frame);
         int width = getWidth();
+        // The content comes back from an app scaled down and faded out (ANIM-09); the
+        // background stays opaque.
+        float scale = frame[CONTENT_SCALE] / 10_000f;
+        float alpha = frame[CONTENT_ALPHA] / 255f;
         for (int i = 0; i < VIEWS; i++) {
             int x = frame[PAGES + i];
             pages[i].setTranslationX(x);
+            pages[i].setScaleX(scale);
+            pages[i].setScaleY(scale);
+            pages[i].setAlpha(alpha);
             // A view out of sight is hidden, from screen readers too.
             pages[i].setVisibility(width > 0 && Math.abs(x) < width ? VISIBLE : INVISIBLE);
         }

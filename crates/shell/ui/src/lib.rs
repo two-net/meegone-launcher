@@ -3,7 +3,8 @@
 //! Only the shell depends on other features (ARCH-03).
 //!
 //! It also tells the host what to draw for the home views in each frame, as a [`HomeFrame`]:
-//! where the carousel's views are and how the view indicator looks (ADR 0006).
+//! where the carousel's views are, how the view indicator looks, and how the content comes back
+//! from an app (ADR 0006, ADR 0007).
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -33,6 +34,12 @@ pub struct HomeFrame {
     /// The view on screen, or the one the carousel is settling on, which screen readers
     /// announce (A11Y-08).
     pub current: HomeView,
+    /// The home content's scale in ten-thousandths: 10 000 at rest, from 9 400 while it comes
+    /// back from an app (ANIM-09).
+    pub content_scale: u16,
+    /// The home content's opacity, from 0 to 255: 255 at rest (ANIM-09). The background stays
+    /// opaque.
+    pub content_alpha: u8,
     /// Something is still moving or fading, so the host should draw another frame.
     pub animating: bool,
     /// The home views' solid background (HOME-11, THEME-04).
@@ -106,7 +113,9 @@ impl ShellView {
             indicator_alpha: (state.carousel.indicator.clamp(0.0, 1.0) * 255.0).round() as u8,
             indicator_selected: state.nearest_view(),
             current: state.current,
-            animating: state.carousel.animating,
+            content_scale: (state.return_home.scale.clamp(0.0, 1.0) * 10_000.0).round() as u16,
+            content_alpha: (state.return_home.alpha.clamp(0.0, 1.0) * 255.0).round() as u8,
+            animating: state.carousel.animating || state.return_home.animating,
             background: tokens.background,
             foreground: tokens.text_primary,
             dim: tokens.text_secondary,

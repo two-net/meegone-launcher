@@ -384,6 +384,8 @@ pub struct FakeSystem {
     pub dark: Mutex<bool>,
     /// 1.0 unless set; 0.0 means animations are removed.
     pub animation_scale: Mutex<f64>,
+    /// False unless set, so MeeGone plays its own return motion (ANIM-09).
+    pub animates_return_home: Mutex<bool>,
     pub now_ms: Mutex<u64>,
     /// UTC unless set.
     pub utc_offset_ms: Mutex<i64>,
@@ -406,6 +408,7 @@ impl Default for FakeSystem {
         Self {
             dark: Mutex::default(),
             animation_scale: Mutex::new(1.0),
+            animates_return_home: Mutex::default(),
             now_ms: Mutex::default(),
             utc_offset_ms: Mutex::default(),
             locale: Mutex::new("en-US".into()),
@@ -440,6 +443,10 @@ impl SystemConfigAdapter for FakeSystem {
 
     fn animation_scale(&self) -> f64 {
         *self.animation_scale.lock().unwrap()
+    }
+
+    fn animates_return_home(&self) -> bool {
+        *self.animates_return_home.lock().unwrap()
     }
 
     fn now_ms(&self) -> u64 {

@@ -5,7 +5,7 @@
 //! This feature also provides [`HomeBanner`], which the shell shows on the home views while
 //! MeeGone isn't the default home app (ONB-04).
 
-use meegone_core_state::ThemeChoice;
+use meegone_core_state::{HomeTarget, ThemeChoice};
 use meegone_core_ui::{Dispatch, Latest, Slot, Tokens, View};
 use meegone_settings_state::{SettingsIntent, SettingsState};
 
@@ -30,6 +30,11 @@ impl SettingsView {
     /// THEME-01
     pub fn theme_chosen(&self, theme: ThemeChoice) {
         self.dispatch.send(SettingsIntent::SetTheme(theme));
+    }
+
+    /// "Home button opens": the last view or always Applications (HOME-06).
+    pub fn home_target_chosen(&self, target: HomeTarget) {
+        self.dispatch.send(SettingsIntent::SetHomeTarget(target));
     }
 
     /// HOME-04

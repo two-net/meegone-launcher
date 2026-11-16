@@ -273,6 +273,26 @@ impl Carousel {
         self.indicator.out_length = self.scaled(INDICATOR_OUT);
     }
 
+    /// The system animation speed, as the carousel takes it: 0 means animations are removed
+    /// (ANIM-05).
+    pub fn animation_scale(&self) -> f64 {
+        self.animation_scale
+    }
+
+    /// Puts the row at rest on the current view at once, with the indicator hidden. Used when
+    /// the view changes while the home is out of sight, so nothing is seen moving (HOME-06,
+    /// REL-05).
+    pub fn reset(&mut self) {
+        self.state.offset = 0.0;
+        self.gesture = Gesture::Idle;
+        self.tracker.clear();
+        self.indicator = Indicator {
+            out_length: self.indicator.out_length,
+            ..Indicator::default()
+        };
+        self.publish();
+    }
+
     /// The host laid the home views out again. A drag in progress ends, because its finger
     /// positions no longer fit.
     pub fn layout(&mut self, layout: Layout, current: HomeView) -> Option<Release> {

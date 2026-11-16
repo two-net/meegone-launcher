@@ -1,16 +1,20 @@
-//! Home shell state (SRS 4.1): the carousel of views, Home and Back, and the theme.
+//! Home shell state (SRS 4.1): the carousel of views, Home and Back, coming back to the home,
+//! and the theme.
 //!
 //! [`HomeShell::compose`] is the only place features are put together (ARCH-03). Each feature
 //! runs in its own [`Store`], so a failing feature never takes down the shell (ARCH-09).
 
 mod carousel;
+mod return_home;
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use meegone_apps_data::PersistentLayoutStore;
 use meegone_apps_state::{AppsHolder, AppsIntent};
-use meegone_core_data::{PersistentSettingsStore, Platform, SettingsStore, SystemConfigAdapter};
+use meegone_core_data::{
+    HomeTarget, PersistentSettingsStore, Platform, SettingsStore, SystemConfigAdapter,
+};
 use meegone_core_state::{Store, ThemeHolder, ThemeIntent};
 use meegone_events_state::{EventsHolder, EventsIntent};
 use meegone_lockimage_data::PersistentImageCache;
@@ -20,6 +24,8 @@ use meegone_settings_state::{SettingsHolder, SettingsIntent, SettingsState};
 
 use carousel::{Carousel, Release};
 pub use carousel::{CarouselState, Layout, PointerEvent, PointerKind};
+use return_home::ReturnHome;
+pub use return_home::ReturnHomeState;
 
 /// The three home views, left to right (HOME-02).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -54,6 +60,11 @@ impl HomeView {
         }
     }
 
+    /// The view at `index` in [`HomeView::ALL`], if there is one.
+    pub fn from_index(index: usize) -> Option<HomeView> {
+        HomeView::ALL.get(index).copied()
+    }
+
     /// The view a swipe shows. Past either end it wraps around when `wrap` is on, and otherwise
     /// stays put (HOME-04).
     pub fn neighbour(self, direction: Direction, wrap: bool) -> Option<HomeView> {
@@ -76,6 +87,8 @@ pub struct ShellState {
     pub current: HomeView,
     pub settings_open: bool,
     pub carousel: CarouselState,
+    /// The home content's scale and opacity while it comes back from an app (ANIM-09).
+    pub return_home: ReturnHomeState,
 }
 
 impl ShellState {
@@ -91,6 +104,16 @@ impl ShellState {
     }
 }
 
+/// What the home keeps while the system may end MeeGone's process, so it comes back as it was
+/// (REL-05). Open folders, menus, search, edit mode and close mode aren't kept, so ending the
+/// process cancels them cleanly.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SavedHome {
+    pub view: HomeView,
+    /// How far Applications was scrolled from its top, in pixels.
+    pub apps_scroll_px: f64,
+}
+
 #[derive(Debug)]
 pub enum ShellIntent {
     /// Shows the neighbouring view without a gesture, such as from a screen reader (A11Y-05).
@@ -101,7 +124,7 @@ pub enum ShellIntent {
     Pointer(PointerEvent),
     /// The display is about to draw a frame at this time on the host's monotonic clock.
     Frame(Duration),
-    /// The system Home action (HOME-07).
+    /// The system Home action while the home is on screen (HOME-07).
     Home,
     /// The system Back action (HOME-08).
     Back,
@@ -111,6 +134,15 @@ pub enum ShellIntent {
     /// another app or a settings screen. The default home app or the day may have changed
     /// (HOME-01, ONB-04).
     Resumed,
+    /// The home is back on screen after an app or a system screen covered it (HOME-06). `home`
+    /// is true when the system Home action brought it back, and false when the app closed or
+    /// the user switched back another way. Sent after `Resumed`.
+    Returned {
+        home: bool,
+    },
+    /// The system ended MeeGone's process while it was out of sight, and this is how the home
+    /// was (REL-05). Sent once, right after start, never after a device restart (HOME-05).
+    Restore(SavedHome),
     /// The device's dark-theme setting changed (THEME-02).
     SystemThemeChanged,
     /// An app was installed, updated or removed, or a profile was paused or resumed
@@ -125,7 +157,8 @@ pub enum ShellIntent {
     Settings(SettingsIntent),
 }
 
-/// One Home action closes at most this many open elements, such as a folder inside edit mode.
+/// One Home action closes at most this many open elements in a view, such as a folder inside
+/// edit mode.
 const MAX_OPEN_ELEMENTS: usize = 8;
 
 /// Puts the features together and routes intents between them.
@@ -134,6 +167,7 @@ pub struct HomeShell {
     settings_store: Arc<dyn SettingsStore>,
     system: Arc<dyn SystemConfigAdapter>,
     carousel: Carousel,
+    return_home: ReturnHome,
     theme: Store<ThemeHolder>,
     apps: Store<AppsHolder>,
     events: Store<EventsHolder>,
@@ -152,6 +186,7 @@ impl HomeShell {
             state: ShellState::default(),
             system: platform.system.clone(),
             carousel: Carousel::new(true, 1.0),
+            return_home: ReturnHome::default(),
             theme: Store::new(ThemeHolder::new(
                 settings_store.clone(),
                 platform.system.clone(),
@@ -195,6 +230,14 @@ impl HomeShell {
 
     pub fn state(&self) -> &ShellState {
         &self.state
+    }
+
+    /// What to keep in case the system ends MeeGone's process (REL-05).
+    pub fn saved(&self) -> SavedHome {
+        SavedHome {
+            view: self.state.current,
+            apps_scroll_px: self.apps.state().scroll_px,
+        }
     }
 
     pub fn theme(&self) -> &Store<ThemeHolder> {
@@ -241,13 +284,20 @@ impl HomeShell {
                 self.settle(release);
             }
             ShellIntent::Pointer(event) => {
+                if event.kind == PointerKind::Down {
+                    // A touch never waits for the return motion (ANIM-03).
+                    self.return_home.finish();
+                }
                 // Settings covers the home views.
                 if !self.state.settings_open {
                     let release = self.carousel.pointer(event, self.state.current);
                     self.settle(release);
                 }
             }
-            ShellIntent::Frame(at) => self.carousel.frame(at),
+            ShellIntent::Frame(at) => {
+                self.carousel.frame(at);
+                self.return_home.frame(at);
+            }
             ShellIntent::Home => self.home(),
             ShellIntent::Back => self.back(),
             ShellIntent::OpenSettings => {
@@ -262,6 +312,8 @@ impl HomeShell {
                 // The animation speed may have changed in system settings (ANIM-05).
                 self.configure_carousel();
             }
+            ShellIntent::Returned { home } => self.returned(home),
+            ShellIntent::Restore(saved) => self.restore(saved),
             ShellIntent::SystemThemeChanged => self.theme.dispatch(ThemeIntent::Refresh),
             ShellIntent::AppsChanged => {
                 self.apps.dispatch(AppsIntent::Refresh);
@@ -281,6 +333,7 @@ impl HomeShell {
             }
         }
         self.state.carousel = self.carousel.state();
+        self.state.return_home = self.return_home.state();
     }
 
     /// Takes on the wrap-around setting and the system animation speed, which the carousel
@@ -318,37 +371,82 @@ impl HomeShell {
         }
     }
 
-    /// HOME-07: close what is open; otherwise go to Applications.
+    /// HOME-07: close what is open; otherwise go to Applications, or, on Applications, scroll
+    /// it to the top.
     fn home(&mut self) {
         if std::mem::take(&mut self.state.settings_open) {
             return;
         }
-        let mut closed_any = false;
-        for _ in 0..MAX_OPEN_ELEMENTS {
-            if !self.close_topmost() {
-                break;
-            }
-            closed_any = true;
+        if self.close_everything_in(self.state.current) {
+            return;
         }
-        // A drag in progress ends too.
-        let carousel = self.carousel.state();
-        let moving = carousel.dragging || carousel.offset != 0.0;
-        if !closed_any && (self.state.current != HomeView::Applications || moving) {
+        if self.state.current != HomeView::Applications || self.carousel.state().dragging {
+            // A drag in progress ends too.
             self.move_to(HomeView::Applications, 0.0, None);
+        } else {
+            // At rest on Applications, or settling onto it, so a second quick Home after
+            // leaving another view scrolls too.
+            self.apps.dispatch(AppsIntent::ScrollToTop);
         }
-        // On Applications with nothing open, Home scrolls to the top; scrolling arrives with
-        // the grid (#6, #9).
     }
 
     /// HOME-08: close the topmost open element; otherwise do nothing.
     fn back(&mut self) {
         if !std::mem::take(&mut self.state.settings_open) {
-            self.close_topmost();
+            self.close_topmost(self.state.current);
         }
     }
 
-    fn close_topmost(&mut self) -> bool {
-        match self.state.current {
+    /// HOME-06: the home shows the view the user left. When Home brought it back and the Home
+    /// target is Applications, it shows Applications instead, with nothing open. Recent
+    /// refreshes (REC-09), and the content comes in with its own motion unless the system
+    /// animates the return (ANIM-09).
+    fn returned(&mut self, home: bool) {
+        if home && self.settings_store.get().home_target == HomeTarget::Applications {
+            self.state.settings_open = false;
+            for view in HomeView::ALL {
+                self.close_everything_in(view);
+            }
+            self.jump_to(HomeView::Applications);
+        }
+        self.recent.dispatch(RecentIntent::Refresh);
+        if self.system.animates_return_home() {
+            self.return_home.finish();
+        } else {
+            self.return_home.start(self.carousel.animation_scale());
+        }
+    }
+
+    /// REL-05: the view and the Applications scroll position as they were. Nothing else was
+    /// kept, so any edit or close mode is cancelled.
+    fn restore(&mut self, saved: SavedHome) {
+        self.jump_to(saved.view);
+        self.apps
+            .dispatch(AppsIntent::Scrolled(saved.apps_scroll_px));
+    }
+
+    /// Shows `view` at once, with nothing moving, while the home is out of sight.
+    fn jump_to(&mut self, view: HomeView) {
+        self.carousel.reset();
+        if view != self.state.current {
+            self.show(view);
+        }
+    }
+
+    /// Closes everything open in `view`, topmost first. Returns whether anything was.
+    fn close_everything_in(&mut self, view: HomeView) -> bool {
+        let mut closed_any = false;
+        for _ in 0..MAX_OPEN_ELEMENTS {
+            if !self.close_topmost(view) {
+                break;
+            }
+            closed_any = true;
+        }
+        closed_any
+    }
+
+    fn close_topmost(&mut self, view: HomeView) -> bool {
+        match view {
             HomeView::Events => self.events.back(),
             HomeView::Applications => self.apps.back(),
             HomeView::Recent => self.recent.back(),
@@ -368,12 +466,40 @@ impl HomeShell {
 
 #[cfg(test)]
 mod tests {
-    use meegone_apps_state::GridItem;
+    use meegone_apps_data::{Layout as SavedLayout, LayoutEntry, LayoutStore};
+    use meegone_apps_state::{FolderId, GridItem};
     use meegone_core_data::fakes::{FakeApps, Fakes, app, app_id};
-    use meegone_core_data::{App, AppId, AppsAdapter, DataError, Profile, Shortcut};
+    use meegone_core_data::{App, AppId, AppsAdapter, DataError, Profile, RecentUse, Shortcut};
     use meegone_core_state::{Access, Health, Theme, ThemeChoice};
 
     use super::*;
+
+    fn ms(millis: u64) -> Duration {
+        Duration::from_millis(millis)
+    }
+
+    /// A shell whose Applications grid holds one folder, with Maps and Mail.
+    fn with_a_folder() -> (Fakes, HomeShell) {
+        let fakes = Fakes::default();
+        *fakes.apps.apps.lock().unwrap() = vec![app("maps", "Maps"), app("mail", "Mail")];
+        PersistentLayoutStore::new(fakes.storage.clone())
+            .save(&SavedLayout {
+                entries: vec![LayoutEntry::Folder {
+                    id: FolderId(1),
+                    name: "Folder".into(),
+                    apps: vec![app_id("maps"), app_id("mail")],
+                }],
+            })
+            .unwrap();
+        let shell = HomeShell::compose(fakes.platform());
+        (fakes, shell)
+    }
+
+    fn always_applications(shell: &mut HomeShell) {
+        shell.dispatch(ShellIntent::Settings(SettingsIntent::SetHomeTarget(
+            HomeTarget::Applications,
+        )));
+    }
 
     fn swipes(shell: &mut HomeShell, direction: Direction, count: usize) -> Vec<HomeView> {
         (0..count)
@@ -588,5 +714,256 @@ mod tests {
         assert_eq!(shell.state().current, HomeView::Applications);
         shell.dispatch(ShellIntent::Back);
         assert_eq!(shell.state().current, HomeView::Applications);
+    }
+
+    #[test]
+    fn home_on_applications_scrolls_it_to_the_top() {
+        // HOME-07, AC-04
+        let mut shell = HomeShell::compose(Fakes::default().platform());
+        shell.dispatch(ShellIntent::Apps(AppsIntent::Scrolled(900.0)));
+
+        shell.dispatch(ShellIntent::Home);
+
+        assert_eq!(shell.state().current, HomeView::Applications);
+        assert_eq!(shell.apps().state().scroll_px, 0.0);
+    }
+
+    #[test]
+    fn a_second_quick_home_scrolls_while_the_views_still_settle() {
+        // HOME-07, AC-04: Home on Events moves to Applications; Home again scrolls it to the
+        // top, even before the row has come to rest.
+        let mut shell = HomeShell::compose(Fakes::default().platform());
+        shell.dispatch(ShellIntent::Layout(Layout {
+            width_px: 1000.0,
+            density: 2.0,
+            touch_slop_px: 16.0,
+            rtl: false,
+        }));
+        shell.dispatch(ShellIntent::Apps(AppsIntent::Scrolled(900.0)));
+        shell.dispatch(ShellIntent::Swipe(Direction::Previous));
+        for frame in 0..100 {
+            shell.dispatch(ShellIntent::Frame(ms(frame * 16)));
+        }
+        assert_eq!(shell.state().current, HomeView::Events);
+
+        shell.dispatch(ShellIntent::Home);
+        shell.dispatch(ShellIntent::Frame(ms(2_000)));
+        shell.dispatch(ShellIntent::Frame(ms(2_050)));
+        assert_eq!(shell.state().current, HomeView::Applications);
+        assert_ne!(shell.state().carousel.offset, 0.0);
+        assert_eq!(shell.apps().state().scroll_px, 900.0);
+
+        shell.dispatch(ShellIntent::Home);
+
+        assert_eq!(shell.apps().state().scroll_px, 0.0);
+        assert!(shell.state().carousel.animating);
+    }
+
+    #[test]
+    fn home_with_an_open_folder_closes_it_and_applications_stays_where_it_was() {
+        // HOME-07, issue #6
+        let (_, mut shell) = with_a_folder();
+        shell.dispatch(ShellIntent::Apps(AppsIntent::Scrolled(480.0)));
+        shell.dispatch(ShellIntent::Apps(AppsIntent::OpenFolder(FolderId(1))));
+        assert_eq!(shell.apps().state().open_folder, Some(FolderId(1)));
+
+        shell.dispatch(ShellIntent::Home);
+
+        let apps = shell.apps().state();
+        assert_eq!(apps.open_folder, None);
+        assert_eq!(apps.scroll_px, 480.0);
+        assert_eq!(shell.state().current, HomeView::Applications);
+    }
+
+    #[test]
+    fn back_with_nothing_open_does_nothing() {
+        // HOME-08, issue #6
+        let mut shell = HomeShell::compose(Fakes::default().platform());
+        shell.dispatch(ShellIntent::Apps(AppsIntent::Scrolled(480.0)));
+        shell.dispatch(ShellIntent::Swipe(Direction::Next));
+        let before = shell.state().clone();
+
+        shell.dispatch(ShellIntent::Back);
+
+        assert_eq!(*shell.state(), before);
+        assert_eq!(shell.apps().state().scroll_px, 480.0);
+    }
+
+    #[test]
+    fn coming_back_shows_the_view_the_user_left_as_it_was() {
+        // HOME-06: by default, Home from an app shows the last view, with what was open.
+        let mut shell = HomeShell::compose(Fakes::default().platform());
+        shell.dispatch(ShellIntent::Apps(AppsIntent::EnterEditMode));
+        shell.dispatch(ShellIntent::Returned { home: true });
+        assert_eq!(shell.state().current, HomeView::Applications);
+        assert!(shell.apps().state().edit_mode);
+
+        shell.dispatch(ShellIntent::Swipe(Direction::Next));
+        shell.dispatch(ShellIntent::Returned { home: true });
+        assert_eq!(shell.state().current, HomeView::Recent);
+    }
+
+    #[test]
+    fn with_always_applications_home_from_an_app_shows_applications_with_nothing_open() {
+        // HOME-06: shown at once, with nothing moving, and the grid where it was.
+        let (_, mut shell) = with_a_folder();
+        always_applications(&mut shell);
+        shell.dispatch(ShellIntent::Apps(AppsIntent::Scrolled(480.0)));
+        shell.dispatch(ShellIntent::Apps(AppsIntent::EnterEditMode));
+        shell.dispatch(ShellIntent::Apps(AppsIntent::OpenFolder(FolderId(1))));
+        shell.dispatch(ShellIntent::Swipe(Direction::Next));
+        shell.dispatch(ShellIntent::Recent(RecentIntent::EnterCloseMode));
+        shell.dispatch(ShellIntent::OpenSettings);
+
+        shell.dispatch(ShellIntent::Returned { home: true });
+
+        let state = shell.state();
+        assert_eq!(state.current, HomeView::Applications);
+        assert!(!state.settings_open);
+        assert_eq!(state.carousel.offset, 0.0);
+        assert!(!state.carousel.animating);
+        let apps = shell.apps().state();
+        assert_eq!(apps.open_folder, None);
+        assert!(!apps.edit_mode);
+        assert_eq!(apps.scroll_px, 480.0);
+        assert!(!shell.recent().state().close_mode);
+    }
+
+    #[test]
+    fn coming_back_without_home_keeps_the_last_view_even_with_always_applications() {
+        // HOME-06, ADR 0007: the setting is "Home button opens", so Back from an app, such as
+        // the system screen that grants notification access, returns to the view it left.
+        let mut shell = HomeShell::compose(Fakes::default().platform());
+        always_applications(&mut shell);
+        shell.dispatch(ShellIntent::Swipe(Direction::Previous));
+
+        shell.dispatch(ShellIntent::Returned { home: false });
+
+        assert_eq!(shell.state().current, HomeView::Events);
+    }
+
+    #[test]
+    fn coming_back_refreshes_recent() {
+        // REC-09: Recent refreshes when MeeGone returns to the foreground.
+        let fakes = Fakes::default();
+        *fakes.usage.access.lock().unwrap() = Access::Granted;
+        *fakes.apps.apps.lock().unwrap() = vec![app("maps", "Maps"), app("mail", "Mail")];
+        *fakes.system.now_ms.lock().unwrap() = 1_000_000;
+        let used = |package: &str, at: u64| RecentUse {
+            app: app_id(package),
+            last_used_ms: at,
+        };
+        *fakes.usage.uses.lock().unwrap() = vec![used("maps", 900_000)];
+        let mut shell = HomeShell::compose(fakes.platform());
+
+        fakes.usage.uses.lock().unwrap().push(used("mail", 999_000));
+        shell.dispatch(ShellIntent::Returned { home: false });
+
+        let cards = &shell.recent().state().cards;
+        assert_eq!(cards.len(), 2);
+        assert_eq!(cards[0].app.label, "Mail");
+    }
+
+    #[test]
+    fn the_home_content_comes_back_with_its_own_motion_unless_the_system_animates_it() {
+        // ANIM-09
+        let fakes = Fakes::default();
+        let mut shell = HomeShell::compose(fakes.platform());
+        assert_eq!(shell.state().return_home, ReturnHomeState::default());
+
+        shell.dispatch(ShellIntent::Returned { home: true });
+        let first = shell.state().return_home;
+        assert!(first.animating);
+        assert_eq!((first.scale, first.alpha), (0.94, 0.0));
+        shell.dispatch(ShellIntent::Frame(ms(1_000)));
+        shell.dispatch(ShellIntent::Frame(ms(1_125)));
+        assert!(shell.state().return_home.alpha > 0.5);
+        shell.dispatch(ShellIntent::Frame(ms(1_250)));
+        assert_eq!(shell.state().return_home, ReturnHomeState::default());
+
+        *fakes.system.animates_return_home.lock().unwrap() = true;
+        shell.dispatch(ShellIntent::Returned { home: true });
+        assert_eq!(shell.state().return_home, ReturnHomeState::default());
+    }
+
+    #[test]
+    fn with_animations_removed_the_content_comes_back_at_once() {
+        // ANIM-05, ANIM-09
+        let fakes = Fakes::default();
+        *fakes.system.animation_scale.lock().unwrap() = 0.0;
+        let mut shell = HomeShell::compose(fakes.platform());
+
+        shell.dispatch(ShellIntent::Returned { home: false });
+
+        assert_eq!(shell.state().return_home, ReturnHomeState::default());
+    }
+
+    #[test]
+    fn a_touch_shows_the_returning_content_at_once() {
+        // ANIM-03: no animation blocks input.
+        let mut shell = HomeShell::compose(Fakes::default().platform());
+        shell.dispatch(ShellIntent::Returned { home: true });
+        shell.dispatch(ShellIntent::Frame(ms(0)));
+
+        shell.dispatch(ShellIntent::Pointer(PointerEvent {
+            kind: PointerKind::Down,
+            x: 100.0,
+            y: 100.0,
+            at: ms(40),
+        }));
+
+        assert_eq!(shell.state().return_home, ReturnHomeState::default());
+    }
+
+    #[test]
+    fn after_the_system_ends_the_process_the_home_comes_back_as_it_was() {
+        // REL-05: the view and the scroll position come back; edit and close mode don't.
+        let fakes = Fakes::default();
+        let mut before = HomeShell::compose(fakes.platform());
+        before.dispatch(ShellIntent::Apps(AppsIntent::Scrolled(720.0)));
+        before.dispatch(ShellIntent::Apps(AppsIntent::EnterEditMode));
+        before.dispatch(ShellIntent::Swipe(Direction::Next));
+        before.dispatch(ShellIntent::Recent(RecentIntent::EnterCloseMode));
+        let saved = before.saved();
+        assert_eq!(
+            saved,
+            SavedHome {
+                view: HomeView::Recent,
+                apps_scroll_px: 720.0
+            }
+        );
+
+        let mut after = HomeShell::compose(fakes.platform());
+        after.dispatch(ShellIntent::Restore(saved));
+
+        let state = after.state();
+        assert_eq!(state.current, HomeView::Recent);
+        assert_eq!(state.carousel.offset, 0.0);
+        assert!(!state.carousel.animating);
+        assert_eq!(after.apps().state().scroll_px, 720.0);
+        assert!(!after.apps().state().edit_mode);
+        assert!(!after.recent().state().close_mode);
+    }
+
+    #[test]
+    fn a_restart_shows_applications_whatever_showed_before() {
+        // HOME-05: after a device restart nothing is restored.
+        let fakes = Fakes::default();
+        let mut before = HomeShell::compose(fakes.platform());
+        before.dispatch(ShellIntent::Swipe(Direction::Next));
+
+        let after = HomeShell::compose(fakes.platform());
+
+        assert_eq!(after.state().current, HomeView::Applications);
+    }
+
+    #[test]
+    fn views_are_found_by_their_place() {
+        assert_eq!(HomeView::from_index(0), Some(HomeView::Events));
+        assert_eq!(HomeView::from_index(2), Some(HomeView::Recent));
+        assert_eq!(HomeView::from_index(3), None);
+        for view in HomeView::ALL {
+            assert_eq!(HomeView::from_index(view.index()), Some(view));
+        }
     }
 }

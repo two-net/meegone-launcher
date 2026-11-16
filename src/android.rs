@@ -1,5 +1,5 @@
-//! The native methods of `HomeActivity` (ADR 0005) and `HomeViews` (ADR 0006), called by
-//! Android on the main thread.
+//! The native methods of `HomeActivity` (ADR 0005, ADR 0007) and `HomeViews` (ADR 0006),
+//! called by Android on the main thread.
 //!
 //! The process has one [`Launcher`], kept on the main thread. Every `HomeActivity` shares it:
 //! the one opened from the app drawer and the one Home starts can be alive at once, and two
@@ -22,7 +22,10 @@ use std::time::Duration;
 use meegone_core_data::Rgb;
 use meegone_core_data::android::{self, Env, JObject, LocalRef, RawEnv};
 
-use crate::{Direction, HomeFrame, Launcher, Layout, PointerEvent, PointerKind, ShellIntent};
+use crate::{
+    Direction, HomeFrame, HomeView, Launcher, Layout, PointerEvent, PointerKind, SavedHome,
+    ShellIntent,
+};
 
 /// JNI's `jboolean`.
 type JBoolean = u8;
@@ -31,7 +34,12 @@ thread_local! {
     static LAUNCHER: RefCell<Option<Launcher>> = const { RefCell::new(None) };
 }
 
-/// `void nativeStart(Bridge bridge, String filesDir)`: starts MeeGone, once per process.
+/// `boolean nativeStart(Bridge bridge, String filesDir, int savedView, int savedAppsScrollPx)`:
+/// starts MeeGone, once per process. Returns whether this call started it.
+///
+/// `savedView` is the view kept in the activity's saved state, or -1 if there is none. When
+/// this call starts MeeGone with one, the system had ended the process, and the home comes
+/// back as it was (REL-05). A launcher that is already running keeps its own state.
 ///
 /// # Safety
 ///
@@ -42,7 +50,9 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeActivity_nativeS
     _activity: JObject,
     bridge: JObject,
     files_dir: JObject,
-) {
+    saved_view: i32,
+    saved_apps_scroll_px: i32,
+) -> JBoolean {
     // SAFETY: the JVM passes this thread's environment and live local references, which are
     // used only during this call.
     let (env, bridge, files_dir) = unsafe {
@@ -52,19 +62,34 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeActivity_nativeS
             LocalRef::from_raw(files_dir),
         )
     };
+    let mut started = false;
     guarded(env, || {
         LAUNCHER.with_borrow_mut(|launcher| {
             if launcher.is_none() {
                 let platform = android::platform(env, &bridge, &files_dir)
                     .map_err(|error| format!("MeeGone couldn't start: {error}"))?;
-                *launcher = Some(Launcher::start(platform));
+                let mut new = Launcher::start(platform);
+                if let Some(view) = usize::try_from(saved_view)
+                    .ok()
+                    .and_then(HomeView::from_index)
+                {
+                    new.dispatch(ShellIntent::Restore(SavedHome {
+                        view,
+                        apps_scroll_px: f64::from(saved_apps_scroll_px),
+                    }));
+                }
+                *launcher = Some(new);
+                started = true;
             }
             Ok(())
         })
     });
+    JBoolean::from(started)
 }
 
-/// `void nativeResumed()`: MeeGone came to the foreground (HOME-01, ONB-04).
+/// `void nativeResumed(boolean returning, boolean byHome)`: MeeGone came to the foreground
+/// (HOME-01, ONB-04). `returning` is true when an app or a system screen had covered the home,
+/// and `byHome` when the system Home action brought it back meanwhile (HOME-06, ADR 0007).
 ///
 /// # Safety
 ///
@@ -73,12 +98,80 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeActivity_nativeS
 pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeActivity_nativeResumed(
     env: RawEnv,
     _activity: JObject,
+    returning: JBoolean,
+    by_home: JBoolean,
 ) {
     // SAFETY: the JVM passes this thread's environment.
     let env = unsafe { Env::from_raw(env) };
     with_launcher(env, |launcher| {
         launcher.dispatch(ShellIntent::Resumed);
+        if returning != 0 {
+            launcher.dispatch(ShellIntent::Returned { home: by_home != 0 });
+        }
         launcher.frame();
+    });
+}
+
+/// `void nativeHome()`: the system Home action while the home is on screen (HOME-07).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeActivity_nativeHome(
+    env: RawEnv,
+    _activity: JObject,
+) {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_launcher(env, |launcher| {
+        launcher.dispatch(ShellIntent::Home);
+        launcher.frame();
+    });
+}
+
+/// `void nativeBack()`: the system Back action on the home (HOME-08).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeActivity_nativeBack(
+    env: RawEnv,
+    _activity: JObject,
+) {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_launcher(env, |launcher| {
+        launcher.dispatch(ShellIntent::Back);
+        launcher.frame();
+    });
+}
+
+/// `void nativeSave(int[] saved)`: fills `saved` with what the activity keeps in case the system
+/// ends the process (REL-05): the current view, 0 to 2, then how far Applications is scrolled,
+/// in whole pixels.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeActivity_nativeSave(
+    env: RawEnv,
+    _activity: JObject,
+    saved: JObject,
+) {
+    // SAFETY: the JVM passes this thread's environment and a live local reference to an
+    // `int[]`, used only during this call.
+    let (env, saved) = unsafe { (Env::from_raw(env), LocalRef::from_raw(saved)) };
+    guarded(env, || {
+        LAUNCHER.with_borrow_mut(|launcher| {
+            let launcher = launcher.as_mut().ok_or("MeeGone hasn't started")?;
+            let home = launcher.shell().saved();
+            let slots = [home.view.index() as i32, home.apps_scroll_px.round() as i32];
+            env.set_int_array(&saved, &slots)
+                .map_err(|error| format!("Couldn't save the home: {error}"))
+        })
     });
 }
 
@@ -251,7 +344,9 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRead
 /// | 5 | The current view, 0 to 2 |
 /// | 6 | 1 while something moves, so another frame is needed; otherwise 0 |
 /// | 7–9 | The background, foreground and dim colours, as opaque ARGB |
-fn frame_slots(frame: &HomeFrame) -> [i32; 10] {
+/// | 10 | The home content's scale in ten-thousandths, 10 000 at rest (ANIM-09) |
+/// | 11 | The home content's opacity, 0 to 255 (ANIM-09) |
+fn frame_slots(frame: &HomeFrame) -> [i32; 12] {
     let [events, applications, recent] = frame.pages;
     [
         events,
@@ -264,6 +359,8 @@ fn frame_slots(frame: &HomeFrame) -> [i32; 10] {
         argb(frame.background),
         argb(frame.foreground),
         argb(frame.dim),
+        i32::from(frame.content_scale),
+        i32::from(frame.content_alpha),
     ]
 }
 

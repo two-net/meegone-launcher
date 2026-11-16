@@ -163,6 +163,17 @@ pub fn scaled(duration: Duration, system_scale: f64) -> Duration {
     duration.mul_f64(system_scale.max(0.0))
 }
 
+/// Decelerating easing, as Android's `DecelerateInterpolator`: fast at first, slowing to a stop.
+/// `progress` runs from 0 to 1 and is clamped to that range.
+pub fn decelerate(progress: f64) -> f64 {
+    let progress = if progress.is_nan() {
+        1.0
+    } else {
+        progress.clamp(0.0, 1.0)
+    };
+    1.0 - (1.0 - progress) * (1.0 - progress)
+}
+
 /// One element settling with a [`Spring`] towards a target at displacement 0.
 ///
 /// The motion is the spring's exact solution, so it is the same at any frame rate and a late
@@ -469,5 +480,20 @@ mod tests {
         // ANIM-05
         assert_eq!(scaled(FOLDER, 0.0), Duration::ZERO);
         assert_eq!(scaled(FOLDER, 2.0), ms(500));
+    }
+
+    #[test]
+    fn decelerating_motion_starts_fast_and_ends_at_rest() {
+        // ANIM-09
+        assert_eq!(decelerate(0.0), 0.0);
+        assert_eq!(decelerate(1.0), 1.0);
+        assert!(decelerate(0.5) > 0.5);
+        let steps: Vec<f64> = (0..=10)
+            .map(|step| decelerate(f64::from(step) / 10.0))
+            .collect();
+        assert!(steps.windows(2).all(|pair| pair[1] > pair[0]));
+        assert_eq!(decelerate(-1.0), 0.0);
+        assert_eq!(decelerate(2.0), 1.0);
+        assert_eq!(decelerate(f64::NAN), 1.0);
     }
 }

@@ -3,7 +3,6 @@
 //!
 //! Not automated yet, because the behaviour isn't built:
 //! - AC-01: first-run setup (#35)
-//! - AC-03 and the second half of AC-04: returning home and scrolling to the top (#6)
 //! - AC-05's open folder, AC-08: folders (#14)
 //! - AC-07, AC-09: edit mode and a persisted layout (#13, #11)
 //! - AC-12: Clear in Events (#20)
@@ -17,7 +16,7 @@
 use std::time::Duration;
 
 use meegone_core_data::fakes::{Fakes, app, app_id};
-use meegone_core_data::{Notification, ThemeChoice};
+use meegone_core_data::{HomeTarget, Notification, RecentUse, ThemeChoice};
 use meegone_core_state::{Access, Health, Theme};
 use meegone_launcher::{
     Direction, HomeView, Launcher, Layout, PointerEvent, PointerKind, ShellIntent,
@@ -145,14 +144,80 @@ fn anim07_a_drag_past_35_percent_or_a_fling_settles_and_a_short_slow_drag_return
 }
 
 #[test]
-fn ac04_home_on_events_shows_applications() {
-    let mut launcher = Launcher::start(Fakes::default().platform());
+fn ac03_home_from_an_app_opened_from_recent_shows_recent_with_it_at_the_top_left() {
+    // Opening an app from its card arrives with #22; here the user leaves Recent and uses Mail.
+    let fakes = Fakes::default();
+    *fakes.usage.access.lock().unwrap() = Access::Granted;
+    *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail"), app("maps", "Maps")];
+    *fakes.system.now_ms.lock().unwrap() = 10_000_000;
+    let used = |package: &str, at: u64| RecentUse {
+        app: app_id(package),
+        last_used_ms: at,
+    };
+    *fakes.usage.uses.lock().unwrap() = vec![used("maps", 9_000_000), used("mail", 8_000_000)];
+    let mut launcher = Launcher::start(fakes.platform());
+    launcher.dispatch(ShellIntent::Swipe(Direction::Next));
+    assert_eq!(launcher.shell().recent().state().cards[0].app.label, "Maps");
+
+    *fakes.system.now_ms.lock().unwrap() = 10_060_000;
+    fakes.usage.uses.lock().unwrap()[1].last_used_ms = 10_060_000;
+    launcher.dispatch(ShellIntent::Resumed);
+    launcher.dispatch(ShellIntent::Returned { home: true });
+    launcher.frame();
+
+    assert_eq!(launcher.shell().state().current, HomeView::Recent);
+    assert_eq!(launcher.shell().recent().state().cards[0].app.label, "Mail");
+}
+
+#[test]
+fn ac04_home_on_events_shows_applications_and_home_again_scrolls_it_to_the_top() {
+    let (mut launcher, mut clock) = on_a_phone(&Fakes::default());
+    launcher.view().apps().grid_scrolled(600.0);
     launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
+    launcher.frame();
     assert_eq!(launcher.shell().state().current, HomeView::Events);
+
+    launcher.dispatch(ShellIntent::Home);
+    launcher.frame();
+    assert_eq!(launcher.shell().state().current, HomeView::Applications);
+    assert_eq!(launcher.shell().apps().state().scroll_px, 600.0);
+    while launcher.frame().animating {
+        clock += 8;
+        launcher.dispatch(ShellIntent::Frame(Duration::from_millis(clock)));
+    }
+    assert_eq!(launcher.frame().pages, [-1080, 0, 1080]);
 
     launcher.dispatch(ShellIntent::Home);
 
     assert_eq!(launcher.shell().state().current, HomeView::Applications);
+    assert_eq!(launcher.shell().apps().state().scroll_px, 0.0);
+}
+
+#[test]
+fn home06_with_always_applications_home_from_an_app_shows_applications() {
+    // Chosen in Settings as "Home button opens: Always Applications".
+    let (mut launcher, _) = on_a_phone(&Fakes::default());
+    launcher.dispatch(ShellIntent::OpenSettings);
+    launcher
+        .view()
+        .settings()
+        .home_target_chosen(HomeTarget::Applications);
+    launcher.frame();
+    launcher.dispatch(ShellIntent::Back);
+    // The user left while Recent was still sliding in.
+    launcher.dispatch(ShellIntent::Swipe(Direction::Next));
+    launcher.frame();
+
+    launcher.dispatch(ShellIntent::Resumed);
+    launcher.dispatch(ShellIntent::Returned { home: true });
+    let frame = launcher.frame();
+
+    // Shown at once, with nothing moving.
+    assert_eq!(frame.current, HomeView::Applications);
+    assert_eq!(frame.pages, [-1080, 0, 1080]);
+    // The content comes back scaled down and faded out (ANIM-09).
+    assert_eq!((frame.content_scale, frame.content_alpha), (9_400, 0));
+    assert!(frame.animating);
 }
 
 #[test]

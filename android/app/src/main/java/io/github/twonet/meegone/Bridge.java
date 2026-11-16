@@ -7,9 +7,13 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
+import android.graphics.Insets;
+import android.os.Build;
 import android.os.SystemClock;
 import android.provider.Settings;
 import android.util.Log;
+import android.view.View;
+import android.view.WindowInsets;
 import java.util.TimeZone;
 
 /**
@@ -124,6 +128,41 @@ final class Bridge {
                 + ", shown: " + !neverShown);
         if (neverShown && !isDefaultHome()) {
             openHomeSettings(from);
+        }
+    }
+
+    /**
+     * Whether the system animates the home's return from an app itself, so MeeGone's own return
+     * motion would double up (ANIM-09, ADR 0007). It does with gesture navigation, whose
+     * swipe-home motion carries the app into the home: the navigation bar is then there but
+     * has nothing to tap. With unknown insets the answer is yes, so the two never double up.
+     * Called from Rust.
+     */
+    @SuppressWarnings("deprecation") // getTappableElementInsets is the only way on Android 10.
+    boolean animatesReturnHome() {
+        Activity current = activity;
+        try {
+            View decor = current == null ? null : current.getWindow().peekDecorView();
+            WindowInsets insets = decor == null ? null : decor.getRootWindowInsets();
+            if (insets == null) {
+                return true;
+            }
+            Insets tappable;
+            Insets bars;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                tappable = insets.getInsets(WindowInsets.Type.tappableElement());
+                bars = insets.getInsets(WindowInsets.Type.navigationBars());
+            } else {
+                tappable = insets.getTappableElementInsets();
+                bars = insets.getSystemWindowInsets();
+            }
+            boolean gestures = tappable.left == 0 && tappable.right == 0 && tappable.bottom == 0
+                    && (bars.left > 0 || bars.right > 0 || bars.bottom > 0);
+            Log.i(TAG, "Gesture navigation: " + gestures);
+            return gestures;
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Couldn't check the navigation mode", e);
+            return true;
         }
     }
 

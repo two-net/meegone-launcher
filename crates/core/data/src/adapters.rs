@@ -109,6 +109,9 @@ pub trait SystemConfigAdapter: Send + Sync {
     /// The system animation speed: 1.0 is normal and 0.0 means animations are removed
     /// (ANIM-05).
     fn animation_scale(&self) -> f64;
+    /// Whether the system animates the home's return from an app itself, so MeeGone's own
+    /// return motion would double up (ANIM-09).
+    fn animates_return_home(&self) -> bool;
     /// Wall-clock time in milliseconds since the Unix epoch.
     fn now_ms(&self) -> u64;
     /// The local time zone's offset from UTC at `at_ms`, for local midnight (WALL-03) and the
