@@ -26,6 +26,8 @@ pub mod model;
 mod notification_records;
 pub mod settings;
 pub mod storage;
+#[cfg(any(test, target_os = "android"))]
+mod usage_records;
 
 pub use adapters::{
     AppsAdapter, NetworkAdapter, NotificationsAdapter, Platform, SchedulerAdapter,

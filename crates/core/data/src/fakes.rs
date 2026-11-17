@@ -92,6 +92,18 @@ pub fn work_app(package: &str, label: &str) -> App {
     }
 }
 
+/// A use of `package` in the personal profile at `at_ms`, in its launcher activity as
+/// [`app_id`] names it (REC-03).
+pub fn used(package: &str, at_ms: u64) -> RecentUse {
+    let id = app_id(package);
+    RecentUse {
+        profile: id.profile,
+        package: id.package,
+        activity: id.activity,
+        last_used_ms: at_ms,
+    }
+}
+
 /// A clearable notification from `package` in the personal profile, titled "Title" with the
 /// text "Text", posted at 1 ms. The system names its app by its package (EVT-04).
 pub fn notification(key: &str, package: &str) -> Notification {

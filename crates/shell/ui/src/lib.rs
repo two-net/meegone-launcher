@@ -7,9 +7,9 @@
 //! from an app, the home menu, the Applications grid, the pressed icon, the grid's cells as
 //! apps come, go and move, a cell's long-press menu, the dragged icon, edit mode, the open
 //! folder, search, Settings' Hidden apps list and "Show card in Events" switch, the Events
-//! header, list and a notification's long-press menu, and the image-of-the-day card and its
-//! details screen (ADR 0006 to ADR 0008, ADR 0010, ADR 0012 to ADR 0017, ADR 0019 to
-//! ADR 0022).
+//! header, list and a notification's long-press menu, the image-of-the-day card and its
+//! details screen, and Recent's cards (ADR 0006 to ADR 0008, ADR 0010, ADR 0012 to ADR 0017,
+//! ADR 0019 to ADR 0023).
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -29,6 +29,7 @@ pub use meegone_events_ui::{
 pub use meegone_lockimage_ui::CardContent;
 use meegone_lockimage_ui::{ImageCard, ImageSettingsSection};
 use meegone_recent_ui::RecentView;
+pub use meegone_recent_ui::{Age, RecentMode, ShownCard};
 use meegone_settings_ui::{HomeBanner, SettingsView};
 pub use meegone_shell_state::BADGE_ROWS;
 use meegone_shell_state::{HomeShell, HomeView, MenuItem, SettingsGroup, ShellIntent};
@@ -72,6 +73,17 @@ pub struct EventsListFrame {
     pub revision: u32,
     /// The section header offers Clear: something shown can be cleared (EVT-07).
     pub clearable: bool,
+}
+
+/// What Recent shows below its title (REC-02, REC-03, REC-10, ADR 0023).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecentFrame {
+    pub mode: RecentMode,
+    /// Changes whenever the mode or the cards do: the host then reads the cards again with
+    /// [`RecentView::cards`].
+    pub revision: u32,
+    /// How many cards each row holds (REC-05).
+    pub columns: u8,
 }
 
 /// The dragged icon, as the host draws it above everything (APPS-11, APPS-12, ADR 0015).
@@ -265,6 +277,8 @@ pub struct HomeFrame {
     /// `None` while the lock-screen image isn't working, so Settings doesn't offer it
     /// (ARCH-09).
     pub show_image_card: Option<bool>,
+    /// What Recent shows, or `None` while Recent isn't working, so nothing does (ARCH-09).
+    pub recent: Option<RecentFrame>,
     /// The home views' solid background (HOME-11, THEME-04).
     pub background: Rgb,
     /// Menus and Settings (THEME-03).
@@ -490,6 +504,14 @@ impl ShellView {
             show_image_card: shell
                 .lockimage_ready()
                 .then(|| self.image_settings.show_card()),
+            recent: shell.recent_ready().then(|| {
+                let revision = self.recent.show_cards(&shell.recent().state(), tokens);
+                RecentFrame {
+                    mode: self.recent.mode(),
+                    revision,
+                    columns: self.recent.columns(),
+                }
+            }),
             background: tokens.background,
             surface: tokens.surface,
             foreground: tokens.text_primary,

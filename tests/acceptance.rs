@@ -17,18 +17,19 @@ mod backup;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use meegone_core_data::fakes::{Fakes, WORK_PROFILE, app, app_id, notification, work_app};
+use meegone_core_data::fakes::{Fakes, WORK_PROFILE, app, app_id, notification, used, work_app};
 use meegone_core_data::storage::format::seal;
 use meegone_core_data::{
-    App, DataError, HomeTarget, Notification, NotificationsAdapter, Profile, ProfileId, RecentUse,
-    Rect, Rgb, Shortcut, StoredFile, ThemeChoice, accent,
+    App, DataError, HomeTarget, Notification, NotificationsAdapter, Profile, ProfileId, Rect, Rgb,
+    Shortcut, StoredFile, ThemeChoice, accent,
 };
 use meegone_core_state::{Access, Health, Theme};
 use meegone_core_ui::tokens;
 use meegone_launcher::{
-    AppMenuItem, BADGE_ROWS, Bounds, CardContent, CellKey, Direction, EventsListMode,
+    Age, AppMenuItem, BADGE_ROWS, Bounds, CardContent, CellKey, Direction, EventsListMode,
     EventsMenuFrame, FolderId, GridLayout, HomeView, Launcher, Layout, LiftFrame, MenuItem,
-    NotificationMenuItem, PointerEvent, PointerKind, SettingsGroup, ShellIntent, Surface,
+    NotificationMenuItem, PointerEvent, PointerKind, RecentMode, SettingsGroup, ShellIntent,
+    Surface,
 };
 
 /// A phone 1080 × 2400 px at 2.75 px per dp.
@@ -176,28 +177,33 @@ fn anim07_a_drag_past_35_percent_or_a_fling_settles_and_a_short_slow_drag_return
 
 #[test]
 fn ac03_home_from_an_app_opened_from_recent_shows_recent_with_it_at_the_top_left() {
-    // Opening an app from its card arrives with #22; here the user leaves Recent and uses Mail.
+    // Issue #22: REC-03, REC-06, HOME-06. Mail is opened from its card, then Home is pressed.
     let fakes = Fakes::default();
     *fakes.usage.access.lock().unwrap() = Access::Granted;
     *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail"), app("maps", "Maps")];
     *fakes.system.now_ms.lock().unwrap() = 10_000_000;
-    let used = |package: &str, at: u64| RecentUse {
-        app: app_id(package),
-        last_used_ms: at,
-    };
     *fakes.usage.uses.lock().unwrap() = vec![used("maps", 9_000_000), used("mail", 8_000_000)];
     let mut launcher = Launcher::start(fakes.platform());
     launcher.dispatch(ShellIntent::Swipe(Direction::Next));
-    assert_eq!(launcher.shell().recent().state().cards[0].app.label, "Maps");
+    let (mode, cards) = recent_cards(&mut launcher);
+    assert_eq!(mode, RecentMode::Cards);
+    assert_eq!(labels(&cards), ["Maps", "Mail"]);
 
+    let revision = launcher.frame().recent.expect("Recent works").revision;
+    assert!(launcher.view().recent().card_tapped(revision, 1, CARD));
+    launcher.frame();
+    assert_eq!(*fakes.apps.launched.lock().unwrap(), [app_id("mail")]);
+    assert_eq!(*fakes.apps.launched_from.lock().unwrap(), [Some(CARD)]);
+
+    // The user reads mail for a minute; the system reports it used when it leaves the front.
     *fakes.system.now_ms.lock().unwrap() = 10_060_000;
     fakes.usage.uses.lock().unwrap()[1].last_used_ms = 10_060_000;
     launcher.dispatch(ShellIntent::Resumed);
     launcher.dispatch(ShellIntent::Returned { home: true });
-    launcher.frame();
 
     assert_eq!(launcher.shell().state().current, HomeView::Recent);
-    assert_eq!(launcher.shell().recent().state().cards[0].app.label, "Mail");
+    let (_, cards) = recent_cards(&mut launcher);
+    assert_eq!(labels(&cards), ["Mail", "Maps"]);
 }
 
 #[test]
@@ -1658,10 +1664,7 @@ fn mail_in_recent(fakes: &Fakes, icon: &[u32]) -> Launcher {
     *fakes.apps.apps.lock().unwrap() = vec![mail];
     *fakes.usage.access.lock().unwrap() = Access::Granted;
     *fakes.system.now_ms.lock().unwrap() = 10_000_000;
-    *fakes.usage.uses.lock().unwrap() = vec![RecentUse {
-        app: app_id("mail"),
-        last_used_ms: 9_940_000,
-    }];
+    *fakes.usage.uses.lock().unwrap() = vec![used("mail", 9_940_000)];
     let mut launcher = Launcher::start(fakes.platform());
     launcher.dispatch(ShellIntent::Swipe(Direction::Next));
     launcher
@@ -2697,10 +2700,7 @@ fn ready_to_hide(fakes: &Fakes) -> (Launcher, u64) {
     *fakes.system.now_ms.lock().unwrap() = 1_000_000;
     *fakes.usage.uses.lock().unwrap() = [("maps", 900_000), ("mail", 999_000)]
         .iter()
-        .map(|(package, at)| RecentUse {
-            app: app_id(package),
-            last_used_ms: *at,
-        })
+        .map(|(package, at)| used(package, *at))
         .collect();
     ready_to_search(fakes)
 }
@@ -3049,4 +3049,172 @@ fn evt12_given_a_new_image_arrives_then_the_card_shows_it_and_its_thumbnail_cros
     come_to_rest(&mut launcher, &mut clock);
     assert_eq!(clock, 9_304);
     assert_eq!(launcher.frame().image_change, 10_000);
+}
+
+/// A card's on-screen rect, which its app grows from (ANIM-08).
+const CARD: Rect = Rect {
+    left: 48,
+    top: 400,
+    right: 368,
+    bottom: 1100,
+};
+
+/// What Recent shows after a frame, and each card's label and age.
+fn recent_cards(launcher: &mut Launcher) -> (RecentMode, Vec<(String, Age)>) {
+    let recent = launcher.frame().recent.expect("Recent works");
+    let cards = launcher.view().recent().cards();
+    let cards = cards
+        .iter()
+        .map(|card| (card.label.clone(), card.age))
+        .collect();
+    (recent.mode, cards)
+}
+
+fn labels(cards: &[(String, Age)]) -> Vec<&str> {
+    cards.iter().map(|(label, _)| label.as_str()).collect()
+}
+
+/// Recent showing, with usage access: Maps was used an hour ago, then Mail five minutes ago.
+fn on_recent(fakes: &Fakes) -> Launcher {
+    *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail"), app("maps", "Maps")];
+    *fakes.usage.access.lock().unwrap() = Access::Granted;
+    *fakes.system.now_ms.lock().unwrap() = 10_000_000;
+    *fakes.usage.uses.lock().unwrap() = vec![used("maps", 6_400_000), used("mail", 9_700_000)];
+    let mut launcher = Launcher::start(fakes.platform());
+    launcher.dispatch(ShellIntent::Swipe(Direction::Next));
+    assert_eq!(launcher.shell().state().current, HomeView::Recent);
+    launcher
+}
+
+#[test]
+fn rec02_given_usage_access_is_revoked_while_recent_shows_then_the_explainer_appears() {
+    // Issue #22: REC-02, REL-01. The system reports the change while Recent is on screen.
+    let fakes = Fakes::default();
+    let mut launcher = on_recent(&fakes);
+    assert_eq!(recent_cards(&mut launcher).0, RecentMode::Cards);
+
+    *fakes.usage.access.lock().unwrap() = Access::Missing;
+    launcher.dispatch(ShellIntent::UsageAccessChanged);
+
+    assert_eq!(
+        recent_cards(&mut launcher),
+        (RecentMode::Explainer, Vec::new())
+    );
+    let recent = launcher.shell().recent();
+    assert_eq!(*recent.health(), Health::Ready);
+    assert_eq!(recent.state().problem, None);
+    assert_eq!(launcher.shell().state().current, HomeView::Recent);
+    // A tap on a card as it was drawn opens nothing.
+    assert!(!launcher.view().recent().card_tapped(1, 0, CARD));
+    assert!(fakes.apps.launched.lock().unwrap().is_empty());
+}
+
+#[test]
+fn rec02_given_access_is_revoked_as_recent_reads_then_the_explainer_appears_without_a_problem() {
+    // Issue #22: REC-02. Access goes between asking whether it is granted and reading the uses.
+    let fakes = Fakes::default();
+    let mut launcher = on_recent(&fakes);
+
+    *fakes.usage.error.lock().unwrap() = Some(DataError::AccessDenied);
+    launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
+    launcher.dispatch(ShellIntent::Swipe(Direction::Next));
+
+    assert_eq!(
+        recent_cards(&mut launcher),
+        (RecentMode::Explainer, Vec::new())
+    );
+    assert_eq!(launcher.shell().recent().state().problem, None);
+}
+
+#[test]
+fn rec02_without_usage_access_recent_explains_and_allow_opens_the_access_screen() {
+    // Issue #22: REC-02, ONB-02. No placeholder cards; access is granted in system settings.
+    let fakes = Fakes::default();
+    *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail")];
+    *fakes.usage.uses.lock().unwrap() = vec![used("mail", 1)];
+    let mut launcher = Launcher::start(fakes.platform());
+    launcher.dispatch(ShellIntent::Swipe(Direction::Next));
+    assert_eq!(
+        recent_cards(&mut launcher),
+        (RecentMode::Explainer, Vec::new())
+    );
+
+    launcher.view().recent().allow_access_tapped();
+    launcher.frame();
+    assert_eq!(*fakes.usage.access_screen_opened.lock().unwrap(), 1);
+    *fakes.usage.access.lock().unwrap() = Access::Granted;
+    launcher.dispatch(ShellIntent::Resumed);
+    launcher.dispatch(ShellIntent::Returned { home: false });
+
+    let (mode, cards) = recent_cards(&mut launcher);
+    assert_eq!(mode, RecentMode::Cards);
+    assert_eq!(labels(&cards), ["Mail"]);
+}
+
+#[test]
+fn rec03_given_twenty_apps_used_then_the_eighteen_newest_show_newest_first() {
+    // Issue #22: REC-03. Three columns, filling rows left to right from the top left.
+    let fakes = Fakes::default();
+    let packages: Vec<String> = (0..20).map(|i| format!("app{i:02}")).collect();
+    *fakes.apps.apps.lock().unwrap() = packages.iter().map(|p| app(p, p)).collect();
+    *fakes.usage.access.lock().unwrap() = Access::Granted;
+    *fakes.system.now_ms.lock().unwrap() = 10_000_000;
+    *fakes.usage.uses.lock().unwrap() = packages
+        .iter()
+        .zip(0..)
+        .map(|(package, i)| used(package, 10_000_000 - i * 60_000))
+        .collect();
+    let mut launcher = Launcher::start(fakes.platform());
+    launcher.dispatch(ShellIntent::Swipe(Direction::Next));
+
+    let (_, cards) = recent_cards(&mut launcher);
+    assert_eq!(launcher.frame().recent.unwrap().columns, 3);
+    assert_eq!(cards.len(), 18);
+    assert_eq!(cards[0], ("app00".to_owned(), Age::JustNow));
+    assert_eq!(cards[17], ("app17".to_owned(), Age::Minutes(17)));
+}
+
+#[test]
+fn rec04_a_card_is_filled_with_its_apps_accent_and_says_when_it_was_used() {
+    // Issue #22: REC-04, APPS-17, THEME-07.
+    let fakes = Fakes::default();
+    let mut launcher = mail_in_recent(&fakes, &icon_of(0x1877F2));
+
+    let (_, cards) = recent_cards(&mut launcher);
+    let card = &launcher.view().recent().cards()[0];
+    let (accent, background) = drawn_accent(&launcher);
+
+    assert_eq!(cards, [("Mail".to_owned(), Age::Minutes(1))]);
+    assert_eq!(card.fill, accent);
+    assert!(card.fill.contrast_ratio(background) >= 3.0);
+    assert!(card.available);
+}
+
+#[test]
+fn rec09_recent_refreshes_when_it_becomes_visible() {
+    // Issue #22: REC-09. Nothing polls: the cards change only when Recent comes into view.
+    let fakes = Fakes::default();
+    let mut launcher = on_recent(&fakes);
+    assert_eq!(labels(&recent_cards(&mut launcher).1), ["Mail", "Maps"]);
+
+    *fakes.system.now_ms.lock().unwrap() = 10_100_000;
+    fakes.usage.uses.lock().unwrap()[0].last_used_ms = 10_100_000;
+    launcher.frame();
+    assert_eq!(labels(&recent_cards(&mut launcher).1), ["Mail", "Maps"]);
+
+    launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
+    launcher.dispatch(ShellIntent::Swipe(Direction::Next));
+    assert_eq!(labels(&recent_cards(&mut launcher).1), ["Maps", "Mail"]);
+}
+
+#[test]
+fn rec10_given_no_app_was_used_then_recent_says_no_recent_apps() {
+    // Issue #22: REC-10.
+    let fakes = Fakes::default();
+    *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail")];
+    *fakes.usage.access.lock().unwrap() = Access::Granted;
+    let mut launcher = Launcher::start(fakes.platform());
+    launcher.dispatch(ShellIntent::Swipe(Direction::Next));
+
+    assert_eq!(recent_cards(&mut launcher), (RecentMode::Empty, Vec::new()));
 }

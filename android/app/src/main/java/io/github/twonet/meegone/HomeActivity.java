@@ -68,6 +68,8 @@ public final class HomeActivity extends Activity {
         bridge.watchClock();
         // Events' list follows the notifications and notification access (ADR 0020).
         bridge.watchNotifications();
+        // Recent follows usage access, even while it shows (ADR 0023).
+        bridge.watchUsageAccess();
         // Saved state with a launcher this call started: the system had ended the process while
         // the user was elsewhere. A recreation after a configuration change finds it running.
         away = started && savedInstanceState != null;
@@ -251,6 +253,18 @@ public final class HomeActivity extends Activity {
         }
     }
 
+    /**
+     * Usage access was granted or revoked (REC-02, ADR 0023). The shared launcher reads the
+     * recent apps again, and {@code resumed}, if it is a home, redraws. Called by {@link Bridge}
+     * on the main thread.
+     */
+    static void usageAccessChanged(Activity resumed) {
+        nativeUsageAccessChanged();
+        if (resumed instanceof HomeActivity) {
+            ((HomeActivity) resumed).views.refresh();
+        }
+    }
+
     private static boolean isHome(Intent intent) {
         return Intent.ACTION_MAIN.equals(intent.getAction())
                 && intent.hasCategory(Intent.CATEGORY_HOME);
@@ -293,6 +307,9 @@ public final class HomeActivity extends Activity {
 
     /** A notification came or went, or notification access changed (ADR 0020). */
     private static native void nativeNotificationsChanged();
+
+    /** Usage access was granted or revoked (ADR 0023). */
+    private static native void nativeUsageAccessChanged();
 
     /** Taps the banner's "make default" button; only debug builds' {@link DebugHooks} call it. */
     private native void nativeRequestDefaultHome();

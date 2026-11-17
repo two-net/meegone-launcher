@@ -64,8 +64,6 @@ final class EventsList extends LinearLayout {
     private static final int MEDIUM = 500;
     /** The side margins (SRS 5.2), inside the page's safe area. */
     private static final float MARGIN_DP = 16f;
-    /** Cards and panels (SRS 5.2). */
-    private static final float CORNER_DP = 12f;
     private static final float ICON_DP = 40f;
     private static final float MARKER_DP = 4f;
     private static final float GAP_DP = 12f;
@@ -93,10 +91,7 @@ final class EventsList extends LinearLayout {
     private final AppIcons icons;
     private final Listener listener;
     private final float density;
-    private final LinearLayout explainer;
-    private final GradientDrawable card;
-    private final TextView sentence;
-    private final TextView allow;
+    private final AccessCard explainer;
     private final SectionHeader section;
     private final TextView clear;
     private final TextView empty;
@@ -119,29 +114,8 @@ final class EventsList extends LinearLayout {
         setPadding(margin, dp(GAP_DP), margin, dp(MARGIN_DP));
 
         // EVT-03, ONB-02: one plain sentence, and a button to the system's screen.
-        explainer = new LinearLayout(context);
-        explainer.setOrientation(VERTICAL);
-        explainer.setPadding(margin, margin, margin, dp(4));
-        card = new GradientDrawable();
-        card.setCornerRadius(dp(CORNER_DP));
-        explainer.setBackground(card);
-        sentence = new TextView(context);
-        sentence.setText(R.string.events_access_explainer);
-        sentence.setTextSize(TypedValue.COMPLEX_UNIT_SP, BODY_SP);
-        explainer.addView(sentence, matchWidth());
-        allow = new TextView(context);
-        allow.setText(R.string.events_access_allow);
-        allow.setTextSize(TypedValue.COMPLEX_UNIT_SP, BODY_SP);
-        allow.setTypeface(Typeface.create(Typeface.DEFAULT, MEDIUM, false));
-        allow.setGravity(Gravity.CENTER);
-        allow.setMinHeight(dp(TARGET_DP));
-        allow.setMinWidth(dp(TARGET_DP));
-        allow.setPadding(dp(GAP_DP), 0, dp(GAP_DP), 0);
-        allow.setOnClickListener(view -> listener.allow());
-        LayoutParams allowParams = wrap();
-        allowParams.gravity = Gravity.END;
-        allowParams.topMargin = dp(4);
-        explainer.addView(allow, allowParams);
+        explainer = new AccessCard(context, R.string.events_access_explainer,
+                R.string.events_access_allow, listener::allow);
         addView(explainer, matchWidth());
 
         // The section header, with a hairline towards the end and Clear there (SRS 5.2, EVT-07).
@@ -347,11 +321,8 @@ final class EventsList extends LinearLayout {
     }
 
     private void paint() {
-        card.setColor(surface);
-        sentence.setTextColor(foreground);
-        allow.setTextColor(accent);
+        explainer.colour(foreground, surface, accent);
         ColorStateList pressed = ColorStateList.valueOf((foreground & 0x00FFFFFF) | 0x1F000000);
-        allow.setBackground(new RippleDrawable(pressed, null, new ColorDrawable(Color.WHITE)));
         section.colour(dim, divider);
         clear.setTextColor(accent);
         clear.setBackground(new RippleDrawable(pressed, null, new ColorDrawable(Color.WHITE)));

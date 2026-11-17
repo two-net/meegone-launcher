@@ -1,12 +1,20 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- MeeGone asks only for the access listed in SRS 8.1 (SEC-03). Being the home app is a role
      the user grants in the system dialog (HOME-01). -->
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
 
     <!-- Uninstall requests (APPS-13, ADR 0013): from Android 9 the system's uninstall
          confirmation refuses apps without it. Granted at install, with no prompt; the system
          still asks the user to confirm every uninstall. -->
     <uses-permission android:name="android.permission.REQUEST_DELETE_PACKAGES" />
+
+    <!-- Usage access for Recent (REC-02, REC-03, ADR 0023), one of the two optional special
+         accesses in SRS 8.1. Declaring it only lists MeeGone on the system's usage-access
+         screen: the user grants it there, and Recent explains what it reads first (ONB-02). -->
+    <uses-permission
+        android:name="android.permission.PACKAGE_USAGE_STATS"
+        tools:ignore="ProtectedPermissions" />
 
     <!-- Applications lists every app with a launcher entry (APPS-01), and the first grid puts
          the default browser and camera first (APPS-05). From Android 11, other apps are hidden

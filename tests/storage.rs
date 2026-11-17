@@ -7,10 +7,8 @@ mod backup;
 
 use std::collections::BTreeSet;
 
-use meegone_core_data::fakes::{Fakes, app, app_id};
-use meegone_core_data::{
-    Access, DataError, Notification, ProfileId, RecentUse, StoredFile, ThemeChoice,
-};
+use meegone_core_data::fakes::{Fakes, app, app_id, used};
+use meegone_core_data::{Access, DataError, Notification, ProfileId, StoredFile, ThemeChoice};
 use meegone_core_state::{Health, Theme};
 use meegone_launcher::{AppMenuItem, CellKey, Direction, Launcher, ShellIntent};
 
@@ -168,16 +166,7 @@ fn notification_content_and_usage_history_are_never_stored() {
         auto_cancel: false,
     }];
     *fakes.usage.access.lock().unwrap() = Access::Granted;
-    *fakes.usage.uses.lock().unwrap() = vec![
-        RecentUse {
-            app: app_id("chat"),
-            last_used_ms: USED_MS,
-        },
-        RecentUse {
-            app: app_id("maps"),
-            last_used_ms: USED_MS + 1,
-        },
-    ];
+    *fakes.usage.uses.lock().unwrap() = vec![used("chat", USED_MS), used("maps", USED_MS + 1)];
 
     let mut launcher = Launcher::start(fakes.platform());
     for _ in 0..3 {

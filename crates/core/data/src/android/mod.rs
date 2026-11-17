@@ -10,6 +10,7 @@
 //!   ADR 0010).
 //! - [`notifications`]: notification access, the active notifications, opening and dismissing
 //!   them, and an app's notification settings (EVT-03 to EVT-08, ADR 0020, ADR 0021).
+//! - [`usage`]: usage access and the apps used recently (REC-02, REC-03, ADR 0023).
 //! - [`stubs`]: every adapter not built yet, answering with its "if unavailable" value.
 
 mod apps;
@@ -17,6 +18,7 @@ mod jni;
 mod notifications;
 mod stubs;
 mod system;
+mod usage;
 
 use std::sync::Arc;
 
@@ -34,7 +36,7 @@ pub fn platform(env: Env, bridge: &LocalRef, files_dir: &LocalRef) -> Result<Pla
     Ok(Platform {
         apps: Arc::new(apps::AndroidApps::new(env, bridge)?),
         notifications: Arc::new(notifications::AndroidNotifications::new(env, bridge)?),
-        usage: not_built.clone(),
+        usage: Arc::new(usage::AndroidUsage::new(env, bridge)?),
         wallpaper: not_built.clone(),
         network: not_built.clone(),
         scheduler: not_built,

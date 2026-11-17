@@ -58,7 +58,9 @@ import java.util.List;
  * it. It keeps nothing else. The frame slots below must stay in step with {@code frame_slots}
  * in {@code src/android.rs}. Applications is an {@link AppsGrid}, which draws the frame's
  * Applications slots (ADR 0010), as the open folder's grid and search's results draw their own;
- * all three share one {@link AppIcons}. Events and Recent show their names until #19 and #22.
+ * all three share one {@link AppIcons}, with Events' list and Recent's cards. Events is its
+ * header, list and image card (ADR 0019 to ADR 0022), and Recent its {@link RecentList}
+ * (ADR 0023).
  *
  * <p>The background fills the window edge to edge, behind the system bars. Everything else stays
  * inside a safe area clear of the bars, display cut-outs and the screen's rounded corners: each
@@ -168,7 +170,11 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private static final int IMAGE_CHANGE = 91; // 0 to 10 000: a new thumbnail fading in
     private static final int IMAGE_DETAILS = 92; // 1 while the details screen shows
     private static final int SHOW_IMAGE_CARD = 93; // 1 on, 0 off, -1 not offered
-    private static final int FRAME_SIZE = 94;
+    // Recent (ADR 0023).
+    private static final int RECENT = 94; // RecentList.NOTHING, EXPLAINER, EMPTY or CARDS
+    private static final int RECENT_REVISION = 95; // changes when its cards change
+    private static final int RECENT_COLUMNS = 96; // cards in each row
+    private static final int FRAME_SIZE = 97;
     private static final int SEARCH_OPEN = 1; // the field has the keyboard
     private static final int SEARCH_RESULTS = 2; // the results show instead of the grid
     private static final int SEARCH_NOTHING = 4; // nothing matches
@@ -218,17 +224,14 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
 
     private final int[] frame = new int[FRAME_SIZE];
     private final FrameLayout[] pages = new FrameLayout[VIEWS];
-    /**
-     * Each view's name, until its content arrives; null for Events, which has its header, and
-     * Applications, which has its grid.
-     */
-    private final TextView[] titles = new TextView[VIEWS];
     /** The date and the next alarm at the top of Events (EVT-01, EVT-02). */
     private final EventsHeader eventsHeader;
     /** Below the header: notification access, or the notifications (EVT-03, EVT-04). */
     private final EventsList eventsList;
     /** Below the notifications: the image of the day (EVT-12). */
     private final ImageCard imageCard;
+    /** Recent: usage access, or the recently used apps (REC-02, REC-03). */
+    private final RecentList recentList;
     private final AppsGrid apps;
     /** The open folder's grid, in its panel (FOLD-04). */
     private final AppsGrid folderApps;
@@ -329,6 +332,8 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private long eventsListShown = -1;
     /** The image card's revision as shown, as an unsigned int, or -1 before it is first read. */
     private long imageCardShown = -1;
+    /** Recent's revision as shown, as an unsigned int, or -1 before it is first read. */
+    private long recentShown = -1;
     private int imageDetailsShown;
     private int menuOffered = -1;
     /** Whether screen readers can open search, as last told, or -1 before the first frame. */
@@ -409,6 +414,17 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
                 apply();
             }
         });
+        recentList = new RecentList(context, icons, new RecentList.Listener() {
+            @Override
+            public void allow() {
+                allowUsage();
+            }
+
+            @Override
+            public void tapped(int index, Rect onScreen) {
+                recentCardTapped(index, onScreen);
+            }
+        });
         doneMargin = dp(16);
         done = new TextView(context);
         done.setText(R.string.edit_done);
@@ -454,13 +470,14 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
                 page.addView(scroll, new LayoutParams(
                         LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
             } else {
-                // Until Recent's content arrives (#22), it shows its name.
-                TextView title = new TextView(context);
-                title.setText(NAMES[i]);
-                title.setTextSize(TypedValue.COMPLEX_UNIT_SP, 28);
-                titles[i] = title;
-                page.addView(title, new LayoutParams(
-                        LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT, Gravity.CENTER));
+                // Recent's title, then its cards, scrolling together (ADR 0023).
+                ScrollView scroll = new ScrollView(context);
+                scroll.setVerticalScrollBarEnabled(false);
+                scroll.setOverScrollMode(OVER_SCROLL_IF_CONTENT_SCROLLS);
+                scroll.addView(recentList, new LayoutParams(
+                        LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
+                page.addView(scroll, new LayoutParams(
+                        LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
             }
             page.setVisibility(INVISIBLE);
             pages[i] = page;
@@ -596,6 +613,8 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     @Override
     protected void onSizeChanged(int width, int height, int oldWidth, int oldHeight) {
         super.onSizeChanged(width, height, oldWidth, oldHeight);
+        // Recent's cards take the window's proportions (REC-04).
+        recentList.window(width, height);
         sendLayout();
         apply();
     }
@@ -944,6 +963,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         results.refreshIcons();
         hiddenApps.refreshIcons();
         eventsList.refreshIcons();
+        recentList.refreshIcons();
         shadow.invalidate();
     }
 
@@ -976,11 +996,6 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             foreground = frame[FOREGROUND];
             dim = frame[DIM];
             surface = frame[SURFACE];
-            for (TextView title : titles) {
-                if (title != null) {
-                    title.setTextColor(foreground);
-                }
-            }
             settings.setBackgroundColor(surface);
             settingsTitle.setTextColor(foreground);
             imageDetails.setBackgroundColor(surface);
@@ -1035,6 +1050,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         applyEventsHeader();
         applyEventsList();
         applyImageCard();
+        applyRecent();
         applyImageDetails();
         applySettings();
         applyMenu();
@@ -1317,6 +1333,42 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             imageDetails.setVisibility(imageDetailsShown != 0 ? VISIBLE : GONE);
             hidePagesFromScreenReaders();
         }
+    }
+
+    /**
+     * What Recent shows (REC-02, REC-03, REC-10): nothing below its title while Recent doesn't
+     * work (ARCH-09), the usage-access card, "No recent apps" or the cards, in as many columns
+     * as the frame says. The cards are read again whenever their revision changes.
+     */
+    private void applyRecent() {
+        int mode = frame[RECENT];
+        recentList.show(mode);
+        recentList.colour(foreground, dim, surface, frame[ACCENT], frame[DIVIDER]);
+        recentList.columns(frame[RECENT_COLUMNS]);
+        long revision = frame[RECENT_REVISION] & 0xFFFF_FFFFL;
+        if (mode != RecentList.NOTHING && revision != recentShown) {
+            recentShown = revision;
+            recentList.fill(nativeRecentCards());
+        }
+    }
+
+    /** Allow was tapped on Recent's card (REC-02): the system's usage-access screen opens. */
+    private void allowUsage() {
+        String message = nativeAllowUsage();
+        apply();
+        toast(message);
+    }
+
+    /**
+     * Card {@code index} of Recent's cards last read was tapped, at {@code onScreen} (REC-06):
+     * its app comes to the front, growing from the card (ANIM-08).
+     */
+    private void recentCardTapped(int index, Rect onScreen) {
+        // The revision is unsigned in Rust and travels as Java's int.
+        String message = nativeRecentCardTapped((int) recentShown, index, onScreen.left,
+                onScreen.top, onScreen.right, onScreen.bottom);
+        apply();
+        toast(message);
     }
 
     /** Allow was tapped on Events' card (EVT-03): the system's notification-access screen opens. */
@@ -1879,6 +1931,25 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
      * message to show when no system screen could open.
      */
     private native String nativeAllowNotifications();
+
+    /**
+     * Recent's cards, {@link RecentList#FIELDS} fields each, newest first (REC-03, REC-04,
+     * ADR 0023). Empty while Recent doesn't work.
+     */
+    private native String[] nativeRecentCards();
+
+    /**
+     * Card {@code index} of Recent's cards at {@code revision} was tapped, at this rect on the
+     * screen (REC-06). Returns null, or a short message to show when the app couldn't open.
+     */
+    private native String nativeRecentCardTapped(int revision, int index, int left, int top,
+            int right, int bottom);
+
+    /**
+     * Allow was tapped on Recent's usage-access card (REC-02). Returns null, or a short message
+     * to show when no system screen could open.
+     */
+    private native String nativeAllowUsage();
 
     /**
      * Row {@code index} of the Events rows at {@code revision} was tapped, at this rect on the

@@ -194,4 +194,48 @@
     <!-- Settings → Lock-screen image: the switch that hides or shows the card in Events
          (EVT-12, SET-02). -->
     <string name="show_image_card">Show card in Events</string>
+    <!-- Recent's card while MeeGone has no usage access: one plain sentence saying what is
+         read and why (REC-02, ONB-02), and the button that opens the system's usage-access
+         screen. -->
+    <string name="recent_access_explainer">MeeGone reads which apps you used recently only to show them here, and that never leaves this phone.</string>
+    <string name="recent_access_allow">Allow</string>
+    <!-- Shown briefly when no system screen for usage access could open (REC-02). -->
+    <string name="usage_access_unavailable">Usage access can\'t open right now</string>
+    <!-- Recent with usage access and no app used lately (REC-10). -->
+    <string name="recent_empty">No recent apps</string>
+    <!-- How long ago an app was last used, below its label on its Recent card (REC-04). It
+         never says the app is running or closed (REC-01). %d is how many minutes, hours or
+         days. -->
+    <string name="recent_just_now">Just now</string>
+    <plurals name="recent_minutes_ago">
+        <item quantity="one">%d min ago</item>
+        <item quantity="other">%d min ago</item>
+    </plurals>
+    <plurals name="recent_hours_ago">
+        <item quantity="one">%d h ago</item>
+        <item quantity="other">%d h ago</item>
+    </plurals>
+    <plurals name="recent_days_ago">
+        <item quantity="one">%d d ago</item>
+        <item quantity="other">%d d ago</item>
+    </plurals>
+    <!-- The same in words, for screen readers (A11Y-01). -->
+    <plurals name="recent_minutes_ago_spoken">
+        <item quantity="one">%d minute ago</item>
+        <item quantity="other">%d minutes ago</item>
+    </plurals>
+    <plurals name="recent_hours_ago_spoken">
+        <item quantity="one">%d hour ago</item>
+        <item quantity="other">%d hours ago</item>
+    </plurals>
+    <plurals name="recent_days_ago_spoken">
+        <item quantity="one">%d day ago</item>
+        <item quantity="other">%d days ago</item>
+    </plurals>
+    <!-- What screen readers read for a Recent card (REC-04, A11Y-01), e.g. "Mail, work, 5
+         minutes ago". %1$s is the app's name, with "work" when it has it; %2$s how long ago it
+         was used. -->
+    <string name="recent_card_description">%1$s, %2$s</string>
+    <!-- What screen readers say a tap on a Recent card does (REC-06, A11Y-01). -->
+    <string name="action_open_app">Open</string>
 </resources>

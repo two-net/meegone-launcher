@@ -306,6 +306,8 @@ pub enum ShellIntent {
     AppsChanged,
     /// A notification was posted or removed, or notification access changed (EVT-10).
     NotificationsChanged,
+    /// Usage access was granted or revoked, even while Recent shows (REC-02, ADR 0023).
+    UsageAccessChanged,
     /// The date, the time, the time zone, the 12- or 24-hour setting or the next alarm changed
     /// (EVT-01, EVT-02, L10N-03, ADR 0019).
     ClockChanged,
@@ -480,6 +482,11 @@ impl HomeShell {
         *self.events.health() == Health::Ready
     }
 
+    /// Whether Recent works. Its cards are drawn only then (ARCH-09).
+    pub fn recent_ready(&self) -> bool {
+        *self.recent.health() == Health::Ready
+    }
+
     /// Whether the lock-screen image works. Its card in Events, its section in Settings and
     /// its details screen are offered only then (ARCH-09).
     pub fn lockimage_ready(&self) -> bool {
@@ -615,6 +622,7 @@ impl HomeShell {
             ShellIntent::NotificationsChanged => {
                 self.events.dispatch(EventsIntent::RefreshNotifications);
             }
+            ShellIntent::UsageAccessChanged => self.recent.dispatch(RecentIntent::Refresh),
             ShellIntent::ClockChanged => self.events.dispatch(EventsIntent::RefreshHeader),
             ShellIntent::NewImageShown => {
                 self.image_change.start(self.carousel.animation_scale());
@@ -1390,10 +1398,12 @@ impl HomeShell {
 mod tests {
     use meegone_apps_data::{Layout as SavedLayout, LayoutEntry, LayoutStore};
     use meegone_apps_state::{AppMenuItem, Bounds, FolderId, GridItem, GridLayout};
-    use meegone_core_data::fakes::{FakeApps, FakeNotifications, Fakes, app, app_id, notification};
+    use meegone_core_data::fakes::{
+        FakeApps, FakeNotifications, Fakes, app, app_id, notification, used,
+    };
     use meegone_core_data::{
         App, AppId, AppsAdapter, DataError, Notification, NotificationsAdapter, Profile, ProfileId,
-        RecentUse, Rect, Shortcut, Size, WallpaperAdapter,
+        RecentUse, Rect, Shortcut, Size, UsageAdapter, WallpaperAdapter,
     };
     use meegone_core_state::motion::{DRAG_LIFT_SCALE, ICON_PRESS_SCALE};
     use meegone_core_state::{Access, Health, Theme, ThemeChoice};
@@ -2160,10 +2170,6 @@ mod tests {
         *fakes.usage.access.lock().unwrap() = Access::Granted;
         *fakes.apps.apps.lock().unwrap() = vec![app("maps", "Maps"), app("mail", "Mail")];
         *fakes.system.now_ms.lock().unwrap() = 1_000_000;
-        let used = |package: &str, at: u64| RecentUse {
-            app: app_id(package),
-            last_used_ms: at,
-        };
         *fakes.usage.uses.lock().unwrap() = vec![used("maps", 900_000)];
         let mut shell = HomeShell::compose(fakes.platform());
 
@@ -2183,12 +2189,72 @@ mod tests {
         *fakes.usage.uses.lock().unwrap() = ["maps", "mail"]
             .iter()
             .zip([900_000, 999_000])
-            .map(|(package, at)| RecentUse {
-                app: app_id(package),
-                last_used_ms: at,
-            })
+            .map(|(package, at)| used(package, at))
             .collect();
         HomeShell::compose(fakes.platform())
+    }
+
+    #[test]
+    fn recent_follows_usage_access_as_it_changes() {
+        // REC-02: access revoked while Recent shows brings the explainer back, and granted
+        // brings the cards.
+        let fakes = Fakes::default();
+        let mut shell = with_recent_maps_and_mail(&fakes);
+        shell.dispatch(ShellIntent::Swipe(Direction::Next));
+        assert_eq!(shell.state().current, HomeView::Recent);
+        assert_eq!(recent_labels(&shell), ["Mail", "Maps"]);
+
+        *fakes.usage.access.lock().unwrap() = Access::Missing;
+        shell.dispatch(ShellIntent::UsageAccessChanged);
+        assert_eq!(shell.recent().state().access, Access::Missing);
+        assert!(recent_labels(&shell).is_empty());
+        assert_eq!(shell.recent().state().problem, None);
+
+        *fakes.usage.access.lock().unwrap() = Access::Granted;
+        shell.dispatch(ShellIntent::UsageAccessChanged);
+        assert_eq!(recent_labels(&shell), ["Mail", "Maps"]);
+        assert!(shell.recent_ready());
+    }
+
+    /// Usage access that panics when asked what was used.
+    struct BrokenUsage;
+
+    impl UsageAdapter for BrokenUsage {
+        fn access(&self) -> Access {
+            Access::Granted
+        }
+
+        fn used_since(&self, _since_ms: u64) -> Result<Vec<RecentUse>, DataError> {
+            panic!("usage bug");
+        }
+
+        fn open_access_settings(&self) -> Result<(), DataError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_failing_recent_never_stops_applications() {
+        // REL-01, ARCH-09
+        let fakes = Fakes::default();
+        *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail")];
+        let mut platform = fakes.platform();
+        platform.usage = Arc::new(BrokenUsage);
+        let mut shell = HomeShell::compose(platform);
+
+        assert_eq!(*shell.recent().health(), Health::Failed("usage bug".into()));
+        assert!(!shell.recent_ready());
+        shell.dispatch(ShellIntent::UsageAccessChanged);
+        shell.dispatch(ShellIntent::Swipe(Direction::Next));
+        assert_eq!(shell.state().current, HomeView::Recent);
+        shell.dispatch(ShellIntent::Home);
+        assert_eq!(shell.state().current, HomeView::Applications);
+        shell.dispatch(ShellIntent::Apps(AppsIntent::Launch {
+            app: app_id("mail"),
+            from: None,
+        }));
+        assert_eq!(*fakes.apps.launched.lock().unwrap(), [app_id("mail")]);
+        assert!(shell.apps_ready());
     }
 
     fn recent_labels(shell: &HomeShell) -> Vec<String> {

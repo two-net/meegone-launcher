@@ -15,7 +15,8 @@
 //! names a cell by revision and place when its ✕ is tapped or a screen reader moves it
 //! (ADR 0014). Search's field sends each change of its text, and its results are a third grid
 //! (ADR 0016). Events' rows are read the same way, with `nativeEventsList`, and named by
-//! revision and place when tapped or long-pressed (ADR 0020, ADR 0021).
+//! revision and place when tapped or long-pressed (ADR 0020, ADR 0021). So are Recent's cards,
+//! with `nativeRecentCards`, named by revision and place when tapped (ADR 0023).
 //!
 //! A bug in MeeGone becomes a Java `RuntimeException` instead of an abort, so its message
 //! reaches logcat. Containing it keeps `panic = "unwind"`, as ARCH-09 already requires.
@@ -31,10 +32,10 @@ use meegone_core_data::android::{self, Env, JObject, LocalRef, RawEnv};
 use meegone_core_data::{App, Rect, Rgb, accent};
 
 use crate::{
-    AppMenuItem, BADGE_ROWS, Bounds, Cell, CellKey, Direction, EventsListMode, EventsRow,
+    Age, AppMenuItem, BADGE_ROWS, Bounds, Cell, CellKey, Direction, EventsListMode, EventsRow,
     FOLDER_COLUMNS, FolderId, GridLayout, HomeFrame, HomeView, Launcher, Layout, MenuItem,
-    NotificationMenuItem, PREVIEW_APPS, PointerEvent, PointerKind, RowTarget, SavedHome,
-    SettingsGroup, ShellIntent, Surface,
+    NotificationMenuItem, PREVIEW_APPS, PointerEvent, PointerKind, RecentMode, RowTarget,
+    SavedHome, SettingsGroup, ShellIntent, ShownCard, Surface,
 };
 
 /// JNI's `jboolean`.
@@ -242,6 +243,26 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeActivity_nativeN
     let env = unsafe { Env::from_raw(env) };
     with_launcher(env, |launcher| {
         launcher.dispatch(ShellIntent::NotificationsChanged);
+        launcher.frame();
+    });
+}
+
+/// `static void nativeUsageAccessChanged()`: usage access was granted or revoked, even while
+/// Recent shows (REC-02, ADR 0023). `Bridge` coalesces a burst of them into one call, and makes
+/// none before the home has started.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeActivity_nativeUsageAccessChanged(
+    env: RawEnv,
+    _class: JObject,
+) {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_launcher(env, |launcher| {
+        launcher.dispatch(ShellIntent::UsageAccessChanged);
         launcher.frame();
     });
 }
@@ -960,6 +981,147 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeAllo
     let env = unsafe { Env::from_raw(env) };
     with_events_message(env, |launcher| {
         launcher.view().events().allow_access_tapped();
+        true
+    })
+}
+
+/// `String[] nativeRecentCards()`: Recent's cards as of the last frame, newest first, each in the
+/// fields of [`recent_card_fields`] (REC-03, REC-04). Empty unless the frame's slot 94 says the
+/// cards show.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRecentCards(
+    env: RawEnv,
+    _views: JObject,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    let mut cards = std::ptr::null_mut();
+    guarded(env, || {
+        LAUNCHER.with_borrow(|launcher| {
+            let launcher = launcher.as_ref().ok_or("MeeGone hasn't started")?;
+            let fields: Vec<String> = if launcher.shell().recent_ready() {
+                let cards = launcher.view().recent().cards();
+                cards.iter().flat_map(recent_card_fields).collect()
+            } else {
+                Vec::new()
+            };
+            let array = env
+                .new_string_array(fields.iter().map(String::as_str))
+                .map_err(|error| format!("Couldn't pass Recent's cards: {error}"))?;
+            cards = array.into_raw();
+            Ok(())
+        })
+    });
+    cards
+}
+
+/// The fields of one card in `nativeRecentCards`, mirrored in `RecentList.java`:
+/// 1. the app's label;
+/// 2. its flags: 1 in a work profile (APPS-20); 2 unavailable, so it is drawn greyed (APPS-09);
+/// 3. to 5. its package, launcher activity and profile serial number, which its icon is loaded
+///    by;
+/// 6. the card's fill, the app's accent as opaque ARGB in decimal (REC-04);
+/// 7. and 8. how long ago the app was used: the unit, 0 just now, 1 minutes, 2 hours or 3 days,
+///    and how many of it (REC-04).
+fn recent_card_fields(card: &ShownCard) -> [String; 8] {
+    let flags = u8::from(card.work) | u8::from(!card.available) << 1;
+    let (unit, count) = match card.age {
+        Age::JustNow => (0, 0),
+        Age::Minutes(count) => (1, count),
+        Age::Hours(count) => (2, count),
+        Age::Days(count) => (3, count),
+    };
+    [
+        card.label.clone(),
+        flags.to_string(),
+        card.app.package.clone(),
+        card.app.activity.clone(),
+        card.app.profile.0.to_string(),
+        argb(card.fill).to_string(),
+        unit.to_string(),
+        count.to_string(),
+    ]
+}
+
+/// Asks something of Recent with `step`, applies it, and returns Recent's `problem` as a message
+/// for the host to show, or `null`. Does nothing while Recent isn't working (ARCH-09).
+fn with_recent_message(env: Env, step: impl FnOnce(&Launcher) -> bool) -> JObject {
+    let mut shown = std::ptr::null_mut();
+    guarded(env, || {
+        LAUNCHER.with_borrow_mut(|launcher| {
+            let launcher = launcher.as_mut().ok_or("MeeGone hasn't started")?;
+            if !launcher.shell().recent_ready() || !step(launcher) {
+                return Ok(());
+            }
+            launcher.frame();
+            shown = message(env, launcher.shell().recent().state().problem.as_deref())?;
+            Ok(())
+        })
+    });
+    shown
+}
+
+/// `String nativeRecentCardTapped(int revision, int index, int left, int top, int right, int
+/// bottom)`: card `index` of Recent's cards at `revision` was tapped, and is at that rect on the
+/// screen. Its app comes to the front, resumed if the system kept it, its window growing from
+/// the card (REC-06, ANIM-08). Returns `null`, or a short message to show when it couldn't
+/// open. Cards that changed since the host drew them do nothing.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)] // The JNI calling convention.
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRecentCardTapped(
+    env: RawEnv,
+    _views: JObject,
+    revision: i32,
+    index: i32,
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    let from = Rect {
+        left,
+        top,
+        right,
+        bottom,
+    };
+    with_recent_message(env, |launcher| {
+        let Ok(index) = usize::try_from(index) else {
+            return false;
+        };
+        // The revision travels as Java's `int`.
+        launcher
+            .view()
+            .recent()
+            .card_tapped(revision as u32, index, from)
+    })
+}
+
+/// `String nativeAllowUsage()`: the user tapped Allow on Recent's usage-access card, which
+/// opens the system's usage-access screen (REC-02). Returns `null`, or a short message to show
+/// when no screen could open.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeAllowUsage(
+    env: RawEnv,
+    _views: JObject,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_recent_message(env, |launcher| {
+        launcher.view().recent().allow_access_tapped();
         true
     })
 }
@@ -1969,7 +2131,7 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRead
 }
 
 /// How many slots the frame has.
-const FRAME_SLOTS: usize = 94;
+const FRAME_SLOTS: usize = 97;
 
 /// A `HomeFrame` as the `int[]` that `HomeViews.java` reads, slot by slot:
 ///
@@ -2050,6 +2212,9 @@ const FRAME_SLOTS: usize = 94;
 /// | 91 | How far the card's new thumbnail has faded in, 0 to 10 000 (ANIM-22) |
 /// | 92 | 1 while the image details screen covers the home views (WALL-15); otherwise 0 |
 /// | 93 | Settings → "Show card in Events": 1 on, 0 off, or -1 while the lock-screen image isn't working, so it isn't offered (EVT-12, ARCH-09) |
+/// | 94 | What Recent shows below its title: 0 nothing, while Recent isn't working (ARCH-09); 1 the usage-access card (REC-02); 2 "No recent apps" (REC-10); 3 the cards (REC-03) |
+/// | 95 | Recent's revision: when it changes, the cards are read again with `nativeRecentCards` |
+/// | 96 | How many cards each of Recent's rows holds (REC-05) |
 fn frame_slots(frame: &HomeFrame) -> [i32; FRAME_SLOTS] {
     let [events, applications, recent] = frame.pages;
     let menu_items = frame.menu.map_or(0, |menu| {
@@ -2199,6 +2364,13 @@ fn frame_slots(frame: &HomeFrame) -> [i32; FRAME_SLOTS] {
         i32::from(frame.image_change),
         i32::from(frame.image_details_open),
         frame.show_image_card.map_or(-1, i32::from),
+        frame.recent.map_or(0, |recent| match recent.mode {
+            RecentMode::Explainer => 1,
+            RecentMode::Empty => 2,
+            RecentMode::Cards => 3,
+        }),
+        frame.recent.map_or(0, |recent| recent.revision as i32),
+        frame.recent.map_or(0, |recent| i32::from(recent.columns)),
     ];
     slots[40 + BADGE_ROWS..].copy_from_slice(&rest);
     slots

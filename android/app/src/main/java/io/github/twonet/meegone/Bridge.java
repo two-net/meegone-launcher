@@ -1,13 +1,17 @@
 package io.github.twonet.meegone;
 
+import android.Manifest;
 import android.app.Activity;
 import android.app.ActivityOptions;
 import android.app.AlarmManager;
+import android.app.AppOpsManager;
 import android.app.Notification;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.SearchManager;
 import android.app.role.RoleManager;
+import android.app.usage.UsageEvents;
+import android.app.usage.UsageStatsManager;
 import android.content.ActivityNotFoundException;
 import android.content.BroadcastReceiver;
 import android.content.ComponentName;
@@ -62,10 +66,11 @@ import java.util.regex.Pattern;
  * What the Rust platform adapters ask of Android (ADR 0005).
  *
  * <p>Rust looks these methods up by name and signature on the main thread, so keep them in step
- * with {@code crates/core/data/src/android/system.rs}, {@code apps.rs} and {@code
- * notifications.rs}. Every method catches what Android may throw: an exception must never reach
- * Rust. Logs hold only yes/no answers and the kinds of errors, never user data such as which
- * apps are installed or what a notification says (EVT-13).
+ * with {@code crates/core/data/src/android/system.rs}, {@code apps.rs}, {@code
+ * notifications.rs} and {@code usage.rs}. Every method catches what Android may throw: an
+ * exception must never reach Rust. Logs hold only yes/no answers and the kinds of errors, never
+ * user data such as which apps are installed or used, or what a notification says (EVT-13,
+ * PRIV-03).
  */
 final class Bridge {
     private static final String TAG = "MeeGone";
@@ -88,6 +93,10 @@ final class Bridge {
     private static final int NOTIFICATION_ONGOING = 2;
     private static final int NOTIFICATION_SUMMARY = 4;
     private static final int NOTIFICATION_AUTO_CANCEL = 8;
+    // An app used recently (ADR 0023), mirrored in crates/core/data/src/usage_records.rs:
+    // package, the class of the activity last resumed, profile serial number and when it was
+    // last used.
+    private static final int USE_FIELDS = 4;
     /**
      * The extra by which the system's notification settings learn which profile's copy of an app
      * to show: the app's uid there. Settings reads it with the package (ADR 0021).
@@ -155,6 +164,9 @@ final class Bridge {
     /** Tells the Rust app about a burst of notifications coming and going once (ADR 0020). */
     private final Runnable reportNotificationsChanged =
             () -> HomeActivity.notificationsChanged(this.activity);
+    /** Tells the Rust app that usage access was granted or revoked (ADR 0023). */
+    private final Runnable reportUsageAccessChanged =
+            () -> HomeActivity.usageAccessChanged(this.activity);
     /** Each app's accent colour, derived from its icon (APPS-17, ADR 0011). */
     private final AppAccents accents;
     /** The resumed activity, which can start the system's screens; null while none is. */
@@ -163,6 +175,7 @@ final class Bridge {
     private boolean watchingApps;
     private boolean watchingClock;
     private boolean watchingNotifications;
+    private boolean watchingUsageAccess;
 
     private Bridge(Context context) {
         this.context = context.getApplicationContext();
@@ -1168,6 +1181,126 @@ final class Bridge {
         }
         Log.w(TAG, "Couldn't open the notification-access screen");
         return context.getString(R.string.notification_access_unavailable);
+    }
+
+    /**
+     * Starts telling the Rust app when the user grants or revokes usage access, even while
+     * Recent shows (REC-02, ADR 0023). Once per process; later calls do nothing. The system
+     * reports it as a change of MeeGone's own app op, which is never polled (PWR-02).
+     */
+    void watchUsageAccess() {
+        if (watchingUsageAccess) {
+            return;
+        }
+        watchingUsageAccess = true;
+        try {
+            context.getSystemService(AppOpsManager.class).startWatchingMode(
+                    AppOpsManager.OPSTR_GET_USAGE_STATS, context.getPackageName(),
+                    (op, packageName) -> {
+                        // On a binder thread.
+                        main.removeCallbacks(reportUsageAccessChanged);
+                        main.post(reportUsageAccessChanged);
+                    });
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Couldn't watch usage access: " + e.getClass().getSimpleName());
+        }
+    }
+
+    /** Whether the user has granted MeeGone usage access (REC-02). Called from Rust. */
+    boolean usageAccess() {
+        try {
+            int mode = context.getSystemService(AppOpsManager.class).unsafeCheckOpNoThrow(
+                    AppOpsManager.OPSTR_GET_USAGE_STATS, Process.myUid(),
+                    context.getPackageName());
+            if (mode == AppOpsManager.MODE_DEFAULT) {
+                return context.checkSelfPermission(Manifest.permission.PACKAGE_USAGE_STATS)
+                        == PackageManager.PERMISSION_GRANTED;
+            }
+            return mode == AppOpsManager.MODE_ALLOWED;
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Couldn't check usage access: " + e.getClass().getSimpleName());
+            return false;
+        }
+    }
+
+    /**
+     * Every other app used at or after {@code sinceMs}, one record each (REC-03, ADR 0023):
+     * package, the class of the activity last resumed, profile serial number, and when it last
+     * came to the front or left it, in ms since the epoch. An app used for an hour reads as used
+     * when the user left it. MeeGone itself is left out. The system reports only this profile's
+     * apps. Null if the system couldn't list them. Called from Rust.
+     */
+    String[] recentUses(long sinceMs) {
+        try {
+            UsageEvents events = context.getSystemService(UsageStatsManager.class)
+                    .queryEvents(sinceMs, System.currentTimeMillis());
+            if (events == null) {
+                return null;
+            }
+            String own = context.getPackageName();
+            Map<String, Long> lastUsed = new HashMap<>();
+            Map<String, String> activities = new HashMap<>();
+            UsageEvents.Event event = new UsageEvents.Event();
+            while (events.getNextEvent(event)) {
+                int type = event.getEventType();
+                boolean resumed = type == UsageEvents.Event.ACTIVITY_RESUMED;
+                if (!resumed && type != UsageEvents.Event.ACTIVITY_PAUSED) {
+                    continue;
+                }
+                String pkg = event.getPackageName();
+                if (pkg == null || pkg.equals(own)) {
+                    continue;
+                }
+                long at = event.getTimeStamp();
+                Long before = lastUsed.get(pkg);
+                if (before == null || at >= before) {
+                    lastUsed.put(pkg, at);
+                }
+                if (resumed && event.getClassName() != null) {
+                    // Events come oldest first, so the last one resumed stays.
+                    activities.put(pkg, event.getClassName());
+                }
+            }
+            String serial = Long.toString(context.getSystemService(UserManager.class)
+                    .getSerialNumberForUser(Process.myUserHandle()));
+            List<String> fields = new ArrayList<>(lastUsed.size() * USE_FIELDS);
+            for (Map.Entry<String, Long> used : lastUsed.entrySet()) {
+                String activity = activities.get(used.getKey());
+                fields.add(used.getKey());
+                fields.add(activity != null ? activity : "");
+                fields.add(serial);
+                fields.add(Long.toString(used.getValue()));
+            }
+            return fields.toArray(new String[0]);
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Couldn't read the recent apps: " + e.getClass().getSimpleName());
+            return null;
+        }
+    }
+
+    /**
+     * Opens MeeGone's page of the system's usage-access screen, or the screen itself, where the
+     * user grants access (REC-02). Returns null, or a short message if neither opens. Called
+     * from Rust.
+     */
+    String openUsageAccess() {
+        Activity current = activity;
+        Context from = current != null ? current : context;
+        Intent[] screens = {
+            new Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS,
+                    Uri.fromParts("package", context.getPackageName(), null)),
+            new Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS),
+        };
+        for (Intent screen : screens) {
+            try {
+                from.startActivity(screen.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                return null;
+            } catch (ActivityNotFoundException | SecurityException e) {
+                // Try the next screen.
+            }
+        }
+        Log.w(TAG, "Couldn't open the usage-access screen");
+        return context.getString(R.string.usage_access_unavailable);
     }
 
     /**

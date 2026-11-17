@@ -135,9 +135,18 @@ impl fmt::Debug for Notification {
 }
 
 /// When an app was last used (REC-03). Memory only (PRIV-03).
+///
+/// The system reports the activity last resumed, which is rarely the app's launcher activity,
+/// so this isn't an [`AppId`]: Recent finds the launchable app with the same profile and
+/// package.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecentUse {
-    pub app: AppId,
+    pub profile: ProfileId,
+    pub package: String,
+    /// The class of the activity last resumed, or empty if the system didn't say.
+    pub activity: String,
+    /// The last time the app came to the front or left it, in milliseconds since the Unix
+    /// epoch.
     pub last_used_ms: u64,
 }
 
