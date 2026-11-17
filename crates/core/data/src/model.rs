@@ -112,6 +112,8 @@ pub struct Notification {
     /// A summary the app posts for a bundle of its notifications, which stand for themselves
     /// (EVT-04).
     pub summary: bool,
+    /// Meant to disappear when opened: MeeGone removes it after opening it (EVT-06).
+    pub auto_cancel: bool,
 }
 
 impl fmt::Debug for Notification {
@@ -127,6 +129,7 @@ impl fmt::Debug for Notification {
             .field("clearable", &self.clearable)
             .field("ongoing", &self.ongoing)
             .field("summary", &self.summary)
+            .field("auto_cancel", &self.auto_cancel)
             .finish()
     }
 }
@@ -252,6 +255,7 @@ mod tests {
             clearable: true,
             ongoing: false,
             summary: false,
+            auto_cancel: true,
         };
 
         let printed = format!("{notification:?}");

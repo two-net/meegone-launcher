@@ -17,8 +17,8 @@
 use std::sync::Arc;
 
 use crate::model::{
-    Access, App, AppId, DataError, ImageJob, NetworkState, Notification, Profile, RecentUse, Rect,
-    Shortcut, Size, TimeStyle,
+    Access, App, AppId, DataError, ImageJob, NetworkState, Notification, Profile, ProfileId,
+    RecentUse, Rect, Shortcut, Size, TimeStyle,
 };
 use crate::storage::StorageAdapter;
 
@@ -58,15 +58,21 @@ pub trait NotificationsAdapter: Send + Sync {
     /// Other apps' active notifications, in any order; never MeeGone's own (EVT-05). Ongoing
     /// ones are included and marked, for Events to leave out.
     fn active(&self) -> Result<Vec<Notification>, DataError>;
-    /// Opens the notification's content. The system removes it if it is meant to disappear
-    /// when opened (EVT-06).
-    fn open(&self, key: &str) -> Result<(), DataError>;
-    /// Removes a clearable notification (EVT-07, EVT-08).
-    fn dismiss(&self, key: &str) -> Result<(), DataError>;
+    /// Opens the notification's content, or its app if it has none (EVT-06). Its window grows
+    /// from `from`, the tapped row, with the platform's launch-from-bounds transition (ANIM-08).
+    ///
+    /// It never removes the notification: Events dismisses one that is meant to disappear when
+    /// opened. A notification that is already gone opens nothing and is no error. Fails with a
+    /// short message for a status line when nothing could open.
+    fn open(&self, key: &str, from: Option<Rect>) -> Result<(), DataError>;
+    /// Removes these notifications, in one request; the system keeps any that aren't clearable
+    /// (EVT-07, EVT-08). They go when the system reports it, as `NotificationsChanged`.
+    fn dismiss(&self, keys: &[String]) -> Result<(), DataError>;
     /// Opens the system's notification-access screen (EVT-03).
     fn open_access_settings(&self) -> Result<(), DataError>;
-    /// Opens the system's notification settings for one app (EVT-08).
-    fn open_app_settings(&self, package: &str) -> Result<(), DataError>;
+    /// Opens the system's notification settings for one app, in its own profile (EVT-08,
+    /// APPS-20).
+    fn open_app_settings(&self, profile: ProfileId, package: &str) -> Result<(), DataError>;
 }
 
 /// App-usage history, read through usage access (REC-02, REC-03).

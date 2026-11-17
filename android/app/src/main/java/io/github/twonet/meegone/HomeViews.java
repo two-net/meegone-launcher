@@ -156,7 +156,11 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private static final int EVENTS_LIST_REVISION = 83; // changes when its rows change
     private static final int EVENTS_CHANGE = 84; // 0 to 10 000: rows coming and going
     private static final int DIVIDER = 85; // ARGB: hairlines
-    private static final int FRAME_SIZE = 86;
+    // The Events list's Clear and a notification's menu (ADR 0021).
+    private static final int EVENTS_CLEARABLE = 86; // 1 while Clear is offered
+    private static final int EVENTS_MENU = 87; // its items as bits 1 << item; 0 if closed
+    private static final int EVENTS_MENU_ROW = 88; // the row it opens at, or -1 to centre it
+    private static final int FRAME_SIZE = 89;
     private static final int SEARCH_OPEN = 1; // the field has the keyboard
     private static final int SEARCH_RESULTS = 2; // the results show instead of the grid
     private static final int SEARCH_NOTHING = 4; // nothing matches
@@ -194,6 +198,13 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private static final int[] APP_MENU_ITEMS = {
         R.string.menu_app_info, R.string.menu_uninstall, R.string.menu_edit_applications, 0,
         R.string.menu_rename_folder, R.string.menu_hide
+    };
+    /**
+     * The text of each item of a notification's menu, by its code in notification_menu_bit in
+     * src/android.rs: Dismiss and Notification settings (EVT-08).
+     */
+    private static final int[] EVENTS_MENU_ITEMS = {
+        R.string.menu_dismiss, R.string.menu_notification_settings
     };
     private static final int SETTINGS_AT_LOCK_SCREEN_IMAGE = 2;
 
@@ -287,6 +298,10 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private int menuShown;
     /** The app menu's revision as shown, from 0, or -1 while it is closed. */
     private long appMenuShown = -1;
+    /** A notification menu's items as shown, as in {@link #EVENTS_MENU}, or 0. */
+    private int eventsMenuShown;
+    /** The Events row a notification menu was made for, as in {@link #EVENTS_MENU_ROW}. */
+    private int eventsMenuRowShown = -1;
     private int settingsShown;
     /** Hidden apps' revision as shown, as an unsigned int, or -1 before it is first read. */
     private long hiddenAppsShown = -1;
@@ -340,7 +355,27 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         });
         searchPanel.setScreen(this);
         eventsHeader = new EventsHeader(context, this::openAlarm);
-        eventsList = new EventsList(context, icons, this::allowNotifications);
+        eventsList = new EventsList(context, icons, new EventsList.Listener() {
+            @Override
+            public void allow() {
+                allowNotifications();
+            }
+
+            @Override
+            public void clear() {
+                clearNotifications();
+            }
+
+            @Override
+            public void tapped(int index, Rect onScreen) {
+                eventsRowTapped(index, onScreen);
+            }
+
+            @Override
+            public boolean menuRequested(int index) {
+                return eventsMenuRequested(index);
+            }
+        });
         doneMargin = dp(16);
         done = new TextView(context);
         done.setText(R.string.edit_done);
@@ -748,11 +783,15 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             return;
         }
         View target = touchTarget(this, pages[frame[CURRENT]], downX, downY);
+        int row = frame[CURRENT] == EVENTS ? eventsList.indexOfRow(target) : -1;
         if (target == null) {
             claimed = nativeLongPress();
         } else if (target instanceof AppCell && frame[CURRENT] == APPLICATIONS) {
             AppCell cell = (AppCell) target;
             claimed = cell.grid().longPressed(cell);
+        } else if (row >= 0) {
+            // A notification's or a group's menu (EVT-08).
+            claimed = nativeEventsRowLongPressed((int) eventsListShown, row);
         } else {
             return;
         }
@@ -1172,6 +1211,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             eventsList.fill(nativeEventsList());
         }
         eventsList.move(frame[EVENTS_CHANGE]);
+        eventsList.clearable(mode == EventsList.LIST && frame[EVENTS_CLEARABLE] != 0);
     }
 
     /** Allow was tapped on Events' card (EVT-03): the system's notification-access screen opens. */
@@ -1179,6 +1219,32 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         String message = nativeAllowNotifications();
         apply();
         toast(message);
+    }
+
+    /** Clear was tapped (EVT-07): every notification that can be cleared goes. */
+    private void clearNotifications() {
+        String message = nativeClearNotifications();
+        apply();
+        toast(message);
+    }
+
+    /**
+     * Row {@code index} of the Events rows last read was tapped, at {@code onScreen} (EVT-06):
+     * its notification opens, growing from the row (ANIM-08), or its group expands or collapses.
+     */
+    private void eventsRowTapped(int index, Rect onScreen) {
+        // The revision is unsigned in Rust and travels as Java's int.
+        String message = nativeEventsRowTapped((int) eventsListShown, index, onScreen.left,
+                onScreen.top, onScreen.right, onScreen.bottom);
+        apply();
+        toast(message);
+    }
+
+    /** A screen reader asks for an Events row's menu (A11Y-05). Returns whether it opened. */
+    private boolean eventsMenuRequested(int index) {
+        boolean opened = nativeEventsMenuRequested((int) eventsListShown, index);
+        apply();
+        return opened;
     }
 
     /** The alarm row was tapped (EVT-02): the app that set the alarm opens. */
@@ -1219,14 +1285,15 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         }
     }
 
-    /** Whether the home menu or an app's menu is open, as of the last frame. */
+    /** Whether the home menu, an app's or a notification's menu is open, as of the last frame. */
     private boolean menuOpen() {
-        return frame[MENU] != 0 || frame[APP_MENU] != APP_MENU_CLOSED;
+        return frame[MENU] != 0 || frame[APP_MENU] != APP_MENU_CLOSED || frame[EVENTS_MENU] != 0;
     }
 
     /**
-     * Shows the home menu with the items it offers (HOME-10), or an app's menu with its items
-     * (APPS-11), where the Rust app says. Its items are made again whenever they change.
+     * Shows the home menu with the items it offers (HOME-10), an app's menu with its items
+     * (APPS-11), or a notification's (EVT-08), where the Rust app says. Its items are made again
+     * whenever they change.
      */
     private void applyMenu() {
         int homeItems = frame[MENU];
@@ -1234,14 +1301,21 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         long appMenu = frame[APP_MENU] != APP_MENU_CLOSED
                 ? frame[APP_MENU_REVISION] & 0xFFFF_FFFFL
                 : -1;
-        boolean wasOpen = menuShown != 0 || appMenuShown >= 0;
-        if (homeItems != menuShown || appMenu != appMenuShown) {
+        int eventsItems = frame[EVENTS_MENU];
+        int eventsRow = eventsItems != 0 ? frame[EVENTS_MENU_ROW] : -1;
+        boolean wasOpen = menuShown != 0 || appMenuShown >= 0 || eventsMenuShown != 0;
+        if (homeItems != menuShown || appMenu != appMenuShown || eventsItems != eventsMenuShown
+                || eventsRow != eventsMenuRowShown) {
             menuShown = homeItems;
             appMenuShown = appMenu;
+            eventsMenuShown = eventsItems;
+            eventsMenuRowShown = eventsRow;
             if (homeItems != 0) {
                 fillHomeMenu(homeItems);
             } else if (appMenu >= 0) {
                 fillAppMenu(frame[APP_MENU_REVISION]);
+            } else if (eventsItems != 0) {
+                fillEventsMenu(eventsItems, eventsRow);
             }
             hidePagesFromScreenReaders();
             if (!wasOpen && menuOpen() && !menuItems.isEmpty()) {
@@ -1305,6 +1379,29 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             }
             int index = i;
             addMenuItem(text == null ? "" : text, view -> chooseAppMenuItem(revision, index));
+        }
+        colourMenu();
+    }
+
+    /**
+     * A notification's or a group's menu (EVT-08): Dismiss when something it is for can be
+     * cleared, then Notification settings. Its pane title names the app on {@code row}.
+     */
+    private void fillEventsMenu(int items, int row) {
+        clearMenu();
+        String app = eventsList.label(row);
+        menu.setAccessibilityPaneTitle(app != null
+                ? getResources().getString(R.string.app_menu, app)
+                : getResources().getString(R.string.notification_menu));
+        for (int i = 0; i < EVENTS_MENU_ITEMS.length; i++) {
+            if ((items & (1 << i)) != 0) {
+                int item = i;
+                addMenuItem(getResources().getText(EVENTS_MENU_ITEMS[i]), view -> {
+                    String message = nativeEventsMenuChosen(item);
+                    apply();
+                    toast(message);
+                });
+            }
         }
         colourMenu();
     }
@@ -1378,10 +1475,10 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
 
     /**
      * Opens the home menu where the finger was held: from there towards the end of the line,
-     * and above the finger if there is no room below. An app's menu opens at its icon: from the
-     * cell's start, below it, or above it if there is no room below. Without a finger or a
-     * cell, or after the layout changed, the menu is centred. Either way it stays inside the
-     * safe area (HOME-11).
+     * and above the finger if there is no room below. An app's menu opens at its icon, and a
+     * notification's at its row: from the start, below it, or above it if there is no room
+     * below. Without a finger, a cell or a row, or after the layout changed, the menu is
+     * centred. Either way it stays inside the safe area (HOME-11).
      */
     private void placeMenu() {
         int left = safe.left + menuMargin;
@@ -1396,7 +1493,10 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         boolean rtl = getLayoutDirection() == LAYOUT_DIRECTION_RTL;
         float x;
         float y;
-        if (frame[MENU] == 0 && appCellBounds(frame[APP_MENU], anchor)) {
+        boolean atItem = frame[MENU] == 0 && (frame[EVENTS_MENU] != 0
+                ? eventsRowBounds(frame[EVENTS_MENU_ROW], anchor)
+                : appCellBounds(frame[APP_MENU], anchor));
+        if (atItem) {
             x = rtl ? anchor.right - menuWidth : anchor.left;
             y = anchor.bottom + menuHeight <= bottom ? anchor.bottom : anchor.top - menuHeight;
         } else if (frame[MENU] != 0 && frame[MENU_X] >= 0 && frame[MENU_Y] >= 0) {
@@ -1431,13 +1531,28 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         return true;
     }
 
+    /**
+     * Fills {@code bounds} with where row {@code index} of the Events rows last read is, in this
+     * view's coordinates. Returns false if it has no laid-out view.
+     */
+    private boolean eventsRowBounds(int index, Rect bounds) {
+        View row = eventsList.rowAt(index);
+        if (row == null || !row.isLaidOut()) {
+            return false;
+        }
+        bounds.set(0, 0, row.getWidth(), row.getHeight());
+        offsetDescendantRectToMyCoords(row, bounds);
+        return true;
+    }
+
     private static float within(float value, float low, float high) {
         return Math.max(low, Math.min(value, high));
     }
 
     /** While a menu or Settings covers the home views, screen readers skip them. */
     private void hidePagesFromScreenReaders() {
-        int importance = menuShown != 0 || appMenuShown >= 0 || settingsShown != 0
+        int importance = menuShown != 0 || appMenuShown >= 0 || eventsMenuShown != 0
+                || settingsShown != 0
                 ? IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
                 : IMPORTANT_FOR_ACCESSIBILITY_AUTO;
         for (FrameLayout page : pages) {
@@ -1636,8 +1751,9 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private native String nativeOpenAlarm();
 
     /**
-     * The app groups below the Events header, {@link EventsList#FIELDS} fields each (EVT-04,
-     * ADR 0020). Empty while Events doesn't work.
+     * The rows below the Events header, {@link EventsList#FIELDS} fields each: each app's
+     * group, and the expanded group's notifications (EVT-04, EVT-06, ADR 0020, ADR 0021). Empty
+     * while Events doesn't work.
      */
     private native String[] nativeEventsList();
 
@@ -1646,6 +1762,34 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
      * message to show when no system screen could open.
      */
     private native String nativeAllowNotifications();
+
+    /**
+     * Row {@code index} of the Events rows at {@code revision} was tapped, at this rect on the
+     * screen (EVT-06). Returns null, or a short message to show when nothing could open.
+     */
+    private native String nativeEventsRowTapped(int revision, int index, int left, int top,
+            int right, int bottom);
+
+    /**
+     * The finger has been held on row {@code index} of the Events rows at {@code revision} for
+     * the system's long-press time (EVT-08). Returns whether the long-press was taken.
+     */
+    private native boolean nativeEventsRowLongPressed(int revision, int index);
+
+    /**
+     * Opens the menu of row {@code index} of the Events rows at {@code revision} for screen
+     * readers (A11Y-05). Returns whether it opened.
+     */
+    private native boolean nativeEventsMenuRequested(int revision, int index);
+
+    /**
+     * Item {@code item} of the open notification menu was chosen: 0 Dismiss, 1 Notification
+     * settings (EVT-08). Returns null, or a short message to show.
+     */
+    private native String nativeEventsMenuChosen(int item);
+
+    /** Clear was tapped (EVT-07). Returns null, or a short message to show. */
+    private native String nativeClearNotifications();
 
     /** Fills {@code frame} with what to draw now, in the slots above. */
     private native void nativeRead(int[] frame);

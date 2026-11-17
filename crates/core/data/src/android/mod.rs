@@ -8,8 +8,8 @@
 //! - [`system`]: the home-app role, the clock, and web search (HOME-01, ONB-04, SRCH-05).
 //! - [`apps`]: the app catalogue, launching and search keys (APPS-01, APPS-10, SRCH-02,
 //!   ADR 0010).
-//! - [`notifications`]: notification access and the active notifications (EVT-03, EVT-04,
-//!   ADR 0020).
+//! - [`notifications`]: notification access, the active notifications, opening and dismissing
+//!   them, and an app's notification settings (EVT-03 to EVT-08, ADR 0020, ADR 0021).
 //! - [`stubs`]: every adapter not built yet, answering with its "if unavailable" value.
 
 mod apps;

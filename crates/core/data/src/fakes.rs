@@ -106,6 +106,7 @@ pub fn notification(key: &str, package: &str) -> Notification {
         clearable: true,
         ongoing: false,
         summary: false,
+        auto_cancel: false,
     }
 }
 
@@ -258,10 +259,17 @@ impl AppsAdapter for FakeApps {
 pub struct FakeNotifications {
     pub access: Mutex<Access>,
     pub active: Mutex<Vec<Notification>>,
+    /// The key of every notification opened, in order.
     pub opened: Mutex<Vec<String>>,
+    /// Where each opening in `opened` grew from (ANIM-08).
+    pub opened_from: Mutex<Vec<Option<Rect>>>,
+    /// Every key asked to be dismissed, in order, whether it was clearable or not.
     pub dismissed: Mutex<Vec<String>>,
+    /// How many requests `dismissed` came in: Clear sends one for all (EVT-07).
+    pub dismiss_requests: Mutex<u32>,
     pub access_screen_opened: Mutex<u32>,
-    pub app_settings_opened: Mutex<Vec<String>>,
+    /// The app of each notification-settings screen opened (EVT-08).
+    pub app_settings_opened: Mutex<Vec<(ProfileId, String)>>,
     pub error: Mutex<Option<DataError>>,
 }
 
@@ -285,20 +293,23 @@ impl NotificationsAdapter for FakeNotifications {
         Ok(self.active.lock().unwrap().clone())
     }
 
-    fn open(&self, key: &str) -> Result<(), DataError> {
+    /// Records the opening and removes nothing, as the system does.
+    fn open(&self, key: &str, from: Option<Rect>) -> Result<(), DataError> {
         self.check_access()?;
         record(&self.opened, key.to_owned());
+        record(&self.opened_from, from);
         Ok(())
     }
 
-    /// Removes the notification from `active` if it is clearable, as the system does.
-    fn dismiss(&self, key: &str) -> Result<(), DataError> {
+    /// Removes the clearable ones from `active`, as the system does.
+    fn dismiss(&self, keys: &[String]) -> Result<(), DataError> {
         self.check_access()?;
         self.active
             .lock()
             .unwrap()
-            .retain(|n| n.key != key || !n.clearable);
-        record(&self.dismissed, key.to_owned());
+            .retain(|n| !keys.contains(&n.key) || !n.clearable);
+        self.dismissed.lock().unwrap().extend_from_slice(keys);
+        *self.dismiss_requests.lock().unwrap() += 1;
         Ok(())
     }
 
@@ -308,9 +319,9 @@ impl NotificationsAdapter for FakeNotifications {
         Ok(())
     }
 
-    fn open_app_settings(&self, package: &str) -> Result<(), DataError> {
+    fn open_app_settings(&self, profile: ProfileId, package: &str) -> Result<(), DataError> {
         check(&self.error)?;
-        record(&self.app_settings_opened, package.to_owned());
+        record(&self.app_settings_opened, (profile, package.to_owned()));
         Ok(())
     }
 }

@@ -22,6 +22,8 @@ pub(crate) mod notification_flag {
     pub const ONGOING: u32 = 2;
     /// The summary of a bundle of the app's notifications (EVT-04).
     pub const SUMMARY: u32 = 4;
+    /// Meant to disappear when opened (EVT-06).
+    pub const AUTO_CANCEL: u32 = 8;
 }
 
 /// The notifications in `fields`, in order.
@@ -51,6 +53,7 @@ fn notification(record: &[Option<String>]) -> Option<Notification> {
         clearable: flags & notification_flag::CLEARABLE != 0,
         ongoing: flags & notification_flag::ONGOING != 0,
         summary: flags & notification_flag::SUMMARY != 0,
+        auto_cancel: flags & notification_flag::AUTO_CANCEL != 0,
     })
 }
 
@@ -87,7 +90,7 @@ mod tests {
 
     #[test]
     fn notifications_are_read_field_by_field() {
-        // EVT-04, EVT-05, APPS-20
+        // EVT-04, EVT-05, EVT-06, APPS-20
         let records = fields(&[
             Some("0|chat|1|null|10001"),
             Some("com.example.chat"),
@@ -96,7 +99,7 @@ mod tests {
             Some(" Anna "),
             Some("See you at eight"),
             Some("1794873600000"),
-            Some("1"),
+            Some("9"),
             Some("10|player|7|null|10002"),
             Some("com.example.player"),
             Some("10"),
@@ -123,6 +126,7 @@ mod tests {
                     clearable: true,
                     ongoing: false,
                     summary: false,
+                    auto_cancel: true,
                 },
                 Notification {
                     key: "10|player|7|null|10002".into(),
@@ -135,6 +139,7 @@ mod tests {
                     clearable: false,
                     ongoing: true,
                     summary: true,
+                    auto_cancel: false,
                 },
             ]
         );

@@ -1,9 +1,11 @@
 //! Events state (SRS 4.3): the header with the date and the next alarm, and live notifications
-//! grouped by app. Memory only (EVT-13).
+//! grouped by app, which the user opens, expands, dismisses and clears. Memory only (EVT-13).
 //!
 //! The platform writes dates and times in the device's language and 12- or 24-hour setting;
 //! Events decides which to show (L10N-03, ADR 0019). Each group takes its app's label, accent
-//! and icon from the app catalogue (APPS-17, ADR 0002, ADR 0020).
+//! and icon from the app catalogue (APPS-17, ADR 0002, ADR 0020). Opening a notification,
+//! removing one meant to disappear when opened, and what Dismiss and Clear take are decided
+//! here, and carried out through the adapter (ADR 0021).
 
 use std::cmp::Reverse;
 use std::collections::HashMap;
@@ -11,7 +13,7 @@ use std::sync::Arc;
 
 use meegone_core_data::{AppsAdapter, NotificationsAdapter, SystemConfigAdapter, TimeStyle};
 use meegone_core_state::StateHolder;
-pub use meegone_core_state::{Access, App, AppId, Notification, ProfileId};
+pub use meegone_core_state::{Access, App, AppId, Notification, ProfileId, Rect};
 
 /// An alarm that rings within this long shows only its time; a later one also shows its
 /// weekday, so a time alone always means the next time the clock shows it (EVT-02).
@@ -28,6 +30,15 @@ pub struct EventsHeader {
     /// When the next alarm rings, such as "07:00", or "Wed 07:00" when it is more than a day
     /// away. `None` hides the alarm row.
     pub alarm: Option<String>,
+}
+
+/// Which app's group: its profile and package (APPS-20), whatever notifications it holds. A
+/// group keeps it while its row comes and goes, so it names the group that is expanded or that
+/// a menu is for.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GroupId {
+    pub profile: ProfileId,
+    pub package: String,
 }
 
 /// One app's notifications (EVT-04). Its `Debug` output, like each [`Notification`]'s, leaves
@@ -48,6 +59,10 @@ pub struct NotificationGroup {
     /// Newest first, and never empty. A summary the app posts for a bundle of them is left out
     /// while any of the bundle shows.
     pub notifications: Vec<Notification>,
+    /// The keys of the clearable summaries left out while their bundle shows. They go with the
+    /// last of what the group shows, so a summary never shows alone after MeeGone removed the
+    /// rest (ADR 0021).
+    pub hidden_summaries: Vec<String>,
 }
 
 impl NotificationGroup {
@@ -61,6 +76,14 @@ impl NotificationGroup {
         self.notifications.len()
     }
 
+    /// Which app's group it is.
+    pub fn id(&self) -> GroupId {
+        GroupId {
+            profile: self.profile,
+            package: self.package.clone(),
+        }
+    }
+
     /// What tells this group's row apart from the one it had before (ANIM-20).
     pub fn key(&self) -> GroupKey {
         let latest = self.latest();
@@ -70,6 +93,15 @@ impl NotificationGroup {
             latest: latest.key.clone(),
             posted_at_ms: latest.posted_at_ms,
         }
+    }
+
+    /// The notification with `key`, if the group shows it.
+    pub fn notification(&self, key: &str) -> Option<&Notification> {
+        self.notifications.iter().find(|n| n.key == key)
+    }
+
+    fn is(&self, id: &GroupId) -> bool {
+        self.profile == id.profile && self.package == id.package
     }
 }
 
@@ -86,13 +118,67 @@ pub struct GroupKey {
     pub posted_at_ms: u64,
 }
 
+/// One row of the Events list (EVT-04, EVT-06): a group's, or one notification's below the row
+/// of the expanded group.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum RowKey {
+    Group(GroupKey),
+    /// A notification of the expanded group. Its group's key is part of it, so it comes and goes
+    /// with its group's row, and the rows that stay keep their order.
+    Notification {
+        group: GroupKey,
+        key: String,
+    },
+}
+
+/// What a row stands for: a whole group, or one notification of the expanded group. A tap or a
+/// menu acts on it (EVT-06, EVT-08).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowTarget {
+    pub group: GroupId,
+    /// The notification's key, or `None` for the whole group.
+    pub notification: Option<String>,
+}
+
+/// One row of the list as [`EventsState::rows`] makes it: the group, and for a notification's
+/// row, the notification.
+#[derive(Debug, Clone, Copy)]
+pub struct ListRow<'a> {
+    pub group: &'a NotificationGroup,
+    /// `None` for the group's own row.
+    pub notification: Option<&'a Notification>,
+    /// The group's row while it is expanded.
+    pub expanded: bool,
+}
+
+impl ListRow<'_> {
+    pub fn key(&self) -> RowKey {
+        let group = self.group.key();
+        match self.notification {
+            Some(notification) => RowKey::Notification {
+                group,
+                key: notification.key.clone(),
+            },
+            None => RowKey::Group(group),
+        }
+    }
+
+    pub fn target(&self) -> RowTarget {
+        RowTarget {
+            group: self.group.id(),
+            notification: self.notification.map(|n| n.key.clone()),
+        }
+    }
+}
+
 /// Where each of `now`'s rows was in `before`, if it kept its row there; `None` for a row that
 /// came in (ANIM-20). A row of `before` that no row of `now` keeps has gone.
 ///
-/// The rows are in order of their newest notification, and a kept row's newest notification is
-/// the same as before, so kept rows stay in the order they were in.
-pub fn rows_kept(before: &[GroupKey], now: &[GroupKey]) -> Vec<Option<usize>> {
-    let places: HashMap<&GroupKey, usize> = before
+/// The groups are in order of their newest notification, a kept group's newest notification is
+/// the same as before, and a notification's row comes and goes with its group's, so kept rows
+/// stay in the order they were in.
+pub fn rows_kept(before: &[RowKey], now: &[RowKey]) -> Vec<Option<usize>> {
+    let places: HashMap<&RowKey, usize> = before
         .iter()
         .enumerate()
         .map(|(at, key)| (key, at))
@@ -101,9 +187,36 @@ pub fn rows_kept(before: &[GroupKey], now: &[GroupKey]) -> Vec<Option<usize>> {
 }
 
 /// Whether a row came in or went between `before` and `now`, so the list moves (ANIM-20).
-pub fn rows_came_or_went(before: &[GroupKey], now: &[GroupKey]) -> bool {
+pub fn rows_came_or_went(before: &[RowKey], now: &[RowKey]) -> bool {
     let kept = rows_kept(before, now);
     kept.iter().any(Option::is_none) || kept.len() != before.len()
+}
+
+/// One item of a notification's or a group's long-press menu (EVT-08), in the order it shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotificationMenuItem {
+    /// Removes the notification, or every clearable one of the group. Offered only if one is
+    /// clearable.
+    Dismiss,
+    /// Opens the system's notification settings for the app.
+    NotificationSettings,
+}
+
+/// A notification's or a group's long-press menu (EVT-08). It covers the home views while it is
+/// open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotificationMenu {
+    /// The row it is for. The host opens it there.
+    pub target: RowTarget,
+    /// What it offers, in order: Dismiss if something is clearable, then Notification settings.
+    pub items: Vec<NotificationMenuItem>,
+}
+
+impl NotificationMenu {
+    /// Whether the menu offers `item`.
+    pub fn offers(&self, item: NotificationMenuItem) -> bool {
+        self.items.contains(&item)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -114,7 +227,53 @@ pub struct EventsState {
     /// The group with the newest notification comes first (EVT-04). Shared, so the shell can
     /// tell cheaply when it changed.
     pub groups: Arc<[NotificationGroup]>,
+    /// The group showing each of its notifications below its row (EVT-06). Only a group of
+    /// several, and one at a time.
+    pub expanded: Option<GroupId>,
+    /// A notification's or a group's long-press menu, while it is open (EVT-08).
+    pub menu: Option<NotificationMenu>,
     pub problem: Option<String>,
+}
+
+impl EventsState {
+    /// The list's rows, in order: each group's, and below the expanded group's, one for each of
+    /// its notifications (EVT-04, EVT-06).
+    pub fn rows(&self) -> Vec<ListRow<'_>> {
+        let mut rows = Vec::with_capacity(self.groups.len());
+        for group in self.groups.iter() {
+            let expanded = self.expanded.as_ref().is_some_and(|id| group.is(id));
+            rows.push(ListRow {
+                group,
+                notification: None,
+                expanded,
+            });
+            if expanded {
+                rows.extend(group.notifications.iter().map(|notification| ListRow {
+                    group,
+                    notification: Some(notification),
+                    expanded: false,
+                }));
+            }
+        }
+        rows
+    }
+
+    /// The keys of [`EventsState::rows`], to tell which rows came and went (ANIM-20).
+    pub fn row_keys(&self) -> Vec<RowKey> {
+        self.rows().iter().map(ListRow::key).collect()
+    }
+
+    /// Whether anything shown can be cleared, so Clear is offered (EVT-07).
+    pub fn clearable(&self) -> bool {
+        self.groups
+            .iter()
+            .any(|group| group.notifications.iter().any(|n| n.clearable))
+    }
+
+    /// The group `id` names, if it shows.
+    pub fn group(&self, id: &GroupId) -> Option<&NotificationGroup> {
+        self.groups.iter().find(|group| group.is(id))
+    }
 }
 
 #[derive(Debug)]
@@ -134,6 +293,25 @@ pub enum EventsIntent {
     OpenAlarm,
     /// The user tapped Allow on the explainer card (EVT-03).
     OpenAccessSettings,
+    /// The user tapped a row, which is at `from` on the screen (EVT-06). A group of one opens
+    /// its notification; a group of several expands, or collapses if it is expanded; a
+    /// notification of the expanded group opens. A notification meant to disappear when opened
+    /// is then dismissed.
+    Tap {
+        row: RowTarget,
+        from: Option<Rect>,
+    },
+    /// Collapses the expanded group, as when the user leaves Events.
+    Collapse,
+    /// Opens a row's long-press menu (EVT-08). The shell decides whether a long-press counts.
+    OpenMenu(RowTarget),
+    CloseMenu,
+    /// Closes the menu and does what its item says (EVT-08). An item it doesn't offer does
+    /// nothing.
+    ChooseMenuItem(NotificationMenuItem),
+    /// The user tapped Clear: every clearable notification shown goes (EVT-07). Ongoing ones
+    /// were never shown, so they stay (EVT-05, AC-12).
+    Clear,
 }
 
 pub struct EventsHolder {
@@ -233,10 +411,22 @@ impl EventsHolder {
         self.catalogue.as_deref().unwrap_or_default()
     }
 
-    /// Keeps the shared groups when nothing changed, so the shell sees no change.
+    /// Keeps the shared groups when nothing changed, so the shell sees no change. The expanded
+    /// group and the menu follow the new groups.
     fn set_groups(&mut self, groups: Vec<NotificationGroup>) {
         if *self.state.groups != *groups {
             self.state.groups = groups.into();
+        }
+        // A group collapses once it holds fewer than two (EVT-06).
+        let still_expandable =
+            |id: &GroupId| self.state.group(id).is_some_and(|group| group.count() > 1);
+        if !self.state.expanded.as_ref().is_none_or(still_expandable) {
+            self.state.expanded = None;
+        }
+        // The menu closes when what it is for went, and offers Dismiss only while that can go.
+        if let Some(target) = self.state.menu.as_ref().map(|menu| menu.target.clone()) {
+            self.state.menu =
+                menu_items(&self.state, &target).map(|items| NotificationMenu { target, items });
         }
     }
 
@@ -250,6 +440,97 @@ impl EventsHolder {
             .open_next_alarm()
             .err()
             .map(|error| error.to_string());
+    }
+
+    /// EVT-06: a row that no longer shows does nothing.
+    fn tap(&mut self, row: &RowTarget, from: Option<Rect>) {
+        self.state.problem = None;
+        let groups = Arc::clone(&self.state.groups);
+        let Some(group) = groups.iter().find(|group| group.is(&row.group)) else {
+            return;
+        };
+        let notification = match &row.notification {
+            Some(key) => group.notification(key),
+            None if group.count() == 1 => Some(group.latest()),
+            None => {
+                // One group is expanded at a time.
+                let expanded = self.state.expanded.take();
+                if expanded.as_ref() != Some(&row.group) {
+                    self.state.expanded = Some(row.group.clone());
+                }
+                return;
+            }
+        };
+        if let Some(notification) = notification {
+            self.open(group, notification, from);
+        }
+    }
+
+    /// Opens `notification`'s content, and dismisses it if it is meant to disappear when opened
+    /// (EVT-06), with the summaries hidden behind it if it was the last of its group.
+    fn open(&mut self, group: &NotificationGroup, notification: &Notification, from: Option<Rect>) {
+        if let Err(error) = self.notifications.open(&notification.key, from) {
+            self.state.problem = Some(error.to_string());
+            return;
+        }
+        if notification.auto_cancel {
+            self.dismiss(dismissal(group, |n| n.key == notification.key));
+        }
+    }
+
+    /// Asks the system to remove `keys`, at once. Their rows go when it reports that they went
+    /// (`RefreshNotifications`), so nothing comes back if it refused (ANIM-20).
+    fn dismiss(&mut self, keys: Vec<String>) {
+        if keys.is_empty() {
+            return;
+        }
+        self.state.problem = self
+            .notifications
+            .dismiss(&keys)
+            .err()
+            .map(|error| error.to_string());
+    }
+
+    /// EVT-08: a row that no longer shows has no menu.
+    fn open_menu(&mut self, target: RowTarget) {
+        if let Some(items) = menu_items(&self.state, &target) {
+            self.state.menu = Some(NotificationMenu { target, items });
+        }
+    }
+
+    fn choose(&mut self, item: NotificationMenuItem) {
+        self.state.problem = None;
+        let Some(menu) = self.state.menu.take_if(|menu| menu.offers(item)) else {
+            return;
+        };
+        let target = menu.target;
+        match item {
+            NotificationMenuItem::Dismiss => {
+                let groups = Arc::clone(&self.state.groups);
+                if let Some(group) = groups.iter().find(|group| group.is(&target.group)) {
+                    let only = target.notification.as_deref();
+                    self.dismiss(dismissal(group, |n| only.is_none_or(|key| n.key == key)));
+                }
+            }
+            NotificationMenuItem::NotificationSettings => {
+                self.state.problem = self
+                    .notifications
+                    .open_app_settings(target.group.profile, &target.group.package)
+                    .err()
+                    .map(|error| error.to_string());
+            }
+        }
+    }
+
+    /// EVT-07: everything clearable that shows, in one request.
+    fn clear(&mut self) {
+        self.state.problem = None;
+        let groups = Arc::clone(&self.state.groups);
+        let keys = groups
+            .iter()
+            .flat_map(|group| dismissal(group, |_| true))
+            .collect();
+        self.dismiss(keys);
     }
 }
 
@@ -275,8 +556,50 @@ impl StateHolder for EventsHolder {
                     .err()
                     .map(|error| error.to_string());
             }
+            EventsIntent::Tap { row, from } => self.tap(&row, from),
+            EventsIntent::Collapse => self.state.expanded = None,
+            EventsIntent::OpenMenu(target) => self.open_menu(target),
+            EventsIntent::CloseMenu => self.state.menu = None,
+            EventsIntent::ChooseMenuItem(item) => self.choose(item),
+            EventsIntent::Clear => self.clear(),
         }
     }
+
+    /// HOME-08: the menu, then the expanded group.
+    fn on_back(&mut self) -> bool {
+        self.state.menu.take().is_some() || self.state.expanded.take().is_some()
+    }
+}
+
+/// What `target`'s menu offers, or `None` if it no longer shows (EVT-08).
+fn menu_items(state: &EventsState, target: &RowTarget) -> Option<Vec<NotificationMenuItem>> {
+    let group = state.group(&target.group)?;
+    let clearable = match &target.notification {
+        Some(key) => group.notification(key)?.clearable,
+        None => group.notifications.iter().any(|n| n.clearable),
+    };
+    let mut items = Vec::with_capacity(2);
+    if clearable {
+        items.push(NotificationMenuItem::Dismiss);
+    }
+    items.push(NotificationMenuItem::NotificationSettings);
+    Some(items)
+}
+
+/// The keys to dismiss for the clearable notifications of `group` that `chosen` picks. With the
+/// last of what the group shows go the summaries hidden behind it, so none is left showing
+/// alone (ADR 0021).
+fn dismissal(group: &NotificationGroup, chosen: impl Fn(&Notification) -> bool) -> Vec<String> {
+    let mut keys: Vec<String> = group
+        .notifications
+        .iter()
+        .filter(|n| n.clearable && chosen(n))
+        .map(|n| n.key.clone())
+        .collect();
+    if !keys.is_empty() && keys.len() == group.count() {
+        keys.extend(group.hidden_summaries.iter().cloned());
+    }
+    keys
 }
 
 /// Groups notifications by app, newest group first, leaving out ongoing ones (EVT-04, EVT-05).
@@ -299,10 +622,19 @@ fn group(active: Vec<Notification>, catalogue: &[App]) -> Vec<NotificationGroup>
         }
     }
     // A summary stands for the app's bundle of notifications, which show for themselves, so it
-    // counts only when nothing else of its app shows.
+    // counts only when nothing else of its app shows. It is kept aside, to go with the last of
+    // them.
     for group in &mut groups {
         if group.notifications.iter().any(|n| !n.summary) {
-            group.notifications.retain(|n| !n.summary);
+            let (summaries, shown) = std::mem::take(&mut group.notifications)
+                .into_iter()
+                .partition::<Vec<_>, _>(|n| n.summary);
+            group.notifications = shown;
+            group.hidden_summaries = summaries
+                .into_iter()
+                .filter(|n| n.clearable)
+                .map(|n| n.key)
+                .collect();
         }
     }
     groups.sort_by(|a, b| {
@@ -340,6 +672,7 @@ fn new_group(first: Notification, catalogue: &[App]) -> NotificationGroup {
         app,
         work,
         notifications: vec![first],
+        hidden_summaries: Vec::new(),
     }
 }
 
@@ -381,13 +714,8 @@ mod tests {
             .collect()
     }
 
-    fn keys(holder: &EventsHolder) -> Vec<GroupKey> {
-        holder
-            .state()
-            .groups
-            .iter()
-            .map(NotificationGroup::key)
-            .collect()
+    fn keys(holder: &EventsHolder) -> Vec<RowKey> {
+        holder.state().row_keys()
     }
 
     fn at(fakes: &Fakes, now_ms: u64) {
@@ -924,5 +1252,617 @@ mod tests {
         holder.handle(EventsIntent::OpenAccessSettings);
 
         assert_eq!(*fakes.notifications.access_screen_opened.lock().unwrap(), 1);
+    }
+
+    fn id(package: &str) -> GroupId {
+        GroupId {
+            profile: ProfileId(0),
+            package: package.into(),
+        }
+    }
+
+    fn group_row(package: &str) -> RowTarget {
+        RowTarget {
+            group: id(package),
+            notification: None,
+        }
+    }
+
+    fn notification_row(package: &str, key: &str) -> RowTarget {
+        RowTarget {
+            group: id(package),
+            notification: Some(key.into()),
+        }
+    }
+
+    fn tap(holder: &mut EventsHolder, row: RowTarget) {
+        holder.handle(EventsIntent::Tap { row, from: None });
+    }
+
+    fn opened(fakes: &Fakes) -> Vec<String> {
+        fakes.notifications.opened.lock().unwrap().clone()
+    }
+
+    fn dismissed(fakes: &Fakes) -> Vec<String> {
+        fakes.notifications.dismissed.lock().unwrap().clone()
+    }
+
+    /// Mail with three notifications and chat with one, read.
+    fn mail_and_chat(fakes: &Fakes) -> EventsHolder {
+        showing(
+            fakes,
+            vec![
+                notification("m1", "mail", 10, false),
+                notification("m2", "mail", 20, false),
+                notification("m3", "mail", 30, false),
+                notification("c1", "chat", 25, false),
+            ],
+        );
+        let mut holder = holder(fakes);
+        holder.handle(EventsIntent::Refresh);
+        holder
+    }
+
+    #[test]
+    fn tapping_a_group_of_one_opens_its_notification_from_the_row() {
+        // EVT-06, ANIM-08
+        let fakes = Fakes::default();
+        let mut holder = mail_and_chat(&fakes);
+        let from = Rect {
+            left: 0,
+            top: 300,
+            right: 1080,
+            bottom: 480,
+        };
+
+        holder.handle(EventsIntent::Tap {
+            row: group_row("chat"),
+            from: Some(from),
+        });
+
+        assert_eq!(opened(&fakes), ["c1"]);
+        assert_eq!(
+            *fakes.notifications.opened_from.lock().unwrap(),
+            [Some(from)]
+        );
+        assert!(dismissed(&fakes).is_empty(), "it isn't meant to disappear");
+        assert_eq!(holder.state().expanded, None);
+    }
+
+    #[test]
+    fn a_notification_meant_to_disappear_when_opened_is_dismissed() {
+        // EVT-06: MeeGone removes it, as the system's shade does.
+        let fakes = Fakes::default();
+        showing(
+            &fakes,
+            vec![Notification {
+                auto_cancel: true,
+                ..notification("c1", "chat", 10, false)
+            }],
+        );
+        let mut holder = holder(&fakes);
+        holder.handle(EventsIntent::Refresh);
+
+        tap(&mut holder, group_row("chat"));
+
+        assert_eq!(opened(&fakes), ["c1"]);
+        assert_eq!(dismissed(&fakes), ["c1"]);
+        // Its row goes when the system says it went.
+        assert_eq!(holder.state().groups.len(), 1);
+        holder.handle(EventsIntent::RefreshNotifications);
+        assert!(holder.state().groups.is_empty());
+    }
+
+    #[test]
+    fn one_that_cant_be_cleared_stays_after_opening() {
+        let fakes = Fakes::default();
+        showing(
+            &fakes,
+            vec![Notification {
+                auto_cancel: true,
+                clearable: false,
+                ..notification("c1", "chat", 10, false)
+            }],
+        );
+        let mut holder = holder(&fakes);
+        holder.handle(EventsIntent::Refresh);
+
+        tap(&mut holder, group_row("chat"));
+
+        assert_eq!(opened(&fakes), ["c1"]);
+        assert!(dismissed(&fakes).is_empty());
+    }
+
+    #[test]
+    fn tapping_a_group_of_several_expands_it_and_again_collapses_it() {
+        // EVT-06
+        let fakes = Fakes::default();
+        let mut holder = mail_and_chat(&fakes);
+
+        tap(&mut holder, group_row("mail"));
+        assert_eq!(holder.state().expanded, Some(id("mail")));
+        assert!(opened(&fakes).is_empty());
+
+        tap(&mut holder, group_row("mail"));
+        assert_eq!(holder.state().expanded, None);
+        assert!(opened(&fakes).is_empty());
+    }
+
+    #[test]
+    fn one_group_is_expanded_at_a_time() {
+        let fakes = Fakes::default();
+        let mut holder = mail_and_chat(&fakes);
+        fakes
+            .notifications
+            .active
+            .lock()
+            .unwrap()
+            .push(notification("c2", "chat", 5, false));
+        holder.handle(EventsIntent::RefreshNotifications);
+
+        tap(&mut holder, group_row("mail"));
+        tap(&mut holder, group_row("chat"));
+
+        assert_eq!(holder.state().expanded, Some(id("chat")));
+    }
+
+    #[test]
+    fn the_expanded_groups_notifications_follow_its_row() {
+        // EVT-06, ANIM-20: expanding brings their rows in below the group's, which stays.
+        let fakes = Fakes::default();
+        let mut holder = mail_and_chat(&fakes);
+        let before = keys(&holder);
+
+        tap(&mut holder, group_row("mail"));
+
+        let rows = holder.state().rows();
+        let shown: Vec<(&str, Option<&str>, bool)> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.group.package.as_str(),
+                    row.notification.map(|n| n.key.as_str()),
+                    row.expanded,
+                )
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("mail", None, true),
+                ("mail", Some("m3"), false),
+                ("mail", Some("m2"), false),
+                ("mail", Some("m1"), false),
+                ("chat", None, false),
+            ]
+        );
+        let expanded = keys(&holder);
+        assert_eq!(
+            rows_kept(&before, &expanded),
+            [Some(0), None, None, None, Some(1)]
+        );
+        assert!(rows_came_or_went(&before, &expanded));
+        assert_eq!(rows[2].target(), notification_row("mail", "m2"));
+
+        // A notification of the group's that goes takes only its row; collapsing takes the rest.
+        fakes
+            .notifications
+            .active
+            .lock()
+            .unwrap()
+            .retain(|n| n.key != "m2");
+        holder.handle(EventsIntent::RefreshNotifications);
+        let fewer = keys(&holder);
+        assert_eq!(
+            rows_kept(&expanded, &fewer),
+            [Some(0), Some(1), Some(3), Some(4)]
+        );
+        holder.handle(EventsIntent::Collapse);
+        assert_eq!(rows_kept(&fewer, &keys(&holder)), [Some(0), Some(3)]);
+    }
+
+    #[test]
+    fn a_newer_notification_brings_the_expanded_group_in_again_at_the_top() {
+        // ANIM-20: its rows go and come together, so the rows that stay keep their order.
+        let fakes = Fakes::default();
+        let mut holder = mail_and_chat(&fakes);
+        fakes
+            .notifications
+            .active
+            .lock()
+            .unwrap()
+            .push(notification("c2", "chat", 15, false));
+        holder.handle(EventsIntent::RefreshNotifications);
+        tap(&mut holder, group_row("chat"));
+        let before = keys(&holder);
+
+        fakes
+            .notifications
+            .active
+            .lock()
+            .unwrap()
+            .push(notification("c3", "chat", 40, false));
+        holder.handle(EventsIntent::RefreshNotifications);
+
+        assert_eq!(holder.state().expanded, Some(id("chat")));
+        // Before: mail, then chat with c1 and c2. Now chat and its three are new at the top, and
+        // mail stays.
+        assert_eq!(
+            rows_kept(&before, &keys(&holder)),
+            [None, None, None, None, Some(0)]
+        );
+    }
+
+    #[test]
+    fn an_expanded_group_collapses_once_it_holds_fewer_than_two() {
+        // EVT-06
+        let fakes = Fakes::default();
+        let mut holder = mail_and_chat(&fakes);
+        tap(&mut holder, group_row("mail"));
+
+        fakes
+            .notifications
+            .active
+            .lock()
+            .unwrap()
+            .retain(|n| n.key != "m1" && n.key != "m2");
+        holder.handle(EventsIntent::RefreshNotifications);
+
+        assert_eq!(holder.state().expanded, None);
+    }
+
+    #[test]
+    fn a_notification_of_the_expanded_group_opens() {
+        // EVT-06, the issue's acceptance: tapping one item opens it.
+        let fakes = Fakes::default();
+        let mut holder = mail_and_chat(&fakes);
+        tap(&mut holder, group_row("mail"));
+
+        tap(&mut holder, notification_row("mail", "m2"));
+
+        assert_eq!(opened(&fakes), ["m2"]);
+        assert_eq!(holder.state().expanded, Some(id("mail")));
+    }
+
+    #[test]
+    fn a_row_that_no_longer_shows_does_nothing() {
+        let fakes = Fakes::default();
+        let mut holder = mail_and_chat(&fakes);
+
+        tap(&mut holder, group_row("news"));
+        tap(&mut holder, notification_row("mail", "gone"));
+        holder.handle(EventsIntent::OpenMenu(group_row("news")));
+
+        assert!(opened(&fakes).is_empty());
+        assert_eq!(holder.state().expanded, None);
+        assert_eq!(holder.state().menu, None);
+    }
+
+    #[test]
+    fn a_notification_that_cant_open_becomes_the_problem() {
+        // ARCH-09: the host shows it briefly.
+        let fakes = Fakes::default();
+        showing(
+            &fakes,
+            vec![Notification {
+                auto_cancel: true,
+                ..notification("c1", "chat", 10, false)
+            }],
+        );
+        let mut holder = holder(&fakes);
+        holder.handle(EventsIntent::Refresh);
+        *fakes.notifications.error.lock().unwrap() =
+            Some(DataError::Failed("This notification can't open".into()));
+
+        tap(&mut holder, group_row("chat"));
+
+        assert_eq!(
+            holder.state().problem.as_deref(),
+            Some("This notification can't open")
+        );
+        assert!(dismissed(&fakes).is_empty(), "nothing opened, so it stays");
+    }
+
+    #[test]
+    fn the_menu_offers_dismiss_only_for_what_can_be_cleared() {
+        // EVT-08
+        let fakes = Fakes::default();
+        showing(
+            &fakes,
+            vec![
+                notification("m1", "mail", 10, false),
+                Notification {
+                    clearable: false,
+                    ..notification("m2", "mail", 20, false)
+                },
+                Notification {
+                    clearable: false,
+                    ..notification("s1", "system", 30, false)
+                },
+            ],
+        );
+        let mut holder = holder(&fakes);
+        holder.handle(EventsIntent::Refresh);
+        let items = |holder: &EventsHolder| holder.state().menu.as_ref().map(|m| m.items.clone());
+        use NotificationMenuItem::{Dismiss, NotificationSettings};
+
+        holder.handle(EventsIntent::OpenMenu(group_row("mail")));
+        assert_eq!(items(&holder), Some(vec![Dismiss, NotificationSettings]));
+
+        holder.handle(EventsIntent::OpenMenu(notification_row("mail", "m2")));
+        assert_eq!(items(&holder), Some(vec![NotificationSettings]));
+
+        holder.handle(EventsIntent::OpenMenu(group_row("system")));
+        assert_eq!(items(&holder), Some(vec![NotificationSettings]));
+        assert_eq!(
+            holder.state().menu.as_ref().unwrap().target,
+            group_row("system")
+        );
+    }
+
+    #[test]
+    fn dismiss_takes_a_groups_clearable_notifications_or_just_one() {
+        // EVT-08
+        let fakes = Fakes::default();
+        let mut holder = mail_and_chat(&fakes);
+
+        holder.handle(EventsIntent::OpenMenu(notification_row("mail", "m2")));
+        holder.handle(EventsIntent::ChooseMenuItem(NotificationMenuItem::Dismiss));
+        assert_eq!(dismissed(&fakes), ["m2"]);
+        assert_eq!(holder.state().menu, None);
+
+        holder.handle(EventsIntent::RefreshNotifications);
+        holder.handle(EventsIntent::OpenMenu(group_row("mail")));
+        holder.handle(EventsIntent::ChooseMenuItem(NotificationMenuItem::Dismiss));
+        assert_eq!(dismissed(&fakes), ["m2", "m3", "m1"]);
+        assert_eq!(*fakes.notifications.dismiss_requests.lock().unwrap(), 2);
+
+        holder.handle(EventsIntent::RefreshNotifications);
+        assert_eq!(shown(&holder), [("chat".into(), vec!["c1".into()])]);
+    }
+
+    #[test]
+    fn the_last_of_a_bundle_takes_the_summaries_hidden_behind_it() {
+        // ADR 0021: no summary is left showing alone.
+        let fakes = Fakes::default();
+        let summary = |key: &str, posted_at_ms| Notification {
+            summary: true,
+            ..notification(key, "chat", posted_at_ms, false)
+        };
+        showing(
+            &fakes,
+            vec![
+                summary("cs", 50),
+                Notification {
+                    clearable: false,
+                    ..summary("fixed", 40)
+                },
+                notification("c1", "chat", 10, false),
+                notification("c2", "chat", 20, false),
+            ],
+        );
+        let mut holder = holder(&fakes);
+        holder.handle(EventsIntent::Refresh);
+        assert_eq!(holder.state().groups[0].hidden_summaries, ["cs"]);
+
+        // Not the last: the summary stays hidden behind c1.
+        holder.handle(EventsIntent::OpenMenu(notification_row("chat", "c2")));
+        holder.handle(EventsIntent::ChooseMenuItem(NotificationMenuItem::Dismiss));
+        assert_eq!(dismissed(&fakes), ["c2"]);
+
+        holder.handle(EventsIntent::RefreshNotifications);
+        holder.handle(EventsIntent::OpenMenu(notification_row("chat", "c1")));
+        holder.handle(EventsIntent::ChooseMenuItem(NotificationMenuItem::Dismiss));
+        assert_eq!(dismissed(&fakes), ["c2", "c1", "cs"]);
+    }
+
+    #[test]
+    fn notification_settings_open_for_the_app_in_its_profile() {
+        // EVT-08, APPS-20
+        let fakes = Fakes::default();
+        showing(
+            &fakes,
+            vec![Notification {
+                profile: WORK_PROFILE,
+                ..notification("w1", "mail", 10, false)
+            }],
+        );
+        let mut holder = holder(&fakes);
+        holder.handle(EventsIntent::Refresh);
+        let work_mail = RowTarget {
+            group: GroupId {
+                profile: WORK_PROFILE,
+                package: "mail".into(),
+            },
+            notification: None,
+        };
+
+        holder.handle(EventsIntent::OpenMenu(work_mail));
+        holder.handle(EventsIntent::ChooseMenuItem(
+            NotificationMenuItem::NotificationSettings,
+        ));
+
+        assert_eq!(
+            *fakes.notifications.app_settings_opened.lock().unwrap(),
+            [(WORK_PROFILE, "mail".to_owned())]
+        );
+        assert_eq!(holder.state().menu, None);
+        assert!(dismissed(&fakes).is_empty());
+    }
+
+    #[test]
+    fn an_item_the_menu_doesnt_offer_does_nothing() {
+        let fakes = Fakes::default();
+        showing(
+            &fakes,
+            vec![Notification {
+                clearable: false,
+                ..notification("s1", "system", 10, false)
+            }],
+        );
+        let mut holder = holder(&fakes);
+        holder.handle(EventsIntent::Refresh);
+
+        holder.handle(EventsIntent::ChooseMenuItem(NotificationMenuItem::Dismiss));
+        holder.handle(EventsIntent::OpenMenu(group_row("system")));
+        holder.handle(EventsIntent::ChooseMenuItem(NotificationMenuItem::Dismiss));
+
+        assert!(dismissed(&fakes).is_empty());
+        assert!(holder.state().menu.is_some(), "it stays open");
+    }
+
+    #[test]
+    fn a_failed_menu_item_becomes_the_problem() {
+        // ARCH-09
+        let fakes = Fakes::default();
+        let mut holder = mail_and_chat(&fakes);
+        holder.handle(EventsIntent::OpenMenu(group_row("chat")));
+        *fakes.notifications.error.lock().unwrap() = Some(DataError::Unsupported(
+            "Notification settings can't open".into(),
+        ));
+
+        holder.handle(EventsIntent::ChooseMenuItem(
+            NotificationMenuItem::NotificationSettings,
+        ));
+
+        assert_eq!(
+            holder.state().problem.as_deref(),
+            Some("Notification settings can't open")
+        );
+    }
+
+    #[test]
+    fn the_menu_closes_when_what_it_is_for_goes() {
+        let fakes = Fakes::default();
+        let mut holder = mail_and_chat(&fakes);
+        tap(&mut holder, group_row("mail"));
+        holder.handle(EventsIntent::OpenMenu(notification_row("mail", "m1")));
+
+        // Another of mail's going keeps it.
+        fakes
+            .notifications
+            .active
+            .lock()
+            .unwrap()
+            .retain(|n| n.key != "m2");
+        holder.handle(EventsIntent::RefreshNotifications);
+        assert!(holder.state().menu.is_some());
+
+        fakes
+            .notifications
+            .active
+            .lock()
+            .unwrap()
+            .retain(|n| n.key != "m1");
+        holder.handle(EventsIntent::RefreshNotifications);
+        assert_eq!(holder.state().menu, None);
+    }
+
+    #[test]
+    fn back_closes_the_menu_then_collapses_the_group() {
+        // HOME-08
+        let fakes = Fakes::default();
+        let mut holder = mail_and_chat(&fakes);
+        tap(&mut holder, group_row("mail"));
+        holder.handle(EventsIntent::OpenMenu(group_row("mail")));
+
+        assert!(holder.on_back());
+        assert_eq!(holder.state().menu, None);
+        assert_eq!(holder.state().expanded, Some(id("mail")));
+
+        assert!(holder.on_back());
+        assert_eq!(holder.state().expanded, None);
+
+        assert!(!holder.on_back());
+    }
+
+    #[test]
+    fn clear_takes_every_clearable_notification_in_one_request() {
+        // EVT-07, AC-12: ongoing ones were never shown, and those that can't be cleared stay.
+        let fakes = Fakes::default();
+        showing(
+            &fakes,
+            vec![
+                notification("m1", "mail", 10, false),
+                notification("m2", "mail", 20, false),
+                Notification {
+                    summary: true,
+                    ..notification("ms", "mail", 30, false)
+                },
+                notification("c1", "chat", 40, false),
+                Notification {
+                    clearable: false,
+                    ..notification("s1", "system", 50, false)
+                },
+                notification("p1", "player", 60, true),
+            ],
+        );
+        let mut holder = holder(&fakes);
+        holder.handle(EventsIntent::Refresh);
+        assert!(holder.state().clearable());
+
+        holder.handle(EventsIntent::Clear);
+
+        let mut cleared = dismissed(&fakes);
+        cleared.sort();
+        assert_eq!(cleared, ["c1", "m1", "m2", "ms"]);
+        assert_eq!(*fakes.notifications.dismiss_requests.lock().unwrap(), 1);
+        holder.handle(EventsIntent::RefreshNotifications);
+        assert_eq!(shown(&holder), [("system".into(), vec!["s1".into()])]);
+        assert!(!holder.state().clearable(), "Clear is offered no more");
+        let left: Vec<String> = fakes
+            .notifications
+            .active
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|n| n.key.clone())
+            .collect();
+        assert_eq!(left, ["s1", "p1"]);
+    }
+
+    #[test]
+    fn clear_with_nothing_clearable_asks_nothing() {
+        let fakes = Fakes::default();
+        showing(&fakes, Vec::new());
+        let mut holder = holder(&fakes);
+        holder.handle(EventsIntent::Refresh);
+
+        holder.handle(EventsIntent::Clear);
+
+        assert_eq!(*fakes.notifications.dismiss_requests.lock().unwrap(), 0);
+        assert_eq!(holder.state().problem, None);
+    }
+
+    #[test]
+    fn a_failed_clear_becomes_the_problem() {
+        // ARCH-09
+        let fakes = Fakes::default();
+        let mut holder = mail_and_chat(&fakes);
+        *fakes.notifications.error.lock().unwrap() = Some(DataError::Failed(
+            "Notifications can't be cleared right now".into(),
+        ));
+
+        holder.handle(EventsIntent::Clear);
+
+        assert_eq!(
+            holder.state().problem.as_deref(),
+            Some("Notifications can't be cleared right now")
+        );
+    }
+
+    #[test]
+    fn revoking_access_collapses_the_group_and_closes_the_menu() {
+        // AC-21
+        let fakes = Fakes::default();
+        let mut holder = mail_and_chat(&fakes);
+        tap(&mut holder, group_row("mail"));
+        holder.handle(EventsIntent::OpenMenu(group_row("mail")));
+
+        *fakes.notifications.access.lock().unwrap() = Access::Missing;
+        holder.handle(EventsIntent::RefreshNotifications);
+
+        assert_eq!(holder.state().expanded, None);
+        assert_eq!(holder.state().menu, None);
     }
 }

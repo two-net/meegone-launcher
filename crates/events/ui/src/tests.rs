@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use meegone_core_ui::tokens::{DARK, LIGHT};
-use meegone_events_state::{App, Notification};
+use meegone_events_state::{App, GroupId, Notification, NotificationMenu};
 
 use super::*;
 
@@ -37,6 +37,7 @@ fn notification(key: &str, package: &str, posted_at_ms: u64) -> Notification {
         clearable: true,
         ongoing: false,
         summary: false,
+        auto_cancel: false,
     }
 }
 
@@ -49,6 +50,7 @@ fn group(app: Option<App>, package: &str, notifications: Vec<Notification>) -> N
         app,
         work: false,
         notifications,
+        hidden_summaries: Vec::new(),
     }
 }
 
@@ -109,6 +111,8 @@ fn each_group_shows_its_app_its_count_and_its_newest_notification() {
         view.rows(),
         [EventsRow {
             from: None,
+            notification: false,
+            expanded: false,
             profile: ProfileId(0),
             package: "mail".into(),
             activity: Some("mail.Inbox".into()),
@@ -268,4 +272,223 @@ fn allow_asks_for_the_access_screen() {
         sent.borrow().as_slice(),
         [EventsIntent::OpenAccessSettings]
     ));
+}
+
+fn mail_id() -> GroupId {
+    GroupId {
+        profile: ProfileId(0),
+        package: "mail".into(),
+    }
+}
+
+/// Mail with three notifications, from the grid, and chat with one.
+fn mail_and_chat() -> EventsState {
+    state(
+        Access::Granted,
+        vec![
+            group(
+                Some(mail()),
+                "mail",
+                vec![
+                    notification("m3", "mail", 30),
+                    notification("m2", "mail", 20),
+                    notification("m1", "mail", 10),
+                ],
+            ),
+            group(None, "chat", vec![notification("c1", "chat", 5)]),
+        ],
+    )
+}
+
+fn expanded(state: &EventsState) -> EventsState {
+    EventsState {
+        expanded: Some(mail_id()),
+        ..state.clone()
+    }
+}
+
+/// A row's package, whether it is a notification's, whether it is expanded, its count, its title
+/// and where it was.
+type Kind<'a> = (&'a str, bool, bool, usize, &'a str, Option<usize>);
+
+fn kinds(view: &EventsView) -> Vec<Kind<'_>> {
+    view.rows()
+        .iter()
+        .map(|row| {
+            (
+                row.package.as_str(),
+                row.notification,
+                row.expanded,
+                row.count,
+                row.title.as_str(),
+                row.from,
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn an_expanded_groups_notifications_come_in_below_its_row() {
+    // EVT-06, ANIM-20
+    let (mut view, _) = view();
+    let collapsed = mail_and_chat();
+    let first = view.show_list(&collapsed, &LIGHT);
+    let _read = view.rows();
+
+    let revision = view.show_list(&expanded(&collapsed), &LIGHT);
+
+    assert_ne!(revision, first, "expanding is drawn again");
+    assert_eq!(
+        kinds(&view),
+        [
+            // Only the name and the count while expanded.
+            ("mail", false, true, 3, "", Some(0)),
+            ("mail", true, false, 1, "Anna", None),
+            ("mail", true, false, 1, "Anna", None),
+            ("mail", true, false, 1, "Anna", None),
+            ("chat", false, false, 1, "Anna", Some(1)),
+        ]
+    );
+    let row = &view.rows()[1];
+    assert_eq!(row.label, "Mail");
+    assert_eq!(row.accent, LIGHT.app_accent(Rgb::hex(0xFFE082)));
+    assert_eq!(row.text, "See you at eight");
+
+    view.show_list(&collapsed, &LIGHT);
+    assert_eq!(
+        kinds(&view),
+        [
+            ("mail", false, false, 3, "Anna", Some(0)),
+            ("chat", false, false, 1, "Anna", Some(4)),
+        ]
+    );
+}
+
+#[test]
+fn a_tapped_row_is_named_by_what_it_stands_for() {
+    // EVT-06
+    let (mut view, sent) = view();
+    let revision = view.show_list(&expanded(&mail_and_chat()), &LIGHT);
+    let from = Rect {
+        left: 0,
+        top: 200,
+        right: 1080,
+        bottom: 400,
+    };
+
+    assert!(view.row_tapped(revision, 2, from));
+    assert!(view.row_tapped(revision, 4, Rect::default()));
+
+    let sent = sent.borrow();
+    let EventsIntent::Tap { row, from: at } = &sent[0] else {
+        panic!("a tap");
+    };
+    assert_eq!(
+        *row,
+        RowTarget {
+            group: mail_id(),
+            notification: Some("m2".into()),
+        }
+    );
+    assert_eq!(*at, Some(from));
+    let EventsIntent::Tap { row, from: at } = &sent[1] else {
+        panic!("a tap");
+    };
+    assert_eq!(row.group.package, "chat");
+    assert_eq!(row.notification, None);
+    assert_eq!(*at, None, "no rect, no growing from it");
+}
+
+#[test]
+fn a_tap_on_rows_that_changed_since_they_were_drawn_does_nothing() {
+    let (mut view, sent) = view();
+    let revision = view.show_list(&mail_and_chat(), &LIGHT);
+    view.show_list(&expanded(&mail_and_chat()), &LIGHT);
+
+    assert!(!view.row_tapped(revision, 0, Rect::default()));
+    assert_eq!(view.row_target(revision, 1), None);
+    assert!(sent.borrow().is_empty());
+}
+
+#[test]
+fn the_menu_opens_at_its_rows_place() {
+    // EVT-08
+    let (mut view, _) = view();
+    let mut state = expanded(&mail_and_chat());
+    view.show_list(&state, &LIGHT);
+    assert_eq!(view.menu(&state), None);
+
+    state.menu = Some(NotificationMenu {
+        target: RowTarget {
+            group: mail_id(),
+            notification: Some("m1".into()),
+        },
+        items: vec![
+            NotificationMenuItem::Dismiss,
+            NotificationMenuItem::NotificationSettings,
+        ],
+    });
+    assert_eq!(
+        view.menu(&state),
+        Some(EventsMenuFrame {
+            dismiss: true,
+            row: Some(3),
+        })
+    );
+
+    // Collapsed, it opens at its group's row.
+    state.expanded = None;
+    state.menu.as_mut().unwrap().items = vec![NotificationMenuItem::NotificationSettings];
+    view.show_list(&state, &LIGHT);
+    assert_eq!(
+        view.menu(&state),
+        Some(EventsMenuFrame {
+            dismiss: false,
+            row: Some(0),
+        })
+    );
+}
+
+#[test]
+fn clear_is_offered_only_while_something_shown_can_be_cleared() {
+    // EVT-07
+    let (mut view, sent) = view();
+    view.show_list(&mail_and_chat(), &LIGHT);
+    assert!(view.clearable());
+
+    let stuck = Notification {
+        clearable: false,
+        ..notification("s1", "android", 10)
+    };
+    view.show_list(
+        &state(Access::Granted, vec![group(None, "android", vec![stuck])]),
+        &LIGHT,
+    );
+    assert!(!view.clearable());
+
+    view.show_list(&state(Access::Missing, Vec::new()), &LIGHT);
+    assert!(!view.clearable());
+
+    view.clear_tapped();
+    view.menu_item_chosen(NotificationMenuItem::Dismiss);
+    assert!(matches!(
+        sent.borrow().as_slice(),
+        [
+            EventsIntent::Clear,
+            EventsIntent::ChooseMenuItem(NotificationMenuItem::Dismiss)
+        ]
+    ));
+}
+
+#[test]
+fn a_notifications_row_never_prints_what_it_says() {
+    // EVT-13
+    let (mut view, _) = view();
+    view.show_list(&expanded(&mail_and_chat()), &LIGHT);
+
+    let printed = format!("{:?}", view.rows());
+
+    assert!(printed.contains("notification: true"));
+    assert!(!printed.contains("Anna"));
+    assert!(!printed.contains("See you at eight"));
 }

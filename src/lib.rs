@@ -17,9 +17,9 @@ pub use meegone_shell_state::{
 use meegone_shell_ui::ShellView;
 pub use meegone_shell_ui::{
     AppMenuFrame, AppMenuItem, AppsFrame, BADGE_ROWS, Bounds, Cell, CellKey, EditFrame,
-    EventsListFrame, EventsListMode, EventsRow, FolderFrame, FolderId, GridChangeFrame, GridLayout,
-    HomeFrame, HoverFrame, LiftFrame, MenuFrame, MergeFrame, RenameFrame, SearchFrame, Surface,
-    SurfaceCellsFrame,
+    EventsListFrame, EventsListMode, EventsMenuFrame, EventsRow, FolderFrame, FolderId,
+    GridChangeFrame, GridLayout, HomeFrame, HoverFrame, LiftFrame, MenuFrame, MergeFrame,
+    NotificationMenuItem, RenameFrame, RowTarget, SearchFrame, Surface, SurfaceCellsFrame,
 };
 
 pub struct Launcher {

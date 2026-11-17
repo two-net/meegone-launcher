@@ -14,7 +14,8 @@
 //! `nativeAppMenu`, in the fields of [`menu_item_fields`] (ADR 0013). In edit mode, the grid
 //! names a cell by revision and place when its ✕ is tapped or a screen reader moves it
 //! (ADR 0014). Search's field sends each change of its text, and its results are a third grid
-//! (ADR 0016).
+//! (ADR 0016). Events' rows are read the same way, with `nativeEventsList`, and named by
+//! revision and place when tapped or long-pressed (ADR 0020, ADR 0021).
 //!
 //! A bug in MeeGone becomes a Java `RuntimeException` instead of an abort, so its message
 //! reaches logcat. Containing it keeps `panic = "unwind"`, as ARCH-09 already requires.
@@ -32,7 +33,8 @@ use meegone_core_data::{App, Rect, Rgb, accent};
 use crate::{
     AppMenuItem, BADGE_ROWS, Bounds, Cell, CellKey, Direction, EventsListMode, EventsRow,
     FOLDER_COLUMNS, FolderId, GridLayout, HomeFrame, HomeView, Launcher, Layout, MenuItem,
-    PREVIEW_APPS, PointerEvent, PointerKind, SavedHome, SettingsGroup, ShellIntent, Surface,
+    NotificationMenuItem, PREVIEW_APPS, PointerEvent, PointerKind, RowTarget, SavedHome,
+    SettingsGroup, ShellIntent, Surface,
 };
 
 /// JNI's `jboolean`.
@@ -737,24 +739,27 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeEven
     rows
 }
 
-/// The fields of one app group in `nativeEventsList`, mirrored in `EventsList.java`:
-/// 1. where its row was in the rows last read, which keeps its view, or -1 for a row that comes
-///    in (ANIM-20);
+/// The fields of one row in `nativeEventsList`, mirrored in `EventsList.java`:
+/// 1. where it was in the rows last read, which keeps its view, or -1 for a row that comes in
+///    (ANIM-20);
 /// 2. the app's name;
-/// 3. its flags: 1 in a work profile (APPS-20);
+/// 3. its flags: 1 in a work profile (APPS-20); 2 one notification of the expanded group, below
+///    its group's row; 4 a group's row while it is expanded (EVT-06);
 /// 4. to 6. its package, launcher activity and profile serial number, which its icon is loaded
 ///    by; the activity is empty for an app with no icon in the grid, whose icon the system gives;
 /// 7. the marker's colour, as opaque ARGB in decimal (EVT-09);
-/// 8. how many notifications it holds;
-/// 9. and 10. the newest notification's title and text.
+/// 8. how many notifications its group holds, or 1 for a notification's row;
+/// 9. and 10. what it says: a group's newest notification's title and text, empty while the
+///    group is expanded, or the notification's own.
 fn events_row_fields(row: &EventsRow) -> [String; 10] {
+    let flags = u8::from(row.work) | u8::from(row.notification) << 1 | u8::from(row.expanded) << 2;
     [
         row.from
             .and_then(|at| i32::try_from(at).ok())
             .unwrap_or(-1)
             .to_string(),
         row.label.clone(),
-        u8::from(row.work).to_string(),
+        flags.to_string(),
         row.package.clone(),
         row.activity.clone().unwrap_or_default(),
         row.profile.0.to_string(),
@@ -763,6 +768,180 @@ fn events_row_fields(row: &EventsRow) -> [String; 10] {
         row.title.clone(),
         row.text.clone(),
     ]
+}
+
+/// What row `index` of Events' rows at `revision` stands for, if they are still the rows the
+/// host last read and Events works (ARCH-09).
+fn row_at(launcher: &Launcher, revision: i32, index: i32) -> Option<RowTarget> {
+    let index = usize::try_from(index).ok()?;
+    if !launcher.shell().events_ready() {
+        return None;
+    }
+    // The revision travels as Java's `int`.
+    launcher.view().events().row_target(revision as u32, index)
+}
+
+/// Asks something of Events with `step`, applies it, and returns Events' `problem` as a message
+/// for the host to show, or `null`. Does nothing while Events isn't working (ARCH-09). The
+/// message never carries what a notification says (EVT-13).
+fn with_events_message(env: Env, step: impl FnOnce(&Launcher) -> bool) -> JObject {
+    let mut shown = std::ptr::null_mut();
+    guarded(env, || {
+        LAUNCHER.with_borrow_mut(|launcher| {
+            let launcher = launcher.as_mut().ok_or("MeeGone hasn't started")?;
+            if !launcher.shell().events_ready() || !step(launcher) {
+                return Ok(());
+            }
+            launcher.frame();
+            shown = message(env, launcher.shell().events().state().problem.as_deref())?;
+            Ok(())
+        })
+    });
+    shown
+}
+
+/// `String nativeEventsRowTapped(int revision, int index, int left, int top, int right, int
+/// bottom)`: row `index` of Events' rows at `revision` was tapped, and is at that rect on the
+/// screen (EVT-06). A notification opens, its window growing from the row (ANIM-08), and a group
+/// of several expands or collapses. Returns `null`, or a short message to show when nothing
+/// could open. Rows that changed since the host drew them do nothing.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+#[allow(clippy::too_many_arguments)] // The JNI calling convention.
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeEventsRowTapped(
+    env: RawEnv,
+    _views: JObject,
+    revision: i32,
+    index: i32,
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    let from = Rect {
+        left,
+        top,
+        right,
+        bottom,
+    };
+    with_events_message(env, |launcher| {
+        let Ok(index) = usize::try_from(index) else {
+            return false;
+        };
+        // The revision travels as Java's `int`.
+        launcher
+            .view()
+            .events()
+            .row_tapped(revision as u32, index, from)
+    })
+}
+
+/// `boolean nativeEventsRowLongPressed(int revision, int index)`: the finger that is down has
+/// stayed on row `index` of Events' rows at `revision` for the platform's long-press time
+/// (EVT-08). Returns whether the long-press was taken: the row's menu opened, and the rest of
+/// the gesture is the shell's, so lifting the finger taps nothing. Rows that changed since the
+/// host drew them take nothing.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeEventsRowLongPressed(
+    env: RawEnv,
+    _views: JObject,
+    revision: i32,
+    index: i32,
+) -> JBoolean {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    let mut taken = false;
+    with_launcher(env, |launcher| {
+        if let Some(target) = row_at(launcher, revision, index) {
+            launcher.dispatch(ShellIntent::LongPressNotification(target));
+            launcher.frame();
+            let state = launcher.shell().state();
+            taken = state.events_menu_open && state.carousel.held;
+        }
+    });
+    JBoolean::from(taken)
+}
+
+/// `boolean nativeEventsMenuRequested(int revision, int index)`: opens the menu of row `index`
+/// of Events' rows at `revision` without a gesture, for screen readers (A11Y-05). Returns
+/// whether it opened.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeEventsMenuRequested(
+    env: RawEnv,
+    _views: JObject,
+    revision: i32,
+    index: i32,
+) -> JBoolean {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    let mut opened = false;
+    with_launcher(env, |launcher| {
+        if let Some(target) = row_at(launcher, revision, index) {
+            launcher.dispatch(ShellIntent::OpenNotificationMenu(target));
+            launcher.frame();
+            opened = launcher.shell().state().events_menu_open;
+        }
+    });
+    JBoolean::from(opened)
+}
+
+/// `String nativeEventsMenuChosen(int item)`: an item of the open notification menu was chosen,
+/// by its code in [`notification_menu_bit`]: 0 Dismiss, 1 Notification settings (EVT-08).
+/// Returns `null`, or a short message to show when the system refused.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeEventsMenuChosen(
+    env: RawEnv,
+    _views: JObject,
+    item: i32,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    let item = match item {
+        0 => NotificationMenuItem::Dismiss,
+        1 => NotificationMenuItem::NotificationSettings,
+        _ => return std::ptr::null_mut(),
+    };
+    with_events_message(env, |launcher| {
+        launcher.view().events().menu_item_chosen(item);
+        true
+    })
+}
+
+/// `String nativeClearNotifications()`: Clear was tapped on Events' section header, so every
+/// clearable notification goes (EVT-07). Returns `null`, or a short message to show when the
+/// system refused.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeClearNotifications(
+    env: RawEnv,
+    _views: JObject,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_events_message(env, |launcher| {
+        launcher.view().events().clear_tapped();
+        true
+    })
 }
 
 /// `String nativeAllowNotifications()`: Allow was tapped on the Events explainer card, so the
@@ -779,20 +958,10 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeAllo
 ) -> JObject {
     // SAFETY: the JVM passes this thread's environment.
     let env = unsafe { Env::from_raw(env) };
-    let mut shown = std::ptr::null_mut();
-    guarded(env, || {
-        LAUNCHER.with_borrow_mut(|launcher| {
-            let launcher = launcher.as_mut().ok_or("MeeGone hasn't started")?;
-            if !launcher.shell().events_ready() {
-                return Ok(());
-            }
-            launcher.view().events().allow_access_tapped();
-            launcher.frame();
-            shown = message(env, launcher.shell().events().state().problem.as_deref())?;
-            Ok(())
-        })
-    });
-    shown
+    with_events_message(env, |launcher| {
+        launcher.view().events().allow_access_tapped();
+        true
+    })
 }
 
 /// `void nativeFrame(long frameTimeNanos)`: the display is about to draw a frame (ANIM-04).
@@ -1673,7 +1842,7 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRead
 }
 
 /// How many slots the frame has.
-const FRAME_SLOTS: usize = 86;
+const FRAME_SLOTS: usize = 89;
 
 /// A `HomeFrame` as the `int[]` that `HomeViews.java` reads, slot by slot:
 ///
@@ -1746,6 +1915,9 @@ const FRAME_SLOTS: usize = 86;
 /// | 83 | The Events list's revision: when it changes, the groups are read again with `nativeEventsList` |
 /// | 84 | How far the Events list has come in showing groups that came and went, 0 to 10 000 (ANIM-20) |
 /// | 85 | The divider colour of hairlines, as opaque ARGB |
+/// | 86 | 1 while the Events section header offers Clear (EVT-07); otherwise 0 |
+/// | 87 | The notification menu's items, as bits 1 << [`notification_menu_bit`]: 1 Dismiss, 2 Notification settings; 0 while it is closed (EVT-08) |
+/// | 88 | The Events row it opens at, in the rows last read, or -1 to centre it |
 fn frame_slots(frame: &HomeFrame) -> [i32; FRAME_SLOTS] {
     let [events, applications, recent] = frame.pages;
     let menu_items = frame.menu.map_or(0, |menu| {
@@ -1877,9 +2049,31 @@ fn frame_slots(frame: &HomeFrame) -> [i32; FRAME_SLOTS] {
         frame.events_list.map_or(0, |list| list.revision as i32),
         i32::from(frame.events_change),
         argb(frame.divider),
+        i32::from(frame.events_list.is_some_and(|list| list.clearable)),
+        frame.events_menu.map_or(0, |menu| {
+            let mut items = 1 << notification_menu_bit(NotificationMenuItem::NotificationSettings);
+            if menu.dismiss {
+                items |= 1 << notification_menu_bit(NotificationMenuItem::Dismiss);
+            }
+            items
+        }),
+        frame
+            .events_menu
+            .and_then(|menu| menu.row)
+            .and_then(|row| i32::try_from(row).ok())
+            .unwrap_or(-1),
     ];
     slots[40 + BADGE_ROWS..].copy_from_slice(&rest);
     slots
+}
+
+/// A notification menu item's code, mirrored in `HomeViews.java`: its bit in the frame's slot
+/// 87, and what `nativeEventsMenuChosen` takes.
+fn notification_menu_bit(item: NotificationMenuItem) -> u32 {
+    match item {
+        NotificationMenuItem::Dismiss => 0,
+        NotificationMenuItem::NotificationSettings => 1,
+    }
 }
 
 /// An opaque colour as Android's `int` ARGB.

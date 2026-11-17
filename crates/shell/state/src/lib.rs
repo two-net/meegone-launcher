@@ -30,7 +30,9 @@ use meegone_core_data::{
 };
 use meegone_core_state::motion::{MODE_SCALE, VIEW_FLING_VELOCITY_DP};
 use meegone_core_state::{App, Health, Store, ThemeHolder, ThemeIntent};
-use meegone_events_state::{EventsHolder, EventsIntent, NotificationGroup, rows_came_or_went};
+use meegone_events_state::{
+    EventsHolder, EventsIntent, GroupId, NotificationGroup, RowKey, RowTarget, rows_came_or_went,
+};
 use meegone_lockimage_data::PersistentImageCache;
 use meegone_lockimage_state::{LockImageHolder, LockImageIntent, LockImageState};
 use meegone_recent_state::{RecentHolder, RecentIntent};
@@ -127,6 +129,10 @@ pub struct ShellState {
     /// is Applications' own. It covers the home views as the home menu does. A failed
     /// Applications never counts (ARCH-09).
     pub app_menu_open: bool,
+    /// A notification's or a group's long-press menu is open over Events (EVT-08). Its content
+    /// is Events' own. It covers the home views as the home menu does. A failed Events never
+    /// counts (ARCH-09).
+    pub events_menu_open: bool,
     /// A folder is open over Applications (FOLD-04): the carousel stays put, and only the
     /// folder's panel takes touches. A failed Applications never counts (ARCH-09).
     pub folder_open: bool,
@@ -179,6 +185,7 @@ impl ShellState {
         !self.settings_open
             && self.menu.is_none()
             && !self.app_menu_open
+            && !self.events_menu_open
             && !self.folder_open
             && !self.search.open
             && HomeMenu::items_for(self.current, false).is_some()
@@ -253,7 +260,16 @@ pub enum ShellIntent {
     /// Opens an app's or a folder's menu without a gesture, from a screen-reader action
     /// (A11Y-05).
     OpenCellMenu(CellKey),
-    /// A touch outside the home menu or an app's menu closes it.
+    /// The finger that is down has stayed on a notification's or a group's row in Events for
+    /// the platform's long-press time (EVT-08). The shell takes it only if the finger hasn't
+    /// moved past the touch slop and nothing covers the views: the menu opens and ticks
+    /// (ANIM-24), and the rest of the gesture is the shell's, so lifting the finger opens
+    /// nothing.
+    LongPressNotification(RowTarget),
+    /// Opens a notification's or a group's menu without a gesture, from a screen-reader action
+    /// (A11Y-05).
+    OpenNotificationMenu(RowTarget),
+    /// A touch outside the home menu, an app's menu or a notification's menu closes it.
     CloseMenu,
     /// An item of the home menu was chosen (HOME-10).
     ChooseMenuItem(MenuItem),
@@ -319,8 +335,11 @@ pub struct HomeShell {
     seen_hidden: Arc<[App]>,
     search: SearchMotion,
     events_change: EventsChange,
-    /// Events' groups as of the last intent, to tell when its rows came or went (ANIM-20).
+    /// Events' groups and expanded group as of the last intent, to tell cheaply whether its
+    /// rows may have changed, and the keys of those rows, to tell which came or went (ANIM-20).
     seen_groups: Arc<[NotificationGroup]>,
+    seen_expanded: Option<GroupId>,
+    seen_rows: Vec<RowKey>,
     theme: Store<ThemeHolder>,
     apps: Store<AppsHolder>,
     events: Store<EventsHolder>,
@@ -354,6 +373,8 @@ impl HomeShell {
             search: SearchMotion::default(),
             events_change: EventsChange::default(),
             seen_groups: Arc::new([]),
+            seen_expanded: None,
+            seen_rows: Vec::new(),
             theme: Store::new(ThemeHolder::new(
                 settings_store.clone(),
                 platform.system.clone(),
@@ -405,7 +426,10 @@ impl HomeShell {
         // Recent read the hidden apps as it loaded.
         shell.seen_hidden = shell.apps.state().hidden_apps.clone();
         // Events' list as it starts is shown as it is too (ANIM-20).
-        shell.seen_groups = shell.events.state().groups.clone();
+        let events = shell.events.state();
+        shell.seen_groups = events.groups.clone();
+        shell.seen_expanded = events.expanded.clone();
+        shell.seen_rows = events.row_keys();
         shell
     }
 
@@ -540,9 +564,12 @@ impl HomeShell {
             ShellIntent::LongPressCell { surface, key } => self.long_press_cell(surface, key),
             ShellIntent::OpenMenu => self.open_menu(None),
             ShellIntent::OpenCellMenu(key) => self.open_cell_menu(key),
+            ShellIntent::LongPressNotification(target) => self.long_press_notification(target),
+            ShellIntent::OpenNotificationMenu(target) => self.open_notification_menu(target),
             ShellIntent::CloseMenu => {
                 self.state.menu = None;
                 self.close_app_menu();
+                self.close_events_menu();
             }
             ShellIntent::ChooseMenuItem(item) => self.choose(item),
             ShellIntent::OpenSettings => self.open_settings(None),
@@ -595,6 +622,7 @@ impl HomeShell {
         self.state.events_change = self.events_change.state();
         self.state.mode = self.mode_state();
         self.state.app_menu_open = self.app_menu_shown();
+        self.state.events_menu_open = self.events_menu_shown();
         self.state.folder_open = self.folder_shown();
         self.state.folder = self.folder.state();
         self.state.renaming = (*self.apps.health() == Health::Ready)
@@ -605,7 +633,22 @@ impl HomeShell {
 
     /// Whether Settings or a menu covers the home views, so they get no new touches.
     fn covered(&self) -> bool {
-        self.state.settings_open || self.state.menu.is_some() || self.app_menu_shown()
+        self.state.settings_open
+            || self.state.menu.is_some()
+            || self.app_menu_shown()
+            || self.events_menu_shown()
+    }
+
+    /// Whether a notification's menu is open. A failed Events can't close its menu, so it never
+    /// counts: the home must never be left covered for good (ARCH-09).
+    fn events_menu_shown(&self) -> bool {
+        *self.events.health() == Health::Ready && self.events.state().menu.is_some()
+    }
+
+    fn close_events_menu(&mut self) {
+        if self.events_menu_shown() {
+            self.events.dispatch(EventsIntent::CloseMenu);
+        }
     }
 
     /// Whether an app's menu is open. A failed Applications can't close its menu, so it never
@@ -792,20 +835,21 @@ impl HomeShell {
         }
     }
 
-    /// When Events' rows came or went, its list moves to its new rows (ANIM-20). A group whose
-    /// count alone changed moves nothing.
+    /// When Events' rows came or went, as notifications came and went or a group expanded or
+    /// collapsed, its list moves to its new rows (ANIM-20, EVT-06). A group whose count alone
+    /// changed moves nothing.
     fn keep_events_in_step(&mut self) {
-        let groups = self.events.state().groups.clone();
-        if Arc::ptr_eq(&groups, &self.seen_groups) {
+        let events = self.events.state();
+        if Arc::ptr_eq(&events.groups, &self.seen_groups) && events.expanded == self.seen_expanded {
             return;
         }
-        let keys = |groups: &[NotificationGroup]| -> Vec<_> {
-            groups.iter().map(NotificationGroup::key).collect()
-        };
-        if rows_came_or_went(&keys(&self.seen_groups), &keys(&groups)) {
+        let rows = events.row_keys();
+        self.seen_groups = events.groups.clone();
+        self.seen_expanded = events.expanded.clone();
+        if rows_came_or_went(&self.seen_rows, &rows) {
             self.events_change.start(self.carousel.animation_scale());
         }
-        self.seen_groups = groups;
+        self.seen_rows = rows;
     }
 
     /// Recent leaves out the apps Applications hides (APPS-19, REC-03). When they change, by a
@@ -1062,6 +1106,37 @@ impl HomeShell {
         self.system.haptic_tick();
     }
 
+    /// EVT-08: a long-press on a notification's or a group's row opens its menu and ticks
+    /// (ANIM-24). It counts only on Events, while the gesture is still a press and nothing
+    /// covers the views. Then the rest of the gesture is the shell's, so lifting the finger
+    /// opens nothing.
+    fn long_press_notification(&mut self, target: RowTarget) {
+        if self.covered()
+            || self.state.current != HomeView::Events
+            || self.carousel.pressed_at().is_none()
+        {
+            return;
+        }
+        self.events.dispatch(EventsIntent::OpenMenu(target));
+        if !self.events_menu_shown() || self.carousel.long_press().is_none() {
+            return;
+        }
+        // The menu covers the views, so nothing stays pressed.
+        self.press.finish();
+        self.system.haptic_tick();
+    }
+
+    /// A11Y-05: opens a notification's or a group's menu without a gesture, so with no tick.
+    fn open_notification_menu(&mut self, target: RowTarget) {
+        if self.covered() || self.state.current != HomeView::Events {
+            return;
+        }
+        let release = self.carousel.end_gesture(self.state.current);
+        self.settle(release);
+        self.press.finish();
+        self.events.dispatch(EventsIntent::OpenMenu(target));
+    }
+
     /// A11Y-05: opens an app's or a folder's menu without a gesture, so with no tick, and
     /// nothing to pick up.
     fn open_cell_menu(&mut self, key: CellKey) {
@@ -1114,6 +1189,7 @@ impl HomeShell {
         self.search.end_gesture();
         self.state.menu = None;
         self.close_app_menu();
+        self.close_events_menu();
         self.close_folder();
         self.close_search();
         self.settings.dispatch(SettingsIntent::Refresh);
@@ -1215,11 +1291,17 @@ impl HomeShell {
 
     fn show(&mut self, view: HomeView) {
         self.state.current = view;
-        // The menus, the pressed or lifted item and edit mode belong to the view they were in.
+        // The menus, the pressed or lifted item, edit mode and the expanded group belong to the
+        // view they were in.
         self.state.menu = None;
         self.close_app_menu();
+        self.close_events_menu();
         self.press.finish();
         self.lift.cancel();
+        if view != HomeView::Events && self.events_ready() && self.events.state().expanded.is_some()
+        {
+            self.events.dispatch(EventsIntent::Collapse);
+        }
         if view != HomeView::Applications {
             self.close_folder();
             self.close_search();
@@ -1242,11 +1324,12 @@ mod tests {
     use meegone_apps_state::{AppMenuItem, Bounds, FolderId, GridItem, GridLayout};
     use meegone_core_data::fakes::{FakeApps, FakeNotifications, Fakes, app, app_id, notification};
     use meegone_core_data::{
-        App, AppId, AppsAdapter, DataError, Notification, NotificationsAdapter, Profile, RecentUse,
-        Rect, Shortcut,
+        App, AppId, AppsAdapter, DataError, Notification, NotificationsAdapter, Profile, ProfileId,
+        RecentUse, Rect, Shortcut,
     };
     use meegone_core_state::motion::{DRAG_LIFT_SCALE, ICON_PRESS_SCALE};
     use meegone_core_state::{Access, Health, Theme, ThemeChoice};
+    use meegone_events_state::NotificationMenuItem;
 
     use super::*;
 
@@ -1592,20 +1675,20 @@ mod tests {
             panic!("listener bug");
         }
 
-        fn open(&self, key: &str) -> Result<(), DataError> {
-            self.0.open(key)
+        fn open(&self, key: &str, from: Option<Rect>) -> Result<(), DataError> {
+            self.0.open(key, from)
         }
 
-        fn dismiss(&self, key: &str) -> Result<(), DataError> {
-            self.0.dismiss(key)
+        fn dismiss(&self, keys: &[String]) -> Result<(), DataError> {
+            self.0.dismiss(keys)
         }
 
         fn open_access_settings(&self) -> Result<(), DataError> {
             self.0.open_access_settings()
         }
 
-        fn open_app_settings(&self, package: &str) -> Result<(), DataError> {
-            self.0.open_app_settings(package)
+        fn open_app_settings(&self, profile: ProfileId, package: &str) -> Result<(), DataError> {
+            self.0.open_app_settings(profile, package)
         }
     }
 
@@ -2826,6 +2909,252 @@ mod tests {
 
         assert!(matches!(shell.apps().health(), Health::Failed(_)));
         assert!(!shell.state().app_menu_open);
+        assert!(shell.state().menu_offered());
+        shell.dispatch(ShellIntent::OpenMenu);
+        assert!(shell.state().menu.is_some());
+    }
+
+    /// Laid out on Events, with mail's three notifications and chat's one.
+    fn on_events(fakes: &Fakes) -> HomeShell {
+        let posted = |key: &str, package: &str, posted_at_ms| Notification {
+            posted_at_ms,
+            ..notification(key, package)
+        };
+        *fakes.notifications.access.lock().unwrap() = Access::Granted;
+        *fakes.notifications.active.lock().unwrap() = vec![
+            posted("m1", "mail", 10),
+            posted("m2", "mail", 20),
+            posted("m3", "mail", 30),
+            posted("c1", "chat", 25),
+        ];
+        let mut shell = laid_out(fakes);
+        go(&mut shell, Direction::Previous);
+        assert_eq!(shell.state().current, HomeView::Events);
+        shell
+    }
+
+    fn row_of(package: &str) -> RowTarget {
+        RowTarget {
+            group: GroupId {
+                profile: ProfileId(0),
+                package: package.into(),
+            },
+            notification: None,
+        }
+    }
+
+    /// A finger held still on `target`'s row until the host's long-press time has passed
+    /// (EVT-08).
+    fn hold_row(shell: &mut HomeShell, target: RowTarget) {
+        finger(shell, PointerKind::Down, 300.0, 900.0);
+        shell.dispatch(ShellIntent::LongPressNotification(target));
+    }
+
+    fn events_menu_of(shell: &HomeShell) -> Option<RowTarget> {
+        let menu = shell.events().state().menu.clone()?;
+        Some(menu.target)
+    }
+
+    fn expand(shell: &mut HomeShell, package: &str) {
+        shell.dispatch(ShellIntent::Events(EventsIntent::Tap {
+            row: row_of(package),
+            from: None,
+        }));
+    }
+
+    #[test]
+    fn a_long_press_on_a_notification_opens_its_menu_and_ticks() {
+        // EVT-08, ANIM-24
+        let fakes = Fakes::default();
+        let mut shell = on_events(&fakes);
+
+        hold_row(&mut shell, row_of("mail"));
+
+        assert_eq!(events_menu_of(&shell), Some(row_of("mail")));
+        let state = shell.state();
+        assert!(state.events_menu_open);
+        assert!(!state.menu_offered());
+        assert_eq!(ticks(&fakes), 1);
+        // The rest of the gesture is the shell's, so lifting the finger opens nothing.
+        assert!(state.carousel.held);
+        lift(&mut shell);
+        assert!(shell.state().events_menu_open);
+        assert!(fakes.notifications.opened.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_long_press_on_a_notification_counts_only_on_events_while_nothing_covers_it() {
+        // EVT-08: no menu, no tick, and the gesture stays the content's.
+        let not_taken = |shell: &HomeShell, fakes: &Fakes| {
+            assert_eq!(events_menu_of(shell), None);
+            assert!(!shell.state().carousel.held);
+            assert_eq!(ticks(fakes), 0);
+        };
+        let fakes = Fakes::default();
+        let mut shell = on_events(&fakes);
+
+        // The finger moved past the touch slop: a scroll that stopped.
+        finger(&mut shell, PointerKind::Down, 300.0, 900.0);
+        finger(&mut shell, PointerKind::Move, 300.0, 980.0);
+        shell.dispatch(ShellIntent::LongPressNotification(row_of("mail")));
+        not_taken(&shell, &fakes);
+        lift(&mut shell);
+
+        // Under Settings or the home menu.
+        shell.dispatch(ShellIntent::OpenSettings);
+        hold_row(&mut shell, row_of("mail"));
+        not_taken(&shell, &fakes);
+        lift(&mut shell);
+        shell.dispatch(ShellIntent::Back);
+        shell.dispatch(ShellIntent::OpenMenu);
+        hold_row(&mut shell, row_of("mail"));
+        not_taken(&shell, &fakes);
+        lift(&mut shell);
+        shell.dispatch(ShellIntent::CloseMenu);
+
+        // A group that no longer shows has no menu.
+        hold_row(&mut shell, row_of("news"));
+        not_taken(&shell, &fakes);
+        lift(&mut shell);
+
+        // Only on Events.
+        go(&mut shell, Direction::Next);
+        hold_row(&mut shell, row_of("mail"));
+        not_taken(&shell, &fakes);
+        shell.dispatch(ShellIntent::OpenNotificationMenu(row_of("mail")));
+        assert_eq!(events_menu_of(&shell), None);
+    }
+
+    #[test]
+    fn a_screen_reader_opens_a_notifications_menu_without_a_tick() {
+        // A11Y-05
+        let fakes = Fakes::default();
+        let mut shell = on_events(&fakes);
+
+        shell.dispatch(ShellIntent::OpenNotificationMenu(row_of("chat")));
+
+        assert_eq!(events_menu_of(&shell), Some(row_of("chat")));
+        assert!(shell.state().events_menu_open);
+        assert_eq!(ticks(&fakes), 0);
+    }
+
+    #[test]
+    fn the_notification_menu_covers_the_views_and_closes_like_the_others() {
+        // EVT-08, HOME-07, HOME-08
+        let fakes = Fakes::default();
+        let mut shell = on_events(&fakes);
+        shell.dispatch(ShellIntent::OpenNotificationMenu(row_of("mail")));
+
+        // It covers the home views, as the home menu does.
+        hold(&mut shell, 300.0, 900.0);
+        assert_eq!(shell.state().menu, None);
+        lift(&mut shell);
+
+        shell.dispatch(ShellIntent::CloseMenu);
+        assert!(!shell.state().events_menu_open);
+
+        // Back closes the menu, then collapses the group.
+        expand(&mut shell, "mail");
+        shell.dispatch(ShellIntent::OpenNotificationMenu(row_of("mail")));
+        shell.dispatch(ShellIntent::Back);
+        assert!(!shell.state().events_menu_open);
+        assert!(shell.events().state().expanded.is_some());
+        shell.dispatch(ShellIntent::Back);
+        assert_eq!(shell.events().state().expanded, None);
+
+        // Home closes both, and Events stays.
+        expand(&mut shell, "mail");
+        shell.dispatch(ShellIntent::OpenNotificationMenu(row_of("mail")));
+        shell.dispatch(ShellIntent::Home);
+        assert!(!shell.state().events_menu_open);
+        assert_eq!(shell.events().state().expanded, None);
+        assert_eq!(shell.state().current, HomeView::Events);
+
+        // Settings closes it too.
+        shell.dispatch(ShellIntent::OpenNotificationMenu(row_of("mail")));
+        shell.dispatch(ShellIntent::OpenSettings);
+        assert!(!shell.state().events_menu_open);
+    }
+
+    #[test]
+    fn leaving_events_collapses_its_group_and_closes_its_menu() {
+        // EVT-06: as an open folder closes on leaving Applications.
+        let fakes = Fakes::default();
+        let mut shell = on_events(&fakes);
+        expand(&mut shell, "mail");
+        assert!(shell.events().state().expanded.is_some());
+
+        go(&mut shell, Direction::Next);
+
+        assert_eq!(shell.events().state().expanded, None);
+    }
+
+    #[test]
+    fn expanding_and_collapsing_a_group_moves_the_events_list() {
+        // EVT-06, ANIM-20
+        let fakes = Fakes::default();
+        let mut shell = on_events(&fakes);
+        come_to_rest(&mut shell, 20_000);
+        assert!(!shell.state().events_change.animating);
+
+        expand(&mut shell, "mail");
+        assert!(shell.state().events_change.animating);
+        come_to_rest(&mut shell, 30_000);
+
+        expand(&mut shell, "mail");
+        assert_eq!(shell.events().state().expanded, None);
+        assert!(shell.state().events_change.animating);
+    }
+
+    /// Works like [`FakeNotifications`], except that dismissing panics.
+    struct BrokenDismiss(FakeNotifications);
+
+    impl NotificationsAdapter for BrokenDismiss {
+        fn access(&self) -> Access {
+            self.0.access()
+        }
+
+        fn active(&self) -> Result<Vec<Notification>, DataError> {
+            self.0.active()
+        }
+
+        fn open(&self, key: &str, from: Option<Rect>) -> Result<(), DataError> {
+            self.0.open(key, from)
+        }
+
+        fn dismiss(&self, _keys: &[String]) -> Result<(), DataError> {
+            panic!("dismiss bug");
+        }
+
+        fn open_access_settings(&self) -> Result<(), DataError> {
+            self.0.open_access_settings()
+        }
+
+        fn open_app_settings(&self, profile: ProfileId, package: &str) -> Result<(), DataError> {
+            self.0.open_app_settings(profile, package)
+        }
+    }
+
+    #[test]
+    fn a_failing_events_never_leaves_the_home_covered() {
+        // ARCH-09: a menu Events can no longer close doesn't count.
+        let fakes = Fakes::default();
+        let mut platform = fakes.platform();
+        let broken = FakeNotifications::default();
+        *broken.access.lock().unwrap() = Access::Granted;
+        *broken.active.lock().unwrap() = vec![notification("c1", "chat")];
+        platform.notifications = Arc::new(BrokenDismiss(broken));
+        let mut shell = HomeShell::compose(platform);
+        shell.dispatch(ShellIntent::Swipe(Direction::Previous));
+        shell.dispatch(ShellIntent::OpenNotificationMenu(row_of("chat")));
+        assert!(shell.state().events_menu_open);
+
+        shell.dispatch(ShellIntent::Events(EventsIntent::ChooseMenuItem(
+            NotificationMenuItem::Dismiss,
+        )));
+
+        assert!(matches!(shell.events().health(), Health::Failed(_)));
+        assert!(!shell.state().events_menu_open);
         assert!(shell.state().menu_offered());
         shell.dispatch(ShellIntent::OpenMenu);
         assert!(shell.state().menu.is_some());

@@ -9,11 +9,15 @@ import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
+import android.os.Build;
+import android.os.Bundle;
 import android.text.TextUtils;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.accessibility.AccessibilityNodeInfo;
+import android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.TextView;
@@ -23,12 +27,18 @@ import java.util.List;
 /**
  * What Events shows below its header (EVT-03, EVT-04, EVT-09, EVT-11, ADR 0020): the card that
  * asks for notification access, "No new events", or a "Notifications" section with one row per
- * app, newest first.
+ * app, newest first, and Clear (EVT-07). Below the expanded group's row, each of its
+ * notifications has a row of its own (EVT-06, ADR 0021).
  *
  * <p>The Rust app decides what shows and when the rows change; this view reads the rows again
  * only when the frame's revision changes. Each row says where it was in the rows last read, so a
  * row that stays keeps its view, a new one slides in, and one that went collapses where it was,
  * as far as the frame's progress says (ANIM-20).
+ *
+ * <p>A tap on a row opens its notification or expands its group, and a long-press, which {@link
+ * HomeViews} times, opens its menu (EVT-08). Rows are named by their place in the rows last
+ * read. Screen readers get the long-press as "Open menu", and a group's expanding as its own
+ * actions (A11Y-05).
  *
  * <p>Rows hold what each newest notification says only to show it; nothing here logs it
  * (EVT-13).
@@ -44,6 +54,10 @@ final class EventsList extends LinearLayout {
     // serial number for its icon; the marker's colour; the count; the title and the text.
     static final int FIELDS = 10;
     private static final int WORK = 1;
+    /** One notification of the expanded group, below its group's row. */
+    private static final int NOTIFICATION = 2;
+    /** A group's row while its notifications show below it. */
+    private static final int EXPANDED = 4;
     /** Body text (SRS 5.2). */
     private static final float BODY_SP = 15f;
     /** Section headers: 13 sp, in capitals and letter-spaced (SRS 5.2). */
@@ -61,12 +75,26 @@ final class EventsList extends LinearLayout {
     /** The smallest a touch target gets (A11Y-02). */
     private static final float TARGET_DP = 48f;
 
-    /** Allow was tapped on the explainer card. */
-    interface Allow {
+    /** What the user does with the list. */
+    interface Listener {
+        /** Allow was tapped on the explainer card (EVT-03). */
         void allow();
+
+        /** Clear was tapped on the section header (EVT-07). */
+        void clear();
+
+        /** Row {@code index} of the rows last read was tapped, at {@code onScreen} (EVT-06). */
+        void tapped(int index, Rect onScreen);
+
+        /**
+         * A screen reader asks for row {@code index}'s menu (A11Y-05). Returns whether it
+         * opened.
+         */
+        boolean menuRequested(int index);
     }
 
     private final AppIcons icons;
+    private final Listener listener;
     private final float density;
     private final LinearLayout explainer;
     private final GradientDrawable card;
@@ -75,6 +103,7 @@ final class EventsList extends LinearLayout {
     private final LinearLayout section;
     private final TextView sectionTitle;
     private final View hairline;
+    private final TextView clear;
     private final TextView empty;
     private final Rows rows;
     /** The rows as of the last fill, in order, without those going. */
@@ -85,9 +114,10 @@ final class EventsList extends LinearLayout {
     private int accent = -1;
     private int divider = -1;
 
-    EventsList(Context context, AppIcons icons, Allow onAllow) {
+    EventsList(Context context, AppIcons icons, Listener listener) {
         super(context);
         this.icons = icons;
+        this.listener = listener;
         density = getResources().getDisplayMetrics().density;
         int margin = dp(MARGIN_DP);
         setOrientation(VERTICAL);
@@ -112,14 +142,14 @@ final class EventsList extends LinearLayout {
         allow.setMinHeight(dp(TARGET_DP));
         allow.setMinWidth(dp(TARGET_DP));
         allow.setPadding(dp(GAP_DP), 0, dp(GAP_DP), 0);
-        allow.setOnClickListener(view -> onAllow.allow());
+        allow.setOnClickListener(view -> listener.allow());
         LayoutParams allowParams = wrap();
         allowParams.gravity = Gravity.END;
         allowParams.topMargin = dp(4);
         explainer.addView(allow, allowParams);
         addView(explainer, matchWidth());
 
-        // The section header, with a hairline to the right edge (SRS 5.2).
+        // The section header, with a hairline towards the end and Clear there (SRS 5.2, EVT-07).
         section = new LinearLayout(context);
         section.setOrientation(HORIZONTAL);
         section.setGravity(Gravity.CENTER_VERTICAL);
@@ -137,6 +167,20 @@ final class EventsList extends LinearLayout {
                 new LayoutParams(0, Math.max(1, Math.round(density)), 1f);
         hairlineParams.setMarginStart(dp(GAP_DP));
         section.addView(hairline, hairlineParams);
+        clear = new TextView(context);
+        clear.setText(R.string.events_clear);
+        clear.setContentDescription(getResources().getString(R.string.events_clear_description));
+        clear.setTextSize(TypedValue.COMPLEX_UNIT_SP, BODY_SP);
+        clear.setTypeface(Typeface.create(Typeface.DEFAULT, MEDIUM, false));
+        clear.setGravity(Gravity.CENTER);
+        clear.setMinHeight(dp(TARGET_DP));
+        clear.setMinWidth(dp(TARGET_DP));
+        clear.setPadding(dp(GAP_DP), 0, dp(GAP_DP), 0);
+        clear.setOnClickListener(view -> listener.clear());
+        clear.setVisibility(GONE);
+        LayoutParams clearParams = wrap();
+        clearParams.setMarginStart(dp(4));
+        section.addView(clear, clearParams);
         addView(section, matchWidth());
 
         rows = new Rows(context);
@@ -148,6 +192,8 @@ final class EventsList extends LinearLayout {
         empty.setTextSize(TypedValue.COMPLEX_UNIT_SP, BODY_SP);
         empty.setGravity(Gravity.CENTER);
         empty.setMinHeight(dp(TARGET_DP));
+        // A11Y-08: read when it appears, such as after Clear.
+        empty.setAccessibilityLiveRegion(ACCESSIBILITY_LIVE_REGION_POLITE);
         LayoutParams emptyParams = matchWidth();
         emptyParams.topMargin = dp(MARGIN_DP);
         addView(empty, emptyParams);
@@ -163,6 +209,26 @@ final class EventsList extends LinearLayout {
         // A group that went still collapses as the empty state shows.
         rows.setVisibility(mode == EMPTY || mode == LIST ? VISIBLE : GONE);
         empty.setVisibility(mode == EMPTY ? VISIBLE : GONE);
+    }
+
+    /** Offers Clear while something shown can be cleared, as the frame's slot 86 says. */
+    void clearable(boolean offered) {
+        clear.setVisibility(offered ? VISIBLE : GONE);
+    }
+
+    /** Row {@code index} of the rows last read, or null. */
+    View rowAt(int index) {
+        return index >= 0 && index < shown.size() ? shown.get(index) : null;
+    }
+
+    /** The app's name on row {@code index} of the rows last read, or null. */
+    String label(int index) {
+        return index >= 0 && index < shown.size() ? shown.get(index).label : null;
+    }
+
+    /** Where {@code view} is in the rows last read, if it is one of them; otherwise -1. */
+    int indexOfRow(View view) {
+        return view instanceof Row ? shown.indexOf(view) : -1;
     }
 
     /**
@@ -228,8 +294,9 @@ final class EventsList extends LinearLayout {
         if (!kept[place]) {
             Row going = before[place];
             going.role = Row.GOING;
-            // Screen readers no longer reach it (A11Y-01).
+            // Screen readers and touches no longer reach it (A11Y-01).
             going.setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS);
+            going.setClickable(false);
             order.add(going);
         }
     }
@@ -308,6 +375,8 @@ final class EventsList extends LinearLayout {
         allow.setBackground(new RippleDrawable(pressed, null, new ColorDrawable(Color.WHITE)));
         sectionTitle.setTextColor(dim);
         hairline.setBackgroundColor(divider);
+        clear.setTextColor(accent);
+        clear.setBackground(new RippleDrawable(pressed, null, new ColorDrawable(Color.WHITE)));
         empty.setTextColor(dim);
         for (int i = 0; i < rows.getChildCount(); i++) {
             ((Row) rows.getChildAt(i)).colour(foreground, dim);
@@ -401,7 +470,9 @@ final class EventsList extends LinearLayout {
 
     /**
      * One app's group (EVT-04): its accent marker (EVT-09), icon, name and count, and its newest
-     * notification's title and text in at most two lines. Screen readers read it as one item.
+     * notification's title and text in at most two lines, or nothing more while it is expanded.
+     * Or one notification of the expanded group, below it (EVT-06): the marker, and its title
+     * and text where the group's name is. Screen readers read either as one item.
      */
     private final class Row extends LinearLayout {
         static final int STAYING = 0;
@@ -410,23 +481,32 @@ final class EventsList extends LinearLayout {
 
         private final GradientDrawable marker = new GradientDrawable();
         private final ImageView image;
+        private final LinearLayout top;
         private final TextView name;
         private final TextView count;
         private final TextView message;
         int role = STAYING;
         /** How much of its height it takes, from 0 to 1 (ANIM-20). */
         float share = 1f;
+        String label = "";
         private long profile;
         private String packageName = "";
         private String activity = "";
         private String title = "";
         private String text = "";
+        private boolean notification;
+        private boolean expanded;
+        private int notifications = 1;
 
         Row(Context context) {
             super(context);
             setOrientation(HORIZONTAL);
             setPadding(0, dp(GAP_DP), 0, dp(GAP_DP));
+            setMinimumHeight(dp(TARGET_DP));
             setScreenReaderFocusable(true);
+            // Not long-clickable: HomeViews times the long-press, so Android starts no second
+            // timer (ADR 0013).
+            setOnClickListener(view -> tapped());
 
             View bar = new View(context);
             marker.setCornerRadius(dp(MARKER_DP) / 2f);
@@ -444,7 +524,7 @@ final class EventsList extends LinearLayout {
             LinearLayout texts = new LinearLayout(context);
             texts.setOrientation(VERTICAL);
             texts.setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS);
-            LinearLayout top = new LinearLayout(context);
+            top = new LinearLayout(context);
             top.setOrientation(HORIZONTAL);
             name = body(context);
             name.setTypeface(Typeface.create(Typeface.DEFAULT, MEDIUM, false));
@@ -474,25 +554,53 @@ final class EventsList extends LinearLayout {
 
         /** Takes on the row whose fields start at {@code at}. */
         void bind(String[] fields, int at) {
-            String label = field(fields, at + 1);
-            boolean work = (parseInt(field(fields, at + 2), 0) & WORK) != 0;
+            label = field(fields, at + 1);
+            int flags = parseInt(field(fields, at + 2), 0);
+            boolean work = (flags & WORK) != 0;
+            notification = (flags & NOTIFICATION) != 0;
+            expanded = (flags & EXPANDED) != 0;
             packageName = field(fields, at + 3);
             activity = field(fields, at + 4);
             profile = parseLong(field(fields, at + 5));
             marker.setColor(parseInt(field(fields, at + 6), Color.GRAY));
-            int notifications = Math.max(1, parseInt(field(fields, at + 7), 1));
+            notifications = Math.max(1, parseInt(field(fields, at + 7), 1));
             title = field(fields, at + 8);
             text = field(fields, at + 9);
 
+            // A notification's row keeps the icon's room, so its text lines up with the name.
+            image.setVisibility(notification ? INVISIBLE : VISIBLE);
+            top.setVisibility(notification ? GONE : VISIBLE);
+            int padding = dp(notification ? GAP_DP / 2 : GAP_DP);
+            setPadding(0, padding, 0, padding);
             name.setText(label);
             count.setText(Integer.toString(notifications));
             String said = said();
             message.setText(said);
             message.setVisibility(said.isEmpty() ? GONE : VISIBLE);
             String app = work ? getResources().getString(R.string.app_work, label) : label;
-            setContentDescription(getResources().getQuantityString(
-                    R.plurals.events_group_description, notifications, app, notifications,
-                    said));
+            if (notification) {
+                setContentDescription(said.isEmpty() ? app : said);
+            } else if (expanded) {
+                setContentDescription(getResources().getQuantityString(
+                        R.plurals.events_group_expanded_description, notifications, app,
+                        notifications));
+            } else {
+                setContentDescription(getResources().getQuantityString(
+                        R.plurals.events_group_description, notifications, app, notifications,
+                        said));
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                setStateDescription(expandable()
+                        ? getResources().getString(
+                                expanded ? R.string.events_expanded : R.string.events_collapsed)
+                        : null);
+            }
+            setClickable(role != GOING);
+        }
+
+        /** A group of several, which a tap expands or collapses rather than opens. */
+        private boolean expandable() {
+            return !notification && notifications > 1;
         }
 
         /** The title and the text, either alone if the other is empty. */
@@ -503,6 +611,17 @@ final class EventsList extends LinearLayout {
             return getResources().getString(R.string.events_title_text, title, text);
         }
 
+        private void tapped() {
+            int index = shown.indexOf(this);
+            if (index < 0 || role == GOING) {
+                return;
+            }
+            int[] at = new int[2];
+            getLocationOnScreen(at);
+            listener.tapped(index, new Rect(at[0], at[1], at[0] + getWidth(),
+                    at[1] + getHeight()));
+        }
+
         void icon(AppIcons icons) {
             Drawable icon = icons.get(profile, packageName, activity);
             image.setImageDrawable(icon);
@@ -511,7 +630,49 @@ final class EventsList extends LinearLayout {
         void colour(int foreground, int dim) {
             name.setTextColor(foreground);
             count.setTextColor(dim);
-            message.setTextColor(dim);
+            // A notification's own row reads as the group's newest does.
+            message.setTextColor(notification ? foreground : dim);
+            ColorStateList pressed =
+                    ColorStateList.valueOf((foreground & 0x00FFFFFF) | 0x1F000000);
+            setBackground(new RippleDrawable(pressed, null, new ColorDrawable(Color.WHITE)));
+        }
+
+        // A tap opens or expands, and the long-press's menu is an action (A11Y-05).
+        @Override
+        public void onInitializeAccessibilityNodeInfo(AccessibilityNodeInfo info) {
+            super.onInitializeAccessibilityNodeInfo(info);
+            if (role == GOING) {
+                return;
+            }
+            int click = expandable()
+                    ? (expanded ? R.string.action_collapse : R.string.action_expand)
+                    : R.string.action_open_notification;
+            info.addAction(new AccessibilityAction(AccessibilityNodeInfo.ACTION_CLICK,
+                    getResources().getString(click)));
+            if (expandable()) {
+                info.addAction(expanded
+                        ? AccessibilityAction.ACTION_COLLAPSE
+                        : AccessibilityAction.ACTION_EXPAND);
+            }
+            info.setLongClickable(true);
+            info.addAction(new AccessibilityAction(AccessibilityNodeInfo.ACTION_LONG_CLICK,
+                    getResources().getString(R.string.action_app_menu)));
+        }
+
+        @Override
+        public boolean performAccessibilityAction(int action, Bundle arguments) {
+            if (role != GOING) {
+                if (action == AccessibilityNodeInfo.ACTION_LONG_CLICK) {
+                    int index = shown.indexOf(this);
+                    return index >= 0 && listener.menuRequested(index);
+                }
+                if ((action == AccessibilityNodeInfo.ACTION_EXPAND && expandable() && !expanded)
+                        || (action == AccessibilityNodeInfo.ACTION_COLLAPSE && expanded)) {
+                    tapped();
+                    return true;
+                }
+            }
+            return super.performAccessibilityAction(action, arguments);
         }
     }
 

@@ -165,6 +165,7 @@ fn notification_content_and_usage_history_are_never_stored() {
         clearable: true,
         ongoing: false,
         summary: false,
+        auto_cancel: false,
     }];
     *fakes.usage.access.lock().unwrap() = Access::Granted;
     *fakes.usage.uses.lock().unwrap() = vec![

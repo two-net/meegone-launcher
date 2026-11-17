@@ -8,8 +8,8 @@ import android.service.notification.StatusBarNotification;
  * grants MeeGone notification access, and unbinds it when they revoke it.
  *
  * <p>It keeps nothing. {@link Bridge} asks it for the active notifications when the Rust app
- * reads them, and it tells {@link Bridge} when they change. Nothing here logs what a
- * notification says (EVT-13).
+ * reads them, opens or removes them through it (EVT-06 to EVT-08, ADR 0021), and it tells {@link
+ * Bridge} when they change. Nothing here logs what a notification says (EVT-13).
  *
  * <p>The system calls it on the main thread, which is the only thread that reads {@link
  * #connected}.

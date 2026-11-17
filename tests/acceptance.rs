@@ -3,7 +3,6 @@
 //!
 //! Not automated yet, because the behaviour isn't built:
 //! - AC-01: first-run setup (#35)
-//! - AC-12: Clear in Events (#20)
 //! - AC-13, AC-14: Recent density and close mode (#23, #24)
 //! - AC-15 to AC-17: the daily image (#27 to #30)
 //!
@@ -26,9 +25,9 @@ use meegone_core_data::{
 use meegone_core_state::{Access, Health, Theme};
 use meegone_core_ui::tokens;
 use meegone_launcher::{
-    AppMenuItem, BADGE_ROWS, Bounds, CellKey, Direction, EventsListMode, FolderId, GridLayout,
-    HomeView, Launcher, Layout, LiftFrame, MenuItem, PointerEvent, PointerKind, SettingsGroup,
-    ShellIntent, Surface,
+    AppMenuItem, BADGE_ROWS, Bounds, CellKey, Direction, EventsListMode, EventsMenuFrame, FolderId,
+    GridLayout, HomeView, Launcher, Layout, LiftFrame, MenuItem, NotificationMenuItem,
+    PointerEvent, PointerKind, SettingsGroup, ShellIntent, Surface,
 };
 
 /// A phone 1080 × 2400 px at 2.75 px per dp.
@@ -1022,6 +1021,274 @@ fn evt10_given_events_showing_then_a_new_group_slides_in_and_a_dismissed_one_col
     );
 }
 
+/// Where a tapped Events row is on the phone's screen.
+const ROW: Rect = Rect {
+    left: 0,
+    top: 900,
+    right: 1080,
+    bottom: 1100,
+};
+
+/// The Events rows after a frame, with their revision: each row's name, whether it is one
+/// notification's, its count and its title.
+fn events_rows(launcher: &mut Launcher) -> (u32, Vec<(String, bool, usize, String)>) {
+    let list = launcher.frame().events_list.expect("Events works");
+    let rows = launcher
+        .view()
+        .events()
+        .rows()
+        .iter()
+        .map(|row| {
+            (
+                row.label.clone(),
+                row.notification,
+                row.count,
+                row.title.clone(),
+            )
+        })
+        .collect();
+    (list.revision, rows)
+}
+
+fn sorted(keys: &std::sync::Mutex<Vec<String>>) -> Vec<String> {
+    let mut keys = keys.lock().unwrap().clone();
+    keys.sort();
+    keys
+}
+
+#[test]
+fn ac12_given_clearable_and_ongoing_notifications_when_clear_is_tapped_then_only_ongoing_remain() {
+    // Issue #20: EVT-05, EVT-07. A paused player can be cleared in the system's shade, but it
+    // is ongoing playback, so Events never showed it and Clear leaves it.
+    let fakes = Fakes::default();
+    *fakes.notifications.access.lock().unwrap() = Access::Granted;
+    *fakes.notifications.active.lock().unwrap() = vec![
+        notification("m1", "mail"),
+        notification("m2", "mail"),
+        notification("c1", "chat"),
+        Notification {
+            ongoing: true,
+            ..notification("p1", "player")
+        },
+        Notification {
+            ongoing: true,
+            clearable: false,
+            ..notification("n1", "maps")
+        },
+    ];
+    let (mut launcher, _) = on_a_phone(&fakes);
+    launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
+    let list = launcher.frame().events_list.expect("Events works");
+    assert!(list.clearable, "Clear is offered");
+
+    launcher.view().events().clear_tapped();
+    launcher.frame();
+    assert_eq!(sorted(&fakes.notifications.dismissed), ["c1", "m1", "m2"]);
+    // The system reports them gone.
+    launcher.dispatch(ShellIntent::NotificationsChanged);
+
+    let list = launcher.frame().events_list.expect("Events works");
+    assert_eq!(list.mode, EventsListMode::Empty);
+    assert!(!list.clearable);
+    let left: Vec<String> = fakes
+        .notifications
+        .active
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|n| n.key.clone())
+        .collect();
+    assert_eq!(left, ["p1", "n1"]);
+}
+
+#[test]
+fn evt06_given_a_group_of_three_when_it_is_tapped_then_it_expands_and_tapping_one_item_opens_it() {
+    // Issue #20's acceptance criterion: EVT-06, ANIM-08, ANIM-20. The opened notification is
+    // meant to disappear when opened, so MeeGone removes it.
+    let fakes = Fakes::default();
+    *fakes.apps.apps.lock().unwrap() = vec![app("messages", "Messages")];
+    let message = |key: &str, title: &str, posted_at_ms| Notification {
+        title: title.into(),
+        posted_at_ms,
+        auto_cancel: true,
+        ..notification(key, "messages")
+    };
+    *fakes.notifications.access.lock().unwrap() = Access::Granted;
+    *fakes.notifications.active.lock().unwrap() = vec![
+        message("m1", "Anna", 10),
+        message("m2", "Ben", 20),
+        message("m3", "Cleo", 30),
+    ];
+    let (mut launcher, mut clock) = on_a_phone(&fakes);
+    launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
+    come_to_rest(&mut launcher, &mut clock);
+    let (revision, rows) = events_rows(&mut launcher);
+    assert_eq!(rows, [("Messages".into(), false, 3, "Cleo".into())]);
+
+    assert!(launcher.view().events().row_tapped(revision, 0, ROW));
+    let frame = launcher.frame();
+
+    assert!(frame.animating, "its notifications slide in");
+    let (revision, rows) = events_rows(&mut launcher);
+    assert_eq!(
+        rows,
+        [
+            ("Messages".into(), false, 3, String::new()),
+            ("Messages".into(), true, 1, "Cleo".into()),
+            ("Messages".into(), true, 1, "Ben".into()),
+            ("Messages".into(), true, 1, "Anna".into()),
+        ]
+    );
+    assert!(fakes.notifications.opened.lock().unwrap().is_empty());
+
+    assert!(launcher.view().events().row_tapped(revision, 2, ROW));
+    launcher.frame();
+
+    assert_eq!(*fakes.notifications.opened.lock().unwrap(), ["m2"]);
+    assert_eq!(
+        *fakes.notifications.opened_from.lock().unwrap(),
+        [Some(ROW)]
+    );
+    assert_eq!(*fakes.notifications.dismissed.lock().unwrap(), ["m2"]);
+    launcher.dispatch(ShellIntent::NotificationsChanged);
+    let (_, rows) = events_rows(&mut launcher);
+    assert_eq!(rows.len(), 3, "the group and its two left");
+}
+
+#[test]
+fn evt06_given_a_group_of_one_when_it_is_tapped_then_its_notification_opens() {
+    // Issue #20: EVT-06.
+    let fakes = Fakes::default();
+    *fakes.notifications.access.lock().unwrap() = Access::Granted;
+    *fakes.notifications.active.lock().unwrap() = vec![notification("c1", "chat")];
+    let (mut launcher, _) = on_a_phone(&fakes);
+    launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
+    let (revision, _) = events_rows(&mut launcher);
+
+    assert!(launcher.view().events().row_tapped(revision, 0, ROW));
+    launcher.frame();
+
+    assert_eq!(*fakes.notifications.opened.lock().unwrap(), ["c1"]);
+    assert!(
+        fakes.notifications.dismissed.lock().unwrap().is_empty(),
+        "it isn't meant to disappear when opened"
+    );
+}
+
+#[test]
+fn evt08_given_a_long_press_on_a_notification_then_dismiss_and_notification_settings_are_offered() {
+    // Issue #20: EVT-08, ANIM-24.
+    let fakes = Fakes::default();
+    *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail")];
+    *fakes.notifications.access.lock().unwrap() = Access::Granted;
+    *fakes.notifications.active.lock().unwrap() = vec![
+        Notification {
+            posted_at_ms: 20,
+            ..notification("m1", "mail")
+        },
+        Notification {
+            clearable: false,
+            ..notification("s1", "android")
+        },
+    ];
+    let (mut launcher, mut clock) = on_a_phone(&fakes);
+    launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
+    come_to_rest(&mut launcher, &mut clock);
+    let (revision, _) = events_rows(&mut launcher);
+    let hold = |launcher: &mut Launcher, row: usize, clock: u64| {
+        launcher.dispatch(ShellIntent::Pointer(PointerEvent {
+            kind: PointerKind::Down,
+            x: 500.0,
+            y: 1000.0,
+            at: Duration::from_millis(clock),
+        }));
+        let target = launcher
+            .view()
+            .events()
+            .row_target(revision, row)
+            .expect("the row shows");
+        launcher.dispatch(ShellIntent::LongPressNotification(target));
+        launcher.dispatch(ShellIntent::Pointer(PointerEvent {
+            kind: PointerKind::Up,
+            x: 500.0,
+            y: 1000.0,
+            at: Duration::from_millis(clock + 700),
+        }));
+        launcher.frame()
+    };
+
+    // Mail can be cleared; the system's notification can't.
+    let frame = hold(&mut launcher, 1, clock);
+    assert_eq!(
+        frame.events_menu,
+        Some(EventsMenuFrame {
+            dismiss: false,
+            row: Some(1),
+        })
+    );
+    launcher.dispatch(ShellIntent::CloseMenu);
+    let frame = hold(&mut launcher, 0, clock + 1_000);
+    assert_eq!(
+        frame.events_menu,
+        Some(EventsMenuFrame {
+            dismiss: true,
+            row: Some(0),
+        })
+    );
+    assert_eq!(*fakes.system.haptic_ticks.lock().unwrap(), 2);
+    assert!(
+        fakes.notifications.opened.lock().unwrap().is_empty(),
+        "lifting the finger opened nothing"
+    );
+
+    launcher
+        .view()
+        .events()
+        .menu_item_chosen(NotificationMenuItem::NotificationSettings);
+    let frame = launcher.frame();
+    assert_eq!(frame.events_menu, None);
+    assert_eq!(
+        *fakes.notifications.app_settings_opened.lock().unwrap(),
+        [(ProfileId(0), "mail".to_owned())]
+    );
+
+    hold(&mut launcher, 0, clock + 2_000);
+    launcher
+        .view()
+        .events()
+        .menu_item_chosen(NotificationMenuItem::Dismiss);
+    launcher.frame();
+    assert_eq!(*fakes.notifications.dismissed.lock().unwrap(), ["m1"]);
+    launcher.dispatch(ShellIntent::NotificationsChanged);
+    let (_, rows) = events_rows(&mut launcher);
+    assert_eq!(rows, [("android".into(), false, 1, "Title".into())]);
+}
+
+#[test]
+fn a11y05_a_screen_reader_opens_a_notifications_menu_without_a_gesture() {
+    // Issue #20: A11Y-05. Back closes it (HOME-08).
+    let fakes = Fakes::default();
+    *fakes.notifications.access.lock().unwrap() = Access::Granted;
+    *fakes.notifications.active.lock().unwrap() = vec![notification("c1", "chat")];
+    let (mut launcher, _) = on_a_phone(&fakes);
+    launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
+    let (revision, _) = events_rows(&mut launcher);
+    let target = launcher
+        .view()
+        .events()
+        .row_target(revision, 0)
+        .expect("the row shows");
+
+    launcher.dispatch(ShellIntent::OpenNotificationMenu(target));
+    let frame = launcher.frame();
+
+    assert!(frame.events_menu.is_some());
+    assert!(!frame.menu_offered);
+    assert_eq!(*fakes.system.haptic_ticks.lock().unwrap(), 0);
+    launcher.dispatch(ShellIntent::Back);
+    assert_eq!(launcher.frame().events_menu, None);
+}
+
 /// Notification access granted, but reading the notifications panics: a bug in Events.
 struct BrokenListener;
 
@@ -1034,11 +1301,11 @@ impl NotificationsAdapter for BrokenListener {
         panic!("listener bug");
     }
 
-    fn open(&self, _key: &str) -> Result<(), DataError> {
+    fn open(&self, _key: &str, _from: Option<Rect>) -> Result<(), DataError> {
         Ok(())
     }
 
-    fn dismiss(&self, _key: &str) -> Result<(), DataError> {
+    fn dismiss(&self, _keys: &[String]) -> Result<(), DataError> {
         Ok(())
     }
 
@@ -1046,7 +1313,7 @@ impl NotificationsAdapter for BrokenListener {
         Ok(())
     }
 
-    fn open_app_settings(&self, _package: &str) -> Result<(), DataError> {
+    fn open_app_settings(&self, _profile: ProfileId, _package: &str) -> Result<(), DataError> {
         Ok(())
     }
 }

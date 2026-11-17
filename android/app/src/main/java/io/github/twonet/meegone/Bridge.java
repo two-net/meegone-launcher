@@ -87,6 +87,12 @@ final class Bridge {
     private static final int NOTIFICATION_CLEARABLE = 1;
     private static final int NOTIFICATION_ONGOING = 2;
     private static final int NOTIFICATION_SUMMARY = 4;
+    private static final int NOTIFICATION_AUTO_CANCEL = 8;
+    /**
+     * The extra by which the system's notification settings learn which profile's copy of an app
+     * to show: the app's uid there. Settings reads it with the package (ADR 0021).
+     */
+    private static final String EXTRA_APP_UID = "app_uid";
     /**
      * The extra in which every notification carries the app info of the app that posted it, as
      * {@code Notification.Builder.recoverBuilder} reads it. It names apps that Android 11's
@@ -675,6 +681,12 @@ final class Bridge {
 
     /** The window grows from {@code icon}, a rect on the screen (ANIM-08), or null for none. */
     private Bundle growFrom(Rect icon) {
+        ActivityOptions options = growOptions(icon);
+        return options != null ? options.toBundle() : null;
+    }
+
+    /** Options for a window that grows from {@code icon} (ANIM-08), or null for none. */
+    private ActivityOptions growOptions(Rect icon) {
         Activity current = activity;
         View decor = current == null ? null : current.getWindow().peekDecorView();
         if (icon == null || decor == null) {
@@ -683,7 +695,7 @@ final class Bridge {
         int[] origin = new int[2];
         decor.getLocationOnScreen(origin);
         return ActivityOptions.makeScaleUpAnimation(decor, icon.left - origin[0],
-                icon.top - origin[1], icon.width(), icon.height()).toBundle();
+                icon.top - origin[1], icon.width(), icon.height());
     }
 
     /**
@@ -1003,7 +1015,131 @@ final class Bridge {
         if ((notification.flags & Notification.FLAG_GROUP_SUMMARY) != 0) {
             flags |= NOTIFICATION_SUMMARY;
         }
+        if ((notification.flags & Notification.FLAG_AUTO_CANCEL) != 0) {
+            flags |= NOTIFICATION_AUTO_CANCEL;
+        }
         return flags;
+    }
+
+    /**
+     * Opens a notification's content (EVT-06): sends its content intent as if MeeGone started
+     * it, with the window growing from the tapped row, a rect on the screen (ANIM-08). Without
+     * one, or if its app cancelled it, opens the app instead. It never removes the notification:
+     * the Rust app dismisses one meant to disappear when opened. One that is already gone opens
+     * nothing, as the list follows. Returns null, or a short message if nothing could open.
+     * Called from Rust.
+     */
+    String openNotification(String key, int left, int top, int right, int bottom) {
+        NotificationListener listener = NotificationListener.connected();
+        if (listener == null) {
+            return context.getString(R.string.notification_unavailable);
+        }
+        Rect row = right > left && bottom > top ? new Rect(left, top, right, bottom) : null;
+        StatusBarNotification posted;
+        try {
+            StatusBarNotification[] found = listener.getActiveNotifications(new String[] {key});
+            posted = found != null && found.length > 0 ? found[0] : null;
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Couldn't find a notification: " + e.getClass().getSimpleName());
+            return context.getString(R.string.notification_unavailable);
+        }
+        if (posted == null) {
+            return null;
+        }
+        PendingIntent content = posted.getNotification().contentIntent;
+        if (content != null) {
+            Activity current = activity;
+            try {
+                content.send(current != null ? current : context, 0, null, null, null, null,
+                        startFromHome(growOptions(row)));
+                return null;
+            } catch (PendingIntent.CanceledException | RuntimeException e) {
+                Log.w(TAG, "Couldn't open a notification: " + e.getClass().getSimpleName());
+            }
+        }
+        if (openApp(posted.getPackageName(), posted.getUser(), row)) {
+            return null;
+        }
+        return context.getString(R.string.notification_unavailable);
+    }
+
+    /**
+     * Starts an app's first launcher activity in {@code user}, growing from {@code from}.
+     * Returns false if it has none, or the system refused.
+     */
+    private boolean openApp(String packageName, UserHandle user, Rect from) {
+        try {
+            LauncherApps launcher = context.getSystemService(LauncherApps.class);
+            List<LauncherActivityInfo> activities = launcher.getActivityList(packageName, user);
+            if (activities == null || activities.isEmpty()) {
+                return false;
+            }
+            launcher.startMainActivity(
+                    activities.get(0).getComponentName(), user, from, growFrom(from));
+            return true;
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Couldn't open an app: " + e.getClass().getSimpleName());
+            return false;
+        }
+    }
+
+    /**
+     * Removes notifications, in one request (EVT-07, EVT-08). The system keeps any that can't
+     * be cleared, and reports the others as removed, which updates the list. Returns null, or a
+     * short message if it refused. Called from Rust.
+     */
+    String dismissNotifications(String[] keys) {
+        NotificationListener listener = NotificationListener.connected();
+        if (listener == null) {
+            return context.getString(R.string.notifications_dismiss_unavailable);
+        }
+        try {
+            listener.cancelNotifications(keys);
+            return null;
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Couldn't dismiss notifications: " + e.getClass().getSimpleName());
+            return context.getString(R.string.notifications_dismiss_unavailable);
+        }
+    }
+
+    /**
+     * Opens the system's notification settings for an app, in its own profile (EVT-08,
+     * APPS-20). Settings learns another profile's copy by its uid, in {@link #EXTRA_APP_UID}.
+     * If that screen doesn't open, the app's App info does. Returns null, or a short message if
+     * neither opens. Called from Rust.
+     */
+    String openNotificationSettings(String packageName, long profile) {
+        Activity current = activity;
+        Context from = current != null ? current : context;
+        UserHandle user = user(profile);
+        if (user == null) {
+            return context.getString(R.string.notification_settings_unavailable);
+        }
+        LauncherApps launcher = context.getSystemService(LauncherApps.class);
+        try {
+            Intent settings = new Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                    .putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            if (!user.equals(Process.myUserHandle())) {
+                settings.putExtra(EXTRA_APP_UID,
+                        launcher.getApplicationInfo(packageName, 0, user).uid);
+            }
+            from.startActivity(settings);
+            return null;
+        } catch (PackageManager.NameNotFoundException | RuntimeException e) {
+            Log.w(TAG, "Couldn't open notification settings: " + e.getClass().getSimpleName());
+        }
+        try {
+            List<LauncherActivityInfo> activities = launcher.getActivityList(packageName, user);
+            if (activities != null && !activities.isEmpty()) {
+                launcher.startAppDetailsActivity(
+                        activities.get(0).getComponentName(), user, null, null);
+                return null;
+            }
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Couldn't open App info: " + e.getClass().getSimpleName());
+        }
+        return context.getString(R.string.notification_settings_unavailable);
     }
 
     /**
@@ -1062,7 +1198,7 @@ final class Bridge {
                     context.getSystemService(AlarmManager.class).getNextAlarmClock();
             PendingIntent show = next != null ? next.getShowIntent() : null;
             if (show != null) {
-                show.send(from, 0, null, null, null, null, startFromHome());
+                show.send(from, 0, null, null, null, null, startFromHome(null));
                 return null;
             }
         } catch (PendingIntent.CanceledException | RuntimeException e) {
@@ -1080,19 +1216,20 @@ final class Bridge {
     }
 
     /**
-     * Lets an intent another app made, such as an alarm's, start its screen as if MeeGone did,
-     * while MeeGone shows. From Android 14 the sender must say so, or the system may block it
-     * because the app that made it is in the background.
+     * Lets an intent another app made, such as an alarm's or a notification's, start its screen
+     * as if MeeGone did, while MeeGone shows, with {@code options} if any. From Android 14 the
+     * sender must say so, or the system may block it because the app that made it is in the
+     * background.
      */
     @SuppressWarnings("deprecation") // ALLOWED is the only mode on Android 14 and 15.
-    private static Bundle startFromHome() {
+    private static Bundle startFromHome(ActivityOptions options) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            return null;
+            return options != null ? options.toBundle() : null;
         }
         int mode = Build.VERSION.SDK_INT >= Build.VERSION_CODES.BAKLAVA
                 ? ActivityOptions.MODE_BACKGROUND_ACTIVITY_START_ALLOW_IF_VISIBLE
                 : ActivityOptions.MODE_BACKGROUND_ACTIVITY_START_ALLOWED;
-        return ActivityOptions.makeBasic()
+        return (options != null ? options : ActivityOptions.makeBasic())
                 .setPendingIntentBackgroundActivityStartMode(mode)
                 .toBundle();
     }

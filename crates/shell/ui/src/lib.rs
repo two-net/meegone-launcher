@@ -6,8 +6,9 @@
 //! where the carousel's views are, how the view indicator looks, how the content comes back
 //! from an app, the home menu, the Applications grid, the pressed icon, the grid's cells as
 //! apps come, go and move, a cell's long-press menu, the dragged icon, edit mode, the open
-//! folder, search, Settings' Hidden apps list, and the Events header and list (ADR 0006 to
-//! ADR 0008, ADR 0010, ADR 0012 to ADR 0017, ADR 0019, ADR 0020).
+//! folder, search, Settings' Hidden apps list, and the Events header, list and a notification's
+//! long-press menu (ADR 0006 to ADR 0008, ADR 0010, ADR 0012 to ADR 0017, ADR 0019 to
+//! ADR 0021).
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -21,7 +22,9 @@ pub use meegone_apps_ui::{
 use meegone_apps_ui::{AppsView, HiddenAppsSection};
 use meegone_core_ui::{Dispatch, Latest, Rgb, Slot, View, tokens};
 use meegone_events_ui::EventsView;
-pub use meegone_events_ui::{EventsListMode, EventsRow};
+pub use meegone_events_ui::{
+    EventsListMode, EventsMenuFrame, EventsRow, NotificationMenuItem, RowTarget,
+};
 use meegone_lockimage_ui::{ImageCard, ImageSettingsSection};
 use meegone_recent_ui::RecentView;
 use meegone_settings_ui::{HomeBanner, SettingsView};
@@ -65,6 +68,8 @@ pub struct EventsListFrame {
     /// Changes whenever the mode or the rows do: the host then reads the rows again with
     /// [`EventsView::rows`].
     pub revision: u32,
+    /// The section header offers Clear: something shown can be cleared (EVT-07).
+    pub clearable: bool,
 }
 
 /// The dragged icon, as the host draws it above everything (APPS-11, APPS-12, ADR 0015).
@@ -242,6 +247,9 @@ pub struct HomeFrame {
     /// How far the Events list has come in showing rows that came and went, from 0 to 10 000
     /// (ANIM-20). Each row says where it was, so the host knows which came and which went.
     pub events_change: u16,
+    /// A notification's or a group's long-press menu, while it is open over Events (EVT-08).
+    /// A failed Events never shows it (ARCH-09).
+    pub events_menu: Option<EventsMenuFrame>,
     /// The home views' solid background (HOME-11, THEME-04).
     pub background: Rgb,
     /// Menus and Settings (THEME-03).
@@ -444,9 +452,15 @@ impl ShellView {
                 EventsListFrame {
                     mode: self.events.mode(),
                     revision,
+                    clearable: self.events.clearable(),
                 }
             }),
             events_change: ten_thousandths(state.events_change.progress),
+            // After the list, so the menu opens at its row among the rows just made.
+            events_menu: state
+                .events_menu_open
+                .then(|| self.events.menu(&shell.events().state()))
+                .flatten(),
             background: tokens.background,
             surface: tokens.surface,
             foreground: tokens.text_primary,

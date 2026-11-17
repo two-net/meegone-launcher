@@ -150,6 +150,38 @@
         <item quantity="one">%1$s, %2$d notification: %3$s</item>
         <item quantity="other">%1$s, %2$d notifications: %3$s</item>
     </plurals>
+    <!-- What screen readers read for an expanded group's row, whose notifications show below
+         it (EVT-06, A11Y-01), e.g. "Messages, 3 notifications". %1$s is the app's name, with
+         "work" when it has it; %2$d how many it holds. -->
+    <plurals name="events_group_expanded_description">
+        <item quantity="one">%1$s, %2$d notification</item>
+        <item quantity="other">%1$s, %2$d notifications</item>
+    </plurals>
+    <!-- Whether a group of several shows its notifications, as screen readers say it (EVT-06,
+         A11Y-01). -->
+    <string name="events_expanded">Expanded</string>
+    <string name="events_collapsed">Collapsed</string>
+    <!-- What screen readers say a tap on a row does (A11Y-01): open the notification, or show
+         or hide a group's notifications (EVT-06). -->
+    <string name="action_open_notification">Open</string>
+    <string name="action_expand">Expand</string>
+    <string name="action_collapse">Collapse</string>
+    <!-- The button at the end of the Notifications section header, which removes every
+         notification that can be cleared (EVT-07), and what screen readers read for it. -->
+    <string name="events_clear">Clear</string>
+    <string name="events_clear_description">Clear all notifications</string>
+    <!-- A notification's or a group's long-press menu (EVT-08): its pane title when it opens
+         without a row to name, and its items. -->
+    <string name="notification_menu">Notification menu</string>
+    <string name="menu_dismiss">Dismiss</string>
+    <string name="menu_notification_settings">Notification settings</string>
+    <!-- Shown briefly when neither a notification nor its app could open (EVT-06). -->
+    <string name="notification_unavailable">This notification can\'t open right now</string>
+    <!-- Shown briefly when the system refused to remove notifications (EVT-07, EVT-08). -->
+    <string name="notifications_dismiss_unavailable">Notifications can\'t be cleared right now</string>
+    <!-- Shown briefly when neither an app's notification settings nor its App info could open
+         (EVT-08). -->
+    <string name="notification_settings_unavailable">Notification settings can\'t open right now</string>
     <!-- MeeGone's notification listener, as the system's notification-access screen names it
          (EVT-03). -->
     <string name="notification_listener_label">MeeGone Events</string>
