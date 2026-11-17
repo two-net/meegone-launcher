@@ -4,34 +4,124 @@
 //! and a section in Settings (SET-02). Both are [`Slot`]s that the shell puts in place, so
 //! neither Events nor Settings depends on this feature (ARCH-03, ADR 0002).
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use meegone_core_ui::{Dispatch, Latest, Slot, Tokens};
 use meegone_lockimage_state::{ImageStatus, LockImageIntent, LockImageState};
 
-/// The image-of-the-day card shown in Events (EVT-12).
+#[cfg(test)]
+mod tests;
+
+/// What the image-of-the-day card shows (EVT-12).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CardContent {
+    pub title: String,
+    /// Shown as the source provides it (LEGAL-03).
+    pub attribution: String,
+    /// The file that holds the image, relative to the storage root, which the host decodes the
+    /// thumbnail from (ADR 0022).
+    pub image_path: &'static str,
+    /// Tells images apart: it changes only when the image does, so the host decodes the
+    /// thumbnail again, and cross-fades to it, only then (ANIM-22).
+    pub image_key: String,
+}
+
+/// The image-of-the-day card shown in Events, below the notifications (EVT-12; ADR 0022).
+///
+/// The host draws it as it draws Events' rows (ADR 0020): [`ImageCard::revision`] changes
+/// whenever what the card shows does, and the host then reads [`ImageCard::content`]. A tap on
+/// a card that changed meanwhile does nothing.
+///
+/// Clones share what the host was last told, so the shell can keep one for the host while
+/// Events holds another.
+#[derive(Clone)]
 pub struct ImageCard {
     latest: Latest<LockImageState>,
+    dispatch: Dispatch<LockImageIntent>,
+    told: Rc<RefCell<Told>>,
+}
+
+/// The card the host was last told about, and its revision.
+#[derive(Default)]
+struct Told {
+    content: Option<CardContent>,
+    revision: u32,
 }
 
 impl ImageCard {
-    pub fn new(latest: Latest<LockImageState>) -> Self {
-        Self { latest }
+    pub fn new(latest: Latest<LockImageState>, dispatch: Dispatch<LockImageIntent>) -> Self {
+        Self {
+            latest,
+            dispatch,
+            told: Rc::default(),
+        }
     }
 
     /// Shown while the daily image is on, there is an image and the card isn't hidden (EVT-12).
     pub fn is_visible(&self) -> bool {
-        let state = self.latest.get();
-        state.status == ImageStatus::On && state.show_card && state.current.is_some()
+        Self::shown(&self.latest.get()).is_some()
+    }
+
+    /// The card's revision, which changes whenever what it shows does, so the host reads
+    /// [`ImageCard::content`] again. While the card is hidden it keeps what it last showed.
+    pub fn revision(&self) -> u32 {
+        let mut told = self.told.borrow_mut();
+        if let Some(content) = Self::shown(&self.latest.get()) {
+            if told.content.as_ref() != Some(&content) {
+                told.content = Some(content);
+                told.revision = told.revision.wrapping_add(1);
+            }
+        }
+        told.revision
+    }
+
+    /// What the card shows, as of the last [`ImageCard::revision`].
+    pub fn content(&self) -> Option<CardContent> {
+        self.told.borrow().content.clone()
+    }
+
+    /// The card at `revision` was tapped: the image details screen opens (EVT-12, WALL-15).
+    /// Returns whether that was asked; a card that changed or was hidden meanwhile asks
+    /// nothing.
+    pub fn tapped(&self, revision: u32) -> bool {
+        let current = {
+            let told = self.told.borrow();
+            told.revision == revision && told.content.is_some()
+        };
+        if !current || !self.is_visible() {
+            return false;
+        }
+        self.dispatch.send(LockImageIntent::OpenDetails);
+        true
+    }
+
+    fn shown(state: &LockImageState) -> Option<CardContent> {
+        if state.status != ImageStatus::On || !state.show_card {
+            return None;
+        }
+        let record = state.current.as_ref()?;
+        let file = record.image?;
+        Some(CardContent {
+            title: record.title.clone(),
+            attribution: record.attribution.clone(),
+            image_path: file.path(),
+            image_key: format!("{} {} {}", record.date, record.region, file.path()),
+        })
     }
 }
 
 impl Slot for ImageCard {
     fn render(&mut self, _tokens: &Tokens) {
-        // Drawing the thumbnail, title and attribution when `is_visible` arrives with #21
-        // (ADR 0006).
+        // The host draws the card from `revision` and `content` (ADR 0006, ADR 0022).
     }
 }
 
 /// The "Lock-screen image" section of Settings (SET-02).
+///
+/// Clones share their state, so the shell can keep one for the host while Settings holds
+/// another.
+#[derive(Clone)]
 pub struct ImageSettingsSection {
     latest: Latest<LockImageState>,
     dispatch: Dispatch<LockImageIntent>,
@@ -51,10 +141,21 @@ impl ImageSettingsSection {
     pub fn daily_image_toggled(&self, on: bool) {
         self.dispatch.send(LockImageIntent::SetEnabled(on));
     }
+
+    /// Whether "Show card in Events" is on (EVT-12).
+    pub fn show_card(&self) -> bool {
+        self.latest.get().show_card
+    }
+
+    /// "Show card in Events" was switched (EVT-12, SET-03).
+    pub fn show_card_toggled(&self, on: bool) {
+        self.dispatch.send(LockImageIntent::SetShowCard(on));
+    }
 }
 
 impl Slot for ImageSettingsSection {
     fn render(&mut self, _tokens: &Tokens) {
-        // Drawing arrives with the Settings screen, #34 (ADR 0006).
+        // The host draws "Show card in Events" until the Settings screen, #34, draws the rest
+        // (ADR 0006, ADR 0022).
     }
 }

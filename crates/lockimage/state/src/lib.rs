@@ -13,7 +13,7 @@ use meegone_core_data::{
 use meegone_core_state::StateHolder;
 use meegone_lockimage_data::ImageCache;
 
-pub use meegone_lockimage_data::ImageRecord;
+pub use meegone_lockimage_data::{ImageFile, ImageRecord};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ImageStatus {
@@ -39,6 +39,11 @@ pub enum LockImageIntent {
     Refresh,
     /// Turns the daily image on or off (WALL-02, WALL-12).
     SetEnabled(bool),
+    /// Shows or hides the image-of-the-day card in Events (EVT-12).
+    SetShowCard(bool),
+    /// Opens the image details screen, from the card in Events (EVT-12, WALL-15). The screen
+    /// covers the home views, so the shell opens it (ADR 0022); the holder ignores it.
+    OpenDetails,
 }
 
 pub struct LockImageHolder {
@@ -88,6 +93,14 @@ impl LockImageHolder {
         self.refresh();
     }
 
+    fn set_show_card(&mut self, on: bool) {
+        let result = self
+            .settings
+            .update(&mut |settings| settings.image.show_card = on);
+        self.state.problem = result.err().map(|error| error.to_string());
+        self.refresh();
+    }
+
     fn apply(&self, options: &ImageOptions) -> Result<(), DataError> {
         if options.enabled {
             // When the job runs again after this is decided by the updater (WALL-03, #28).
@@ -119,6 +132,8 @@ impl StateHolder for LockImageHolder {
         match intent {
             LockImageIntent::Refresh => self.refresh(),
             LockImageIntent::SetEnabled(on) => self.set_enabled(on),
+            LockImageIntent::SetShowCard(on) => self.set_show_card(on),
+            LockImageIntent::OpenDetails => {}
         }
     }
 }
@@ -233,14 +248,18 @@ mod tests {
         } = setup();
         holder.handle(LockImageIntent::SetEnabled(true));
         cache
-            .put(ImageRecord {
-                date: "20261115".into(),
-                region: "en-US".into(),
-                title: "Title".into(),
-                attribution: "© Someone".into(),
-                info_link: None,
-                applied_at_ms: Some(1),
-            })
+            .put(
+                ImageRecord {
+                    date: "20261115".into(),
+                    region: "en-US".into(),
+                    title: "Title".into(),
+                    attribution: "© Someone".into(),
+                    info_link: None,
+                    applied_at_ms: Some(1),
+                    image: None,
+                },
+                b"image",
+            )
             .unwrap();
 
         holder.handle(LockImageIntent::SetEnabled(false));
@@ -266,5 +285,50 @@ mod tests {
             ImageStatus::Unavailable("Blocked by device policy".into())
         );
         assert_eq!(*fakes.scheduler.job.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn the_card_shows_until_the_user_hides_it() {
+        // EVT-12, SET-03: the choice is saved and takes effect at once.
+        let Setup {
+            settings,
+            mut holder,
+            ..
+        } = setup();
+        assert!(holder.state().show_card);
+
+        holder.handle(LockImageIntent::SetShowCard(false));
+
+        assert!(!holder.state().show_card);
+        assert!(!settings.get().image.show_card);
+        assert_eq!(holder.state().problem, None);
+
+        holder.handle(LockImageIntent::SetShowCard(true));
+
+        assert!(holder.state().show_card);
+        assert!(settings.get().image.show_card);
+    }
+
+    #[test]
+    fn a_choice_that_cant_be_saved_is_the_problem() {
+        // ARCH-09
+        let Setup {
+            fakes, mut holder, ..
+        } = setup();
+        *fakes.storage.error.lock().unwrap() = Some(DataError::Failed("Disk error".into()));
+
+        holder.handle(LockImageIntent::SetShowCard(false));
+
+        assert_eq!(holder.state().problem.as_deref(), Some("Disk error"));
+    }
+
+    #[test]
+    fn the_holder_leaves_opening_the_details_to_the_shell() {
+        let Setup { mut holder, .. } = setup();
+        let before = holder.state().clone();
+
+        holder.handle(LockImageIntent::OpenDetails);
+
+        assert_eq!(*holder.state(), before);
     }
 }

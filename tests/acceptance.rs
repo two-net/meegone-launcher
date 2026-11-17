@@ -4,7 +4,8 @@
 //! Not automated yet, because the behaviour isn't built:
 //! - AC-01: first-run setup (#35)
 //! - AC-13, AC-14: Recent density and close mode (#23, #24)
-//! - AC-15 to AC-17: the daily image (#27 to #30)
+//! - AC-15 to AC-17: the daily image (#27 to #30). Its card in Events (EVT-12, #21) is
+//!   automated below.
 //!
 //! AC-18 to AC-20 (animation scale, screen reader, timing) need a device; they belong to the
 //! device matrix (#43). Their core logic is tested without one: the carousel with animations
@@ -25,9 +26,9 @@ use meegone_core_data::{
 use meegone_core_state::{Access, Health, Theme};
 use meegone_core_ui::tokens;
 use meegone_launcher::{
-    AppMenuItem, BADGE_ROWS, Bounds, CellKey, Direction, EventsListMode, EventsMenuFrame, FolderId,
-    GridLayout, HomeView, Launcher, Layout, LiftFrame, MenuItem, NotificationMenuItem,
-    PointerEvent, PointerKind, SettingsGroup, ShellIntent, Surface,
+    AppMenuItem, BADGE_ROWS, Bounds, CardContent, CellKey, Direction, EventsListMode,
+    EventsMenuFrame, FolderId, GridLayout, HomeView, Launcher, Layout, LiftFrame, MenuItem,
+    NotificationMenuItem, PointerEvent, PointerKind, SettingsGroup, ShellIntent, Surface,
 };
 
 /// A phone 1080 × 2400 px at 2.75 px per dp.
@@ -2892,4 +2893,160 @@ fn apps21_given_a_backed_up_app_comes_after_a_week_then_it_is_new_at_the_end() {
         .retain(|app| app.id != app_id("go"));
     let restarted = Launcher::start(new.platform());
     assert_eq!(grid(&restarted), ["Phone", "Chess", "Mail", "Maps"]);
+}
+
+/// The image cache holding today's image, Puffins on a cliff, in its first file, as the daily
+/// image's updater leaves it (WALL-09, ADR 0022).
+fn image_cached(fakes: &Fakes) {
+    let mut files = fakes.storage.files.lock().unwrap();
+    files.insert(
+        StoredFile::ImageDetails,
+        seal(
+            "image-cache",
+            2,
+            "current 20261116 en-GB Puffins\\son\\sa\\scliff,\\sSkomer \
+             ©\\sA\\sPhotographer\\s/\\sAgency - 1763272800000 a\nprevious -\n",
+        ),
+    );
+    files.insert(StoredFile::ImageA, b"\xff\xd8 a JPEG".to_vec());
+}
+
+/// MeeGone with today's image cached, its daily image turned on in Settings, showing Events.
+fn with_the_daily_image(fakes: &Fakes) -> Launcher {
+    image_cached(fakes);
+    let mut launcher = Launcher::start(fakes.platform());
+    launcher.dispatch(ShellIntent::OpenSettings);
+    launcher.view().image_settings().daily_image_toggled(true);
+    launcher.dispatch(ShellIntent::Back);
+    launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
+    launcher
+}
+
+/// What the image-of-the-day card shows after a frame, or `None` while it doesn't.
+fn image_card(launcher: &mut Launcher) -> Option<CardContent> {
+    launcher.frame().image_card?;
+    launcher.view().image_card().content()
+}
+
+#[test]
+fn evt12_given_an_image_is_cached_then_events_shows_its_card_offline_and_without_access() {
+    // Issue #21: EVT-12, LEGAL-03, EVT-03, REL-06. The network is offline, and MeeGone has no
+    // notification access.
+    let fakes = Fakes::default();
+    let mut launcher = with_the_daily_image(&fakes);
+
+    assert_eq!(
+        image_card(&mut launcher),
+        Some(CardContent {
+            title: "Puffins on a cliff, Skomer".into(),
+            attribution: "© A Photographer / Agency".into(),
+            image_path: "images/a",
+            image_key: "20261116 en-GB images/a".into(),
+        })
+    );
+    // Below the notification-access card, which still asks (EVT-03).
+    assert_eq!(
+        events_list(&mut launcher),
+        (EventsListMode::Explainer, Vec::new())
+    );
+    // The thumbnail is the cached file's; nothing was fetched.
+    assert!(fakes.network.requests.lock().unwrap().is_empty());
+    assert_eq!(
+        fakes.storage.files.lock().unwrap()[&StoredFile::ImageA],
+        b"\xff\xd8 a JPEG"
+    );
+}
+
+#[test]
+fn evt12_given_show_card_in_events_is_off_then_the_card_isnt_shown() {
+    // Issue #21: EVT-12, SET-03. The choice takes effect at once, and lasts.
+    let fakes = Fakes::default();
+    let mut launcher = with_the_daily_image(&fakes);
+    assert!(image_card(&mut launcher).is_some());
+
+    launcher.dispatch(ShellIntent::OpenSettings);
+    assert_eq!(launcher.frame().show_image_card, Some(true));
+    launcher.view().image_settings().show_card_toggled(false);
+    assert_eq!(launcher.frame().show_image_card, Some(false));
+    launcher.dispatch(ShellIntent::Back);
+
+    assert_eq!(image_card(&mut launcher), None);
+    drop(launcher);
+    let mut restarted = Launcher::start(fakes.platform());
+    restarted.dispatch(ShellIntent::Swipe(Direction::Previous));
+    assert_eq!(image_card(&mut restarted), None);
+
+    restarted.view().image_settings().show_card_toggled(true);
+    assert!(image_card(&mut restarted).is_some());
+}
+
+#[test]
+fn evt12_given_the_daily_image_is_off_then_there_is_no_card() {
+    // Issue #21: EVT-12. An image left in the cache shows nothing while the feature is off.
+    let fakes = Fakes::default();
+    image_cached(&fakes);
+    let mut launcher = Launcher::start(fakes.platform());
+    launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
+
+    assert_eq!(image_card(&mut launcher), None);
+    // Its setting is still offered.
+    assert_eq!(launcher.frame().show_image_card, Some(true));
+}
+
+#[test]
+fn evt12_given_the_card_is_tapped_then_the_image_details_open_and_back_closes_them() {
+    // Issue #21: EVT-12, WALL-15, HOME-08.
+    let fakes = Fakes::default();
+    let mut launcher = with_the_daily_image(&fakes);
+    let revision = launcher.frame().image_card.expect("the card shows");
+
+    assert!(launcher.view().image_card().tapped(revision));
+    let frame = launcher.frame();
+    assert!(frame.image_details_open);
+    assert!(!frame.menu_offered);
+
+    launcher.dispatch(ShellIntent::Back);
+    let frame = launcher.frame();
+    assert!(!frame.image_details_open);
+    assert_eq!(frame.current, HomeView::Events);
+}
+
+#[test]
+fn evt12_given_a_new_image_arrives_then_the_card_shows_it_and_its_thumbnail_cross_fades() {
+    // Issue #21: EVT-12, ANIM-22. The daily job cached a new image while MeeGone was away; the
+    // host decodes it and fades it in over 300 ms.
+    let fakes = Fakes::default();
+    let mut launcher = with_the_daily_image(&fakes);
+    let first = launcher.frame().image_card.expect("the card shows");
+    fakes.storage.files.lock().unwrap().insert(
+        StoredFile::ImageDetails,
+        seal(
+            "image-cache",
+            2,
+            "current 20261117 en-GB Tomorrow ©\\sSomeone - - b\nprevious -\n",
+        ),
+    );
+    fakes
+        .storage
+        .files
+        .lock()
+        .unwrap()
+        .insert(StoredFile::ImageB, b"\xff\xd8 another JPEG".to_vec());
+
+    launcher.dispatch(ShellIntent::Resumed);
+    let frame = launcher.frame();
+    let second = frame.image_card.expect("the card still shows");
+    assert_ne!(second, first);
+    let content = launcher.view().image_card().content().unwrap();
+    assert_eq!(content.title, "Tomorrow");
+    assert_eq!(content.image_path, "images/b");
+    assert_eq!(frame.image_change, 10_000);
+
+    launcher.dispatch(ShellIntent::NewImageShown);
+    let mut clock = 9_000;
+    launcher.dispatch(ShellIntent::Frame(Duration::from_millis(clock)));
+    assert_eq!(launcher.frame().image_change, 0);
+    come_to_rest(&mut launcher, &mut clock);
+    assert_eq!(clock, 9_304);
+    assert_eq!(launcher.frame().image_change, 10_000);
 }

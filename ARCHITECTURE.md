@@ -28,9 +28,9 @@ Each crate is `crates/<area>/<layer>`, with the package name `meegone-<area>-<la
 | **apps** | Layout store | Grid, its columns, scroll position and geometry, an app's long-press menu, edit mode and its arrangement, folders, search and its ranking, hidden apps, keeping the layout in step with the installed apps, the apps a restore waits for | `AppsView`, `HiddenAppsSection` | Layout store; hidden apps (in the settings store) |
 | **events** | – | The header with the date and the next alarm, notifications grouped by app, the expanded group, a notification's long-press menu, what opening, Dismiss and Clear remove | `EventsView` | Nothing (memory only) |
 | **recent** | – | Filtering, ordering, close mode | `RecentView` | Removed-apps list (in the settings store) |
-| **lockimage** | Image cache, image-feed interface | On/off, availability, current image | `ImageCard`, `ImageSettingsSection` | Image cache |
+| **lockimage** | Image cache (the current and previous images and their details), image-feed interface | On/off, availability, current image, whether Events shows its card | `ImageCard`, `ImageSettingsSection` | Image cache; image options (in the settings store) |
 | **settings** | – | Settings, access status, the home-app banner (ONB-04) | `SettingsView`, `HomeBanner` | The settings screens |
-| **shell** | – | `HomeShell`: the carousel of views, the home menu, which long-press counts, Home and Back, coming back to the home, the icon press, the dragged icon across the grid and the open folder, the grid's motion as apps come, go and move, edit mode's motion, a folder's opening and closing, the search field's pull, the Events list's motion as notifications come and go and groups expand, which long-press on an Events row counts, Recent following the hidden apps, composes every feature | `ShellView`, `HomeFrame` | Nothing persistent |
+| **shell** | – | `HomeShell`: the carousel of views, the home menu, which long-press counts, Home and Back, coming back to the home, the icon press, the dragged icon across the grid and the open folder, the grid's motion as apps come, go and move, edit mode's motion, a folder's opening and closing, the search field's pull, the Events list's motion as notifications come and go and groups expand, which long-press on an Events row counts, the image details screen and the image card's cross-fade, Recent following the hidden apps, composes every feature | `ShellView`, `HomeFrame` | Nothing persistent |
 
 The root package `meegone-launcher` is the app. `Launcher::start(platform)` hands the platform adapters to the shell. On Android it is also a native library, which the Java host in `android/` loads ([ADR 0005](docs/adr/0005-android-host-and-home-role.md)) and asks what to draw ([ADR 0006](docs/adr/0006-android-views-and-the-carousel.md)). `tools/arch-check` is a development tool that is never part of the app.
 
@@ -108,6 +108,11 @@ AppsView.cell_tapped(revision, 4, icon)          ui     sends AppsIntent::Launch
   - Events decides: it dismisses a notification meant to disappear when opened, and with the last of what a group shows, the summaries hidden behind it. Rows go when the system reports them gone, never in advance.
   - The expanded group and the menu live in `EventsState`. `on_back` closes the menu, then collapses the group; leaving Events collapses it.
   - The shell decides whether a long-press on a row counts, ticks, and treats Events' menu as covering the views, but only while Events works (ARCH-09). A screen reader opens the menu with "Open menu" (A11Y-05).
+- **The image-of-the-day card** ([ADR 0022](docs/adr/0022-the-image-of-the-day-card.md)). While the daily image is on and has an image, a card below the notifications shows its thumbnail, title and attribution. It works offline and without notification access. "Show card in Events" hides it, and a tap opens the image details screen (EVT-12, LEGAL-03).
+  - The lock-screen image owns the card and the setting; the shell places the card in Events (ADR 0002). `Resumed` and swiping to Events read the image again.
+  - The image cache keeps two images, `images/a` and `images/b`. Each record names its file, and `ImageCache::put` picks the file and writes it crash-safely (WALL-09).
+  - The details screen covers the home views as Settings does, and Back and Home close it. It shows only its name until #30. It opens only while the lock-screen image works (ARCH-09).
+  - When the host has decoded a new thumbnail over the old one, it sends `NewImageShown`, and the shell fades it in over 300 ms (ANIM-22).
 
 ## Drawing (ADR 0006)
 
@@ -140,7 +145,10 @@ HomeViews (Java)                                            Rust
 - **The Events list** ([ADR 0020](docs/adr/0020-listing-notifications-in-events.md), [ADR 0021](docs/adr/0021-acting-on-notifications-in-events.md)). Below the header, in one `ScrollView`, `EventsList` draws the notification-access card, "No new events", or the "Notifications" section and its rows, as the frame says: each group, and below the expanded group's row, its notifications. It reads the rows with `nativeEventsList` only when their revision changes. Each row says where it was, so new rows slide in and rows that went collapse as the frame's progress says (ANIM-20). Allow calls `nativeAllowNotifications`.
   - Rows are clickable and name themselves by revision and place: a tap calls `nativeEventsRowTapped` with the row's rect (ANIM-08), and `HomeViews`' long-press timer calls `nativeEventsRowLongPressed`. Screen readers get "Open", "Expand" or "Collapse", and "Open menu" (A11Y-05).
   - Clear, at the end of the section header, shows while the frame offers it and calls `nativeClearNotifications`. The menu card shows a notification's menu at its row, and reports a choice with `nativeEventsMenuChosen`.
-- **Settings** shows its name until #34 draws it, and below it `HiddenAppsList`: Applications → Hidden apps, each app with its icon and Unhide, read by revision like the cells ([ADR 0017](docs/adr/0017-hiding-apps.md)).
+- **The image-of-the-day card** ([ADR 0022](docs/adr/0022-the-image-of-the-day-card.md)). Below `EventsList`, in the same `ScrollView`, `ImageCard` draws an "Image of the day" section header and a flat card in the surface colour: the thumbnail at 16:9 (at most 240 dp tall), the title and the attribution in full. It reads them with `nativeImageCard` only when their revision changes. It decodes the middle of the cached image, from the app's files folder, on a background thread, and fades a new one in as the frame's progress says (ANIM-22). A tap calls `nativeImageCardTapped`. While the image details screen is open, it covers the home views with its name. `SectionHeader` draws Events' section headers.
+- **Settings** shows its name until #34 draws it, and below it:
+  - `HiddenAppsList`: Applications → Hidden apps, each app with its icon and Unhide, read by revision like the cells ([ADR 0017](docs/adr/0017-hiding-apps.md)).
+  - `ImageSettings`: Lock-screen image → "Show card in Events", which calls `nativeShowImageCard` ([ADR 0022](docs/adr/0022-the-image-of-the-day-card.md)).
 - **Search** ([ADR 0016](docs/adr/0016-app-search.md)). `SearchPanel`, inside the Applications page, draws the field in a pill as far as the frame's reveal, and moves the grid down with it. Once something is typed, its own `AppsGrid` shows the results instead of the grid, which keeps its scroll position. Each change of the field's text goes to Rust; Go launches the first result. The window asks for `adjustResize`, and only the results take the keyboard's height, as padding, so the safe area never changes with it.
 - **Icons and accents** ([ADR 0011](docs/adr/0011-icon-shape-and-app-accents.md)). Every icon is one rounded square: adaptive icons are masked to it, and legacy ones sit on a white plate of that shape (APPS-15). Each app's accent comes from its icon once per process: `AppAccents` samples the icon on a background thread, and the Rust app's pure `nativeAccent` picks the colour (APPS-17). It reaches Rust in the app catalogue, and a theme draws it with `Tokens::app_accent`, at 3:1 or more against its background (THEME-07).
 - **Long-press** (ADR 0008, ADR 0013).
@@ -202,7 +210,7 @@ Bugs are contained by `Store`. It runs every intent inside `catch_unwind`. If a 
 | App | The system, through `AppsAdapter` (memory only) | The system |
 | Layout item, folder, new-app mark, a restore's waiting apps | `LayoutStore` (`meegone-apps-data`), saved in `layout` | Applications |
 | Settings | `SettingsStore` (`meegone-core-data`), saved in `settings` | Each field has one writer: Settings (theme, Home target, wrap-around, when the home-app banner was dismissed), Applications (hidden apps), Lock-screen image (image options), Recent (apps removed from Recent) |
-| Image record | `ImageCache` (`meegone-lockimage-data`), saved in `images/details` | Lock-screen image |
+| Image record and its image | `ImageCache` (`meegone-lockimage-data`), saved in `images/details`, `images/a` and `images/b` | Lock-screen image |
 | Notification group | The system, through `NotificationsAdapter` (memory only) | The system |
 | Recent entry | The system, through `UsageAdapter` (memory only) | The system |
 
@@ -216,7 +224,7 @@ MeeGone keeps three persistent stores, each in its own file under one private fo
 |---|---|---|---|
 | Layout | `PersistentLayoutStore` (`meegone-apps-data`) | `layout` | `LAYOUT_VERSION` |
 | Settings | `PersistentSettingsStore` (`meegone-core-data`) | `settings` | `SETTINGS_VERSION` |
-| Image cache | `PersistentImageCache` (`meegone-lockimage-data`) | `images/details` | `IMAGE_CACHE_VERSION` |
+| Image cache | `PersistentImageCache` (`meegone-lockimage-data`) | `images/details`, and the images in `images/a` and `images/b` | `IMAGE_CACHE_VERSION` |
 
 - **Where.**
   - `StoredFile` names every file, so nothing else can be stored. Notification content and usage history have no file (PRIV-03, EVT-13).
@@ -252,7 +260,7 @@ MeeGone keeps three persistent stores, each in its own file under one private fo
 
 ## Not built yet
 
-The skeleton is from issue #1; the Android host and the home-app role from #4; the carousel of home views from #5; Home, Back and coming back to the home from #6; the home menu from #7; edge to edge, screen sizes and navigation modes from #8; the Applications grid and the app catalogue from #9; one icon shape and each app's accent from #10; the layout kept in step with the installed apps from #11; the app long-press menu from #12; edit mode from #13; folders from #14; app search from #15; hiding apps from #16; backup and restore from #17; the Events header from #18; Events' notifications from #19; opening, clearing and dismissing them from #20. The following arrive with later requirements:
+The skeleton is from issue #1; the Android host and the home-app role from #4; the carousel of home views from #5; Home, Back and coming back to the home from #6; the home menu from #7; edge to edge, screen sizes and navigation modes from #8; the Applications grid and the app catalogue from #9; one icon shape and each app's accent from #10; the layout kept in step with the installed apps from #11; the app long-press menu from #12; edit mode from #13; folders from #14; app search from #15; hiding apps from #16; backup and restore from #17; the Events header from #18; Events' notifications from #19; opening, clearing and dismissing them from #20; the image-of-the-day card from #21. The following arrive with later requirements:
 
 - **Android adapters.**
   - Built:
@@ -263,11 +271,11 @@ The skeleton is from issue #1; the Android host and the home-app role from #4; t
     - Dates and times in the device's language and 12- or 24-hour setting, and the next alarm (ADR 0019).
     - Notification access and the active notifications (ADR 0020), opening and dismissing them, and an app's notification settings (ADR 0021).
   - Stubs until their issues: usage, wallpaper, network, scheduling, opening links (#30) and the remaining device settings.
-- **The daily image.** The Bing implementation of `ImageFeed` (#26) and the updater (SRS 7.5) come with the WALL requirements.
-- **Drawing.** The home views, their carousel, the view indicator, the return-home motion, the home menu, the Applications grid, its edit mode, its folders, search, Settings' Hidden apps, and the Events header and notifications are drawn (ADR 0006 to ADR 0008, ADR 0010, ADR 0014 to ADR 0017, ADR 0019 to ADR 0021). Recent shows only its name until its cards arrive (#22). Expanded groups' action buttons (EVT-14, Could) come with a later issue.
+- **The daily image.** The Bing implementation of `ImageFeed` (#26) and the updater (SRS 7.5) come with the WALL requirements. The updater stores each image with `ImageCache::put` (#27). Until the wallpaper adapter is built (#29), the lock-screen image reports itself unavailable on Android, so the card in Events doesn't show there yet.
+- **Drawing.** The home views, their carousel, the view indicator, the return-home motion, the home menu, the Applications grid, its edit mode, its folders, search, Settings' Hidden apps and "Show card in Events", the Events header and notifications, and the image-of-the-day card are drawn (ADR 0006 to ADR 0008, ADR 0010, ADR 0014 to ADR 0017, ADR 0019 to ADR 0022). The image details screen shows only its name until #30. Recent shows only its name until its cards arrive (#22). Expanded groups' action buttons (EVT-14, Could) come with a later issue.
   - Recent's cards adapt to large screens when #22 builds them. Today the pages, the carousel, the safe area, the menu, Settings and the Applications columns adapt (HOME-12, APPS-02).
   - Recent's card fill draws each app's accent with `Tokens::app_accent` when #22 draws it, as Events' group marker does.
-  - Settings covers the home views with only its name, its group's and Applications' Hidden apps until #34 draws it. "Home button opens", the home-app banner and first-run setup send intents but aren't drawn yet.
+  - Settings covers the home views with only its name, its group's, Applications' Hidden apps and "Show card in Events" until #34 draws it. "Home button opens", the home-app banner and first-run setup send intents but aren't drawn yet.
   - Close mode changes state but isn't drawn yet (#24). Edit mode's "Sort A–Z" (APPS-14, Could) and folders' category names (FOLD-07, Could) come with later issues.
   - The Android host doesn't yet follow the system's dark mode (#32); the Rust app already does, open folders included.
 - **First-run setup** comes with the ONB requirements. The lock-screen image step is provided as a `Slot`, like its Settings section.

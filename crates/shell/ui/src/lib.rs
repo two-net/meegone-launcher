@@ -6,9 +6,10 @@
 //! where the carousel's views are, how the view indicator looks, how the content comes back
 //! from an app, the home menu, the Applications grid, the pressed icon, the grid's cells as
 //! apps come, go and move, a cell's long-press menu, the dragged icon, edit mode, the open
-//! folder, search, Settings' Hidden apps list, and the Events header, list and a notification's
-//! long-press menu (ADR 0006 to ADR 0008, ADR 0010, ADR 0012 to ADR 0017, ADR 0019 to
-//! ADR 0021).
+//! folder, search, Settings' Hidden apps list and "Show card in Events" switch, the Events
+//! header, list and a notification's long-press menu, and the image-of-the-day card and its
+//! details screen (ADR 0006 to ADR 0008, ADR 0010, ADR 0012 to ADR 0017, ADR 0019 to
+//! ADR 0022).
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -25,6 +26,7 @@ use meegone_events_ui::EventsView;
 pub use meegone_events_ui::{
     EventsListMode, EventsMenuFrame, EventsRow, NotificationMenuItem, RowTarget,
 };
+pub use meegone_lockimage_ui::CardContent;
 use meegone_lockimage_ui::{ImageCard, ImageSettingsSection};
 use meegone_recent_ui::RecentView;
 use meegone_settings_ui::{HomeBanner, SettingsView};
@@ -250,6 +252,19 @@ pub struct HomeFrame {
     /// A notification's or a group's long-press menu, while it is open over Events (EVT-08).
     /// A failed Events never shows it (ARCH-09).
     pub events_menu: Option<EventsMenuFrame>,
+    /// The image-of-the-day card below the notifications (EVT-12): its revision, which changes
+    /// whenever what it shows does, or `None` while it isn't shown: the daily image is off or
+    /// has no image yet, the card is hidden, or the lock-screen image isn't working (ARCH-09).
+    pub image_card: Option<u32>,
+    /// How far the card's new thumbnail has faded in over the old one, from 0 to 10 000
+    /// (ANIM-22).
+    pub image_change: u16,
+    /// The image details screen covers the home views (WALL-15).
+    pub image_details_open: bool,
+    /// Settings → Lock-screen image → "Show card in Events" (EVT-12): whether it is on, or
+    /// `None` while the lock-screen image isn't working, so Settings doesn't offer it
+    /// (ARCH-09).
+    pub show_image_card: Option<bool>,
     /// The home views' solid background (HOME-11, THEME-04).
     pub background: Rgb,
     /// Menus and Settings (THEME-03).
@@ -273,6 +288,8 @@ pub struct ShellView {
     recent: RecentView,
     settings: SettingsView,
     hidden_apps: HiddenAppsSection,
+    image_card: ImageCard,
+    image_settings: ImageSettingsSection,
     home_banner: HomeBanner,
 }
 
@@ -288,8 +305,13 @@ impl ShellView {
             move |state| image.set(Arc::clone(state))
         });
 
+        // The shell keeps a handle on each for the host (ADR 0022).
+        let image_card = ImageCard::new(image.clone(), dispatch(&outbox, ShellIntent::LockImage));
+        let image_settings =
+            ImageSettingsSection::new(image, dispatch(&outbox, ShellIntent::LockImage));
+
         let mut events = EventsView::new(dispatch(&outbox, ShellIntent::Events));
-        events.add_card(Box::new(ImageCard::new(image.clone())));
+        events.add_card(Box::new(image_card.clone()));
 
         // Applications shows its Hidden apps section in Settings (APPS-19). It reads the latest
         // Applications state, which the shell keeps current, and comes before the lock-screen
@@ -303,10 +325,7 @@ impl ShellView {
 
         let mut settings = SettingsView::new(dispatch(&outbox, ShellIntent::Settings));
         settings.add_section(Box::new(hidden_apps.clone()));
-        settings.add_section(Box::new(ImageSettingsSection::new(
-            image,
-            dispatch(&outbox, ShellIntent::LockImage),
-        )));
+        settings.add_section(Box::new(image_settings.clone()));
 
         // Settings and setup offers to make MeeGone the default home app on the home views
         // (ONB-04).
@@ -323,6 +342,8 @@ impl ShellView {
             events,
             settings,
             hidden_apps,
+            image_card,
+            image_settings,
             home_banner,
             outbox,
         }
@@ -433,7 +454,8 @@ impl ShellView {
                 || mode.animating
                 || state.folder.animating
                 || state.search.animating
-                || state.events_change.animating,
+                || state.events_change.animating
+                || state.image_change.animating,
             menu: state.menu.map(|menu| MenuFrame {
                 items: menu.items,
                 anchor: menu
@@ -461,6 +483,13 @@ impl ShellView {
                 .events_menu_open
                 .then(|| self.events.menu(&shell.events().state()))
                 .flatten(),
+            image_card: (shell.lockimage_ready() && self.image_card.is_visible())
+                .then(|| self.image_card.revision()),
+            image_change: ten_thousandths(state.image_change.progress),
+            image_details_open: state.image_details_open,
+            show_image_card: shell
+                .lockimage_ready()
+                .then(|| self.image_settings.show_card()),
             background: tokens.background,
             surface: tokens.surface,
             foreground: tokens.text_primary,
@@ -476,6 +505,10 @@ impl ShellView {
         let tokens = tokens(shell.theme().state().theme);
         if shell.state().settings_open {
             self.settings.render(&shell.settings().state(), tokens);
+            return;
+        }
+        if shell.state().image_details_open {
+            // The host draws the image details screen's name until #30 draws the rest.
             return;
         }
         match shell.state().current {
@@ -506,6 +539,18 @@ impl ShellView {
     /// [`HomeFrame::hidden_apps`] is.
     pub fn hidden_apps(&self) -> &HiddenAppsSection {
         &self.hidden_apps
+    }
+
+    /// The image-of-the-day card in Events (EVT-12). Shown only while
+    /// [`HomeFrame::image_card`] is.
+    pub fn image_card(&self) -> &ImageCard {
+        &self.image_card
+    }
+
+    /// Settings → Lock-screen image (SET-02). Offered only while
+    /// [`HomeFrame::show_image_card`] is.
+    pub fn image_settings(&self) -> &ImageSettingsSection {
+        &self.image_settings
     }
 
     /// Shown over the home views, never over Settings (ONB-04).

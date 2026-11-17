@@ -185,4 +185,13 @@
     <!-- MeeGone's notification listener, as the system's notification-access screen names it
          (EVT-03). -->
     <string name="notification_listener_label">MeeGone Events</string>
+
+    <!-- The heading over Events' card with today's lock-screen image, drawn in capitals, and
+         the name of the image details screen it opens (EVT-12, WALL-15). -->
+    <string name="image_of_the_day">Image of the day</string>
+    <!-- What screen readers say a tap on that card does (A11Y-01). -->
+    <string name="action_image_details">Show image details</string>
+    <!-- Settings → Lock-screen image: the switch that hides or shows the card in Events
+         (EVT-12, SET-02). -->
+    <string name="show_image_card">Show card in Events</string>
 </resources>

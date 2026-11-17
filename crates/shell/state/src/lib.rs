@@ -1,7 +1,8 @@
 //! Home shell state (SRS 4.1): the carousel of views, the home menu, which long-press counts,
 //! Home and Back, coming back to the home, the icon press, the dragged icon, the grid's motion
 //! as apps come, go and move, edit mode's motion, the open folder's motion, the search field's
-//! pull, the Events list's motion as notifications come and go, and the theme.
+//! pull, the Events list's motion as notifications come and go, the image details screen and
+//! the image-of-the-day card's cross-fade, and the theme.
 //!
 //! [`HomeShell::compose`] is the only place features are put together (ARCH-03). Each feature
 //! runs in its own [`Store`], so a failing feature never takes down the shell (ARCH-09).
@@ -11,6 +12,7 @@ mod events_change;
 mod folder;
 mod grid_change;
 mod home_menu;
+mod image_change;
 mod lift;
 mod mode;
 mod press;
@@ -47,6 +49,8 @@ pub use folder::FolderState;
 use grid_change::GridChange;
 pub use grid_change::GridChangeState;
 pub use home_menu::{HomeMenu, MenuItem};
+use image_change::ImageChange;
+pub use image_change::ImageChangeState;
 use lift::{DragSurfaces, DropAt, Lift, LiftEvent, SurfaceView};
 pub use lift::{HoverState, LiftState, MergeState};
 pub use meegone_apps_state::{FOLDER_COLUMNS, GridItem, PREVIEW_APPS, preview_slot};
@@ -122,6 +126,9 @@ pub struct ShellState {
     pub settings_open: bool,
     /// The group Settings opened at, or `None` for its top.
     pub settings_group: Option<SettingsGroup>,
+    /// The image details screen covers the home views (WALL-15). The image-of-the-day card in
+    /// Events opens it (EVT-12, ADR 0022).
+    pub image_details_open: bool,
     /// The home menu, open over the current view (HOME-10). It covers the home views: they get
     /// no touches while it is open.
     pub menu: Option<HomeMenu>,
@@ -165,6 +172,8 @@ pub struct ShellState {
     /// How far the Events list has come in showing notifications that came and went
     /// (ANIM-20).
     pub events_change: EventsChangeState,
+    /// How far the image-of-the-day card's new thumbnail has faded in (ANIM-22).
+    pub image_change: ImageChangeState,
 }
 
 impl ShellState {
@@ -183,6 +192,7 @@ impl ShellState {
     /// (A11Y-05): Events and Applications do, while nothing covers them.
     pub fn menu_offered(&self) -> bool {
         !self.settings_open
+            && !self.image_details_open
             && self.menu.is_none()
             && !self.app_menu_open
             && !self.events_menu_open
@@ -197,6 +207,7 @@ impl ShellState {
     pub fn search_offered(&self) -> bool {
         self.current == HomeView::Applications
             && !self.settings_open
+            && !self.image_details_open
             && self.menu.is_none()
             && !self.app_menu_open
             && !self.folder_open
@@ -298,6 +309,9 @@ pub enum ShellIntent {
     /// The date, the time, the time zone, the 12- or 24-hour setting or the next alarm changed
     /// (EVT-01, EVT-02, L10N-03, ADR 0019).
     ClockChanged,
+    /// The host decoded the image-of-the-day card's new thumbnail and is about to draw it over
+    /// the one it showed, so the cross-fade starts (ANIM-22, ADR 0022).
+    NewImageShown,
     Apps(AppsIntent),
     Events(EventsIntent),
     Recent(RecentIntent),
@@ -335,6 +349,7 @@ pub struct HomeShell {
     seen_hidden: Arc<[App]>,
     search: SearchMotion,
     events_change: EventsChange,
+    image_change: ImageChange,
     /// Events' groups and expanded group as of the last intent, to tell cheaply whether its
     /// rows may have changed, and the keys of those rows, to tell which came or went (ANIM-20).
     seen_groups: Arc<[NotificationGroup]>,
@@ -372,6 +387,7 @@ impl HomeShell {
             seen_hidden: Arc::new([]),
             search: SearchMotion::default(),
             events_change: EventsChange::default(),
+            image_change: ImageChange::default(),
             seen_groups: Arc::new([]),
             seen_expanded: None,
             seen_rows: Vec::new(),
@@ -464,6 +480,12 @@ impl HomeShell {
         *self.events.health() == Health::Ready
     }
 
+    /// Whether the lock-screen image works. Its card in Events, its section in Settings and
+    /// its details screen are offered only then (ARCH-09).
+    pub fn lockimage_ready(&self) -> bool {
+        *self.lockimage.health() == Health::Ready
+    }
+
     pub fn events(&self) -> &Store<EventsHolder> {
         &self.events
     }
@@ -549,6 +571,7 @@ impl HomeShell {
                 self.press.frame(at);
                 self.grid_change.frame(at);
                 self.events_change.frame(at);
+                self.image_change.frame(at);
                 self.mode.frame(at);
                 self.folder.frame(at);
                 self.search.frame(at);
@@ -580,6 +603,8 @@ impl HomeShell {
                 // (EVT-03, AC-11, AC-21).
                 self.events.dispatch(EventsIntent::RefreshHeader);
                 self.events.dispatch(EventsIntent::RefreshNotifications);
+                // The daily image may have changed while MeeGone was away (EVT-12, ANIM-22).
+                self.lockimage.dispatch(LockImageIntent::Refresh);
                 // The animation speed may have changed in system settings (ANIM-05).
                 self.configure_carousel();
             }
@@ -591,10 +616,14 @@ impl HomeShell {
                 self.events.dispatch(EventsIntent::RefreshNotifications);
             }
             ShellIntent::ClockChanged => self.events.dispatch(EventsIntent::RefreshHeader),
+            ShellIntent::NewImageShown => {
+                self.image_change.start(self.carousel.animation_scale());
+            }
             ShellIntent::Apps(AppsIntent::OpenSearch) => self.open_search(),
             ShellIntent::Apps(intent) => self.apps.dispatch(intent),
             ShellIntent::Events(intent) => self.events.dispatch(intent),
             ShellIntent::Recent(intent) => self.recent.dispatch(intent),
+            ShellIntent::LockImage(LockImageIntent::OpenDetails) => self.open_image_details(),
             ShellIntent::LockImage(intent) => self.lockimage.dispatch(intent),
             ShellIntent::Settings(intent) => {
                 self.settings.dispatch(intent);
@@ -620,6 +649,7 @@ impl HomeShell {
         self.state.merge = self.lift.merge_state();
         self.state.grid_change = self.grid_change.state();
         self.state.events_change = self.events_change.state();
+        self.state.image_change = self.image_change.state();
         self.state.mode = self.mode_state();
         self.state.app_menu_open = self.app_menu_shown();
         self.state.events_menu_open = self.events_menu_shown();
@@ -631,9 +661,11 @@ impl HomeShell {
         self.state.search = self.search.state();
     }
 
-    /// Whether Settings or a menu covers the home views, so they get no new touches.
+    /// Whether Settings, the image details or a menu covers the home views, so they get no new
+    /// touches.
     fn covered(&self) -> bool {
         self.state.settings_open
+            || self.state.image_details_open
             || self.state.menu.is_some()
             || self.app_menu_shown()
             || self.events_menu_shown()
@@ -1203,10 +1235,41 @@ impl HomeShell {
         std::mem::take(&mut self.state.settings_open)
     }
 
+    /// Opens the image details screen over the home views (EVT-12, WALL-15), while the
+    /// lock-screen image works (ARCH-09). It shows only its name until #30 draws it.
+    fn open_image_details(&mut self) {
+        if !self.lockimage_ready() {
+            return;
+        }
+        // It covers the home views as Settings does.
+        let release = self.carousel.end_gesture(self.state.current);
+        self.settle(release);
+        self.press.finish();
+        self.lift.cancel();
+        self.search.end_gesture();
+        self.state.menu = None;
+        self.close_app_menu();
+        self.close_events_menu();
+        self.close_folder();
+        self.close_search();
+        self.state.image_details_open = true;
+    }
+
+    /// Closes the image details screen. Returns whether it was open.
+    fn close_image_details(&mut self) -> bool {
+        std::mem::take(&mut self.state.image_details_open)
+    }
+
+    /// Closes Settings, or else the image details screen: whichever covers the home views.
+    /// Returns whether either was open.
+    fn close_screen(&mut self) -> bool {
+        self.close_settings() || self.close_image_details()
+    }
+
     /// HOME-07: close what is open; otherwise go to Applications, or, on Applications, scroll
     /// it to the top.
     fn home(&mut self) {
-        if self.close_settings() {
+        if self.close_screen() {
             return;
         }
         // The menu and everything open in the view close together.
@@ -1224,10 +1287,10 @@ impl HomeShell {
         }
     }
 
-    /// HOME-08: close the topmost open element (Settings, then the home menu, then the view's
-    /// own); otherwise do nothing.
+    /// HOME-08: close the topmost open element (Settings, then the image details, then the home
+    /// menu, then the view's own); otherwise do nothing.
     fn back(&mut self) {
-        if !self.close_settings() && self.state.menu.take().is_none() {
+        if !self.close_screen() && self.state.menu.take().is_none() {
             self.close_topmost(self.state.current);
         }
     }
@@ -1239,6 +1302,7 @@ impl HomeShell {
     fn returned(&mut self, home: bool) {
         if home && self.settings_store.get().home_target == HomeTarget::Applications {
             self.close_settings();
+            self.close_image_details();
             self.state.menu = None;
             for view in HomeView::ALL {
                 self.close_everything_in(view);
@@ -1311,7 +1375,11 @@ impl HomeShell {
         }
         // Recent refreshes whenever it becomes visible (REC-09); Events does too, to stay live.
         match view {
-            HomeView::Events => self.events.dispatch(EventsIntent::Refresh),
+            HomeView::Events => {
+                self.events.dispatch(EventsIntent::Refresh);
+                // The card below the notifications stays live too (EVT-12).
+                self.lockimage.dispatch(LockImageIntent::Refresh);
+            }
             HomeView::Recent => self.recent.dispatch(RecentIntent::Refresh),
             HomeView::Applications => {}
         }
@@ -1325,11 +1393,13 @@ mod tests {
     use meegone_core_data::fakes::{FakeApps, FakeNotifications, Fakes, app, app_id, notification};
     use meegone_core_data::{
         App, AppId, AppsAdapter, DataError, Notification, NotificationsAdapter, Profile, ProfileId,
-        RecentUse, Rect, Shortcut,
+        RecentUse, Rect, Shortcut, Size, WallpaperAdapter,
     };
     use meegone_core_state::motion::{DRAG_LIFT_SCALE, ICON_PRESS_SCALE};
     use meegone_core_state::{Access, Health, Theme, ThemeChoice};
     use meegone_events_state::NotificationMenuItem;
+    use meegone_lockimage_data::ImageCache;
+    use meegone_lockimage_state::ImageRecord;
 
     use super::*;
 
@@ -1660,6 +1730,170 @@ mod tests {
             .retain(|n| n.package != "chat");
         shell.dispatch(ShellIntent::NotificationsChanged);
         assert!(shell.state().events_change.animating);
+    }
+
+    /// The daily image on, with `date`'s image cached (EVT-12).
+    fn cache_image(fakes: &Fakes, date: &str) {
+        PersistentImageCache::new(fakes.storage.clone())
+            .put(
+                ImageRecord {
+                    date: date.into(),
+                    region: "en-GB".into(),
+                    title: format!("Image of {date}"),
+                    attribution: "© Someone".into(),
+                    info_link: None,
+                    applied_at_ms: None,
+                    image: None,
+                },
+                date.as_bytes(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn the_image_card_opens_its_details_over_the_home_views() {
+        // EVT-12, WALL-15: they cover the views as Settings does, and Back or Home closes them.
+        let mut shell = laid_out(&Fakes::default());
+        go(&mut shell, Direction::Previous);
+        shell.dispatch(ShellIntent::OpenMenu);
+
+        shell.dispatch(ShellIntent::LockImage(LockImageIntent::OpenDetails));
+        assert!(shell.state().image_details_open);
+        assert_eq!(shell.state().menu, None);
+        assert!(!shell.state().menu_offered());
+        hold(&mut shell, 500.0, 900.0);
+        assert_eq!(shell.state().menu, None);
+        lift(&mut shell);
+
+        shell.dispatch(ShellIntent::Back);
+        assert!(!shell.state().image_details_open);
+        assert_eq!(shell.state().current, HomeView::Events);
+
+        shell.dispatch(ShellIntent::LockImage(LockImageIntent::OpenDetails));
+        shell.dispatch(ShellIntent::Home);
+        assert!(!shell.state().image_details_open);
+        assert_eq!(shell.state().current, HomeView::Events);
+    }
+
+    #[test]
+    fn settings_opened_over_the_image_details_close_first() {
+        // HOME-08: Back closes the topmost screen.
+        let mut shell = laid_out(&Fakes::default());
+        shell.dispatch(ShellIntent::LockImage(LockImageIntent::OpenDetails));
+        shell.dispatch(ShellIntent::OpenSettings);
+
+        shell.dispatch(ShellIntent::Back);
+        assert!(!shell.state().settings_open);
+        assert!(shell.state().image_details_open);
+
+        shell.dispatch(ShellIntent::Back);
+        assert!(!shell.state().image_details_open);
+    }
+
+    #[test]
+    fn home_from_an_app_closes_the_image_details_for_always_applications() {
+        // HOME-06
+        let mut shell = laid_out(&Fakes::default());
+        go(&mut shell, Direction::Previous);
+        shell.dispatch(ShellIntent::Settings(SettingsIntent::SetHomeTarget(
+            HomeTarget::Applications,
+        )));
+        shell.dispatch(ShellIntent::LockImage(LockImageIntent::OpenDetails));
+
+        shell.dispatch(ShellIntent::Returned { home: true });
+
+        assert!(!shell.state().image_details_open);
+        assert_eq!(shell.state().current, HomeView::Applications);
+    }
+
+    /// Works like [`FakeWallpaper`], except that it panics when asked whether the lock screen
+    /// can be set.
+    struct BrokenWallpaper;
+
+    impl WallpaperAdapter for BrokenWallpaper {
+        fn lock_screen_support(&self) -> Result<(), DataError> {
+            panic!("wallpaper bug");
+        }
+
+        fn lock_screen_size(&self) -> Size {
+            Size::default()
+        }
+
+        fn set_lock_screen(&self, _image: &[u8]) -> Result<(), DataError> {
+            panic!("wallpaper bug");
+        }
+
+        fn reset_lock_screen(&self) -> Result<(), DataError> {
+            panic!("wallpaper bug");
+        }
+
+        fn open_wallpaper_settings(&self) -> Result<(), DataError> {
+            panic!("wallpaper bug");
+        }
+    }
+
+    #[test]
+    fn a_failing_lock_screen_image_never_covers_the_home() {
+        // ARCH-09: its details never open, and Events still works.
+        let fakes = Fakes::default();
+        let mut platform = fakes.platform();
+        platform.wallpaper = Arc::new(BrokenWallpaper);
+        let mut shell = HomeShell::compose(platform);
+        assert!(matches!(shell.lockimage().health(), Health::Failed(_)));
+        assert!(!shell.lockimage_ready());
+
+        shell.dispatch(ShellIntent::LockImage(LockImageIntent::OpenDetails));
+        shell.dispatch(ShellIntent::Swipe(Direction::Previous));
+        shell.dispatch(ShellIntent::Resumed);
+
+        assert!(!shell.state().image_details_open);
+        assert!(shell.state().menu_offered());
+        assert!(shell.events_ready());
+    }
+
+    #[test]
+    fn coming_back_and_showing_events_read_the_image_again() {
+        // EVT-12: the daily job may have cached a new image while MeeGone was away.
+        let fakes = Fakes::default();
+        let mut shell = laid_out(&fakes);
+        shell.dispatch(ShellIntent::LockImage(LockImageIntent::SetEnabled(true)));
+        assert_eq!(shell.lockimage().state().current, None);
+
+        cache_image(&fakes, "20261116");
+        shell.dispatch(ShellIntent::Resumed);
+        let date = |shell: &HomeShell| shell.lockimage().state().current.clone().unwrap().date;
+        assert_eq!(date(&shell), "20261116");
+
+        cache_image(&fakes, "20261117");
+        go(&mut shell, Direction::Previous);
+        assert_eq!(date(&shell), "20261117");
+    }
+
+    #[test]
+    fn a_new_thumbnail_cross_fades_in_300_ms() {
+        // ANIM-22
+        let fakes = Fakes::default();
+        let mut shell = laid_out(&fakes);
+        assert_eq!(shell.state().image_change, ImageChangeState::default());
+
+        shell.dispatch(ShellIntent::NewImageShown);
+        assert!(shell.state().image_change.animating);
+        assert_eq!(shell.state().image_change.progress, 0.0);
+
+        let mut at = 7_000;
+        shell.dispatch(ShellIntent::Frame(ms(at)));
+        while shell.state().image_change.animating {
+            at += 8;
+            shell.dispatch(ShellIntent::Frame(ms(at)));
+        }
+        assert_eq!(at, 7_304);
+        assert_eq!(shell.state().image_change, ImageChangeState::default());
+
+        // ANIM-05: with animations removed, the new thumbnail shows at once.
+        *fakes.system.animation_scale.lock().unwrap() = 0.0;
+        shell.dispatch(ShellIntent::Resumed);
+        shell.dispatch(ShellIntent::NewImageShown);
+        assert_eq!(shell.state().image_change, ImageChangeState::default());
     }
 
     /// Works like [`FakeNotifications`], except that it panics when asked for the active

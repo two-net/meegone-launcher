@@ -33,18 +33,30 @@ pub enum StoredFile {
     Settings,
     /// The image cache: the details of the current and previous images (WALL-09).
     ImageDetails,
+    /// The image cache: one of the two images it keeps. The details say which image each file
+    /// holds (WALL-09, ADR 0022).
+    ImageA,
+    ImageB,
 }
 
 impl StoredFile {
-    pub const ALL: [StoredFile; 3] = [Self::Layout, Self::Settings, Self::ImageDetails];
+    pub const ALL: [StoredFile; 5] = [
+        Self::Layout,
+        Self::Settings,
+        Self::ImageDetails,
+        Self::ImageA,
+        Self::ImageB,
+    ];
 
     /// Where the file lives, relative to the storage root, with `/` between folders. The image
-    /// cache has a folder of its own, so the images themselves can join it (#27).
+    /// cache keeps its details and its images in a folder of its own.
     pub const fn path(self) -> &'static str {
         match self {
             Self::Layout => "layout",
             Self::Settings => "settings",
             Self::ImageDetails => "images/details",
+            Self::ImageA => "images/a",
+            Self::ImageB => "images/b",
         }
     }
 }

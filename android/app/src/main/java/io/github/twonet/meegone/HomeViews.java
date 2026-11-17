@@ -49,6 +49,8 @@ import java.util.List;
  * Applications page, with its own {@link AppsGrid}; renaming it asks for the name in a dialog
  * (FOLD-03, FOLD-04, ADR 0015). Pulling down at the top of Applications reveals the search field
  * of a {@link SearchPanel}, whose results are a third {@link AppsGrid} (SRCH-01, ADR 0016).
+ * Below the notifications, Events shows the image of the day in an {@link ImageCard}, whose tap
+ * opens the image details screen over the home views (EVT-12, ADR 0022).
  *
  * <p>The Rust app owns the gesture, the motion, the view indicator and the menus. This view
  * passes it every touch, frame time and layout change, says when a finger has been held on
@@ -160,7 +162,13 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private static final int EVENTS_CLEARABLE = 86; // 1 while Clear is offered
     private static final int EVENTS_MENU = 87; // its items as bits 1 << item; 0 if closed
     private static final int EVENTS_MENU_ROW = 88; // the row it opens at, or -1 to centre it
-    private static final int FRAME_SIZE = 89;
+    // The image-of-the-day card, its details and its setting (EVT-12, ANIM-22, ADR 0022):
+    private static final int IMAGE_CARD_SHOWN = 89; // 1 while the card shows
+    private static final int IMAGE_CARD_REVISION = 90; // changes when what it shows changes
+    private static final int IMAGE_CHANGE = 91; // 0 to 10 000: a new thumbnail fading in
+    private static final int IMAGE_DETAILS = 92; // 1 while the details screen shows
+    private static final int SHOW_IMAGE_CARD = 93; // 1 on, 0 off, -1 not offered
+    private static final int FRAME_SIZE = 94;
     private static final int SEARCH_OPEN = 1; // the field has the keyboard
     private static final int SEARCH_RESULTS = 2; // the results show instead of the grid
     private static final int SEARCH_NOTHING = 4; // nothing matches
@@ -219,6 +227,8 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private final EventsHeader eventsHeader;
     /** Below the header: notification access, or the notifications (EVT-03, EVT-04). */
     private final EventsList eventsList;
+    /** Below the notifications: the image of the day (EVT-12). */
+    private final ImageCard imageCard;
     private final AppsGrid apps;
     /** The open folder's grid, in its panel (FOLD-04). */
     private final AppsGrid folderApps;
@@ -251,6 +261,14 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private final TextView settingsTitle;
     private final TextView settingsGroup;
     private final HiddenAppsList hiddenApps;
+    /** Settings → Lock-screen image → "Show card in Events" (EVT-12). */
+    private final ImageSettings imageSettings;
+    /**
+     * Covers the home views while the image details screen is open (WALL-15). Until #30 draws
+     * it, it shows its name.
+     */
+    private final LinearLayout imageDetails;
+    private final TextView imageDetailsTitle;
     /**
      * The home menu (HOME-10), a card at the finger, or an app's menu (APPS-11), a card at its
      * icon: over the home views. Its items are made for the menu that opens.
@@ -309,6 +327,9 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private long eventsHeaderShown = -1;
     /** The Events list's revision as shown, as an unsigned int, or -1 before it is first read. */
     private long eventsListShown = -1;
+    /** The image card's revision as shown, as an unsigned int, or -1 before it is first read. */
+    private long imageCardShown = -1;
+    private int imageDetailsShown;
     private int menuOffered = -1;
     /** Whether screen readers can open search, as last told, or -1 before the first frame. */
     private int searchOffered = -1;
@@ -376,6 +397,18 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
                 return eventsMenuRequested(index);
             }
         });
+        imageCard = new ImageCard(context, new ImageCard.Listener() {
+            @Override
+            public void tapped() {
+                imageCardTapped();
+            }
+
+            @Override
+            public void newImageShown() {
+                nativeNewImageShown();
+                apply();
+            }
+        });
         doneMargin = dp(16);
         done = new TextView(context);
         done.setText(R.string.edit_done);
@@ -403,12 +436,15 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
                 page.addView(folderPanel, new LayoutParams(
                         LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
             } else if (i == EVENTS) {
-                // The header, then the notifications, scrolling together (ADR 0020).
+                // The header, then the notifications, then the image of the day, scrolling
+                // together (ADR 0020, ADR 0022).
                 LinearLayout content = new LinearLayout(context);
                 content.setOrientation(LinearLayout.VERTICAL);
                 content.addView(eventsHeader, new LinearLayout.LayoutParams(
                         LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
                 content.addView(eventsList, new LinearLayout.LayoutParams(
+                        LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
+                content.addView(imageCard, new LinearLayout.LayoutParams(
                         LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
                 ScrollView scroll = new ScrollView(context);
                 scroll.setVerticalScrollBarEnabled(false);
@@ -464,6 +500,23 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         status.setAccessibilityLiveRegion(ACCESSIBILITY_LIVE_REGION_POLITE);
         addView(status, new LayoutParams(1, 1, Gravity.TOP | Gravity.START));
 
+        // Below Settings, which can open over it.
+        imageDetails = new LinearLayout(context);
+        imageDetails.setOrientation(LinearLayout.VERTICAL);
+        imageDetails.setGravity(Gravity.TOP | Gravity.CENTER_HORIZONTAL);
+        // Touches on it stay there.
+        imageDetails.setClickable(true);
+        imageDetails.setVisibility(GONE);
+        imageDetails.setAccessibilityPaneTitle(
+                getResources().getString(R.string.image_of_the_day));
+        imageDetailsTitle = new TextView(context);
+        imageDetailsTitle.setText(R.string.image_of_the_day);
+        imageDetailsTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 28);
+        imageDetails.addView(imageDetailsTitle, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+        addView(imageDetails, new LayoutParams(
+                LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
+
         settings = new LinearLayout(context);
         settings.setOrientation(LinearLayout.VERTICAL);
         settings.setGravity(Gravity.TOP | Gravity.CENTER_HORIZONTAL);
@@ -489,8 +542,21 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             toast(message);
         });
         hiddenApps.setVisibility(GONE);
+        // Settings → Lock-screen image (EVT-12), after Applications in SET-02's order.
+        imageSettings = new ImageSettings(context, on -> {
+            String message = nativeShowImageCard(on);
+            apply();
+            toast(message);
+        });
+        imageSettings.setVisibility(GONE);
+        LinearLayout groups = new LinearLayout(context);
+        groups.setOrientation(LinearLayout.VERTICAL);
+        groups.addView(hiddenApps, new LinearLayout.LayoutParams(
+                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
+        groups.addView(imageSettings, new LinearLayout.LayoutParams(
+                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
         ScrollView hiddenAppsScroll = new ScrollView(context);
-        hiddenAppsScroll.addView(hiddenApps, new ScrollView.LayoutParams(
+        hiddenAppsScroll.addView(groups, new ScrollView.LayoutParams(
                 LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
         LinearLayout.LayoutParams scrollParams = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f);
@@ -572,6 +638,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             done.setLayoutParams(doneParams);
         }
         settings.setPadding(safe.left, safe.top, safe.right, safe.bottom);
+        imageDetails.setPadding(safe.left, safe.top, safe.right, safe.bottom);
         LayoutParams params = (LayoutParams) indicator.getLayoutParams();
         if (params.topMargin != safe.top + indicatorMargin) {
             params.topMargin = safe.top + indicatorMargin;
@@ -916,6 +983,8 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             }
             settings.setBackgroundColor(surface);
             settingsTitle.setTextColor(foreground);
+            imageDetails.setBackgroundColor(surface);
+            imageDetailsTitle.setTextColor(foreground);
             settingsGroup.setTextColor(dim);
             menuCard.setColor(surface);
             colourMenu();
@@ -965,6 +1034,8 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         }
         applyEventsHeader();
         applyEventsList();
+        applyImageCard();
+        applyImageDetails();
         applySettings();
         applyMenu();
         applyRename();
@@ -1214,6 +1285,40 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         eventsList.clearable(mode == EventsList.LIST && frame[EVENTS_CLEARABLE] != 0);
     }
 
+    /**
+     * The image-of-the-day card below the notifications (EVT-12): shown only while the daily
+     * image is on with an image and the card isn't hidden, and read again whenever its revision
+     * changes. A new thumbnail fades in as the frame says (ANIM-22).
+     */
+    private void applyImageCard() {
+        boolean shown = frame[IMAGE_CARD_SHOWN] != 0;
+        imageCard.setVisibility(shown ? VISIBLE : GONE);
+        imageCard.colour(foreground, dim, surface, frame[DIVIDER]);
+        long revision = frame[IMAGE_CARD_REVISION] & 0xFFFF_FFFFL;
+        if (shown && revision != imageCardShown) {
+            imageCardShown = revision;
+            imageCard.fill(nativeImageCard());
+        }
+        imageCard.fade(frame[IMAGE_CHANGE]);
+    }
+
+    /** The image card was tapped (EVT-12): the image details screen opens. */
+    private void imageCardTapped() {
+        // The revision is unsigned in Rust and travels as Java's int.
+        String message = nativeImageCardTapped((int) imageCardShown);
+        apply();
+        toast(message);
+    }
+
+    /** Shows the image details screen over the home views while it is open (WALL-15). */
+    private void applyImageDetails() {
+        if (frame[IMAGE_DETAILS] != imageDetailsShown) {
+            imageDetailsShown = frame[IMAGE_DETAILS];
+            imageDetails.setVisibility(imageDetailsShown != 0 ? VISIBLE : GONE);
+            hidePagesFromScreenReaders();
+        }
+    }
+
     /** Allow was tapped on Events' card (EVT-03): the system's notification-access screen opens. */
     private void allowNotifications() {
         String message = nativeAllowNotifications();
@@ -1255,8 +1360,8 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     }
 
     /**
-     * Shows Settings over the home views while it is open; until #34, only its name and Hidden
-     * apps.
+     * Shows Settings over the home views while it is open; until #34, only its name, Hidden
+     * apps and "Show card in Events".
      */
     private void applySettings() {
         if (frame[SETTINGS] != settingsShown) {
@@ -1267,6 +1372,18 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             hidePagesFromScreenReaders();
         }
         applyHiddenApps();
+        applyImageSettings();
+    }
+
+    /**
+     * Settings → Lock-screen image → "Show card in Events" (EVT-12): offered only while the
+     * lock-screen image works (ARCH-09).
+     */
+    private void applyImageSettings() {
+        int showCard = frame[SHOW_IMAGE_CARD];
+        imageSettings.setVisibility(showCard >= 0 ? VISIBLE : GONE);
+        imageSettings.colour(foreground, dim, frame[ACCENT]);
+        imageSettings.show(showCard > 0);
     }
 
     /**
@@ -1552,7 +1669,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     /** While a menu or Settings covers the home views, screen readers skip them. */
     private void hidePagesFromScreenReaders() {
         int importance = menuShown != 0 || appMenuShown >= 0 || eventsMenuShown != 0
-                || settingsShown != 0
+                || settingsShown != 0 || imageDetailsShown != 0
                 ? IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
                 : IMPORTANT_FOR_ACCESSIBILITY_AUTO;
         for (FrameLayout page : pages) {
@@ -1790,6 +1907,27 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
 
     /** Clear was tapped (EVT-07). Returns null, or a short message to show. */
     private native String nativeClearNotifications();
+
+    /**
+     * The image-of-the-day card as of the last frame, in {@link ImageCard#FIELDS} fields
+     * (EVT-12). Empty while it doesn't show.
+     */
+    private native String[] nativeImageCard();
+
+    /**
+     * The image card at {@code revision} was tapped (EVT-12): the image details screen opens.
+     * Returns null, or a short message to show.
+     */
+    private native String nativeImageCardTapped(int revision);
+
+    /** A new thumbnail is about to fade in over the card's old one (ANIM-22). */
+    private native void nativeNewImageShown();
+
+    /**
+     * "Show card in Events" was switched (EVT-12). Returns null, or a short message to show when
+     * the choice couldn't be saved.
+     */
+    private native String nativeShowImageCard(boolean on);
 
     /** Fills {@code frame} with what to draw now, in the slots above. */
     private native void nativeRead(int[] frame);

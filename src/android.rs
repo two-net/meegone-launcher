@@ -964,6 +964,133 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeAllo
     })
 }
 
+/// `String[] nativeImageCard()`: the image-of-the-day card as of the last frame (EVT-12, ADR
+/// 0022), mirrored in `ImageCard.java`:
+/// 1. the image's title;
+/// 2. its attribution, as the source provides it (LEGAL-03);
+/// 3. the file that holds the image, relative to the folder `nativeStart` was given;
+/// 4. the image's key, which changes only when the image does (ANIM-22).
+///
+/// Empty unless the frame's slot 89 says the card shows.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeImageCard(
+    env: RawEnv,
+    _views: JObject,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    let mut fields = std::ptr::null_mut();
+    guarded(env, || {
+        LAUNCHER.with_borrow(|launcher| {
+            let launcher = launcher.as_ref().ok_or("MeeGone hasn't started")?;
+            let card = launcher.view().image_card();
+            let content = if launcher.shell().lockimage_ready() && card.is_visible() {
+                card.content()
+            } else {
+                None
+            };
+            let texts: Vec<&str> = content.as_ref().map_or_else(Vec::new, |content| {
+                vec![
+                    content.title.as_str(),
+                    content.attribution.as_str(),
+                    content.image_path,
+                    content.image_key.as_str(),
+                ]
+            });
+            let array = env
+                .new_string_array(texts.into_iter())
+                .map_err(|error| format!("Couldn't pass the image card: {error}"))?;
+            fields = array.into_raw();
+            Ok(())
+        })
+    });
+    fields
+}
+
+/// `String nativeImageCardTapped(int revision)`: the image-of-the-day card at `revision` was
+/// tapped, so the image details screen opens (EVT-12, WALL-15). Returns `null`, or a short
+/// message to show. A card that changed since the host drew it does nothing, as does a
+/// lock-screen image that isn't working (ARCH-09).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeImageCardTapped(
+    env: RawEnv,
+    _views: JObject,
+    revision: i32,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    // The revision travels as Java's `int`.
+    with_image_message(env, |launcher| {
+        launcher.view().image_card().tapped(revision as u32)
+    })
+}
+
+/// `void nativeNewImageShown()`: the host decoded the image-of-the-day card's new thumbnail and
+/// is about to draw it over the one it showed, so the cross-fade starts (ANIM-22, ADR 0022).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeNewImageShown(
+    env: RawEnv,
+    _views: JObject,
+) {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_launcher(env, |launcher| {
+        launcher.dispatch(ShellIntent::NewImageShown);
+        launcher.frame();
+    });
+}
+
+/// `String nativeShowImageCard(boolean on)`: Settings → Lock-screen image → "Show card in
+/// Events" was switched (EVT-12, SET-03). Returns `null`, or a short message to show when the
+/// choice couldn't be saved. Does nothing while the lock-screen image isn't working (ARCH-09).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeShowImageCard(
+    env: RawEnv,
+    _views: JObject,
+    on: JBoolean,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_image_message(env, |launcher| {
+        launcher.view().image_settings().show_card_toggled(on != 0);
+        true
+    })
+}
+
+/// Asks something of the lock-screen image with `step`, applies it, and returns its `problem`
+/// as a message for the host to show, or `null`. Does nothing while it isn't working (ARCH-09).
+fn with_image_message(env: Env, step: impl FnOnce(&Launcher) -> bool) -> JObject {
+    let mut shown = std::ptr::null_mut();
+    guarded(env, || {
+        LAUNCHER.with_borrow_mut(|launcher| {
+            let launcher = launcher.as_mut().ok_or("MeeGone hasn't started")?;
+            if !launcher.shell().lockimage_ready() || !step(launcher) {
+                return Ok(());
+            }
+            launcher.frame();
+            shown = message(env, launcher.shell().lockimage().state().problem.as_deref())?;
+            Ok(())
+        })
+    });
+    shown
+}
+
 /// `void nativeFrame(long frameTimeNanos)`: the display is about to draw a frame (ANIM-04).
 ///
 /// # Safety
@@ -1842,7 +1969,7 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRead
 }
 
 /// How many slots the frame has.
-const FRAME_SLOTS: usize = 89;
+const FRAME_SLOTS: usize = 94;
 
 /// A `HomeFrame` as the `int[]` that `HomeViews.java` reads, slot by slot:
 ///
@@ -1918,6 +2045,11 @@ const FRAME_SLOTS: usize = 89;
 /// | 86 | 1 while the Events section header offers Clear (EVT-07); otherwise 0 |
 /// | 87 | The notification menu's items, as bits 1 << [`notification_menu_bit`]: 1 Dismiss, 2 Notification settings; 0 while it is closed (EVT-08) |
 /// | 88 | The Events row it opens at, in the rows last read, or -1 to centre it |
+/// | 89 | 1 while the image-of-the-day card shows below the notifications (EVT-12); otherwise 0: the daily image is off or has no image yet, the card is hidden, or the lock-screen image isn't working (ARCH-09) |
+/// | 90 | The card's revision: when it changes, the card is read again with `nativeImageCard` |
+/// | 91 | How far the card's new thumbnail has faded in, 0 to 10 000 (ANIM-22) |
+/// | 92 | 1 while the image details screen covers the home views (WALL-15); otherwise 0 |
+/// | 93 | Settings → "Show card in Events": 1 on, 0 off, or -1 while the lock-screen image isn't working, so it isn't offered (EVT-12, ARCH-09) |
 fn frame_slots(frame: &HomeFrame) -> [i32; FRAME_SLOTS] {
     let [events, applications, recent] = frame.pages;
     let menu_items = frame.menu.map_or(0, |menu| {
@@ -2062,6 +2194,11 @@ fn frame_slots(frame: &HomeFrame) -> [i32; FRAME_SLOTS] {
             .and_then(|menu| menu.row)
             .and_then(|row| i32::try_from(row).ok())
             .unwrap_or(-1),
+        i32::from(frame.image_card.is_some()),
+        frame.image_card.map_or(0, |revision| revision as i32),
+        i32::from(frame.image_change),
+        i32::from(frame.image_details_open),
+        frame.show_image_card.map_or(-1, i32::from),
     ];
     slots[40 + BADGE_ROWS..].copy_from_slice(&rest);
     slots

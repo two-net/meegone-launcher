@@ -345,7 +345,13 @@ mod tests {
 
         assert_eq!(
             folder.files(),
-            BTreeSet::from(["images/details".into(), "layout".into(), "settings".into()])
+            BTreeSet::from([
+                "images/a".into(),
+                "images/b".into(),
+                "images/details".into(),
+                "layout".into(),
+                "settings".into(),
+            ])
         );
     }
 

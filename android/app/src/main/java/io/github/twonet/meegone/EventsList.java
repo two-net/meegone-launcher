@@ -60,9 +60,6 @@ final class EventsList extends LinearLayout {
     private static final int EXPANDED = 4;
     /** Body text (SRS 5.2). */
     private static final float BODY_SP = 15f;
-    /** Section headers: 13 sp, in capitals and letter-spaced (SRS 5.2). */
-    private static final float SECTION_SP = 13f;
-    private static final float SECTION_SPACING = 0.1f;
     /** Medium, for the app's name. */
     private static final int MEDIUM = 500;
     /** The side margins (SRS 5.2), inside the page's safe area. */
@@ -100,9 +97,7 @@ final class EventsList extends LinearLayout {
     private final GradientDrawable card;
     private final TextView sentence;
     private final TextView allow;
-    private final LinearLayout section;
-    private final TextView sectionTitle;
-    private final View hairline;
+    private final SectionHeader section;
     private final TextView clear;
     private final TextView empty;
     private final Rows rows;
@@ -150,23 +145,7 @@ final class EventsList extends LinearLayout {
         addView(explainer, matchWidth());
 
         // The section header, with a hairline towards the end and Clear there (SRS 5.2, EVT-07).
-        section = new LinearLayout(context);
-        section.setOrientation(HORIZONTAL);
-        section.setGravity(Gravity.CENTER_VERTICAL);
-        section.setMinimumHeight(dp(TARGET_DP));
-        sectionTitle = new TextView(context);
-        sectionTitle.setText(R.string.events_notifications);
-        sectionTitle.setAllCaps(true);
-        sectionTitle.setLetterSpacing(SECTION_SPACING);
-        sectionTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, SECTION_SP);
-        sectionTitle.setAccessibilityHeading(true);
-        section.addView(sectionTitle, wrap());
-        hairline = new View(context);
-        hairline.setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO);
-        LayoutParams hairlineParams =
-                new LayoutParams(0, Math.max(1, Math.round(density)), 1f);
-        hairlineParams.setMarginStart(dp(GAP_DP));
-        section.addView(hairline, hairlineParams);
+        section = new SectionHeader(context, R.string.events_notifications);
         clear = new TextView(context);
         clear.setText(R.string.events_clear);
         clear.setContentDescription(getResources().getString(R.string.events_clear_description));
@@ -373,8 +352,7 @@ final class EventsList extends LinearLayout {
         allow.setTextColor(accent);
         ColorStateList pressed = ColorStateList.valueOf((foreground & 0x00FFFFFF) | 0x1F000000);
         allow.setBackground(new RippleDrawable(pressed, null, new ColorDrawable(Color.WHITE)));
-        sectionTitle.setTextColor(dim);
-        hairline.setBackgroundColor(divider);
+        section.colour(dim, divider);
         clear.setTextColor(accent);
         clear.setBackground(new RippleDrawable(pressed, null, new ColorDrawable(Color.WHITE)));
         empty.setTextColor(dim);
