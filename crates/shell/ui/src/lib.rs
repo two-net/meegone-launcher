@@ -6,8 +6,8 @@
 //! where the carousel's views are, how the view indicator looks, how the content comes back
 //! from an app, the home menu, the Applications grid, the pressed icon, the grid's cells as
 //! apps come, go and move, a cell's long-press menu, the dragged icon, edit mode, the open
-//! folder, search and Settings' Hidden apps list (ADR 0006 to ADR 0008, ADR 0010, ADR 0012 to
-//! ADR 0017).
+//! folder, search, Settings' Hidden apps list, and the Events header and list (ADR 0006 to
+//! ADR 0008, ADR 0010, ADR 0012 to ADR 0017, ADR 0019, ADR 0020).
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -21,6 +21,7 @@ pub use meegone_apps_ui::{
 use meegone_apps_ui::{AppsView, HiddenAppsSection};
 use meegone_core_ui::{Dispatch, Latest, Rgb, Slot, View, tokens};
 use meegone_events_ui::EventsView;
+pub use meegone_events_ui::{EventsListMode, EventsRow};
 use meegone_lockimage_ui::{ImageCard, ImageSettingsSection};
 use meegone_recent_ui::RecentView;
 use meegone_settings_ui::{HomeBanner, SettingsView};
@@ -55,6 +56,15 @@ pub struct GridChangeFrame {
     /// How far every other cell has come from its old place to its new one: 0 at first,
     /// 10 000 at rest.
     pub shift: u16,
+}
+
+/// What shows below the Events header (EVT-03, EVT-04, EVT-11, ADR 0020).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventsListFrame {
+    pub mode: EventsListMode,
+    /// Changes whenever the mode or the rows do: the host then reads the rows again with
+    /// [`EventsView::rows`].
+    pub revision: u32,
 }
 
 /// The dragged icon, as the host draws it above everything (APPS-11, APPS-12, ADR 0015).
@@ -226,14 +236,22 @@ pub struct HomeFrame {
     /// The Events header (EVT-01, EVT-02): its revision, which changes whenever its text does,
     /// or `None` while Events isn't working, so it isn't drawn (ARCH-09).
     pub events_header: Option<u32>,
+    /// What shows below the Events header, or `None` while Events isn't working, so nothing
+    /// does (ARCH-09).
+    pub events_list: Option<EventsListFrame>,
+    /// How far the Events list has come in showing rows that came and went, from 0 to 10 000
+    /// (ANIM-20). Each row says where it was, so the host knows which came and which went.
+    pub events_change: u16,
     /// The home views' solid background (HOME-11, THEME-04).
     pub background: Rgb,
     /// Menus and Settings (THEME-03).
     pub surface: Rgb,
     /// Text, and the indicator's highlighted segment.
     pub foreground: Rgb,
-    /// The indicator's other segments.
+    /// The indicator's other segments, and secondary text such as section headers.
     pub dim: Rgb,
+    /// Hairlines, such as the one beside a section header (SRS 5.3).
+    pub divider: Rgb,
     /// The dot on a newly installed app (APPS-07).
     pub accent: Rgb,
     /// The opacity of the black scrim behind an open folder, 0 to 255 (FOLD-04).
@@ -406,7 +424,8 @@ impl ShellView {
                 || state.lift.animating
                 || mode.animating
                 || state.folder.animating
-                || state.search.animating,
+                || state.search.animating
+                || state.events_change.animating,
             menu: state.menu.map(|menu| MenuFrame {
                 items: menu.items,
                 anchor: menu
@@ -420,10 +439,19 @@ impl ShellView {
             events_header: shell
                 .events_ready()
                 .then(|| self.events.show_header(&shell.events().state())),
+            events_list: shell.events_ready().then(|| {
+                let revision = self.events.show_list(&shell.events().state(), tokens);
+                EventsListFrame {
+                    mode: self.events.mode(),
+                    revision,
+                }
+            }),
+            events_change: ten_thousandths(state.events_change.progress),
             background: tokens.background,
             surface: tokens.surface,
             foreground: tokens.text_primary,
             dim: tokens.text_secondary,
+            divider: tokens.divider,
             accent: tokens.accent,
             scrim: (u16::from(tokens.scrim_percent.min(100)) * 255 / 100) as u8,
         }

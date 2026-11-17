@@ -8,10 +8,13 @@
 //! - [`system`]: the home-app role, the clock, and web search (HOME-01, ONB-04, SRCH-05).
 //! - [`apps`]: the app catalogue, launching and search keys (APPS-01, APPS-10, SRCH-02,
 //!   ADR 0010).
+//! - [`notifications`]: notification access and the active notifications (EVT-03, EVT-04,
+//!   ADR 0020).
 //! - [`stubs`]: every adapter not built yet, answering with its "if unavailable" value.
 
 mod apps;
 mod jni;
+mod notifications;
 mod stubs;
 mod system;
 
@@ -30,7 +33,7 @@ pub fn platform(env: Env, bridge: &LocalRef, files_dir: &LocalRef) -> Result<Pla
     let not_built = Arc::new(stubs::NotBuiltYet);
     Ok(Platform {
         apps: Arc::new(apps::AndroidApps::new(env, bridge)?),
-        notifications: not_built.clone(),
+        notifications: Arc::new(notifications::AndroidNotifications::new(env, bridge)?),
         usage: not_built.clone(),
         wallpaper: not_built.clone(),
         network: not_built.clone(),

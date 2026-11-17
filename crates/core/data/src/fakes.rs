@@ -92,6 +92,23 @@ pub fn work_app(package: &str, label: &str) -> App {
     }
 }
 
+/// A clearable notification from `package` in the personal profile, titled "Title" with the
+/// text "Text", posted at 1 ms. The system names its app by its package (EVT-04).
+pub fn notification(key: &str, package: &str) -> Notification {
+    Notification {
+        key: key.to_owned(),
+        profile: ProfileId(0),
+        package: package.to_owned(),
+        app_label: package.to_owned(),
+        title: "Title".to_owned(),
+        text: "Text".to_owned(),
+        posted_at_ms: 1,
+        clearable: true,
+        ongoing: false,
+        summary: false,
+    }
+}
+
 /// A stand-in for the platform's search folding (SRCH-02, L10N-04): lowercase, the accents of
 /// Latin-1 letters removed, and runs of spaces collapsed to one, without spaces at either end.
 /// The platform folds every script; this is enough for tests.

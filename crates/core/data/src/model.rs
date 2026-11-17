@@ -96,25 +96,37 @@ pub enum Access {
 #[derive(Clone, PartialEq, Eq)]
 pub struct Notification {
     pub key: String,
+    /// The profile of the app that posted it: the same app in the personal and the work profile
+    /// is two apps (APPS-20).
+    pub profile: ProfileId,
     pub package: String,
+    /// The system's name for the app that posted it, for an app with no icon in the grid, such
+    /// as Android System (EVT-04). Empty if the system has none.
+    pub app_label: String,
     pub title: String,
     pub text: String,
     pub posted_at_ms: u64,
     pub clearable: bool,
     /// Media playback, navigation or a running service (EVT-05).
     pub ongoing: bool,
+    /// A summary the app posts for a bundle of its notifications, which stand for themselves
+    /// (EVT-04).
+    pub summary: bool,
 }
 
 impl fmt::Debug for Notification {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Notification")
             .field("key", &self.key)
+            .field("profile", &self.profile)
             .field("package", &self.package)
+            .field("app_label", &self.app_label)
             .field("title", &"<redacted>")
             .field("text", &"<redacted>")
             .field("posted_at_ms", &self.posted_at_ms)
             .field("clearable", &self.clearable)
             .field("ongoing", &self.ongoing)
+            .field("summary", &self.summary)
             .finish()
     }
 }
@@ -231,16 +243,20 @@ mod tests {
     fn notification_debug_output_leaves_out_its_content() {
         let notification = Notification {
             key: "k1".into(),
+            profile: ProfileId(0),
             package: "com.example.chat".into(),
+            app_label: "Chat".into(),
             title: "Anna".into(),
             text: "See you at eight".into(),
             posted_at_ms: 1,
             clearable: true,
             ongoing: false,
+            summary: false,
         };
 
         let printed = format!("{notification:?}");
 
+        // EVT-13
         assert!(printed.contains("com.example.chat"));
         assert!(!printed.contains("Anna"));
         assert!(!printed.contains("See you at eight"));

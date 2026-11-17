@@ -8,7 +8,9 @@ mod backup;
 use std::collections::BTreeSet;
 
 use meegone_core_data::fakes::{Fakes, app, app_id};
-use meegone_core_data::{Access, DataError, Notification, RecentUse, StoredFile, ThemeChoice};
+use meegone_core_data::{
+    Access, DataError, Notification, ProfileId, RecentUse, StoredFile, ThemeChoice,
+};
 use meegone_core_state::{Health, Theme};
 use meegone_launcher::{AppMenuItem, CellKey, Direction, Launcher, ShellIntent};
 
@@ -154,12 +156,15 @@ fn notification_content_and_usage_history_are_never_stored() {
     *fakes.notifications.access.lock().unwrap() = Access::Granted;
     *fakes.notifications.active.lock().unwrap() = vec![Notification {
         key: "notification-key-1".into(),
+        profile: ProfileId(0),
         package: "chat".into(),
+        app_label: "Chat".into(),
         title: "Dinner with Robin".into(),
         text: "Table booked for eight".into(),
         posted_at_ms: POSTED_MS,
         clearable: true,
         ongoing: false,
+        summary: false,
     }];
     *fakes.usage.access.lock().unwrap() = Access::Granted;
     *fakes.usage.uses.lock().unwrap() = vec![
@@ -180,6 +185,12 @@ fn notification_content_and_usage_history_are_never_stored() {
     }
     launcher.dispatch(ShellIntent::NotificationsChanged);
     assert_eq!(launcher.shell().events().state().groups.len(), 1);
+    // The host draws the group's row, with what its notification says (EVT-04).
+    launcher.frame();
+    assert_eq!(
+        launcher.view().events().rows()[0].title,
+        "Dinner with Robin"
+    );
     assert_eq!(launcher.shell().recent().state().cards.len(), 2);
     launcher.view().recent().remove_tapped(app_id("chat"));
     launcher.dispatch(ShellIntent::OpenSettings);

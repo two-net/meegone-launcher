@@ -151,7 +151,12 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     // The Events header (EVT-01, EVT-02, ADR 0019):
     private static final int EVENTS_HEADER_SHOWN = 80; // 1 while Events works
     private static final int EVENTS_HEADER_REVISION = 81; // changes when its text changes
-    private static final int FRAME_SIZE = 82;
+    // What shows below it (EVT-03, EVT-04, EVT-11, ANIM-20, ADR 0020):
+    private static final int EVENTS_LIST = 82; // EventsList.NOTHING, EXPLAINER, EMPTY or LIST
+    private static final int EVENTS_LIST_REVISION = 83; // changes when its rows change
+    private static final int EVENTS_CHANGE = 84; // 0 to 10 000: rows coming and going
+    private static final int DIVIDER = 85; // ARGB: hairlines
+    private static final int FRAME_SIZE = 86;
     private static final int SEARCH_OPEN = 1; // the field has the keyboard
     private static final int SEARCH_RESULTS = 2; // the results show instead of the grid
     private static final int SEARCH_NOTHING = 4; // nothing matches
@@ -201,6 +206,8 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private final TextView[] titles = new TextView[VIEWS];
     /** The date and the next alarm at the top of Events (EVT-01, EVT-02). */
     private final EventsHeader eventsHeader;
+    /** Below the header: notification access, or the notifications (EVT-03, EVT-04). */
+    private final EventsList eventsList;
     private final AppsGrid apps;
     /** The open folder's grid, in its panel (FOLD-04). */
     private final AppsGrid folderApps;
@@ -285,6 +292,8 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private long hiddenAppsShown = -1;
     /** The Events header's revision as shown, as an unsigned int, or -1 before it is first read. */
     private long eventsHeaderShown = -1;
+    /** The Events list's revision as shown, as an unsigned int, or -1 before it is first read. */
+    private long eventsListShown = -1;
     private int menuOffered = -1;
     /** Whether screen readers can open search, as last told, or -1 before the first frame. */
     private int searchOffered = -1;
@@ -331,6 +340,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         });
         searchPanel.setScreen(this);
         eventsHeader = new EventsHeader(context, this::openAlarm);
+        eventsList = new EventsList(context, icons, this::allowNotifications);
         doneMargin = dp(16);
         done = new TextView(context);
         done.setText(R.string.edit_done);
@@ -358,9 +368,20 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
                 page.addView(folderPanel, new LayoutParams(
                         LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
             } else if (i == EVENTS) {
-                // The notifications come below it with #19.
-                page.addView(eventsHeader, new LayoutParams(LayoutParams.MATCH_PARENT,
-                        LayoutParams.WRAP_CONTENT, Gravity.TOP | Gravity.START));
+                // The header, then the notifications, scrolling together (ADR 0020).
+                LinearLayout content = new LinearLayout(context);
+                content.setOrientation(LinearLayout.VERTICAL);
+                content.addView(eventsHeader, new LinearLayout.LayoutParams(
+                        LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
+                content.addView(eventsList, new LinearLayout.LayoutParams(
+                        LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
+                ScrollView scroll = new ScrollView(context);
+                scroll.setVerticalScrollBarEnabled(false);
+                scroll.setOverScrollMode(OVER_SCROLL_IF_CONTENT_SCROLLS);
+                scroll.addView(content, new LayoutParams(
+                        LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
+                page.addView(scroll, new LayoutParams(
+                        LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
             } else {
                 // Until Recent's content arrives (#22), it shows its name.
                 TextView title = new TextView(context);
@@ -816,6 +837,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         folderApps.refreshIcons();
         results.refreshIcons();
         hiddenApps.refreshIcons();
+        eventsList.refreshIcons();
         shadow.invalidate();
     }
 
@@ -903,6 +925,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             editingShown = frame[EDITING];
         }
         applyEventsHeader();
+        applyEventsList();
         applySettings();
         applyMenu();
         applyRename();
@@ -1132,6 +1155,30 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             eventsHeaderShown = revision;
             eventsHeader.fill(nativeEventsHeader());
         }
+    }
+
+    /**
+     * What shows below the Events header (EVT-03, EVT-04, EVT-11): nothing while Events doesn't
+     * work (ARCH-09), the notification-access card, "No new events" or the app groups. The groups
+     * are read again whenever their revision changes, and move as the frame says (ANIM-20).
+     */
+    private void applyEventsList() {
+        int mode = frame[EVENTS_LIST];
+        eventsList.show(mode);
+        eventsList.colour(foreground, dim, surface, frame[ACCENT], frame[DIVIDER]);
+        long revision = frame[EVENTS_LIST_REVISION] & 0xFFFF_FFFFL;
+        if (mode != EventsList.NOTHING && revision != eventsListShown) {
+            eventsListShown = revision;
+            eventsList.fill(nativeEventsList());
+        }
+        eventsList.move(frame[EVENTS_CHANGE]);
+    }
+
+    /** Allow was tapped on Events' card (EVT-03): the system's notification-access screen opens. */
+    private void allowNotifications() {
+        String message = nativeAllowNotifications();
+        apply();
+        toast(message);
     }
 
     /** The alarm row was tapped (EVT-02): the app that set the alarm opens. */
@@ -1587,6 +1634,18 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
      * when nothing could open.
      */
     private native String nativeOpenAlarm();
+
+    /**
+     * The app groups below the Events header, {@link EventsList#FIELDS} fields each (EVT-04,
+     * ADR 0020). Empty while Events doesn't work.
+     */
+    private native String[] nativeEventsList();
+
+    /**
+     * Allow was tapped on Events' notification-access card (EVT-03). Returns null, or a short
+     * message to show when no system screen could open.
+     */
+    private native String nativeAllowNotifications();
 
     /** Fills {@code frame} with what to draw now, in the slots above. */
     private native void nativeRead(int[] frame);

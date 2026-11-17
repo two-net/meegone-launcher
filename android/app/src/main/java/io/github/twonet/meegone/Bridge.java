@@ -3,6 +3,8 @@ package io.github.twonet.meegone;
 import android.app.Activity;
 import android.app.ActivityOptions;
 import android.app.AlarmManager;
+import android.app.Notification;
+import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.SearchManager;
 import android.app.role.RoleManager;
@@ -38,6 +40,8 @@ import android.provider.AlarmClock;
 import android.provider.MediaStore;
 import android.provider.Settings;
 import android.provider.Telephony;
+import android.service.notification.NotificationListenerService;
+import android.service.notification.StatusBarNotification;
 import android.telecom.TelecomManager;
 import android.util.Log;
 import android.view.HapticFeedbackConstants;
@@ -46,8 +50,10 @@ import android.view.WindowInsets;
 import java.text.Normalizer;
 import java.util.ArrayList;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.TimeZone;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
@@ -56,9 +62,10 @@ import java.util.regex.Pattern;
  * What the Rust platform adapters ask of Android (ADR 0005).
  *
  * <p>Rust looks these methods up by name and signature on the main thread, so keep them in step
- * with {@code crates/core/data/src/android/system.rs} and {@code apps.rs}. Every method catches
- * what Android may throw: an exception must never reach Rust. Logs hold only yes/no answers,
- * never user data such as which apps are installed.
+ * with {@code crates/core/data/src/android/system.rs}, {@code apps.rs} and {@code
+ * notifications.rs}. Every method catches what Android may throw: an exception must never reach
+ * Rust. Logs hold only yes/no answers and the kinds of errors, never user data such as which
+ * apps are installed or what a notification says (EVT-13).
  */
 final class Bridge {
     private static final String TAG = "MeeGone";
@@ -75,6 +82,17 @@ final class Bridge {
     private static final int PROFILE_LOCKED = 4;
     // A shortcut (ADR 0013): id, short label, flags, rank.
     private static final int SHORTCUT_MANIFEST = 1;
+    // A notification (ADR 0020), mirrored in crates/core/data/src/notification_records.rs: key,
+    // package, profile serial number, the app's name, title, text, post time and flags.
+    private static final int NOTIFICATION_CLEARABLE = 1;
+    private static final int NOTIFICATION_ONGOING = 2;
+    private static final int NOTIFICATION_SUMMARY = 4;
+    /**
+     * The extra in which every notification carries the app info of the app that posted it, as
+     * {@code Notification.Builder.recoverBuilder} reads it. It names apps that Android 11's
+     * package visibility hides from MeeGone, such as System UI.
+     */
+    private static final String EXTRA_APP_INFO = "android.appInfo";
     /**
      * The system's broadcasts about the work profile, and about the language, which changes the
      * apps' labels and their alphabetical order (L10N-04). Sent only to registered receivers.
@@ -128,6 +146,9 @@ final class Bridge {
     private final Runnable reportAppsChanged = () -> HomeActivity.appsChanged(this.activity);
     /** Tells the Rust app about a burst of clock and alarm changes once (ADR 0019). */
     private final Runnable reportClockChanged = () -> HomeActivity.clockChanged(this.activity);
+    /** Tells the Rust app about a burst of notifications coming and going once (ADR 0020). */
+    private final Runnable reportNotificationsChanged =
+            () -> HomeActivity.notificationsChanged(this.activity);
     /** Each app's accent colour, derived from its icon (APPS-17, ADR 0011). */
     private final AppAccents accents;
     /** The resumed activity, which can start the system's screens; null while none is. */
@@ -135,6 +156,7 @@ final class Bridge {
     private long roleRequestedAt;
     private boolean watchingApps;
     private boolean watchingClock;
+    private boolean watchingNotifications;
 
     private Bridge(Context context) {
         this.context = context.getApplicationContext();
@@ -815,6 +837,201 @@ final class Bridge {
             Log.w(TAG, "Couldn't write a time: " + e.getClass().getSimpleName());
             return null;
         }
+    }
+
+    /**
+     * Starts telling the Rust app when notifications are posted or removed, and when the
+     * listener is connected or disconnected, as when the user grants or revokes notification
+     * access (EVT-10, ADR 0020). Called once the home has started; until then, a listener the
+     * system binds before any home exists tells nobody, and the home reads the notifications as
+     * it starts.
+     */
+    void watchNotifications() {
+        watchingNotifications = true;
+    }
+
+    /**
+     * A notification was posted or removed, or the listener was connected or disconnected.
+     * Reported once per burst, on the main thread, once the home is watching. Called by {@link
+     * NotificationListener} on the main thread.
+     */
+    static void notificationsChanged() {
+        Bridge bridge;
+        synchronized (Bridge.class) {
+            bridge = instance;
+        }
+        if (bridge == null || !bridge.watchingNotifications) {
+            return;
+        }
+        bridge.main.removeCallbacks(bridge.reportNotificationsChanged);
+        bridge.main.post(bridge.reportNotificationsChanged);
+    }
+
+    /**
+     * Whether the user has granted MeeGone's listener notification access (EVT-03). If they
+     * have but the system hasn't bound the listener, as can happen after MeeGone is updated, it
+     * asks the system to bind it; the connection then reports itself. Called from Rust.
+     */
+    boolean notificationAccess() {
+        ComponentName listener = new ComponentName(context, NotificationListener.class);
+        boolean granted;
+        try {
+            granted = context.getSystemService(NotificationManager.class)
+                    .isNotificationListenerAccessGranted(listener);
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Couldn't check notification access: " + e.getClass().getSimpleName());
+            return false;
+        }
+        if (granted && NotificationListener.connected() == null) {
+            try {
+                NotificationListenerService.requestRebind(listener);
+            } catch (RuntimeException e) {
+                Log.w(TAG, "Couldn't bind the listener: " + e.getClass().getSimpleName());
+            }
+        }
+        return granted;
+    }
+
+    /**
+     * Every other app's active notifications, one record each (EVT-04, EVT-05, ADR 0020): key,
+     * package, profile serial number, the app's name, title, text, post time and flags. None
+     * while the listener isn't connected yet; its connection reports itself. Null if the system
+     * couldn't list them. What they say crosses into Rust's memory only, and is never logged
+     * (EVT-13). Called from Rust.
+     */
+    String[] activeNotifications() {
+        NotificationListener listener = NotificationListener.connected();
+        if (listener == null) {
+            return new String[0];
+        }
+        try {
+            StatusBarNotification[] active = listener.getActiveNotifications();
+            if (active == null) {
+                return new String[0];
+            }
+            UserManager users = context.getSystemService(UserManager.class);
+            Map<String, String> labels = new HashMap<>();
+            List<String> fields = new ArrayList<>();
+            for (StatusBarNotification posted : active) {
+                String packageName = posted.getPackageName();
+                long serial = users.getSerialNumberForUser(posted.getUser());
+                // MeeGone's own are left out (EVT-05).
+                if (context.getPackageName().equals(packageName) || serial < 0) {
+                    continue;
+                }
+                Notification notification = posted.getNotification();
+                Bundle extras = notification.extras != null ? notification.extras : new Bundle();
+                String app = serial + "/" + packageName;
+                String label = labels.get(app);
+                if (label == null) {
+                    label = appLabel(packageName, posted.getUser(), extras);
+                    labels.put(app, label);
+                }
+                fields.add(posted.getKey());
+                fields.add(packageName);
+                fields.add(Long.toString(serial));
+                fields.add(label);
+                fields.add(text(extras, Notification.EXTRA_TITLE, Notification.EXTRA_TITLE_BIG));
+                fields.add(text(extras, Notification.EXTRA_TEXT, Notification.EXTRA_BIG_TEXT));
+                fields.add(Long.toString(posted.getPostTime()));
+                fields.add(Integer.toString(notificationFlags(posted, notification, extras)));
+            }
+            return fields.toArray(new String[0]);
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Couldn't read the notifications: " + e.getClass().getSimpleName());
+            return null;
+        }
+    }
+
+    /**
+     * The name of the app that posted a notification: its label, read from the system, or from
+     * the app info the notification carries for an app MeeGone can't see, such as System UI.
+     * Empty if neither names it.
+     */
+    @SuppressWarnings("deprecation") // getParcelable(String, Class) needs Android 13.
+    private String appLabel(String packageName, UserHandle user, Bundle extras) {
+        PackageManager packages = context.getPackageManager();
+        try {
+            return packages.getApplicationLabel(context.getSystemService(LauncherApps.class)
+                    .getApplicationInfo(packageName, 0, user)).toString().trim();
+        } catch (PackageManager.NameNotFoundException | RuntimeException e) {
+            // Hidden by package visibility: try the notification's own app info.
+        }
+        try {
+            Object carried = extras.getParcelable(EXTRA_APP_INFO);
+            if (carried instanceof ApplicationInfo
+                    && packageName.equals(((ApplicationInfo) carried).packageName)) {
+                return packages.getApplicationLabel((ApplicationInfo) carried).toString().trim();
+            }
+        } catch (RuntimeException e) {
+            // Unreadable: the Rust app names it by its package.
+        }
+        return "";
+    }
+
+    /** The first of {@code keys} that holds text, or an empty string. */
+    private static String text(Bundle extras, String... keys) {
+        for (String key : keys) {
+            CharSequence text = extras.getCharSequence(key);
+            if (text != null && text.toString().trim().length() > 0) {
+                return text.toString();
+            }
+        }
+        return "";
+    }
+
+    /**
+     * Whether the user can clear a notification, whether it is ongoing, and whether it
+     * summarises a bundle. Ongoing ones, which Events leaves out, are ongoing events such as a
+     * call, a foreground service's, media playback (even paused) and navigation (EVT-05).
+     */
+    private static int notificationFlags(
+            StatusBarNotification posted, Notification notification, Bundle extras) {
+        int flags = 0;
+        if (posted.isClearable()) {
+            flags |= NOTIFICATION_CLEARABLE;
+        }
+        boolean ongoing = (notification.flags
+                        & (Notification.FLAG_ONGOING_EVENT | Notification.FLAG_FOREGROUND_SERVICE))
+                != 0
+                || Notification.CATEGORY_TRANSPORT.equals(notification.category)
+                || Notification.CATEGORY_NAVIGATION.equals(notification.category)
+                || extras.containsKey(Notification.EXTRA_MEDIA_SESSION);
+        if (ongoing) {
+            flags |= NOTIFICATION_ONGOING;
+        }
+        if ((notification.flags & Notification.FLAG_GROUP_SUMMARY) != 0) {
+            flags |= NOTIFICATION_SUMMARY;
+        }
+        return flags;
+    }
+
+    /**
+     * Opens MeeGone's page of the system's notification-access screen, or the screen itself,
+     * where the user grants access (EVT-03). Returns null, or a short message if neither opens.
+     * Called from Rust.
+     */
+    String openNotificationAccess() {
+        Activity current = activity;
+        Context from = current != null ? current : context;
+        ComponentName listener = new ComponentName(context, NotificationListener.class);
+        List<Intent> screens = new ArrayList<>();
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            screens.add(new Intent(Settings.ACTION_NOTIFICATION_LISTENER_DETAIL_SETTINGS)
+                    .putExtra(Settings.EXTRA_NOTIFICATION_LISTENER_COMPONENT_NAME,
+                            listener.flattenToString()));
+        }
+        screens.add(new Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS));
+        for (Intent screen : screens) {
+            try {
+                from.startActivity(screen.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                return null;
+            } catch (ActivityNotFoundException | SecurityException e) {
+                // Try the next screen.
+            }
+        }
+        Log.w(TAG, "Couldn't open the notification-access screen");
+        return context.getString(R.string.notification_access_unavailable);
     }
 
     /**

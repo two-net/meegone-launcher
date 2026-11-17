@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use meegone_core_state::motion::{MODE_CHANGE, MODE_SCALE, MODE_STAGGER, decelerate, pop, scaled};
 
-use crate::grid_change::MAX_FRAME_STEP;
+use crate::timed::MAX_FRAME_STEP;
 
 /// How many visible rows have a badge scale of their own. Rows further down take the last one.
 pub const BADGE_ROWS: usize = 12;

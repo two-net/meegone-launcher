@@ -38,7 +38,7 @@ use meegone_core_state::motion::{
 };
 
 use crate::carousel::{PointerEvent, PointerKind};
-use crate::grid_change::MAX_FRAME_STEP;
+use crate::timed::MAX_FRAME_STEP;
 
 /// A place stays the icon's target while its centre is this far, as a fraction of a cell, past
 /// the place's edges. Small, so the gaps beside an icon still take its place.

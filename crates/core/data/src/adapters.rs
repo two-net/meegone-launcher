@@ -51,9 +51,12 @@ pub trait AppsAdapter: Send + Sync {
     fn open_app_info(&self, app: &AppId) -> Result<(), DataError>;
 }
 
-/// Active notifications, read through notification access (EVT-03 to EVT-08).
+/// Active notifications, read through notification access (EVT-03 to EVT-08). Their content
+/// stays in memory and is never stored, logged or transmitted (EVT-13).
 pub trait NotificationsAdapter: Send + Sync {
     fn access(&self) -> Access;
+    /// Other apps' active notifications, in any order; never MeeGone's own (EVT-05). Ongoing
+    /// ones are included and marked, for Events to leave out.
     fn active(&self) -> Result<Vec<Notification>, DataError>;
     /// Opens the notification's content. The system removes it if it is meant to disappear
     /// when opened (EVT-06).

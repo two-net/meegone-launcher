@@ -5,6 +5,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.pm.LauncherActivityInfo;
 import android.content.pm.LauncherApps;
+import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.BitmapShader;
 import android.graphics.Canvas;
@@ -112,7 +113,8 @@ final class AppIcons {
 
     /**
      * The icon of an app, or null until it arrives: then {@code onChange} runs. {@code profile}
-     * is the profile's serial number.
+     * is the profile's serial number. An empty {@code activity} asks for the app's own icon, for
+     * an app with no icon in the grid, such as one in Events (ADR 0020).
      */
     Drawable get(long profile, String packageName, String activity) {
         String key = key(profile, packageName, activity);
@@ -202,16 +204,13 @@ final class AppIcons {
             if (user == null) {
                 return null;
             }
-            Intent intent = new Intent(Intent.ACTION_MAIN)
-                    .addCategory(Intent.CATEGORY_LAUNCHER)
-                    .setComponent(new ComponentName(packageName, activity));
-            LauncherActivityInfo info =
-                    context.getSystemService(LauncherApps.class).resolveActivity(intent, user);
-            if (info == null) {
+            Drawable source = activity.isEmpty()
+                    ? appIcon(packageName, user)
+                    : activityIcon(packageName, activity, user);
+            if (source == null) {
                 return null;
             }
-            Drawable icon = new BitmapDrawable(context.getResources(),
-                    shaped(info.getIcon(densityDpi), sizePx));
+            Drawable icon = new BitmapDrawable(context.getResources(), shaped(source, sizePx));
             Drawable badged = context.getPackageManager().getUserBadgedIcon(icon, user);
             if (badged == icon) {
                 return icon;
@@ -223,6 +222,30 @@ final class AppIcons {
             return new BitmapDrawable(context.getResources(), bitmap);
         } catch (RuntimeException e) {
             return null;
+        }
+    }
+
+    /** A launcher activity's icon, or null if it has gone. On the loader thread. */
+    private Drawable activityIcon(String packageName, String activity, UserHandle user) {
+        Intent intent = new Intent(Intent.ACTION_MAIN)
+                .addCategory(Intent.CATEGORY_LAUNCHER)
+                .setComponent(new ComponentName(packageName, activity));
+        LauncherActivityInfo info =
+                context.getSystemService(LauncherApps.class).resolveActivity(intent, user);
+        return info != null ? info.getIcon(densityDpi) : null;
+    }
+
+    /**
+     * An app's own icon, or the system's default app icon for one MeeGone can't see, such as
+     * System UI under Android 11's package visibility. On the loader thread.
+     */
+    private Drawable appIcon(String packageName, UserHandle user) {
+        PackageManager packages = context.getPackageManager();
+        try {
+            return packages.getApplicationIcon(context.getSystemService(LauncherApps.class)
+                    .getApplicationInfo(packageName, 0, user));
+        } catch (PackageManager.NameNotFoundException | RuntimeException e) {
+            return packages.getDefaultActivityIcon();
         }
     }
 

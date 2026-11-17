@@ -1,12 +1,13 @@
 //! Home shell state (SRS 4.1): the carousel of views, the home menu, which long-press counts,
 //! Home and Back, coming back to the home, the icon press, the dragged icon, the grid's motion
 //! as apps come, go and move, edit mode's motion, the open folder's motion, the search field's
-//! pull, and the theme.
+//! pull, the Events list's motion as notifications come and go, and the theme.
 //!
 //! [`HomeShell::compose`] is the only place features are put together (ARCH-03). Each feature
 //! runs in its own [`Store`], so a failing feature never takes down the shell (ARCH-09).
 
 mod carousel;
+mod events_change;
 mod folder;
 mod grid_change;
 mod home_menu;
@@ -15,6 +16,7 @@ mod mode;
 mod press;
 mod return_home;
 mod search;
+mod timed;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,7 +30,7 @@ use meegone_core_data::{
 };
 use meegone_core_state::motion::{MODE_SCALE, VIEW_FLING_VELOCITY_DP};
 use meegone_core_state::{App, Health, Store, ThemeHolder, ThemeIntent};
-use meegone_events_state::{EventsHolder, EventsIntent};
+use meegone_events_state::{EventsHolder, EventsIntent, NotificationGroup, rows_came_or_went};
 use meegone_lockimage_data::PersistentImageCache;
 use meegone_lockimage_state::{LockImageHolder, LockImageIntent, LockImageState};
 use meegone_recent_state::{RecentHolder, RecentIntent};
@@ -36,6 +38,8 @@ use meegone_settings_state::{SettingsHolder, SettingsIntent, SettingsState};
 
 use carousel::{Carousel, Release};
 pub use carousel::{CarouselState, Layout, PointerEvent, PointerKind};
+use events_change::EventsChange;
+pub use events_change::EventsChangeState;
 use folder::FolderMotion;
 pub use folder::FolderState;
 use grid_change::GridChange;
@@ -152,6 +156,9 @@ pub struct ShellState {
     /// open the carousel stays put, and only the results, or the grid below an empty field,
     /// take touches. A failed Applications never shows it (ARCH-09).
     pub search: SearchState,
+    /// How far the Events list has come in showing notifications that came and went
+    /// (ANIM-20).
+    pub events_change: EventsChangeState,
 }
 
 impl ShellState {
@@ -311,6 +318,9 @@ pub struct HomeShell {
     /// The apps Applications had hidden as of the last intent, so Recent follows (APPS-19).
     seen_hidden: Arc<[App]>,
     search: SearchMotion,
+    events_change: EventsChange,
+    /// Events' groups as of the last intent, to tell when its rows came or went (ANIM-20).
+    seen_groups: Arc<[NotificationGroup]>,
     theme: Store<ThemeHolder>,
     apps: Store<AppsHolder>,
     events: Store<EventsHolder>,
@@ -342,6 +352,8 @@ impl HomeShell {
             seen_folders_made: 0,
             seen_hidden: Arc::new([]),
             search: SearchMotion::default(),
+            events_change: EventsChange::default(),
+            seen_groups: Arc::new([]),
             theme: Store::new(ThemeHolder::new(
                 settings_store.clone(),
                 platform.system.clone(),
@@ -355,6 +367,8 @@ impl HomeShell {
             )),
             events: Store::new(EventsHolder::new(
                 platform.notifications.clone(),
+                // Each group's label, icon and accent come from the catalogue (ADR 0002).
+                platform.apps.clone(),
                 platform.system.clone(),
             )),
             recent: Store::new(RecentHolder::new(
@@ -390,6 +404,8 @@ impl HomeShell {
         shell.seen_cells = shell.apps.state().items.clone();
         // Recent read the hidden apps as it loaded.
         shell.seen_hidden = shell.apps.state().hidden_apps.clone();
+        // Events' list as it starts is shown as it is too (ANIM-20).
+        shell.seen_groups = shell.events.state().groups.clone();
         shell
     }
 
@@ -508,6 +524,7 @@ impl HomeShell {
                 self.return_home.frame(at);
                 self.press.frame(at);
                 self.grid_change.frame(at);
+                self.events_change.frame(at);
                 self.mode.frame(at);
                 self.folder.frame(at);
                 self.search.frame(at);
@@ -531,8 +548,11 @@ impl HomeShell {
             ShellIntent::OpenSettings => self.open_settings(None),
             ShellIntent::Resumed => {
                 self.settings.dispatch(SettingsIntent::Refresh);
-                // The day or the language may have changed while MeeGone was away (EVT-01).
+                // The day or the language may have changed while MeeGone was away (EVT-01), and
+                // notification access may have been granted or revoked in system settings
+                // (EVT-03, AC-11, AC-21).
                 self.events.dispatch(EventsIntent::RefreshHeader);
+                self.events.dispatch(EventsIntent::RefreshNotifications);
                 // The animation speed may have changed in system settings (ANIM-05).
                 self.configure_carousel();
             }
@@ -540,7 +560,9 @@ impl HomeShell {
             ShellIntent::Restore(saved) => self.restore(saved),
             ShellIntent::SystemThemeChanged => self.theme.dispatch(ThemeIntent::Refresh),
             ShellIntent::AppsChanged => self.apps_changed(),
-            ShellIntent::NotificationsChanged => self.events.dispatch(EventsIntent::Refresh),
+            ShellIntent::NotificationsChanged => {
+                self.events.dispatch(EventsIntent::RefreshNotifications);
+            }
             ShellIntent::ClockChanged => self.events.dispatch(EventsIntent::RefreshHeader),
             ShellIntent::Apps(AppsIntent::OpenSearch) => self.open_search(),
             ShellIntent::Apps(intent) => self.apps.dispatch(intent),
@@ -560,6 +582,7 @@ impl HomeShell {
         self.keep_lift_in_step();
         self.keep_mode_in_step();
         self.keep_cells_in_step();
+        self.keep_events_in_step();
         self.keep_recent_in_step();
         self.lift.sync(&self.drag_surfaces());
         self.state.carousel = self.carousel.state();
@@ -569,6 +592,7 @@ impl HomeShell {
         self.state.hover = self.lift.hover();
         self.state.merge = self.lift.merge_state();
         self.state.grid_change = self.grid_change.state();
+        self.state.events_change = self.events_change.state();
         self.state.mode = self.mode_state();
         self.state.app_menu_open = self.app_menu_shown();
         self.state.folder_open = self.folder_shown();
@@ -768,6 +792,22 @@ impl HomeShell {
         }
     }
 
+    /// When Events' rows came or went, its list moves to its new rows (ANIM-20). A group whose
+    /// count alone changed moves nothing.
+    fn keep_events_in_step(&mut self) {
+        let groups = self.events.state().groups.clone();
+        if Arc::ptr_eq(&groups, &self.seen_groups) {
+            return;
+        }
+        let keys = |groups: &[NotificationGroup]| -> Vec<_> {
+            groups.iter().map(NotificationGroup::key).collect()
+        };
+        if rows_came_or_went(&keys(&self.seen_groups), &keys(&groups)) {
+            self.events_change.start(self.carousel.animation_scale());
+        }
+        self.seen_groups = groups;
+    }
+
     /// Recent leaves out the apps Applications hides (APPS-19, REC-03). When they change, by a
     /// Hide, an Unhide or a hidden app that is gone, Recent reads them again at once, so a swipe
     /// never shows a hidden app's card on the next page. A failed save changes nothing, and a
@@ -909,6 +949,8 @@ impl HomeShell {
     fn apps_changed(&mut self) {
         self.apps.dispatch(AppsIntent::Refresh);
         self.recent.dispatch(RecentIntent::Refresh);
+        // Events' groups take on new labels, icons and accents (APPS-17).
+        self.events.dispatch(EventsIntent::AppsChanged);
     }
 
     /// Takes on the wrap-around setting and the system animation speed, which the carousel
@@ -1198,9 +1240,10 @@ impl HomeShell {
 mod tests {
     use meegone_apps_data::{Layout as SavedLayout, LayoutEntry, LayoutStore};
     use meegone_apps_state::{AppMenuItem, Bounds, FolderId, GridItem, GridLayout};
-    use meegone_core_data::fakes::{FakeApps, Fakes, app, app_id};
+    use meegone_core_data::fakes::{FakeApps, FakeNotifications, Fakes, app, app_id, notification};
     use meegone_core_data::{
-        App, AppId, AppsAdapter, DataError, Profile, RecentUse, Rect, Shortcut,
+        App, AppId, AppsAdapter, DataError, Notification, NotificationsAdapter, Profile, RecentUse,
+        Rect, Shortcut,
     };
     use meegone_core_state::motion::{DRAG_LIFT_SCALE, ICON_PRESS_SCALE};
     use meegone_core_state::{Access, Health, Theme, ThemeChoice};
@@ -1444,6 +1487,155 @@ mod tests {
         shell.dispatch(ShellIntent::Resumed);
         assert_eq!(shell.events().state().header.weekday, "Saturday");
         assert!(shell.events_ready());
+    }
+
+    #[test]
+    fn coming_back_reads_notification_access_again() {
+        // EVT-03, AC-11: granted in system settings while MeeGone was away.
+        let fakes = Fakes::default();
+        let mut shell = HomeShell::compose(fakes.platform());
+        assert_eq!(shell.events().state().access, Access::Missing);
+
+        *fakes.notifications.access.lock().unwrap() = Access::Granted;
+        *fakes.notifications.active.lock().unwrap() = vec![notification("m1", "mail")];
+        shell.dispatch(ShellIntent::Resumed);
+
+        assert_eq!(shell.events().state().access, Access::Granted);
+        assert_eq!(shell.events().state().groups.len(), 1);
+    }
+
+    #[test]
+    fn app_changes_reach_the_events_groups() {
+        // APPS-17: a new label, or an accent read late, shows in Events too.
+        let fakes = Fakes::default();
+        *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail")];
+        *fakes.notifications.access.lock().unwrap() = Access::Granted;
+        *fakes.notifications.active.lock().unwrap() = vec![notification("m1", "mail")];
+        let mut shell = HomeShell::compose(fakes.platform());
+        assert_eq!(shell.events().state().groups[0].label, "Mail");
+
+        fakes.apps.apps.lock().unwrap()[0].label = "Email".into();
+        shell.dispatch(ShellIntent::AppsChanged);
+
+        assert_eq!(shell.events().state().groups[0].label, "Email");
+    }
+
+    #[test]
+    fn groups_coming_and_going_move_the_events_list_and_a_new_count_doesnt() {
+        // ANIM-20: Events as it starts shows as it is.
+        let fakes = Fakes::default();
+        let posted = |key: &str, package: &str, posted_at_ms| Notification {
+            posted_at_ms,
+            ..notification(key, package)
+        };
+        *fakes.notifications.access.lock().unwrap() = Access::Granted;
+        *fakes.notifications.active.lock().unwrap() = vec![posted("m1", "mail", 10)];
+        let mut shell = HomeShell::compose(fakes.platform());
+        assert!(!shell.state().events_change.animating);
+
+        // An older notification of mail's changes only its count.
+        fakes
+            .notifications
+            .active
+            .lock()
+            .unwrap()
+            .push(posted("m0", "mail", 5));
+        shell.dispatch(ShellIntent::NotificationsChanged);
+        assert_eq!(shell.events().state().groups[0].count(), 2);
+        assert!(!shell.state().events_change.animating);
+
+        // A new group slides in.
+        fakes
+            .notifications
+            .active
+            .lock()
+            .unwrap()
+            .push(posted("c1", "chat", 20));
+        shell.dispatch(ShellIntent::NotificationsChanged);
+        assert_eq!(
+            shell.state().events_change,
+            EventsChangeState {
+                progress: 0.0,
+                animating: true
+            }
+        );
+
+        let mut at = 1_000;
+        shell.dispatch(ShellIntent::Frame(ms(at)));
+        while shell.state().events_change.animating {
+            at += 8;
+            shell.dispatch(ShellIntent::Frame(ms(at)));
+        }
+        assert_eq!(at, 1_200);
+
+        // A group that goes collapses.
+        fakes
+            .notifications
+            .active
+            .lock()
+            .unwrap()
+            .retain(|n| n.package != "chat");
+        shell.dispatch(ShellIntent::NotificationsChanged);
+        assert!(shell.state().events_change.animating);
+    }
+
+    /// Works like [`FakeNotifications`], except that it panics when asked for the active
+    /// notifications.
+    struct BrokenListener(FakeNotifications);
+
+    impl NotificationsAdapter for BrokenListener {
+        fn access(&self) -> Access {
+            self.0.access()
+        }
+
+        fn active(&self) -> Result<Vec<Notification>, DataError> {
+            panic!("listener bug");
+        }
+
+        fn open(&self, key: &str) -> Result<(), DataError> {
+            self.0.open(key)
+        }
+
+        fn dismiss(&self, key: &str) -> Result<(), DataError> {
+            self.0.dismiss(key)
+        }
+
+        fn open_access_settings(&self) -> Result<(), DataError> {
+            self.0.open_access_settings()
+        }
+
+        fn open_app_settings(&self, package: &str) -> Result<(), DataError> {
+            self.0.open_app_settings(package)
+        }
+    }
+
+    #[test]
+    fn a_failing_events_never_stops_applications() {
+        // REL-01, AC-21
+        let fakes = Fakes::default();
+        *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail")];
+        let mut platform = fakes.platform();
+        let broken = FakeNotifications::default();
+        *broken.access.lock().unwrap() = Access::Granted;
+        platform.notifications = Arc::new(BrokenListener(broken));
+        let mut shell = HomeShell::compose(platform);
+
+        assert_eq!(
+            *shell.events().health(),
+            Health::Failed("listener bug".into())
+        );
+        assert!(!shell.events_ready());
+        shell.dispatch(ShellIntent::NotificationsChanged);
+        shell.dispatch(ShellIntent::Swipe(Direction::Previous));
+        assert_eq!(shell.state().current, HomeView::Events);
+        shell.dispatch(ShellIntent::Home);
+        assert_eq!(shell.state().current, HomeView::Applications);
+        shell.dispatch(ShellIntent::Apps(AppsIntent::Launch {
+            app: app_id("mail"),
+            from: None,
+        }));
+        assert_eq!(*fakes.apps.launched.lock().unwrap(), [app_id("mail")]);
+        assert!(shell.apps_ready());
     }
 
     /// Works like [`FakeApps`], except that it panics when asked to launch or uninstall an app.

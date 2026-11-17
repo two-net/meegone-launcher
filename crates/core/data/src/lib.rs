@@ -22,6 +22,8 @@ mod colour;
 #[cfg(any(test, feature = "fakes"))]
 pub mod fakes;
 pub mod model;
+#[cfg(any(test, target_os = "android"))]
+mod notification_records;
 pub mod settings;
 pub mod storage;
 

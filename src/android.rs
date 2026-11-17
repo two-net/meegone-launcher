@@ -30,9 +30,9 @@ use meegone_core_data::android::{self, Env, JObject, LocalRef, RawEnv};
 use meegone_core_data::{App, Rect, Rgb, accent};
 
 use crate::{
-    AppMenuItem, BADGE_ROWS, Bounds, Cell, CellKey, Direction, FOLDER_COLUMNS, FolderId,
-    GridLayout, HomeFrame, HomeView, Launcher, Layout, MenuItem, PREVIEW_APPS, PointerEvent,
-    PointerKind, SavedHome, SettingsGroup, ShellIntent, Surface,
+    AppMenuItem, BADGE_ROWS, Bounds, Cell, CellKey, Direction, EventsListMode, EventsRow,
+    FOLDER_COLUMNS, FolderId, GridLayout, HomeFrame, HomeView, Launcher, Layout, MenuItem,
+    PREVIEW_APPS, PointerEvent, PointerKind, SavedHome, SettingsGroup, ShellIntent, Surface,
 };
 
 /// JNI's `jboolean`.
@@ -219,6 +219,27 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeActivity_nativeC
     let env = unsafe { Env::from_raw(env) };
     with_launcher(env, |launcher| {
         launcher.dispatch(ShellIntent::ClockChanged);
+        launcher.frame();
+    });
+}
+
+/// `static void nativeNotificationsChanged()`: a notification was posted or removed, or
+/// MeeGone's listener was connected or disconnected, as when notification access is granted or
+/// revoked (EVT-10, ADR 0020). `Bridge` coalesces a burst of them into one call, and makes none
+/// before the home has started.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeActivity_nativeNotificationsChanged(
+    env: RawEnv,
+    _class: JObject,
+) {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_launcher(env, |launcher| {
+        launcher.dispatch(ShellIntent::NotificationsChanged);
         launcher.frame();
     });
 }
@@ -673,6 +694,99 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeOpen
                 return Ok(());
             }
             launcher.view().events().alarm_tapped();
+            launcher.frame();
+            shown = message(env, launcher.shell().events().state().problem.as_deref())?;
+            Ok(())
+        })
+    });
+    shown
+}
+
+/// `String[] nativeEventsList()`: the app groups below the Events header as of the last frame,
+/// newest first, each in the fields of [`events_row_fields`] (EVT-04). Empty unless the frame's
+/// slot 82 says the list shows. The fields hold what each newest notification says, so they
+/// stay in memory, and no error message carries them (EVT-13).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeEventsList(
+    env: RawEnv,
+    _views: JObject,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    let mut rows = std::ptr::null_mut();
+    guarded(env, || {
+        LAUNCHER.with_borrow(|launcher| {
+            let launcher = launcher.as_ref().ok_or("MeeGone hasn't started")?;
+            let fields: Vec<String> = if launcher.shell().events_ready() {
+                let rows = launcher.view().events().rows();
+                rows.iter().flat_map(events_row_fields).collect()
+            } else {
+                Vec::new()
+            };
+            let array = env
+                .new_string_array(fields.iter().map(String::as_str))
+                .map_err(|error| format!("Couldn't pass the Events list: {error}"))?;
+            rows = array.into_raw();
+            Ok(())
+        })
+    });
+    rows
+}
+
+/// The fields of one app group in `nativeEventsList`, mirrored in `EventsList.java`:
+/// 1. where its row was in the rows last read, which keeps its view, or -1 for a row that comes
+///    in (ANIM-20);
+/// 2. the app's name;
+/// 3. its flags: 1 in a work profile (APPS-20);
+/// 4. to 6. its package, launcher activity and profile serial number, which its icon is loaded
+///    by; the activity is empty for an app with no icon in the grid, whose icon the system gives;
+/// 7. the marker's colour, as opaque ARGB in decimal (EVT-09);
+/// 8. how many notifications it holds;
+/// 9. and 10. the newest notification's title and text.
+fn events_row_fields(row: &EventsRow) -> [String; 10] {
+    [
+        row.from
+            .and_then(|at| i32::try_from(at).ok())
+            .unwrap_or(-1)
+            .to_string(),
+        row.label.clone(),
+        u8::from(row.work).to_string(),
+        row.package.clone(),
+        row.activity.clone().unwrap_or_default(),
+        row.profile.0.to_string(),
+        argb(row.accent).to_string(),
+        row.count.to_string(),
+        row.title.clone(),
+        row.text.clone(),
+    ]
+}
+
+/// `String nativeAllowNotifications()`: Allow was tapped on the Events explainer card, so the
+/// system's notification-access screen opens (EVT-03). Returns `null`, or a short message to
+/// show when it couldn't. Does nothing while Events isn't working (ARCH-09).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeAllowNotifications(
+    env: RawEnv,
+    _views: JObject,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    let mut shown = std::ptr::null_mut();
+    guarded(env, || {
+        LAUNCHER.with_borrow_mut(|launcher| {
+            let launcher = launcher.as_mut().ok_or("MeeGone hasn't started")?;
+            if !launcher.shell().events_ready() {
+                return Ok(());
+            }
+            launcher.view().events().allow_access_tapped();
             launcher.frame();
             shown = message(env, launcher.shell().events().state().problem.as_deref())?;
             Ok(())
@@ -1559,7 +1673,7 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRead
 }
 
 /// How many slots the frame has.
-const FRAME_SLOTS: usize = 82;
+const FRAME_SLOTS: usize = 86;
 
 /// A `HomeFrame` as the `int[]` that `HomeViews.java` reads, slot by slot:
 ///
@@ -1628,6 +1742,10 @@ const FRAME_SLOTS: usize = 82;
 /// | 79 | Hidden apps' revision: when it changes, Settings reads the list again with `nativeHiddenApps` |
 /// | 80 | 1 while Events works, so its header is drawn (EVT-01, ARCH-09); otherwise 0 |
 /// | 81 | The Events header's revision: when it changes, the header is read again with `nativeEventsHeader` |
+/// | 82 | What shows below the Events header: 0 nothing, while Events isn't working (ARCH-09); 1 the notification-access card (EVT-03); 2 "No new events" (EVT-11); 3 the app groups (EVT-04) |
+/// | 83 | The Events list's revision: when it changes, the groups are read again with `nativeEventsList` |
+/// | 84 | How far the Events list has come in showing groups that came and went, 0 to 10 000 (ANIM-20) |
+/// | 85 | The divider colour of hairlines, as opaque ARGB |
 fn frame_slots(frame: &HomeFrame) -> [i32; FRAME_SLOTS] {
     let [events, applications, recent] = frame.pages;
     let menu_items = frame.menu.map_or(0, |menu| {
@@ -1751,6 +1869,14 @@ fn frame_slots(frame: &HomeFrame) -> [i32; FRAME_SLOTS] {
         frame.hidden_apps.map_or(0, |revision| revision as i32),
         i32::from(frame.events_header.is_some()),
         frame.events_header.map_or(0, |revision| revision as i32),
+        frame.events_list.map_or(0, |list| match list.mode {
+            EventsListMode::Explainer => 1,
+            EventsListMode::Empty => 2,
+            EventsListMode::List => 3,
+        }),
+        frame.events_list.map_or(0, |list| list.revision as i32),
+        i32::from(frame.events_change),
+        argb(frame.divider),
     ];
     slots[40 + BADGE_ROWS..].copy_from_slice(&rest);
     slots

@@ -128,4 +128,29 @@
     <!-- Shown briefly when neither the app that set the alarm nor a clock app could open
          (EVT-02). -->
     <string name="alarm_unavailable">The alarm can\'t open right now</string>
+
+    <!-- Events' card while MeeGone has no notification access: one plain sentence saying what
+         is read and why (EVT-03, ONB-02), and the button that opens the system's
+         notification-access screen. -->
+    <string name="events_access_explainer">MeeGone reads your notifications only to list them here, and they never leave this phone.</string>
+    <string name="events_access_allow">Allow</string>
+    <!-- Shown briefly when no system screen for notification access could open (EVT-03). -->
+    <string name="notification_access_unavailable">Notification access can\'t open right now</string>
+    <!-- The heading over Events' notifications, drawn in capitals (EVT-04, SRS 5.2). -->
+    <string name="events_notifications">Notifications</string>
+    <!-- Events with nothing to show (EVT-11). -->
+    <string name="events_empty">No new events</string>
+    <!-- A group's newest notification, its title then its text, e.g. "Anna: See you at
+         eight" (EVT-04). Shown in at most two lines. -->
+    <string name="events_title_text">%1$s: %2$s</string>
+    <!-- What screen readers read for one app's group of notifications (EVT-04, A11Y-01), e.g.
+         "Messages, 3 notifications: Anna, See you at eight". %1$s is the app's name, with
+         "work" when it has it; %2$d how many it holds; %3$s the newest one's title and text. -->
+    <plurals name="events_group_description">
+        <item quantity="one">%1$s, %2$d notification: %3$s</item>
+        <item quantity="other">%1$s, %2$d notifications: %3$s</item>
+    </plurals>
+    <!-- MeeGone's notification listener, as the system's notification-access screen names it
+         (EVT-03). -->
+    <string name="notification_listener_label">MeeGone Events</string>
 </resources>

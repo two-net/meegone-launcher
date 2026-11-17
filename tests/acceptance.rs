@@ -17,34 +17,23 @@ mod backup;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use meegone_core_data::fakes::{Fakes, WORK_PROFILE, app, app_id, work_app};
+use meegone_core_data::fakes::{Fakes, WORK_PROFILE, app, app_id, notification, work_app};
 use meegone_core_data::storage::format::seal;
 use meegone_core_data::{
-    App, DataError, HomeTarget, Notification, Profile, ProfileId, RecentUse, Rect, Rgb, Shortcut,
-    StoredFile, ThemeChoice, accent,
+    App, DataError, HomeTarget, Notification, NotificationsAdapter, Profile, ProfileId, RecentUse,
+    Rect, Rgb, Shortcut, StoredFile, ThemeChoice, accent,
 };
 use meegone_core_state::{Access, Health, Theme};
 use meegone_core_ui::tokens;
 use meegone_launcher::{
-    AppMenuItem, BADGE_ROWS, Bounds, CellKey, Direction, FolderId, GridLayout, HomeView, Launcher,
-    Layout, LiftFrame, MenuItem, PointerEvent, PointerKind, SettingsGroup, ShellIntent, Surface,
+    AppMenuItem, BADGE_ROWS, Bounds, CellKey, Direction, EventsListMode, FolderId, GridLayout,
+    HomeView, Launcher, Layout, LiftFrame, MenuItem, PointerEvent, PointerKind, SettingsGroup,
+    ShellIntent, Surface,
 };
 
 /// A phone 1080 × 2400 px at 2.75 px per dp.
 const WIDTH: f64 = 1080.0;
 const HEIGHT: f64 = 2400.0;
-
-fn notification(key: &str, package: &str) -> Notification {
-    Notification {
-        key: key.into(),
-        package: package.into(),
-        title: "Title".into(),
-        text: "Text".into(),
-        posted_at_ms: 1,
-        clearable: true,
-        ongoing: false,
-    }
-}
 
 /// The home views laid out on that phone.
 fn phone() -> Layout {
@@ -810,12 +799,32 @@ fn apps18_a_locked_work_profile_keeps_its_apps_places_until_it_unlocks() {
     assert_eq!(dots(&mut launcher), [false, false]);
 }
 
+/// What shows below the Events header after a frame, and each group's name and count.
+fn events_list(launcher: &mut Launcher) -> (EventsListMode, Vec<(String, usize)>) {
+    let list = launcher.frame().events_list.expect("Events works");
+    let rows = launcher.view().events().rows();
+    let rows = rows
+        .iter()
+        .map(|row| (row.label.clone(), row.count))
+        .collect();
+    (list.mode, rows)
+}
+
 #[test]
 fn ac11_after_access_is_granted_notifications_replace_the_explainer_card() {
+    // Issue #19: EVT-03, EVT-04, ONB-02. Access is granted in system settings, and the
+    // listener's connection reports it.
     let fakes = Fakes::default();
+    *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail")];
     let mut launcher = Launcher::start(fakes.platform());
     launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
     assert_eq!(launcher.shell().events().state().access, Access::Missing);
+    assert_eq!(
+        events_list(&mut launcher),
+        (EventsListMode::Explainer, Vec::new())
+    );
+    // The header still shows (EVT-03).
+    assert!(launcher.frame().events_header.is_some());
 
     launcher.view().events().allow_access_tapped();
     launcher.frame();
@@ -824,9 +833,29 @@ fn ac11_after_access_is_granted_notifications_replace_the_explainer_card() {
     *fakes.notifications.active.lock().unwrap() = vec![notification("m1", "mail")];
     launcher.dispatch(ShellIntent::NotificationsChanged);
 
-    let events = launcher.shell().events().state();
-    assert_eq!(events.access, Access::Granted);
-    assert_eq!(events.groups.len(), 1);
+    // Within the same dispatch, well inside 1 s.
+    assert_eq!(
+        events_list(&mut launcher),
+        (EventsListMode::List, vec![("Mail".into(), 1)])
+    );
+}
+
+#[test]
+fn ac11_given_access_granted_while_away_then_coming_back_shows_the_notifications() {
+    // Issue #19: EVT-03. The system screen covered the home, and MeeGone resumes.
+    let fakes = Fakes::default();
+    let mut launcher = Launcher::start(fakes.platform());
+    launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
+    assert_eq!(events_list(&mut launcher).0, EventsListMode::Explainer);
+
+    *fakes.notifications.access.lock().unwrap() = Access::Granted;
+    *fakes.notifications.active.lock().unwrap() = vec![notification("m1", "mail")];
+    launcher.dispatch(ShellIntent::Resumed);
+
+    assert_eq!(
+        events_list(&mut launcher),
+        (EventsListMode::List, vec![("mail".into(), 1)])
+    );
 }
 
 #[test]
@@ -846,11 +875,239 @@ fn ac21_revoking_notification_access_shows_the_explainer_and_applications_still_
     assert_eq!(events.access, Access::Missing);
     assert!(events.groups.is_empty());
     assert_eq!(*launcher.shell().events().health(), Health::Ready);
+    assert_eq!(
+        events_list(&mut launcher),
+        (EventsListMode::Explainer, Vec::new())
+    );
 
     launcher.dispatch(ShellIntent::Swipe(Direction::Next));
     launcher.view().apps().icon_tapped(app_id("mail"), None);
     launcher.frame();
     assert_eq!(*fakes.apps.launched.lock().unwrap(), [app_id("mail")]);
+}
+
+#[test]
+fn evt04_given_notifications_from_several_apps_then_events_groups_them_newest_first() {
+    // Issue #19: EVT-04, EVT-09, APPS-17, APPS-20. As the SRS's layout mock: Messages with three,
+    // then Mail with one, and an app with no icon in the grid named as the system names it.
+    let fakes = Fakes::default();
+    let messages = App {
+        accent: Rgb::hex(0x34A853),
+        ..app("messages", "Messages")
+    };
+    *fakes.apps.apps.lock().unwrap() =
+        vec![messages, app("mail", "Mail"), work_app("mail", "Mail")];
+    let posted = |key: &str, package: &str, posted_at_ms| Notification {
+        posted_at_ms,
+        ..notification(key, package)
+    };
+    *fakes.notifications.access.lock().unwrap() = Access::Granted;
+    *fakes.notifications.active.lock().unwrap() = vec![
+        posted("s1", "android", 10),
+        posted("m1", "messages", 20),
+        posted("e1", "mail", 30),
+        posted("m2", "messages", 40),
+        Notification {
+            title: "Anna".into(),
+            text: "See you at eight".into(),
+            ..posted("m3", "messages", 50)
+        },
+        Notification {
+            profile: WORK_PROFILE,
+            ..posted("w1", "mail", 5)
+        },
+        Notification {
+            app_label: "Android System".into(),
+            ..posted("s2", "android", 15)
+        },
+    ];
+    let (mut launcher, _) = on_a_phone(&fakes);
+    launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
+
+    assert_eq!(
+        events_list(&mut launcher),
+        (
+            EventsListMode::List,
+            vec![
+                ("Messages".into(), 3),
+                ("Mail".into(), 1),
+                ("Android System".into(), 2),
+                ("Mail".into(), 1),
+            ]
+        )
+    );
+    let rows = launcher.view().events().rows();
+    assert_eq!(
+        (rows[0].title.as_str(), rows[0].text.as_str()),
+        ("Anna", "See you at eight")
+    );
+    // EVT-09: the accent as the theme draws it, and a neutral marker without one.
+    let theme = tokens(launcher.shell().theme().state().theme);
+    assert_eq!(rows[0].accent, theme.app_accent(Rgb::hex(0x34A853)));
+    assert_eq!(rows[2].accent, theme.text_secondary);
+    assert_eq!(rows[2].activity, None);
+    assert_eq!(rows[1].activity.as_deref(), Some("mail.Main"));
+    assert_eq!((rows[1].work, rows[3].work), (false, true));
+}
+
+#[test]
+fn evt05_given_a_media_playback_notification_then_it_isnt_listed() {
+    // Issue #19: EVT-05. Playback, navigation and running services are ongoing.
+    let fakes = Fakes::default();
+    *fakes.notifications.access.lock().unwrap() = Access::Granted;
+    *fakes.notifications.active.lock().unwrap() = vec![
+        Notification {
+            ongoing: true,
+            clearable: false,
+            ..notification("p1", "player")
+        },
+        notification("m1", "mail"),
+    ];
+    let (mut launcher, _) = on_a_phone(&fakes);
+    launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
+
+    assert_eq!(
+        events_list(&mut launcher),
+        (EventsListMode::List, vec![("mail".into(), 1)])
+    );
+
+    // With only the player left, nothing is new.
+    fakes
+        .notifications
+        .active
+        .lock()
+        .unwrap()
+        .retain(|n| n.package == "player");
+    launcher.dispatch(ShellIntent::NotificationsChanged);
+    assert_eq!(
+        events_list(&mut launcher),
+        (EventsListMode::Empty, Vec::new())
+    );
+}
+
+#[test]
+fn evt10_given_events_showing_then_a_new_group_slides_in_and_a_dismissed_one_collapses() {
+    // Issue #19: EVT-10, ANIM-20, EVT-11.
+    let fakes = Fakes::default();
+    *fakes.notifications.access.lock().unwrap() = Access::Granted;
+    let (mut launcher, mut clock) = on_a_phone(&fakes);
+    launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
+    come_to_rest(&mut launcher, &mut clock);
+    assert_eq!(events_list(&mut launcher).0, EventsListMode::Empty);
+
+    fakes
+        .notifications
+        .active
+        .lock()
+        .unwrap()
+        .push(notification("m1", "mail"));
+    launcher.dispatch(ShellIntent::NotificationsChanged);
+    let frame = launcher.frame();
+    assert!(frame.animating);
+    assert_eq!(frame.events_change, 0);
+    assert_eq!(launcher.view().events().rows()[0].from, None, "it comes in");
+
+    let started = clock;
+    come_to_rest(&mut launcher, &mut clock);
+    assert!(clock - started <= 200 + 16, "{} ms", clock - started);
+    assert_eq!(launcher.frame().events_change, 10_000);
+
+    fakes.notifications.active.lock().unwrap().clear();
+    launcher.dispatch(ShellIntent::NotificationsChanged);
+    let frame = launcher.frame();
+    assert!(frame.animating, "the group collapses");
+    assert_eq!(
+        events_list(&mut launcher),
+        (EventsListMode::Empty, Vec::new())
+    );
+}
+
+/// Notification access granted, but reading the notifications panics: a bug in Events.
+struct BrokenListener;
+
+impl NotificationsAdapter for BrokenListener {
+    fn access(&self) -> Access {
+        Access::Granted
+    }
+
+    fn active(&self) -> Result<Vec<Notification>, DataError> {
+        panic!("listener bug");
+    }
+
+    fn open(&self, _key: &str) -> Result<(), DataError> {
+        Ok(())
+    }
+
+    fn dismiss(&self, _key: &str) -> Result<(), DataError> {
+        Ok(())
+    }
+
+    fn open_access_settings(&self) -> Result<(), DataError> {
+        Ok(())
+    }
+
+    fn open_app_settings(&self, _package: &str) -> Result<(), DataError> {
+        Ok(())
+    }
+}
+
+#[test]
+fn rel01_given_events_fails_then_nothing_shows_below_its_header_and_applications_works() {
+    // Issue #19: REL-01, ARCH-09.
+    let fakes = Fakes::default();
+    fakes.apps.apps.lock().unwrap().push(app("mail", "Mail"));
+    let mut platform = fakes.platform();
+    platform.notifications = std::sync::Arc::new(BrokenListener);
+    let mut launcher = Launcher::start(platform);
+    launcher.dispatch(ShellIntent::Layout(phone()));
+    launcher.dispatch(ShellIntent::NotificationsChanged);
+
+    let frame = launcher.frame();
+    assert_eq!(frame.events_list, None);
+    assert_eq!(frame.events_header, None);
+
+    launcher.view().apps().icon_tapped(app_id("mail"), None);
+    launcher.frame();
+    assert_eq!(*fakes.apps.launched.lock().unwrap(), [app_id("mail")]);
+}
+
+#[test]
+fn evt13_given_notifications_showing_then_their_content_is_never_stored_or_printed() {
+    // Issue #19: EVT-13, PRIV-03. Nothing on disk, and nothing a log could print: the state, the
+    // frame and the rows leave it out of their debug output.
+    let fakes = Fakes::default();
+    *fakes.apps.apps.lock().unwrap() = vec![app("chat", "Chat")];
+    *fakes.notifications.access.lock().unwrap() = Access::Granted;
+    *fakes.notifications.active.lock().unwrap() = vec![Notification {
+        title: "Robin".into(),
+        text: "The code is 482913".into(),
+        ..notification("c1", "chat")
+    }];
+    let (mut launcher, _) = on_a_phone(&fakes);
+    launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
+    let frame = launcher.frame();
+    assert_eq!(
+        launcher.view().events().rows()[0].text,
+        "The code is 482913"
+    );
+    // The layout and settings are saved, as they would be on any day.
+    launcher.dispatch(ShellIntent::OpenSettings);
+    launcher.view().settings().wrap_around_toggled(false);
+    launcher.frame();
+    assert!(!fakes.storage.writes.lock().unwrap().is_empty());
+
+    let printed = format!(
+        "{:?} {:?} {:?} {:?}",
+        launcher.shell().events().state(),
+        frame,
+        launcher.view().events().rows(),
+        launcher.shell().saved(),
+    );
+    let stored = fakes.storage.stored_text();
+    for private in ["Robin", "482913"] {
+        assert!(!printed.contains(private), "{private:?} in {printed}");
+        assert!(!stored.contains(private), "{private:?} in {stored}");
+    }
 }
 
 /// Sunday 15 November 2026, 00:00 UTC: the day of the SRS's layout mock.

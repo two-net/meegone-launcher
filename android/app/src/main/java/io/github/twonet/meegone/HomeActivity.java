@@ -66,6 +66,8 @@ public final class HomeActivity extends Activity {
         bridge.watchApps();
         // Events' header follows the date, the clock and the next alarm (ADR 0019).
         bridge.watchClock();
+        // Events' list follows the notifications and notification access (ADR 0020).
+        bridge.watchNotifications();
         // Saved state with a launcher this call started: the system had ended the process while
         // the user was elsewhere. A recreation after a configuration change finds it running.
         away = started && savedInstanceState != null;
@@ -237,6 +239,18 @@ public final class HomeActivity extends Activity {
         }
     }
 
+    /**
+     * A notification was posted or removed, or notification access was granted or revoked
+     * (EVT-10, ADR 0020). The shared launcher reads the notifications again, and {@code
+     * resumed}, if it is a home, redraws. Called by {@link Bridge} on the main thread.
+     */
+    static void notificationsChanged(Activity resumed) {
+        nativeNotificationsChanged();
+        if (resumed instanceof HomeActivity) {
+            ((HomeActivity) resumed).views.refresh();
+        }
+    }
+
     private static boolean isHome(Intent intent) {
         return Intent.ACTION_MAIN.equals(intent.getAction())
                 && intent.hasCategory(Intent.CATEGORY_HOME);
@@ -276,6 +290,9 @@ public final class HomeActivity extends Activity {
 
     /** The date, the clock, the time zone or the next alarm changed (ADR 0019). */
     private static native void nativeClockChanged();
+
+    /** A notification came or went, or notification access changed (ADR 0020). */
+    private static native void nativeNotificationsChanged();
 
     /** Taps the banner's "make default" button; only debug builds' {@link DebugHooks} call it. */
     private native void nativeRequestDefaultHome();

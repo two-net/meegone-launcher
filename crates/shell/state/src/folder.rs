@@ -11,7 +11,7 @@ use std::time::Duration;
 use meegone_apps_state::FolderId;
 use meegone_core_state::motion::{FOLDER, decelerate, scaled};
 
-use crate::grid_change::MAX_FRAME_STEP;
+use crate::timed::MAX_FRAME_STEP;
 
 /// The open folder's panel as it is drawn now: an immutable snapshot inside `ShellState`.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
