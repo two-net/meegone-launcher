@@ -192,7 +192,9 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private static final int RECENT_REMOVALS = 108; // changes when apps were removed
     private static final int RECENT_BADGES = 109; // the ✕ scale of each row, RecentList.ROWS
     private static final int RECENT_LEAVE = 118; // how far each row's cards have gone
-    private static final int FRAME_SIZE = 127;
+    // Settings → Recent → Time window (REC-11, ADR 0026):
+    private static final int RECENT_WINDOW = 127; // 12, 24 or 72 hours; -1 not offered
+    private static final int FRAME_SIZE = 128;
     private static final int SEARCH_OPEN = 1; // the field has the keyboard
     private static final int SEARCH_RESULTS = 2; // the results show instead of the grid
     private static final int SEARCH_NOTHING = 4; // nothing matches
@@ -288,6 +290,8 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private final TextView settingsTitle;
     private final TextView settingsGroup;
     private final HiddenAppsList hiddenApps;
+    /** Settings → Recent → Time window (REC-11). */
+    private final RecentSettings recentSettings;
     /** Settings → Lock-screen image → "Show card in Events" (EVT-12). */
     private final ImageSettings imageSettings;
     /**
@@ -617,7 +621,14 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             toast(message);
         });
         hiddenApps.setVisibility(GONE);
-        // Settings → Lock-screen image (EVT-12), after Applications in SET-02's order.
+        // Settings → Recent → Time window (REC-11), after Applications in SET-02's order.
+        recentSettings = new RecentSettings(context, hours -> {
+            String message = nativeRecentWindow(hours);
+            apply();
+            toast(message);
+        });
+        recentSettings.setVisibility(GONE);
+        // Settings → Lock-screen image (EVT-12), after Recent in SET-02's order.
         imageSettings = new ImageSettings(context, on -> {
             String message = nativeShowImageCard(on);
             apply();
@@ -627,6 +638,8 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         LinearLayout groups = new LinearLayout(context);
         groups.setOrientation(LinearLayout.VERTICAL);
         groups.addView(hiddenApps, new LinearLayout.LayoutParams(
+                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
+        groups.addView(recentSettings, new LinearLayout.LayoutParams(
                 LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
         groups.addView(imageSettings, new LinearLayout.LayoutParams(
                 LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
@@ -1655,7 +1668,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
 
     /**
      * Shows Settings over the home views while it is open; until #34, only its name, Hidden
-     * apps and "Show card in Events".
+     * apps, Recent's time window and "Show card in Events".
      */
     private void applySettings() {
         if (frame[SETTINGS] != settingsShown) {
@@ -1666,7 +1679,18 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             hidePagesFromScreenReaders();
         }
         applyHiddenApps();
+        applyRecentSettings();
         applyImageSettings();
+    }
+
+    /**
+     * Settings → Recent → Time window (REC-11): offered only while Recent works (ARCH-09).
+     */
+    private void applyRecentSettings() {
+        int hours = frame[RECENT_WINDOW];
+        recentSettings.setVisibility(hours >= 0 ? VISIBLE : GONE);
+        recentSettings.colour(foreground, dim, frame[ACCENT]);
+        recentSettings.show(hours);
     }
 
     /**
@@ -2233,6 +2257,12 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
      * short message to show when the choice couldn't be saved.
      */
     private native String nativeRecentDensity(int rows);
+
+    /**
+     * Settings → Recent → Time window was set to 12, 24 or 72 hours (REC-11). Returns null, or a
+     * short message to show when the choice couldn't be saved.
+     */
+    private native String nativeRecentWindow(int hours);
 
     /**
      * In close mode, the ✕ of card {@code index} of Recent's cards at {@code revision} was

@@ -28,7 +28,7 @@ use meegone_launcher::{
     Age, AppMenuItem, BADGE_ROWS, Bounds, CardContent, CellKey, Direction, EventsListMode,
     EventsMenuFrame, FolderId, GridLayout, HomeView, Launcher, Layout, LiftFrame, MenuItem,
     NotificationMenuItem, PinchEvent, PinchKind, PointerEvent, PointerKind, RECENT_ROWS,
-    RecentFrame, RecentMode, SettingsGroup, ShellIntent, Surface,
+    RecentFrame, RecentMode, RecentWindow, SettingsGroup, ShellIntent, Surface,
 };
 
 /// A phone 1080 × 2400 px at 2.75 px per dp.
@@ -3214,6 +3214,70 @@ fn rec10_given_no_app_was_used_then_recent_says_no_recent_apps() {
     launcher.dispatch(ShellIntent::Swipe(Direction::Next));
 
     assert_eq!(recent_cards(&mut launcher), (RecentMode::Empty, Vec::new()));
+}
+
+#[test]
+fn rec11_given_an_app_used_30_hours_ago_then_it_shows_with_3_days_and_not_with_24_hours() {
+    // Issue #25: REC-11, SET-03. The window is chosen in Settings, takes effect at once, and
+    // lasts.
+    const HOUR_MS: u64 = 60 * 60 * 1000;
+    let fakes = Fakes::default();
+    *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail"), app("maps", "Maps")];
+    *fakes.usage.access.lock().unwrap() = Access::Granted;
+    *fakes.system.now_ms.lock().unwrap() = 100 * HOUR_MS;
+    *fakes.usage.uses.lock().unwrap() = vec![
+        used("maps", 70 * HOUR_MS),
+        used("mail", 100 * HOUR_MS - 5 * 60_000),
+    ];
+    let mut launcher = Launcher::start(fakes.platform());
+    launcher.dispatch(ShellIntent::Swipe(Direction::Next));
+    assert_eq!(labels(&recent_cards(&mut launcher).1), ["Mail"]);
+
+    launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
+    launcher.dispatch(ShellIntent::OpenSettings);
+    assert_eq!(
+        launcher.frame().recent_window,
+        Some(RecentWindow::TwentyFourHours)
+    );
+    launcher
+        .view()
+        .recent_settings()
+        .window_chosen(RecentWindow::ThreeDays);
+    assert_eq!(
+        launcher.frame().recent_window,
+        Some(RecentWindow::ThreeDays)
+    );
+    assert_eq!(recent(&launcher), ["Mail", "Maps"], "at once");
+    launcher.dispatch(ShellIntent::Back);
+    launcher.dispatch(ShellIntent::Swipe(Direction::Next));
+
+    assert_eq!(
+        recent_cards(&mut launcher),
+        (
+            RecentMode::Cards,
+            vec![
+                ("Mail".to_owned(), Age::Minutes(5)),
+                ("Maps".to_owned(), Age::Days(1)),
+            ]
+        )
+    );
+
+    drop(launcher);
+    let mut restarted = Launcher::start(fakes.platform());
+    assert_eq!(recent(&restarted), ["Mail", "Maps"]);
+    restarted.dispatch(ShellIntent::OpenSettings);
+    assert_eq!(
+        restarted.frame().recent_window,
+        Some(RecentWindow::ThreeDays)
+    );
+    restarted
+        .view()
+        .recent_settings()
+        .window_chosen(RecentWindow::TwentyFourHours);
+    restarted.frame();
+    restarted.dispatch(ShellIntent::Back);
+    restarted.dispatch(ShellIntent::Swipe(Direction::Next));
+    assert_eq!(labels(&recent_cards(&mut restarted).1), ["Mail"]);
 }
 
 /// Recent on a phone with six apps used, newest first, laid out as the host does: the cards

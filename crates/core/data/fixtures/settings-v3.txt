@@ -1,0 +1,16 @@
+meegone-settings 3
+theme dark
+home_target applications
+wrap_around false
+recent_density two_columns
+recent_window three_days
+hidden 0 games games.Main
+hidden 0 weather weather.Main
+image_enabled true
+image_region en-GB
+image_use_mobile_data true
+image_show_card false
+removed 0 chat chat.Main 1763251200000
+removed 0 maps maps.Main 1763254800000
+home_banner_dismissed 1763290000000
+end 723fc2be58eaf927

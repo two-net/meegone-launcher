@@ -28,8 +28,8 @@ pub use meegone_events_ui::{
 };
 pub use meegone_lockimage_ui::CardContent;
 use meegone_lockimage_ui::{ImageCard, ImageSettingsSection};
-use meegone_recent_ui::RecentView;
-pub use meegone_recent_ui::{Age, RecentMode, ShownCard};
+pub use meegone_recent_ui::{Age, RecentMode, RecentWindow, ShownCard};
+use meegone_recent_ui::{RecentSettingsSection, RecentView};
 use meegone_settings_ui::{HomeBanner, SettingsView};
 pub use meegone_shell_state::{BADGE_ROWS, RECENT_ROWS};
 use meegone_shell_state::{HomeShell, HomeView, MenuItem, SettingsGroup, ShellIntent};
@@ -320,6 +320,9 @@ pub struct HomeFrame {
     /// `None` while the lock-screen image isn't working, so Settings doesn't offer it
     /// (ARCH-09).
     pub show_image_card: Option<bool>,
+    /// Settings → Recent → Time window (REC-11): the window chosen, or `None` while Recent isn't
+    /// working, so Settings doesn't offer it (ARCH-09).
+    pub recent_window: Option<RecentWindow>,
     /// What Recent shows, or `None` while Recent isn't working, so nothing does (ARCH-09).
     pub recent: Option<RecentFrame>,
     /// The home views' solid background (HOME-11, THEME-04).
@@ -347,6 +350,7 @@ pub struct ShellView {
     hidden_apps: HiddenAppsSection,
     image_card: ImageCard,
     image_settings: ImageSettingsSection,
+    recent_settings: RecentSettingsSection,
     home_banner: HomeBanner,
 }
 
@@ -380,8 +384,20 @@ impl ShellView {
         });
         let hidden_apps = HiddenAppsSection::new(apps_state, dispatch(&outbox, ShellIntent::Apps));
 
+        // Recent shows its time window in Settings (REC-11), after Applications' group and
+        // before the lock-screen image's, in SET-02's order. It reads the latest Recent state,
+        // which the shell keeps current.
+        let recent_state = Latest::new(shell.recent().state());
+        shell.subscribe_recent({
+            let recent_state = recent_state.clone();
+            move |state| recent_state.set(Arc::clone(state))
+        });
+        let recent_settings =
+            RecentSettingsSection::new(recent_state, dispatch(&outbox, ShellIntent::Recent));
+
         let mut settings = SettingsView::new(dispatch(&outbox, ShellIntent::Settings));
         settings.add_section(Box::new(hidden_apps.clone()));
+        settings.add_section(Box::new(recent_settings.clone()));
         settings.add_section(Box::new(image_settings.clone()));
 
         // Settings and setup offers to make MeeGone the default home app on the home views
@@ -401,6 +417,7 @@ impl ShellView {
             hidden_apps,
             image_card,
             image_settings,
+            recent_settings,
             home_banner,
             outbox,
         }
@@ -550,6 +567,7 @@ impl ShellView {
             show_image_card: shell
                 .lockimage_ready()
                 .then(|| self.image_settings.show_card()),
+            recent_window: shell.recent_ready().then(|| self.recent_settings.window()),
             recent: shell.recent_ready().then(|| {
                 let revision = self.recent.show_cards(&shell.recent().state(), tokens);
                 let pinch = &state.pinch;
@@ -635,6 +653,12 @@ impl ShellView {
     /// [`HomeFrame::show_image_card`] is.
     pub fn image_settings(&self) -> &ImageSettingsSection {
         &self.image_settings
+    }
+
+    /// Settings → Recent → Time window (REC-11). Offered only while
+    /// [`HomeFrame::recent_window`] is.
+    pub fn recent_settings(&self) -> &RecentSettingsSection {
+        &self.recent_settings
     }
 
     /// Shown over the home views, never over Settings (ONB-04).

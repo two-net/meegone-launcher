@@ -1,9 +1,10 @@
-//! Recent state (SRS 4.4): recently used apps as cards, their density and columns, and close
-//! mode.
+//! Recent state (SRS 4.4): recently used apps as cards, how far back they go, their density and
+//! columns, and close mode.
 //!
-//! Usage history stays in memory. The only things stored are the density, more cards or bigger
-//! ones, and the list of apps the user removed from Recent with when, both in the settings store
-//! (PRIV-03, REC-05, ADR 0002). A removal is forgotten once it can no longer hide anything.
+//! Usage history stays in memory. The only things stored are the time window, the density, more
+//! cards or bigger ones, and the list of apps the user removed from Recent with when, all in the
+//! settings store (PRIV-03, REC-05, REC-11, ADR 0002). A removal is forgotten once it can no
+//! longer hide anything.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,7 +12,9 @@ use std::sync::Arc;
 use meegone_core_data::{
     AppsAdapter, DataError, RecentUse, Settings, SettingsStore, SystemConfigAdapter, UsageAdapter,
 };
-use meegone_core_state::{Access, App, AppId, ProfileId, RecentDensity, Rect, StateHolder};
+use meegone_core_state::{
+    Access, App, AppId, ProfileId, RecentDensity, RecentWindow, Rect, StateHolder,
+};
 
 /// At most this many cards (REC-03).
 pub const MAX_CARDS: usize = 18;
@@ -120,6 +123,8 @@ pub struct RecentState {
     pub removals: u32,
     /// More cards or bigger ones, as last chosen by a pinch or from a screen reader (REC-05).
     pub density: RecentDensity,
+    /// How far back the cards go, as chosen in Settings (REC-11).
+    pub window: RecentWindow,
     /// How wide the cards area is, inside its margins, in dp, as the host last laid it out; 0
     /// until it has.
     pub width_dp: f64,
@@ -170,6 +175,9 @@ pub enum RecentIntent {
     /// More cards or bigger ones, chosen by a pinch or from a screen reader (REC-05, A11Y-05).
     /// The choice is saved, so it stays after a restart.
     SetDensity(RecentDensity),
+    /// How far back the cards go, chosen in Settings → Recent → Time window (REC-11). The choice
+    /// is saved and the cards follow it at once (SET-03).
+    SetWindow(RecentWindow),
 }
 
 /// The cards for `uses`, newest first (REC-03). Pure, so Recent's filtering is tested without a
@@ -270,6 +278,7 @@ impl RecentHolder {
     fn read(&mut self) {
         let settings = self.settings.get();
         self.state.density = settings.recent_density;
+        self.state.window = settings.recent_window;
         self.state.access = self.usage.access();
         self.state.problem = None;
         if self.state.access == Access::Missing {
@@ -278,7 +287,7 @@ impl RecentHolder {
         }
 
         let now = self.system.now_ms();
-        let since = now.saturating_sub(u64::from(settings.recent_window_hours) * HOUR_MS);
+        let since = now.saturating_sub(u64::from(settings.recent_window.hours()) * HOUR_MS);
         let uses = match self.usage.used_since(since) {
             Ok(uses) => uses,
             // Access was revoked since it was asked: the explainer shows, not a problem
@@ -312,6 +321,21 @@ impl RecentHolder {
                 self.state.density = settings.recent_density;
                 self.state.problem = None;
             }
+            Err(error) => self.state.problem = Some(error.to_string()),
+        }
+    }
+
+    /// Saves `window` and reads the cards again, so they follow it at once (SET-03). A failed
+    /// save keeps the window and the cards and says why (ARCH-09).
+    fn set_window(&mut self, window: RecentWindow) {
+        if window == self.state.window {
+            return;
+        }
+        let saved = self.settings.update(&mut |settings| {
+            settings.recent_window = window;
+        });
+        match saved {
+            Ok(_) => self.refresh(),
             Err(error) => self.state.problem = Some(error.to_string()),
         }
     }
@@ -386,6 +410,7 @@ impl StateHolder for RecentHolder {
                 };
             }
             RecentIntent::SetDensity(density) => self.set_density(density),
+            RecentIntent::SetWindow(window) => self.set_window(window),
         }
     }
 
@@ -804,6 +829,83 @@ mod tests {
         );
         restarted.handle(RecentIntent::Refresh);
         assert_eq!(restarted.state().density, RecentDensity::TwoColumns);
+    }
+
+    #[test]
+    fn an_app_used_30_hours_ago_shows_with_three_days_and_not_with_24_hours() {
+        // REC-11, issue #25
+        let (_, settings, mut holder) = setup(vec![used("mail", 1), used("maps", 30)]);
+        holder.handle(RecentIntent::Refresh);
+        assert_eq!(holder.state().window, RecentWindow::TwentyFourHours);
+        assert_eq!(packages(&holder), ["mail"]);
+
+        holder.handle(RecentIntent::SetWindow(RecentWindow::ThreeDays));
+
+        // At once, without another refresh (SET-03).
+        assert_eq!(holder.state().window, RecentWindow::ThreeDays);
+        assert_eq!(packages(&holder), ["mail", "maps"]);
+        assert_eq!(holder.state().cards[1].age, Age::Days(1));
+        assert_eq!(settings.get().recent_window, RecentWindow::ThreeDays);
+        assert_eq!(holder.state().problem, None);
+
+        holder.handle(RecentIntent::SetWindow(RecentWindow::TwentyFourHours));
+        assert_eq!(packages(&holder), ["mail"]);
+    }
+
+    #[test]
+    fn twelve_hours_leaves_out_an_app_used_13_hours_ago() {
+        // REC-11
+        let (_, _, mut holder) = setup(vec![used("mail", 1), used("maps", 13)]);
+        holder.handle(RecentIntent::Refresh);
+        assert_eq!(packages(&holder), ["mail", "maps"]);
+
+        holder.handle(RecentIntent::SetWindow(RecentWindow::TwelveHours));
+
+        assert_eq!(packages(&holder), ["mail"]);
+    }
+
+    #[test]
+    fn the_window_chosen_stays_after_a_restart() {
+        // REC-11
+        let (fakes, _, mut holder) = setup(vec![used("mail", 1), used("maps", 30)]);
+        holder.handle(RecentIntent::Refresh);
+        holder.handle(RecentIntent::SetWindow(RecentWindow::ThreeDays));
+
+        let mut restarted = RecentHolder::new(
+            fakes.usage.clone(),
+            fakes.apps.clone(),
+            Arc::new(PersistentSettingsStore::new(fakes.storage.clone())),
+            fakes.system.clone(),
+        );
+        restarted.handle(RecentIntent::Refresh);
+
+        assert_eq!(restarted.state().window, RecentWindow::ThreeDays);
+        assert_eq!(packages(&restarted), ["mail", "maps"]);
+    }
+
+    #[test]
+    fn choosing_the_same_window_saves_nothing() {
+        let (fakes, _, mut holder) = setup(vec![used("mail", 1)]);
+        holder.handle(RecentIntent::Refresh);
+
+        holder.handle(RecentIntent::SetWindow(RecentWindow::TwentyFourHours));
+
+        assert!(fakes.storage.writes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_window_that_cant_be_saved_keeps_the_cards_and_says_why() {
+        // ARCH-09
+        let (fakes, settings, mut holder) = setup(vec![used("mail", 1), used("maps", 30)]);
+        holder.handle(RecentIntent::Refresh);
+        *fakes.storage.error.lock().unwrap() = Some(DataError::Failed("Storage full".into()));
+
+        holder.handle(RecentIntent::SetWindow(RecentWindow::ThreeDays));
+
+        assert_eq!(holder.state().window, RecentWindow::TwentyFourHours);
+        assert_eq!(holder.state().problem.as_deref(), Some("Storage full"));
+        assert_eq!(settings.get().recent_window, RecentWindow::TwentyFourHours);
+        assert_eq!(packages(&holder), ["mail"]);
     }
 
     #[test]

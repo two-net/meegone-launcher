@@ -119,6 +119,15 @@
          app's name, with "work" when it has it. -->
     <string name="action_unhide">Unhide %1$s</string>
 
+    <!-- The Recent group of Settings (SET-02). -->
+    <string name="settings_group_recent">Recent</string>
+    <!-- Settings → Recent → Time window: how far back Recent looks for recently used apps
+         (REC-11). Its three choices follow. -->
+    <string name="recent_time_window">Time window</string>
+    <string name="recent_window_12_hours">12 hours</string>
+    <string name="recent_window_24_hours">24 hours</string>
+    <string name="recent_window_3_days">3 days</string>
+
     <!-- The Events header's alarm row: when the next alarm rings, e.g. "Alarm 07:00", or
          "Alarm Wed 07:00" when it is more than a day away (EVT-02). %1$s is the time, in the
          device's 12- or 24-hour setting. Tapping it opens the app that set the alarm. -->

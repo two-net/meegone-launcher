@@ -19,8 +19,8 @@ pub use meegone_shell_ui::{
     Age, AppMenuFrame, AppMenuItem, AppsFrame, BADGE_ROWS, Bounds, CardContent, Cell, CellKey,
     CloseFrame, EditFrame, EventsListFrame, EventsListMode, EventsMenuFrame, EventsRow,
     FolderFrame, FolderId, GridChangeFrame, GridLayout, HomeFrame, HoverFrame, LiftFrame,
-    MenuFrame, MergeFrame, NotificationMenuItem, RECENT_ROWS, RecentFrame, RecentMode, RenameFrame,
-    RowTarget, SearchFrame, ShownCard, Surface, SurfaceCellsFrame,
+    MenuFrame, MergeFrame, NotificationMenuItem, RECENT_ROWS, RecentFrame, RecentMode,
+    RecentWindow, RenameFrame, RowTarget, SearchFrame, ShownCard, Surface, SurfaceCellsFrame,
 };
 
 pub struct Launcher {

@@ -15,10 +15,11 @@ use crate::storage::{
 
 /// Version of the saved settings format (MAINT-04). Changing the format means a new version, a
 /// migration in [`SETTINGS_MIGRATIONS`] and a fixture (ARCHITECTURE.md, "Persistence").
-pub const SETTINGS_VERSION: u32 = 2;
+pub const SETTINGS_VERSION: u32 = 3;
 
 /// Brings settings saved by older versions up to date, one version at a time.
-const SETTINGS_MIGRATIONS: [Migration; SETTINGS_VERSION as usize - 1] = [add_home_banner];
+const SETTINGS_MIGRATIONS: [Migration; SETTINGS_VERSION as usize - 1] =
+    [add_home_banner, name_recent_window];
 
 /// Version 2 adds when the "make MeeGone the default" banner was last dismissed (ONB-04). Older
 /// settings never dismissed it.
@@ -26,6 +27,28 @@ fn add_home_banner(body: &str) -> Option<String> {
     let mut added = Writer::default();
     added.line("home_banner_dismissed", None::<u64>);
     Some(format!("{body}{}", added.into_body()))
+}
+
+/// Version 3 saves Recent's window as one of REC-11's three choices, by name, instead of a
+/// number of hours. A window that isn't one of them becomes the shortest choice that still shows
+/// everything it did, or three days if none does (ADR 0026).
+fn name_recent_window(body: &str) -> Option<String> {
+    let mut migrated = String::with_capacity(body.len());
+    for line in body.lines() {
+        match line.strip_prefix("recent_window_hours ") {
+            Some(hours) => {
+                let window = RecentWindow::covering(hours.parse().ok()?);
+                let mut named = Writer::default();
+                named.line("recent_window", window);
+                migrated.push_str(&named.into_body());
+            }
+            None => {
+                migrated.push_str(line);
+                migrated.push('\n');
+            }
+        }
+    }
+    Some(migrated)
 }
 
 /// The user's theme choice (THEME-01).
@@ -51,6 +74,42 @@ pub enum RecentDensity {
     #[default]
     ThreeColumns,
     TwoColumns,
+}
+
+/// How far back Recent looks (REC-11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RecentWindow {
+    TwelveHours,
+    #[default]
+    TwentyFourHours,
+    ThreeDays,
+}
+
+impl RecentWindow {
+    /// Every choice, shortest first, as Settings lists them.
+    pub const ALL: [RecentWindow; 3] = [Self::TwelveHours, Self::TwentyFourHours, Self::ThreeDays];
+
+    /// The window's length in hours.
+    pub const fn hours(self) -> u32 {
+        match self {
+            Self::TwelveHours => 12,
+            Self::TwentyFourHours => 24,
+            Self::ThreeDays => 72,
+        }
+    }
+
+    /// The choice that is exactly `hours` long, if there is one.
+    pub fn of_hours(hours: u32) -> Option<RecentWindow> {
+        Self::ALL.into_iter().find(|window| window.hours() == hours)
+    }
+
+    /// The shortest choice at least `hours` long, or the longest.
+    fn covering(hours: u32) -> RecentWindow {
+        Self::ALL
+            .into_iter()
+            .find(|window| window.hours() >= hours)
+            .unwrap_or(Self::ThreeDays)
+    }
 }
 
 /// Lock-screen image options (SET-02).
@@ -83,7 +142,7 @@ pub struct Settings {
     pub home_target: HomeTarget,
     pub wrap_around: bool,
     pub recent_density: RecentDensity,
-    pub recent_window_hours: u32,
+    pub recent_window: RecentWindow,
     pub hidden_apps: BTreeSet<AppId>,
     pub image: ImageOptions,
     /// Apps the user removed from Recent, with the time of removal (PRIV-03).
@@ -100,7 +159,7 @@ impl Default for Settings {
             home_target: HomeTarget::default(),
             wrap_around: true,
             recent_density: RecentDensity::default(),
-            recent_window_hours: 24,
+            recent_window: RecentWindow::default(),
             hidden_apps: BTreeSet::new(),
             image: ImageOptions::default(),
             removed_from_recent: BTreeMap::new(),
@@ -171,7 +230,7 @@ impl Format for Settings {
             .line("home_target", self.home_target)
             .line("wrap_around", self.wrap_around)
             .line("recent_density", self.recent_density)
-            .line("recent_window_hours", self.recent_window_hours);
+            .line("recent_window", self.recent_window);
         for app in &self.hidden_apps {
             out.line("hidden", app);
         }
@@ -191,7 +250,7 @@ impl Format for Settings {
             home_target: input.line("home_target")?,
             wrap_around: input.line("wrap_around")?,
             recent_density: input.line("recent_density")?,
-            recent_window_hours: input.line("recent_window_hours")?,
+            recent_window: input.line("recent_window")?,
             hidden_apps: input.lines("hidden")?.into_iter().collect(),
             image: ImageOptions {
                 enabled: input.line("image_enabled")?,
@@ -240,6 +299,11 @@ named!(RecentDensity {
     ThreeColumns => "three_columns",
     TwoColumns => "two_columns",
 });
+named!(RecentWindow {
+    TwelveHours => "twelve_hours",
+    TwentyFourHours => "twenty_four_hours",
+    ThreeDays => "three_days",
+});
 
 #[cfg(test)]
 mod tests {
@@ -258,7 +322,8 @@ mod tests {
             wrap_around,
             // Recent's columns, chosen by pinching (REC-05).
             recent_density,
-            recent_window_hours,
+            // Settings → Recent → Time window (REC-11).
+            recent_window,
             // Settings → Applications → Hidden apps (APPS-19).
             hidden_apps,
             image:
@@ -278,7 +343,7 @@ mod tests {
             &home_target,
             &wrap_around,
             &recent_density,
-            &recent_window_hours,
+            &recent_window,
             &hidden_apps,
             &enabled,
             &region,
@@ -295,11 +360,13 @@ mod tests {
     /// Every saved version, oldest first, with the settings it must load as (MAINT-04). Never
     /// change or remove a fixture; add one for each new version.
     const FIXTURES: [Fixture; SETTINGS_VERSION as usize] = [
+        // 48 hours, which no choice is, becomes three days.
         (include_str!("../fixtures/settings-v1.txt"), || Settings {
             home_banner_dismissed_ms: None,
             ..sample()
         }),
         (include_str!("../fixtures/settings-v2.txt"), sample),
+        (include_str!("../fixtures/settings-v3.txt"), sample),
     ];
 
     /// Settings with no default left in place.
@@ -309,7 +376,7 @@ mod tests {
             home_target: HomeTarget::Applications,
             wrap_around: false,
             recent_density: RecentDensity::TwoColumns,
-            recent_window_hours: 48,
+            recent_window: RecentWindow::ThreeDays,
             hidden_apps: BTreeSet::from([app_id("games"), app_id("weather")]),
             image: ImageOptions {
                 enabled: true,
@@ -351,7 +418,7 @@ mod tests {
         assert_eq!(settings.theme, ThemeChoice::System); // THEME-01
         assert!(settings.wrap_around); // HOME-04
         assert!(!settings.image.enabled); // WALL-02
-        assert_eq!(settings.recent_window_hours, 24); // REC-03
+        assert_eq!(settings.recent_window, RecentWindow::TwentyFourHours); // REC-03, REC-11
     }
 
     #[test]
@@ -469,13 +536,16 @@ mod tests {
         for theme in [ThemeChoice::System, ThemeChoice::Light, ThemeChoice::Dark] {
             for home_target in [HomeTarget::LastView, HomeTarget::Applications] {
                 for recent_density in [RecentDensity::ThreeColumns, RecentDensity::TwoColumns] {
-                    let settings = Settings {
-                        theme,
-                        home_target,
-                        recent_density,
-                        ..Settings::default()
-                    };
-                    assert_eq!(decode(&encode(&settings)), Some(settings));
+                    for recent_window in RecentWindow::ALL {
+                        let settings = Settings {
+                            theme,
+                            home_target,
+                            recent_density,
+                            recent_window,
+                            ..Settings::default()
+                        };
+                        assert_eq!(decode(&encode(&settings)), Some(settings));
+                    }
                 }
             }
         }
@@ -485,5 +555,50 @@ mod tests {
             decode::<Settings>(&seal("settings", SETTINGS_VERSION, &unknown)),
             None
         );
+    }
+
+    #[test]
+    fn each_window_is_its_hours() {
+        // REC-11
+        let hours = RecentWindow::ALL.map(RecentWindow::hours);
+
+        assert_eq!(hours, [12, 24, 72]);
+        for window in RecentWindow::ALL {
+            assert_eq!(RecentWindow::of_hours(window.hours()), Some(window));
+        }
+        assert_eq!(RecentWindow::of_hours(48), None);
+    }
+
+    #[test]
+    fn an_older_window_becomes_the_shortest_choice_that_shows_as_much() {
+        // MAINT-04, ADR 0026: the window saved in hours before version 3.
+        let saved_at_v2 = |hours: &str| {
+            let v3 = body(&encode(&Settings::default()));
+            let v2 = v3.replace(
+                "recent_window twenty_four_hours\n",
+                &format!("recent_window_hours {hours}\n"),
+            );
+            seal("settings", 2, &v2)
+        };
+
+        for (hours, window) in [
+            ("0", RecentWindow::TwelveHours),
+            ("12", RecentWindow::TwelveHours),
+            ("13", RecentWindow::TwentyFourHours),
+            ("24", RecentWindow::TwentyFourHours),
+            ("25", RecentWindow::ThreeDays),
+            ("72", RecentWindow::ThreeDays),
+            ("1000", RecentWindow::ThreeDays),
+        ] {
+            let settings = decode::<Settings>(&saved_at_v2(hours));
+            assert_eq!(
+                settings.map(|s| s.recent_window),
+                Some(window),
+                "{hours} hours"
+            );
+        }
+        for not_hours in ["day", "-1", ""] {
+            assert_eq!(decode::<Settings>(&saved_at_v2(not_hours)), None);
+        }
     }
 }

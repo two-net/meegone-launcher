@@ -42,7 +42,7 @@ use meegone_events_state::{
 };
 use meegone_lockimage_data::PersistentImageCache;
 use meegone_lockimage_state::{LockImageHolder, LockImageIntent, LockImageState};
-use meegone_recent_state::{MAX_ROWS, RecentHolder, RecentIntent, other_density};
+use meegone_recent_state::{MAX_ROWS, RecentHolder, RecentIntent, RecentState, other_density};
 use meegone_settings_state::{SettingsHolder, SettingsIntent, SettingsState};
 
 use carousel::{Carousel, Release};
@@ -568,6 +568,12 @@ impl HomeShell {
     /// inside Settings (APPS-19, ADR 0002).
     pub fn subscribe_apps(&mut self, listener: impl FnMut(&Arc<AppsState>) + 'static) {
         self.apps.subscribe(listener);
+    }
+
+    /// Calls `listener` with every new Recent state, for its time window shown inside Settings
+    /// (REC-11, ADR 0002).
+    pub fn subscribe_recent(&mut self, listener: impl FnMut(&Arc<RecentState>) + 'static) {
+        self.recent.subscribe(listener);
     }
 
     /// Calls `listener` with every new settings state, for the banner that offers to make
@@ -2837,6 +2843,29 @@ mod tests {
 
         assert_eq!(shell.recent().state().density, RecentDensity::ThreeColumns);
         assert_eq!(shell.state().pinch.scale, 1.0);
+    }
+
+    #[test]
+    fn a_window_chosen_in_settings_changes_recent_at_once() {
+        // REC-11, SET-03: Recent reads its cards again as the choice is saved, so a swipe after
+        // Settings closes already shows them.
+        const HOUR_MS: u64 = 60 * 60 * 1000;
+        let fakes = Fakes::default();
+        *fakes.usage.access.lock().unwrap() = Access::Granted;
+        *fakes.apps.apps.lock().unwrap() = vec![app("maps", "Maps"), app("mail", "Mail")];
+        *fakes.system.now_ms.lock().unwrap() = 100 * HOUR_MS;
+        *fakes.usage.uses.lock().unwrap() =
+            vec![used("maps", 70 * HOUR_MS), used("mail", 99 * HOUR_MS)];
+        let mut shell = HomeShell::compose(fakes.platform());
+        assert_eq!(recent_labels(&shell), ["Mail"]);
+
+        shell.dispatch(ShellIntent::OpenSettings);
+        shell.dispatch(ShellIntent::Recent(RecentIntent::SetWindow(
+            meegone_core_state::RecentWindow::ThreeDays,
+        )));
+
+        assert!(shell.state().settings_open);
+        assert_eq!(recent_labels(&shell), ["Mail", "Maps"]);
     }
 
     #[test]

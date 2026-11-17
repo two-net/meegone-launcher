@@ -359,3 +359,30 @@ fn close_mode_is_entered_left_and_cleared_without_a_gesture() {
         ]
     ));
 }
+
+#[test]
+fn the_settings_section_shows_the_latest_window_and_sends_a_choice() {
+    // REC-11, SET-03
+    let latest = Latest::new(std::sync::Arc::new(RecentState::default()));
+    let sent = Rc::new(RefCell::new(Vec::new()));
+    let section = RecentSettingsSection::new(
+        latest.clone(),
+        Dispatch::new({
+            let sent = Rc::clone(&sent);
+            move |intent| sent.borrow_mut().push(intent)
+        }),
+    );
+    assert_eq!(section.window(), RecentWindow::TwentyFourHours);
+
+    section.window_chosen(RecentWindow::ThreeDays);
+    assert!(matches!(
+        sent.borrow().as_slice(),
+        [RecentIntent::SetWindow(RecentWindow::ThreeDays)]
+    ));
+
+    latest.set(std::sync::Arc::new(RecentState {
+        window: RecentWindow::ThreeDays,
+        ..RecentState::default()
+    }));
+    assert_eq!(section.window(), RecentWindow::ThreeDays);
+}

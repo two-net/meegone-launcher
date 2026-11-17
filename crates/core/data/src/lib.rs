@@ -38,7 +38,7 @@ pub use model::{
     ProfileId, RecentUse, Rect, Rgb, Shortcut, Size, TimeStyle,
 };
 pub use settings::{
-    HomeTarget, ImageOptions, PersistentSettingsStore, RecentDensity, SETTINGS_VERSION, Settings,
-    SettingsStore, ThemeChoice,
+    HomeTarget, ImageOptions, PersistentSettingsStore, RecentDensity, RecentWindow,
+    SETTINGS_VERSION, Settings, SettingsStore, ThemeChoice,
 };
 pub use storage::{FileStorage, MAX_STORED_BYTES, StorageAdapter, StoredFile};

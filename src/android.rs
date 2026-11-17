@@ -31,7 +31,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::time::Duration;
 
 use meegone_core_data::android::{self, Env, JObject, LocalRef, RawEnv};
-use meegone_core_data::{App, RecentDensity, Rect, Rgb, accent};
+use meegone_core_data::{App, RecentDensity, RecentWindow, Rect, Rgb, accent};
 
 use crate::{
     Age, AppMenuItem, BADGE_ROWS, Bounds, Cell, CellKey, Direction, EventsListMode, EventsRow,
@@ -1179,6 +1179,31 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRece
             .laid_out(f64::from(width_px), density);
         launcher.frame();
     });
+}
+
+/// `String nativeRecentWindow(int hours)`: Settings → Recent → Time window was set to 12, 24 or
+/// 72 hours (REC-11). The choice is saved and Recent's cards follow it at once (SET-03). Returns
+/// `null`, or a short message to show when it couldn't be saved. Other hours do nothing, and so
+/// does a Recent that isn't working (ARCH-09).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRecentWindow(
+    env: RawEnv,
+    _views: JObject,
+    hours: i32,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_recent_message(env, |launcher| {
+        let Some(window) = u32::try_from(hours).ok().and_then(RecentWindow::of_hours) else {
+            return false;
+        };
+        launcher.view().recent_settings().window_chosen(window);
+        true
+    })
 }
 
 /// `String nativeRecentDensity(int rows)`: a screen reader chose bigger cards, 2, or more cards,
@@ -2335,7 +2360,7 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRead
 }
 
 /// How many slots the frame has.
-const FRAME_SLOTS: usize = 127;
+const FRAME_SLOTS: usize = 128;
 /// The first of Recent's close-mode slots.
 const CLOSE_SLOTS: usize = 104;
 
@@ -2434,6 +2459,7 @@ const CLOSE_SLOTS: usize = 104;
 /// | 108 | Changes each time apps are removed from Recent, so the host confirms it (REC-08, A11Y-08) |
 /// | 109–117 | The ✕ scale of each row of cards, in ten-thousandths (ANIM-12) |
 /// | 118–126 | How far the cards that left each row of the cards last read have gone, 0 to 10 000: they shrink and fade (ANIM-18) |
+/// | 127 | Settings → Recent → Time window: 12, 24 or 72 hours, or -1 while Recent isn't working, so Settings doesn't offer it (REC-11) |
 fn frame_slots(frame: &HomeFrame) -> [i32; FRAME_SLOTS] {
     let [events, applications, recent] = frame.pages;
     let menu_items = frame.menu.map_or(0, |menu| {
@@ -2623,9 +2649,13 @@ fn frame_slots(frame: &HomeFrame) -> [i32; FRAME_SLOTS] {
     for (row, slot) in slots[badges..leave].iter_mut().enumerate() {
         *slot = close.map_or(0, |close| i32::from(close.badges[row]));
     }
-    for (row, slot) in slots[leave..].iter_mut().enumerate() {
+    let window = leave + RECENT_ROWS;
+    for (row, slot) in slots[leave..window].iter_mut().enumerate() {
         *slot = recent.map_or(10_000, |recent| i32::from(recent.leave[row]));
     }
+    slots[window] = frame
+        .recent_window
+        .map_or(-1, |window| window.hours() as i32);
     slots
 }
 

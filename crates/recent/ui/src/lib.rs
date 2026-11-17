@@ -6,12 +6,16 @@
 //! that changed meanwhile opens or removes nothing. Each card says where it was in the cards the
 //! host last read, so a card that went shrinks away where it was and the others close the gap
 //! (ANIM-18, ADR 0025).
+//!
+//! Recent also provides [`RecentSettingsSection`], its group of Settings, which the shell puts
+//! in place (ADR 0002, ADR 0026).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+pub use meegone_core_state::RecentWindow;
 use meegone_core_state::{Access, AppId, RecentDensity, Rect};
-use meegone_core_ui::{Dispatch, Rgb, Tokens, View};
+use meegone_core_ui::{Dispatch, Latest, Rgb, Slot, Tokens, View};
 pub use meegone_recent_state::Age;
 use meegone_recent_state::{RecentCard, RecentIntent, RecentState, phone_columns};
 
@@ -255,6 +259,39 @@ impl View for RecentView {
 
     fn render(&mut self, _state: &RecentState, _tokens: &Tokens) {
         // The host draws the cards (ADR 0023).
+    }
+}
+
+/// The "Recent" group of Settings: Time window (SET-02, REC-11).
+///
+/// Clones share their state, so the shell can keep one for the host while Settings holds
+/// another.
+#[derive(Clone)]
+pub struct RecentSettingsSection {
+    latest: Latest<RecentState>,
+    dispatch: Dispatch<RecentIntent>,
+}
+
+impl RecentSettingsSection {
+    pub fn new(latest: Latest<RecentState>, dispatch: Dispatch<RecentIntent>) -> Self {
+        Self { latest, dispatch }
+    }
+
+    /// The window chosen now (REC-11).
+    pub fn window(&self) -> RecentWindow {
+        self.latest.get().window
+    }
+
+    /// A time window was chosen. It takes effect at once (SET-03).
+    pub fn window_chosen(&self, window: RecentWindow) {
+        self.dispatch.send(RecentIntent::SetWindow(window));
+    }
+}
+
+impl Slot for RecentSettingsSection {
+    fn render(&mut self, _tokens: &Tokens) {
+        // The host draws the time window until the Settings screen, #34, draws the rest
+        // (ADR 0006, ADR 0026).
     }
 }
 
