@@ -3,7 +3,7 @@
 //!
 //! Not automated yet, because the behaviour isn't built:
 //! - AC-01: first-run setup (#35)
-//! - AC-13, AC-14: Recent density and close mode (#23, #24)
+//! - AC-14: Recent's close mode (#24). Its density (AC-13, #23) is automated below.
 //! - AC-15 to AC-17: the daily image (#27 to #30). Its card in Events (EVT-12, #21) is
 //!   automated below.
 //!
@@ -20,16 +20,16 @@ use std::time::Duration;
 use meegone_core_data::fakes::{Fakes, WORK_PROFILE, app, app_id, notification, used, work_app};
 use meegone_core_data::storage::format::seal;
 use meegone_core_data::{
-    App, DataError, HomeTarget, Notification, NotificationsAdapter, Profile, ProfileId, Rect, Rgb,
-    Shortcut, StoredFile, ThemeChoice, accent,
+    App, DataError, HomeTarget, Notification, NotificationsAdapter, Profile, ProfileId,
+    RecentDensity, Rect, Rgb, Shortcut, StoredFile, ThemeChoice, accent,
 };
 use meegone_core_state::{Access, Health, Theme};
 use meegone_core_ui::tokens;
 use meegone_launcher::{
     Age, AppMenuItem, BADGE_ROWS, Bounds, CardContent, CellKey, Direction, EventsListMode,
     EventsMenuFrame, FolderId, GridLayout, HomeView, Launcher, Layout, LiftFrame, MenuItem,
-    NotificationMenuItem, PointerEvent, PointerKind, RecentMode, SettingsGroup, ShellIntent,
-    Surface,
+    NotificationMenuItem, PinchEvent, PinchKind, PointerEvent, PointerKind, RecentMode,
+    SettingsGroup, ShellIntent, Surface,
 };
 
 /// A phone 1080 × 2400 px at 2.75 px per dp.
@@ -3217,4 +3217,178 @@ fn rec10_given_no_app_was_used_then_recent_says_no_recent_apps() {
     launcher.dispatch(ShellIntent::Swipe(Direction::Next));
 
     assert_eq!(recent_cards(&mut launcher), (RecentMode::Empty, Vec::new()));
+}
+
+/// Recent on a phone with six apps used, newest first, laid out as the host does: the cards
+/// area is the screen's width less its 16 dp margins.
+fn six_on_recent(fakes: &Fakes) -> (Launcher, u64) {
+    let packages = ["mail", "maps", "music", "camera", "clock", "notes"];
+    *fakes.apps.apps.lock().unwrap() = packages.iter().map(|p| app(p, p)).collect();
+    *fakes.usage.access.lock().unwrap() = Access::Granted;
+    *fakes.system.now_ms.lock().unwrap() = 10_000_000;
+    *fakes.usage.uses.lock().unwrap() = (0..)
+        .zip(packages)
+        .map(|(i, package)| used(package, 9_000_000 - i * 60_000))
+        .collect();
+    let (mut launcher, mut clock) = on_a_phone(fakes);
+    swipe(&mut launcher, &mut clock, 900.0, 300.0, 400, 100);
+    assert_eq!(launcher.shell().state().current, HomeView::Recent);
+    launcher
+        .view()
+        .recent()
+        .laid_out(WIDTH - 2.0 * 16.0 * 2.75, 2.75);
+    launcher.frame();
+    (launcher, clock)
+}
+
+/// Two fingers at the middle of the screen, `from` px apart, move to `to` px apart over 160 ms
+/// and lift, the second one first. Returns the cards' scale as drawn just before they lift.
+fn pinch(launcher: &mut Launcher, clock: &mut u64, from: f64, to: f64) -> u16 {
+    let first = |launcher: &mut Launcher, kind, span: f64, at: u64| {
+        launcher.dispatch(ShellIntent::Pointer(PointerEvent {
+            kind,
+            x: 540.0 - span / 2.0,
+            y: 1200.0,
+            at: Duration::from_millis(at),
+        }));
+    };
+    let both = |launcher: &mut Launcher, kind, span_px, at: u64| {
+        launcher.dispatch(ShellIntent::Pinch(PinchEvent {
+            kind,
+            span_px,
+            x: 540.0,
+            y: 1200.0,
+            at: Duration::from_millis(at),
+        }));
+        launcher.frame()
+    };
+    first(launcher, PointerKind::Down, from, *clock);
+    both(launcher, PinchKind::Start, from, *clock + 8);
+    let mut scale = 10_000;
+    for step in 1..=20_u32 {
+        let span = from + (to - from) * f64::from(step) / 20.0;
+        let at = *clock + 8 + 8 * u64::from(step);
+        first(launcher, PointerKind::Move, span, at);
+        scale = both(launcher, PinchKind::Move, span, at)
+            .recent
+            .expect("Recent works")
+            .scale;
+    }
+    *clock += 180;
+    both(launcher, PinchKind::End, to, *clock);
+    first(launcher, PointerKind::Up, to, *clock + 8);
+    *clock += 8;
+    scale
+}
+
+#[test]
+fn ac13_given_recent_with_six_apps_pinching_in_shows_two_columns_after_a_restart() {
+    // Issue #23: REC-05. Spreading the fingers zooms in, to bigger cards.
+    let fakes = Fakes::default();
+    let (mut launcher, mut clock) = six_on_recent(&fakes);
+    let recent = launcher.frame().recent.expect("Recent works");
+    assert_eq!((recent.columns, recent.rows_per_screen), (3, 3));
+    assert_eq!(recent_cards(&mut launcher).1.len(), 6);
+
+    pinch(&mut launcher, &mut clock, 300.0, 600.0);
+    come_to_rest(&mut launcher, &mut clock);
+
+    let recent = launcher.frame().recent.expect("Recent works");
+    assert_eq!((recent.columns, recent.rows_per_screen), (2, 2));
+    assert_eq!(launcher.shell().state().current, HomeView::Recent);
+
+    let mut restarted = Launcher::start(fakes.platform());
+    restarted.dispatch(ShellIntent::Layout(phone()));
+    restarted.dispatch(ShellIntent::Swipe(Direction::Next));
+    let recent = restarted.frame().recent.expect("Recent works");
+    assert_eq!((recent.columns, recent.rows_per_screen), (2, 2));
+}
+
+#[test]
+fn rec05_pinching_the_other_way_shows_more_cards_again() {
+    // Issue #23: REC-05.
+    let fakes = Fakes::default();
+    let (mut launcher, mut clock) = six_on_recent(&fakes);
+    pinch(&mut launcher, &mut clock, 300.0, 600.0);
+    come_to_rest(&mut launcher, &mut clock);
+
+    pinch(&mut launcher, &mut clock, 600.0, 300.0);
+    come_to_rest(&mut launcher, &mut clock);
+
+    assert_eq!(launcher.frame().recent.expect("Recent works").columns, 3);
+    assert_eq!(
+        launcher.shell().recent().state().density,
+        RecentDensity::ThreeColumns
+    );
+}
+
+#[test]
+fn rec05_a_tablet_adds_columns_to_both_densities() {
+    // Issue #23: REC-05. A tablet 1 280 dp wide keeps cards about a phone's size.
+    let fakes = Fakes::default();
+    let (mut launcher, mut clock) = six_on_recent(&fakes);
+    launcher.view().recent().laid_out(1_248.0 * 2.0, 2.0);
+    assert_eq!(launcher.frame().recent.expect("Recent works").columns, 8);
+
+    pinch(&mut launcher, &mut clock, 300.0, 600.0);
+    come_to_rest(&mut launcher, &mut clock);
+
+    assert_eq!(launcher.frame().recent.expect("Recent works").columns, 5);
+}
+
+#[test]
+fn anim17_the_cards_scale_with_the_fingers_then_reflow_in_about_300_ms() {
+    // Issue #23: ANIM-17, ANIM-01. The drawn scale is the fingers' as of the latest event.
+    let fakes = Fakes::default();
+    let (mut launcher, mut clock) = six_on_recent(&fakes);
+
+    let scale = pinch(&mut launcher, &mut clock, 300.0, 420.0);
+    assert_eq!(scale, 14_000);
+    assert_eq!(launcher.frame().pages[2], 0, "Recent stays put");
+
+    let recent = launcher.frame().recent.expect("Recent works");
+    assert_eq!(recent.scale, 10_000);
+    assert!(recent.reflow_progress < 10_000);
+    let start = clock;
+    come_to_rest(&mut launcher, &mut clock);
+    assert!(
+        (280..=330).contains(&(clock - start)),
+        "{} ms",
+        clock - start
+    );
+    let recent = launcher.frame().recent.expect("Recent works");
+    assert_eq!((recent.columns, recent.reflow_progress), (2, 10_000));
+}
+
+#[test]
+fn a11y05_a_screen_reader_switches_recent_between_more_and_bigger_cards() {
+    // Issue #23: A11Y-05. "Bigger cards" and "More cards" are offered while the cards show.
+    let fakes = Fakes::default();
+    let (mut launcher, _) = six_on_recent(&fakes);
+    let recent = launcher.frame().recent.expect("Recent works");
+    assert!(recent.density_offered);
+
+    launcher
+        .view()
+        .recent()
+        .density_chosen(RecentDensity::TwoColumns);
+    let recent = launcher.frame().recent.expect("Recent works");
+    assert_eq!((recent.columns, recent.rows_per_screen), (2, 2));
+    assert!(launcher.frame().animating, "the cards reflow");
+
+    launcher
+        .view()
+        .recent()
+        .density_chosen(RecentDensity::ThreeColumns);
+    assert_eq!(launcher.frame().recent.expect("Recent works").columns, 3);
+
+    // Not on another view.
+    launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
+    assert!(
+        !launcher
+            .frame()
+            .recent
+            .expect("Recent works")
+            .density_offered
+    );
 }

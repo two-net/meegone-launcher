@@ -2,7 +2,7 @@
 //! Home and Back, coming back to the home, the icon press, the dragged icon, the grid's motion
 //! as apps come, go and move, edit mode's motion, the open folder's motion, the search field's
 //! pull, the Events list's motion as notifications come and go, the image details screen and
-//! the image-of-the-day card's cross-fade, and the theme.
+//! the image-of-the-day card's cross-fade, Recent's pinch and its cards' reflow, and the theme.
 //!
 //! [`HomeShell::compose`] is the only place features are put together (ARCH-03). Each feature
 //! runs in its own [`Store`], so a failing feature never takes down the shell (ARCH-09).
@@ -15,6 +15,7 @@ mod home_menu;
 mod image_change;
 mod lift;
 mod mode;
+mod pinch;
 mod press;
 mod return_home;
 mod search;
@@ -31,13 +32,13 @@ use meegone_core_data::{
     HomeTarget, PersistentSettingsStore, Platform, SettingsStore, SystemConfigAdapter,
 };
 use meegone_core_state::motion::{MODE_SCALE, VIEW_FLING_VELOCITY_DP};
-use meegone_core_state::{App, Health, Store, ThemeHolder, ThemeIntent};
+use meegone_core_state::{App, Health, RecentDensity, Store, ThemeHolder, ThemeIntent};
 use meegone_events_state::{
     EventsHolder, EventsIntent, GroupId, NotificationGroup, RowKey, RowTarget, rows_came_or_went,
 };
 use meegone_lockimage_data::PersistentImageCache;
 use meegone_lockimage_state::{LockImageHolder, LockImageIntent, LockImageState};
-use meegone_recent_state::{RecentHolder, RecentIntent};
+use meegone_recent_state::{RecentHolder, RecentIntent, other_density};
 use meegone_settings_state::{SettingsHolder, SettingsIntent, SettingsState};
 
 use carousel::{Carousel, Release};
@@ -57,6 +58,8 @@ pub use meegone_apps_state::{FOLDER_COLUMNS, GridItem, PREVIEW_APPS, preview_slo
 pub use meegone_settings_state::SettingsGroup;
 use mode::Mode;
 pub use mode::{BADGE_ROWS, ModeState};
+use pinch::{Ended, PinchMotion};
+pub use pinch::{PinchEvent, PinchKind, PinchState};
 use press::Press;
 pub use press::PressState;
 use return_home::ReturnHome;
@@ -174,6 +177,13 @@ pub struct ShellState {
     pub events_change: EventsChangeState,
     /// How far the image-of-the-day card's new thumbnail has faded in (ANIM-22).
     pub image_change: ImageChangeState,
+    /// Recent's cards as two fingers pinch them, and as they reflow to their places (REC-05,
+    /// ANIM-17).
+    pub pinch: PinchState,
+    /// Recent shows its cards with nothing covering them, so a pinch, or a screen reader, can
+    /// switch between more cards and bigger ones (REC-05, A11Y-05). A failed Recent never
+    /// offers it (ARCH-09).
+    pub density_offered: bool,
 }
 
 impl ShellState {
@@ -234,6 +244,9 @@ pub enum ShellIntent {
     Layout(Layout),
     /// A finger on the home views, which may drag the carousel (HOME-03).
     Pointer(PointerEvent),
+    /// Two fingers on the home views, which may pinch Recent's cards between more and bigger
+    /// ones (REC-05, ANIM-17). The host sends it alongside the first finger's `Pointer` events.
+    Pinch(PinchEvent),
     /// The display is about to draw a frame at this time on the host's monotonic clock.
     Frame(Duration),
     /// A finger went down on an item of the current view, such as an app icon, at this time on
@@ -350,6 +363,9 @@ pub struct HomeShell {
     /// The apps Applications had hidden as of the last intent, so Recent follows (APPS-19).
     seen_hidden: Arc<[App]>,
     search: SearchMotion,
+    pinch: PinchMotion,
+    /// Recent's density as of the last intent, so the cards reflow when it changes (ANIM-17).
+    seen_density: RecentDensity,
     events_change: EventsChange,
     image_change: ImageChange,
     /// Events' groups and expanded group as of the last intent, to tell cheaply whether its
@@ -388,6 +404,8 @@ impl HomeShell {
             seen_folders_made: 0,
             seen_hidden: Arc::new([]),
             search: SearchMotion::default(),
+            pinch: PinchMotion::default(),
+            seen_density: RecentDensity::default(),
             events_change: EventsChange::default(),
             image_change: ImageChange::default(),
             seen_groups: Arc::new([]),
@@ -441,8 +459,9 @@ impl HomeShell {
         shell.configure_carousel();
         // The grid as it starts is shown as it is: nothing moves (ANIM-21).
         shell.seen_cells = shell.apps.state().items.clone();
-        // Recent read the hidden apps as it loaded.
+        // Recent read the hidden apps and its density as it loaded: nothing reflows.
         shell.seen_hidden = shell.apps.state().hidden_apps.clone();
+        shell.seen_density = shell.recent.state().density;
         // Events' list as it starts is shown as it is too (ANIM-20).
         let events = shell.events.state();
         shell.seen_groups = events.groups.clone();
@@ -541,6 +560,7 @@ impl HomeShell {
                     }
                     self.lift.cancel();
                     self.search.end_gesture();
+                    self.pinch.end_gesture(self.carousel.animation_scale());
                 }
                 let release = self.carousel.layout(layout, self.state.current);
                 self.settle(release);
@@ -549,6 +569,8 @@ impl HomeShell {
                 if event.kind == PointerKind::Down {
                     // A touch never waits for the return motion (ANIM-03).
                     self.return_home.finish();
+                    // A new gesture, which no pinch holds yet.
+                    self.pinch.new_gesture(self.carousel.animation_scale());
                 }
                 // A long-press on an icon keeps the rest of its gesture, even under its menu:
                 // dragging on picks the icon up and enters edit mode, which closes the menu
@@ -559,9 +581,10 @@ impl HomeShell {
                 self.pull(event);
                 // Settings and the menus cover the home views, but a finger that was already
                 // down may still lift. An open folder or search takes touches itself: the row
-                // stays put, but a press there can still become a long-press (FOLD-04).
+                // stays put, but a press there can still become a long-press (FOLD-04). After
+                // a pinch, the finger left on the views moves nothing (ANIM-17).
                 self.carousel
-                    .lock(self.folder_shown() || self.search_shown());
+                    .lock(self.folder_shown() || self.search_shown() || self.pinch.holding());
                 if !self.covered() || matches!(event.kind, PointerKind::Up | PointerKind::Cancel) {
                     let release = self.carousel.pointer(event, self.state.current);
                     self.settle(release);
@@ -572,8 +595,10 @@ impl HomeShell {
                         .release(event.at, self.carousel.animation_scale());
                 }
             }
+            ShellIntent::Pinch(event) => self.follow_pinch(event),
             ShellIntent::Frame(at) => {
                 self.carousel.frame(at);
+                self.pinch.frame(at);
                 self.return_home.frame(at);
                 self.press.frame(at);
                 self.grid_change.frame(at);
@@ -667,6 +692,8 @@ impl HomeShell {
             .then(|| self.apps.state().renaming)
             .flatten();
         self.state.search = self.search.state();
+        self.state.pinch = self.pinch.state();
+        self.state.density_offered = self.density_offered();
     }
 
     /// Whether Settings, the image details or a menu covers the home views, so they get no new
@@ -896,11 +923,76 @@ impl HomeShell {
     /// Hide, an Unhide or a hidden app that is gone, Recent reads them again at once, so a swipe
     /// never shows a hidden app's card on the next page. A failed save changes nothing, and a
     /// failed Applications changes nothing either.
+    ///
+    /// When Recent's density changes, by a pinch or from a screen reader, its cards reflow to
+    /// their new columns (ANIM-17). A pinch ends without switching once nothing offers it, such
+    /// as after Home or under a menu.
     fn keep_recent_in_step(&mut self) {
         let hidden = &self.apps.state().hidden_apps;
         if !Arc::ptr_eq(hidden, &self.seen_hidden) {
             self.seen_hidden = hidden.clone();
             self.recent.dispatch(RecentIntent::Refresh);
+        }
+        let scale = self.carousel.animation_scale();
+        let density = self.recent.state().density;
+        if density != std::mem::replace(&mut self.seen_density, density) {
+            self.pinch.reflow(scale);
+        }
+        if self.pinch.pinching() && !self.density_offered() {
+            self.pinch.end_gesture(scale);
+        }
+    }
+
+    /// Whether Recent shows its cards on screen with nothing covering them, so its density can
+    /// change (REC-05, A11Y-05). A failed Recent never offers it (ARCH-09).
+    fn density_offered(&self) -> bool {
+        self.state.current == HomeView::Recent
+            && self.recent_ready()
+            && self.recent.state().shows_cards()
+            && !self.covered()
+    }
+
+    /// How much bigger, as a scale, the other density's cards are than these, if a pinch may
+    /// start now: on Recent's cards with nothing covering them, while the views are at rest and
+    /// no long-press holds the finger.
+    fn pinch_target(&self) -> Option<f64> {
+        let carousel = self.carousel.state();
+        if !self.density_offered() || carousel.dragging || carousel.held || carousel.offset != 0.0 {
+            return None;
+        }
+        let recent = self.recent.state();
+        let other = recent.columns_of(other_density(recent.density));
+        Some(f64::from(recent.columns()) / f64::from(other.max(1)))
+    }
+
+    /// Follows two fingers on the home views (REC-05, ANIM-17). A pinch that starts takes the
+    /// gesture: the row lets go of the first finger and stays put, and no long-press counts. A
+    /// release past the threshold switches Recent's density, which saves it.
+    fn follow_pinch(&mut self, event: PinchEvent) {
+        let scale = self.carousel.animation_scale();
+        let target = match event.kind {
+            PinchKind::Start => self.pinch_target(),
+            _ => None,
+        };
+        let was_holding = self.pinch.holding();
+        let ended = self.pinch.pinch(event, target, scale);
+        if !was_holding && self.pinch.holding() {
+            let release = self.carousel.pointer(
+                PointerEvent {
+                    kind: PointerKind::Cancel,
+                    x: event.x,
+                    y: event.y,
+                    at: event.at,
+                },
+                self.state.current,
+            );
+            self.settle(release);
+            self.carousel.lock(true);
+            self.press.release(event.at, scale);
+        }
+        if ended == Some(Ended::Switch) {
+            let density = other_density(self.recent.state().density);
+            self.recent.dispatch(RecentIntent::SetDensity(density));
         }
     }
 
@@ -2405,6 +2497,231 @@ mod tests {
         let after = HomeShell::compose(fakes.platform());
 
         assert_eq!(after.state().current, HomeView::Applications);
+    }
+
+    /// Recent with Mail and Maps, laid out on a phone 1000 px wide and showing.
+    fn on_recent(fakes: &Fakes) -> HomeShell {
+        let mut shell = with_recent_maps_and_mail(fakes);
+        shell.dispatch(ShellIntent::Layout(Layout {
+            width_px: 1000.0,
+            density: 2.0,
+            touch_slop_px: 16.0,
+            rtl: false,
+        }));
+        go(&mut shell, Direction::Next);
+        assert_eq!(shell.state().current, HomeView::Recent);
+        shell
+    }
+
+    fn touch_recent(shell: &mut HomeShell, kind: PointerKind, x: f64, at: u64) {
+        shell.dispatch(ShellIntent::Pointer(PointerEvent {
+            kind,
+            x,
+            y: 1_000.0,
+            at: ms(at),
+        }));
+    }
+
+    fn fingers(shell: &mut HomeShell, kind: PinchKind, span_px: f64, at: u64) {
+        shell.dispatch(ShellIntent::Pinch(PinchEvent {
+            kind,
+            span_px,
+            x: 500.0,
+            y: 1_000.0,
+            at: ms(at),
+        }));
+    }
+
+    /// Two fingers 300 px apart move to `to` px apart and lift, the first one last.
+    fn pinch(shell: &mut HomeShell, to: f64) {
+        touch_recent(shell, PointerKind::Down, 350.0, 2_000);
+        fingers(shell, PinchKind::Start, 300.0, 2_010);
+        for step in 1..=10_u32 {
+            let span = 300.0 + (to - 300.0) * f64::from(step) / 10.0;
+            touch_recent(
+                shell,
+                PointerKind::Move,
+                350.0 - (span - 300.0) / 2.0,
+                2_010 + 8 * u64::from(step),
+            );
+            fingers(shell, PinchKind::Move, span, 2_010 + 8 * u64::from(step));
+        }
+        fingers(shell, PinchKind::End, to, 2_100);
+        touch_recent(shell, PointerKind::Up, 350.0 - (to - 300.0) / 2.0, 2_110);
+    }
+
+    #[test]
+    fn spreading_two_fingers_on_recent_shows_bigger_cards_and_saves_them() {
+        // REC-05, ANIM-17
+        let fakes = Fakes::default();
+        let mut shell = on_recent(&fakes);
+        assert!(shell.state().density_offered);
+        let reflow = shell.state().pinch.reflow;
+
+        pinch(&mut shell, 450.0);
+
+        assert_eq!(shell.recent().state().density, RecentDensity::TwoColumns);
+        assert_eq!(shell.recent().state().columns(), 2);
+        assert_ne!(shell.state().pinch.reflow, reflow);
+        assert!(shell.state().pinch.animating, "the cards reflow");
+        let restarted = HomeShell::compose(fakes.platform());
+        assert_eq!(
+            restarted.recent().state().density,
+            RecentDensity::TwoColumns
+        );
+        assert!(
+            !restarted.state().pinch.animating,
+            "nothing reflows at start"
+        );
+
+        // Bringing the fingers together shows more cards again.
+        pinch(&mut shell, 200.0);
+        assert_eq!(shell.recent().state().density, RecentDensity::ThreeColumns);
+    }
+
+    #[test]
+    fn a_small_pinch_lets_the_cards_go_back() {
+        // ANIM-17
+        let fakes = Fakes::default();
+        let mut shell = on_recent(&fakes);
+        let writes = fakes.storage.writes.lock().unwrap().len();
+
+        pinch(&mut shell, 320.0);
+
+        assert_eq!(shell.recent().state().density, RecentDensity::ThreeColumns);
+        assert!(shell.state().pinch.animating);
+        assert_eq!(
+            fakes.storage.writes.lock().unwrap().len(),
+            writes,
+            "nothing saved"
+        );
+        for frame in 0..40 {
+            shell.dispatch(ShellIntent::Frame(ms(2_200 + frame * 16)));
+        }
+        assert!(!shell.state().pinch.animating);
+        assert_eq!(shell.state().pinch.scale, 1.0);
+    }
+
+    #[test]
+    fn the_cards_scale_with_the_fingers_and_the_views_stay_put() {
+        // ANIM-01, ANIM-17, HOME-03
+        let fakes = Fakes::default();
+        let mut shell = on_recent(&fakes);
+        touch_recent(&mut shell, PointerKind::Down, 350.0, 2_000);
+        fingers(&mut shell, PinchKind::Start, 300.0, 2_010);
+        assert!(shell.state().pinch.holding);
+
+        // The first finger moves far sideways as the two spread.
+        touch_recent(&mut shell, PointerKind::Move, 100.0, 2_020);
+        fingers(&mut shell, PinchKind::Move, 390.0, 2_020);
+        assert!((shell.state().pinch.scale - 1.3).abs() < 1e-9);
+        assert!(!shell.state().carousel.dragging);
+        assert_eq!(shell.state().carousel.offset, 0.0);
+
+        // The finger left after the pinch moves no view either.
+        fingers(&mut shell, PinchKind::End, 390.0, 2_030);
+        touch_recent(&mut shell, PointerKind::Move, 900.0, 2_040);
+        touch_recent(&mut shell, PointerKind::Up, 900.0, 2_050);
+        assert_eq!(shell.state().current, HomeView::Recent);
+        assert!(!shell.state().carousel.dragging);
+
+        // The next gesture is the carousel's again.
+        touch_recent(&mut shell, PointerKind::Down, 900.0, 3_000);
+        assert!(!shell.state().pinch.holding);
+        touch_recent(&mut shell, PointerKind::Move, 500.0, 3_016);
+        assert!(shell.state().carousel.dragging);
+    }
+
+    #[test]
+    fn a_long_press_never_counts_once_a_pinch_starts() {
+        // HOME-10, REC-07
+        let fakes = Fakes::default();
+        let mut shell = on_recent(&fakes);
+        touch_recent(&mut shell, PointerKind::Down, 350.0, 2_000);
+        fingers(&mut shell, PinchKind::Start, 300.0, 2_010);
+
+        shell.dispatch(ShellIntent::LongPress);
+
+        assert!(!shell.recent().state().close_mode);
+    }
+
+    #[test]
+    fn no_pinch_starts_off_recent_under_a_menu_or_without_cards() {
+        let starts = |shell: &mut HomeShell| {
+            touch_recent(shell, PointerKind::Down, 350.0, 2_000);
+            fingers(shell, PinchKind::Start, 300.0, 2_010);
+            let holding = shell.state().pinch.holding;
+            fingers(shell, PinchKind::End, 600.0, 2_020);
+            touch_recent(shell, PointerKind::Up, 350.0, 2_030);
+            holding
+        };
+        assert!(starts(&mut on_recent(&Fakes::default())));
+        let fakes = Fakes::default();
+        let mut shell = on_recent(&fakes);
+
+        // Other views.
+        go(&mut shell, Direction::Previous);
+        assert!(!shell.state().density_offered);
+        assert!(!starts(&mut shell));
+
+        // Settings over Recent.
+        go(&mut shell, Direction::Next);
+        shell.dispatch(ShellIntent::OpenSettings);
+        assert!(!starts(&mut shell));
+        shell.dispatch(ShellIntent::Back);
+
+        // Without usage access: the explainer, no cards.
+        *fakes.usage.access.lock().unwrap() = Access::Missing;
+        shell.dispatch(ShellIntent::UsageAccessChanged);
+        assert!(!shell.state().density_offered);
+        assert!(!starts(&mut shell));
+        assert_eq!(shell.recent().state().density, RecentDensity::ThreeColumns);
+    }
+
+    #[test]
+    fn a_failing_recent_offers_no_pinch() {
+        // ARCH-09
+        let fakes = Fakes::default();
+        let mut platform = fakes.platform();
+        platform.usage = Arc::new(BrokenUsage);
+        let mut shell = HomeShell::compose(platform);
+        go(&mut shell, Direction::Next);
+
+        assert!(!shell.state().density_offered);
+        touch_recent(&mut shell, PointerKind::Down, 350.0, 2_000);
+        fingers(&mut shell, PinchKind::Start, 300.0, 2_010);
+        assert!(!shell.state().pinch.holding);
+    }
+
+    #[test]
+    fn home_during_a_pinch_lets_the_cards_go_back() {
+        let fakes = Fakes::default();
+        let mut shell = on_recent(&fakes);
+        touch_recent(&mut shell, PointerKind::Down, 350.0, 2_000);
+        fingers(&mut shell, PinchKind::Start, 300.0, 2_010);
+        fingers(&mut shell, PinchKind::Move, 600.0, 2_020);
+
+        shell.dispatch(ShellIntent::Home);
+        fingers(&mut shell, PinchKind::End, 600.0, 2_030);
+
+        assert_eq!(shell.recent().state().density, RecentDensity::ThreeColumns);
+        assert_eq!(shell.state().pinch.scale, 1.0);
+    }
+
+    #[test]
+    fn a_density_chosen_from_a_screen_reader_reflows_the_cards() {
+        // A11Y-05, ANIM-17
+        let fakes = Fakes::default();
+        let mut shell = on_recent(&fakes);
+        let reflow = shell.state().pinch.reflow;
+
+        shell.dispatch(ShellIntent::Recent(RecentIntent::SetDensity(
+            RecentDensity::TwoColumns,
+        )));
+
+        assert_eq!(shell.recent().state().columns(), 2);
+        assert_ne!(shell.state().pinch.reflow, reflow);
+        assert!(shell.state().pinch.animating);
     }
 
     /// A phone 1000 px wide, laid out.

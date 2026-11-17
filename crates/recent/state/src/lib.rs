@@ -1,7 +1,9 @@
-//! Recent state (SRS 4.4): recently used apps as cards, and close mode.
+//! Recent state (SRS 4.4): recently used apps as cards, their density and columns, and close
+//! mode.
 //!
-//! Usage history stays in memory. The only thing stored is the list of apps the user removed
-//! from Recent, which lives in the settings store (PRIV-03, ADR 0002).
+//! Usage history stays in memory. The only things stored are the density, more cards or bigger
+//! ones, and the list of apps the user removed from Recent, both in the settings store (PRIV-03,
+//! REC-05, ADR 0002).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,6 +15,11 @@ use meegone_core_state::{Access, App, AppId, ProfileId, RecentDensity, Rect, Sta
 
 /// At most this many cards (REC-03).
 pub const MAX_CARDS: usize = 18;
+/// With more cards, columns are added so no card is wider than this, in dp (REC-05). A phone's
+/// cards area is under 504 dp, so it always has three.
+pub const MAX_CARD_DP: f64 = 160.0;
+/// Between cards side by side, in dp, as the host lays them out (ADR 0023).
+pub const CARD_GAP_DP: f64 = 12.0;
 
 const MINUTE_MS: u64 = 60 * 1000;
 const HOUR_MS: u64 = 60 * MINUTE_MS;
@@ -48,6 +55,45 @@ impl Age {
     }
 }
 
+/// How many cards each row holds on a phone with `density`: three, or two for bigger cards. It is
+/// also how many rows of cards one phone screen shows (REC-05: 3×3 or 2×2).
+pub fn phone_columns(density: RecentDensity) -> u8 {
+    match density {
+        RecentDensity::ThreeColumns => 3,
+        RecentDensity::TwoColumns => 2,
+    }
+}
+
+/// How many cards each row holds with `density` in a cards area `width_dp` wide (REC-05).
+///
+/// With more cards, three, unless three cards would be wider than [`MAX_CARD_DP`]: then as few
+/// columns as keep every card at most that wide, so a large screen adds columns and cards keep a
+/// phone's size. Bigger cards take two columns for every three, rounded, so they are about half
+/// as wide again, and always fewer. A width not known yet gives a phone's columns.
+pub fn columns_for(density: RecentDensity, width_dp: f64) -> u8 {
+    let more = if width_dp.is_finite() && width_dp > 0.0 {
+        let fit = ((width_dp + CARD_GAP_DP) / (MAX_CARD_DP + CARD_GAP_DP)).ceil();
+        fit.clamp(3.0, f64::from(u8::MAX)) as u8
+    } else {
+        3
+    };
+    match density {
+        RecentDensity::ThreeColumns => more,
+        RecentDensity::TwoColumns => {
+            let bigger = (f64::from(more) * 2.0 / 3.0).round() as u8;
+            bigger.max(phone_columns(density))
+        }
+    }
+}
+
+/// The other choice: what a pinch or the screen-reader action switches to (REC-05, A11Y-05).
+pub fn other_density(density: RecentDensity) -> RecentDensity {
+    match density {
+        RecentDensity::ThreeColumns => RecentDensity::TwoColumns,
+        RecentDensity::TwoColumns => RecentDensity::ThreeColumns,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecentCard {
     pub app: App,
@@ -56,7 +102,7 @@ pub struct RecentCard {
     pub age: Age,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct RecentState {
     /// Without usage access, Recent shows its explainer card and no cards (REC-02).
     pub access: Access,
@@ -64,8 +110,29 @@ pub struct RecentState {
     pub cards: Vec<RecentCard>,
     /// REC-07
     pub close_mode: bool,
+    /// More cards or bigger ones, as last chosen by a pinch or from a screen reader (REC-05).
     pub density: RecentDensity,
+    /// How wide the cards area is, inside its margins, in dp, as the host last laid it out; 0
+    /// until it has.
+    pub width_dp: f64,
     pub problem: Option<String>,
+}
+
+impl RecentState {
+    /// How many cards each row holds now (REC-05).
+    pub fn columns(&self) -> u8 {
+        self.columns_of(self.density)
+    }
+
+    /// How many cards each row would hold with `density`, at the current width.
+    pub fn columns_of(&self, density: RecentDensity) -> u8 {
+        columns_for(density, self.width_dp)
+    }
+
+    /// Whether the cards show: with access and at least one app used (REC-03).
+    pub fn shows_cards(&self) -> bool {
+        self.access == Access::Granted && !self.cards.is_empty()
+    }
 }
 
 #[derive(Debug)]
@@ -82,6 +149,13 @@ pub enum RecentIntent {
     EnterCloseMode,
     /// Removes a card from Recent only; the app keeps running (REC-08).
     Remove(AppId),
+    /// The host laid the cards out `width_dp` wide, inside their margins (REC-05).
+    Layout {
+        width_dp: f64,
+    },
+    /// More cards or bigger ones, chosen by a pinch or from a screen reader (REC-05, A11Y-05).
+    /// The choice is saved, so it stays after a restart.
+    SetDensity(RecentDensity),
 }
 
 /// The cards for `uses`, newest first (REC-03). Pure, so Recent's filtering is tested without a
@@ -205,6 +279,23 @@ impl RecentHolder {
         }
     }
 
+    /// Saves `density`. A failed save keeps the cards as they were and says why (ARCH-09).
+    fn set_density(&mut self, density: RecentDensity) {
+        if density == self.state.density {
+            return;
+        }
+        let saved = self.settings.update(&mut |settings| {
+            settings.recent_density = density;
+        });
+        match saved {
+            Ok(settings) => {
+                self.state.density = settings.recent_density;
+                self.state.problem = None;
+            }
+            Err(error) => self.state.problem = Some(error.to_string()),
+        }
+    }
+
     fn remove(&mut self, app: AppId) {
         let now = self.system.now_ms();
         let saved = self.settings.update(&mut |settings| {
@@ -244,6 +335,14 @@ impl StateHolder for RecentHolder {
             }
             RecentIntent::EnterCloseMode => self.state.close_mode = true,
             RecentIntent::Remove(app) => self.remove(app),
+            RecentIntent::Layout { width_dp } => {
+                self.state.width_dp = if width_dp.is_finite() {
+                    width_dp.max(0.0)
+                } else {
+                    0.0
+                };
+            }
+            RecentIntent::SetDensity(density) => self.set_density(density),
         }
     }
 
@@ -579,6 +678,122 @@ mod tests {
 
         assert_eq!(*fakes.usage.access_screen_opened.lock().unwrap(), 1);
         assert_eq!(holder.state().problem, None);
+    }
+
+    #[test]
+    fn a_phone_shows_three_columns_or_two() {
+        // REC-05: 3×3 by default, 2×2 after a pinch, on any phone's cards area.
+        for tenths in 2_880..=5_040 {
+            let width = f64::from(tenths) / 10.0;
+            assert_eq!(
+                columns_for(RecentDensity::ThreeColumns, width),
+                3,
+                "{width} dp"
+            );
+            assert_eq!(
+                columns_for(RecentDensity::TwoColumns, width),
+                2,
+                "{width} dp"
+            );
+        }
+    }
+
+    #[test]
+    fn a_large_screen_adds_columns_so_cards_keep_their_size() {
+        // REC-05: both layouts add columns, and bigger cards always have fewer.
+        let card = |columns: u8, width: f64| {
+            let columns = f64::from(columns);
+            (width - (columns - 1.0) * CARD_GAP_DP) / columns
+        };
+        for tenths in 5_050..=25_600 {
+            let width = f64::from(tenths) / 10.0;
+            let more = columns_for(RecentDensity::ThreeColumns, width);
+            let bigger = columns_for(RecentDensity::TwoColumns, width);
+            assert!(bigger < more, "{width} dp: {bigger} and {more}");
+            assert!(
+                (115.0..=MAX_CARD_DP).contains(&card(more, width)),
+                "{width} dp: {more} columns"
+            );
+            let ratio = card(bigger, width) / card(more, width);
+            assert!((1.2..=1.8).contains(&ratio), "{width} dp: {ratio}");
+        }
+    }
+
+    #[test]
+    fn a_width_not_known_yet_gives_a_phones_columns() {
+        for width in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(columns_for(RecentDensity::ThreeColumns, width), 3);
+            assert_eq!(columns_for(RecentDensity::TwoColumns, width), 2);
+        }
+    }
+
+    #[test]
+    fn the_columns_follow_the_layout() {
+        // REC-05
+        let (_, _, mut holder) = setup(vec![]);
+        assert_eq!(holder.state().columns(), 3);
+
+        holder.handle(RecentIntent::Layout { width_dp: 1_000.0 });
+        assert_eq!(holder.state().columns(), 6);
+        assert_eq!(holder.state().columns_of(RecentDensity::TwoColumns), 4);
+
+        holder.handle(RecentIntent::Layout { width_dp: f64::NAN });
+        assert_eq!(holder.state().columns(), 3);
+    }
+
+    #[test]
+    fn the_density_chosen_stays_after_a_restart() {
+        // REC-05
+        let (fakes, _, mut holder) = setup(vec![used("mail", 1)]);
+        holder.handle(RecentIntent::Refresh);
+        assert_eq!(holder.state().density, RecentDensity::ThreeColumns);
+
+        holder.handle(RecentIntent::SetDensity(RecentDensity::TwoColumns));
+        assert_eq!(holder.state().density, RecentDensity::TwoColumns);
+        assert_eq!(holder.state().columns(), 2);
+        assert_eq!(holder.state().problem, None);
+
+        let mut restarted = RecentHolder::new(
+            fakes.usage.clone(),
+            fakes.apps.clone(),
+            Arc::new(PersistentSettingsStore::new(fakes.storage.clone())),
+            fakes.system.clone(),
+        );
+        restarted.handle(RecentIntent::Refresh);
+        assert_eq!(restarted.state().density, RecentDensity::TwoColumns);
+    }
+
+    #[test]
+    fn a_density_that_cant_be_saved_keeps_the_cards_and_says_why() {
+        // ARCH-09
+        let (fakes, settings, mut holder) = setup(vec![used("mail", 1)]);
+        holder.handle(RecentIntent::Refresh);
+        *fakes.storage.error.lock().unwrap() = Some(DataError::Failed("Storage full".into()));
+
+        holder.handle(RecentIntent::SetDensity(RecentDensity::TwoColumns));
+
+        assert_eq!(holder.state().density, RecentDensity::ThreeColumns);
+        assert_eq!(holder.state().problem.as_deref(), Some("Storage full"));
+        assert_eq!(settings.get().recent_density, RecentDensity::ThreeColumns);
+        assert_eq!(packages(&holder), ["mail"]);
+    }
+
+    #[test]
+    fn choosing_the_density_already_shown_saves_nothing() {
+        let (fakes, _, mut holder) = setup(vec![]);
+        holder.handle(RecentIntent::SetDensity(RecentDensity::ThreeColumns));
+
+        assert!(fakes.storage.writes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn each_density_switches_to_the_other() {
+        for density in [RecentDensity::ThreeColumns, RecentDensity::TwoColumns] {
+            assert_ne!(other_density(density), density);
+            assert_eq!(other_density(other_density(density)), density);
+        }
+        assert_eq!(phone_columns(RecentDensity::ThreeColumns), 3);
+        assert_eq!(phone_columns(RecentDensity::TwoColumns), 2);
     }
 
     #[test]

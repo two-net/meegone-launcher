@@ -84,6 +84,22 @@ pub struct RecentFrame {
     pub revision: u32,
     /// How many cards each row holds (REC-05).
     pub columns: u8,
+    /// How many rows of cards one phone screen shows: three, or two for bigger cards (REC-05).
+    /// It also says which way screen readers can switch.
+    pub rows_per_screen: u8,
+    /// Screen readers can switch between more cards and bigger ones (A11Y-05).
+    pub density_offered: bool,
+    /// The cards' scale in ten-thousandths while two fingers pinch them; 10 000 otherwise
+    /// (ANIM-17).
+    pub scale: u16,
+    /// Where the fingers first met, in whole pixels from the home views' top left: the cards
+    /// scale about it.
+    pub pivot: (i32, i32),
+    /// Changes each time the cards start to reflow from where they are drawn to their places:
+    /// after a pinch, and whenever the density changes (ANIM-17).
+    pub reflow: u32,
+    /// How far that reflow has come, from 0 to 10 000.
+    pub reflow_progress: u16,
 }
 
 /// The dragged icon, as the host draws it above everything (APPS-11, APPS-12, ADR 0015).
@@ -469,7 +485,8 @@ impl ShellView {
                 || state.folder.animating
                 || state.search.animating
                 || state.events_change.animating
-                || state.image_change.animating,
+                || state.image_change.animating
+                || state.pinch.animating,
             menu: state.menu.map(|menu| MenuFrame {
                 items: menu.items,
                 anchor: menu
@@ -506,10 +523,17 @@ impl ShellView {
                 .then(|| self.image_settings.show_card()),
             recent: shell.recent_ready().then(|| {
                 let revision = self.recent.show_cards(&shell.recent().state(), tokens);
+                let pinch = &state.pinch;
                 RecentFrame {
                     mode: self.recent.mode(),
                     revision,
                     columns: self.recent.columns(),
+                    rows_per_screen: self.recent.rows_per_screen(),
+                    density_offered: state.density_offered,
+                    scale: pinch_scale(pinch.scale),
+                    pivot: (pinch.pivot_x.round() as i32, pinch.pivot_y.round() as i32),
+                    reflow: pinch.reflow,
+                    reflow_progress: ten_thousandths(pinch.progress),
                 }
             }),
             background: tokens.background,
@@ -589,6 +613,11 @@ fn ten_thousandths(value: f64) -> u16 {
 /// A scale in ten-thousandths. Springs and pops go a little past their ends.
 fn scale(value: f64) -> u16 {
     (value.clamp(0.0, 1.5) * 10_000.0).round() as u16
+}
+
+/// A pinch's scale in ten-thousandths: the cards stretch a little past either density's size.
+fn pinch_scale(value: f64) -> u16 {
+    (value.clamp(0.1, 3.0) * 10_000.0).round() as u16
 }
 
 /// A dispatcher that queues a view's intents, wrapped for the shell.

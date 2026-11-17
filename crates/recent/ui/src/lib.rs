@@ -8,7 +8,7 @@
 use meegone_core_state::{Access, AppId, RecentDensity, Rect};
 use meegone_core_ui::{Dispatch, Rgb, Tokens, View};
 pub use meegone_recent_state::Age;
-use meegone_recent_state::{RecentCard, RecentIntent, RecentState};
+use meegone_recent_state::{RecentCard, RecentIntent, RecentState, phone_columns};
 
 /// What Recent shows below its title (REC-01).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -56,6 +56,7 @@ pub struct RecentView {
     dispatch: Dispatch<RecentIntent>,
     told: Told,
     columns: u8,
+    density: RecentDensity,
 }
 
 impl RecentView {
@@ -70,7 +71,8 @@ impl RecentView {
                 cards: Vec::new(),
                 revision: 0,
             },
-            columns: columns(RecentDensity::default()),
+            columns: phone_columns(RecentDensity::default()),
+            density: RecentDensity::default(),
         }
     }
 
@@ -79,7 +81,8 @@ impl RecentView {
     /// shows, so Recent is current as it slides in; the cards are made again only when the
     /// access, the cards or the theme change.
     pub fn show_cards(&mut self, state: &RecentState, tokens: &Tokens) -> u32 {
-        self.columns = columns(state.density);
+        self.columns = state.columns();
+        self.density = state.density;
         let told = &mut self.told;
         if told.access == state.access
             && told.from == state.cards
@@ -119,9 +122,35 @@ impl RecentView {
         &self.told.cards
     }
 
-    /// How many cards each row holds: three, or two after a pinch (REC-05).
+    /// How many cards each row holds: three, or two after a pinch, and more of each on a large
+    /// screen (REC-05).
     pub fn columns(&self) -> u8 {
         self.columns
+    }
+
+    /// The density as of the last [`RecentView::show_cards`]: more cards or bigger ones.
+    pub fn density(&self) -> RecentDensity {
+        self.density
+    }
+
+    /// How many rows of cards one phone screen shows: three, or two after a pinch (REC-05).
+    pub fn rows_per_screen(&self) -> u8 {
+        phone_columns(self.density)
+    }
+
+    /// The host laid the cards out `width_px` wide inside their margins, at `px_per_dp`, so
+    /// Recent picks the columns (REC-05). Says nothing while the size isn't known yet.
+    pub fn laid_out(&self, width_px: f64, px_per_dp: f64) {
+        if width_px > 0.0 && px_per_dp > 0.0 {
+            self.dispatch.send(RecentIntent::Layout {
+                width_dp: width_px / px_per_dp,
+            });
+        }
+    }
+
+    /// More cards or bigger ones were chosen without a pinch, from a screen reader (A11Y-05).
+    pub fn density_chosen(&self, density: RecentDensity) {
+        self.dispatch.send(RecentIntent::SetDensity(density));
     }
 
     /// Card `index` of the cards at `revision` was tapped, and is at `from` on the screen: its
@@ -155,13 +184,6 @@ impl RecentView {
     /// REC-08
     pub fn remove_tapped(&self, app: AppId) {
         self.dispatch.send(RecentIntent::Remove(app));
-    }
-}
-
-fn columns(density: RecentDensity) -> u8 {
-    match density {
-        RecentDensity::ThreeColumns => 3,
-        RecentDensity::TwoColumns => 2,
     }
 }
 

@@ -8,6 +8,7 @@ import android.graphics.Color;
 import android.graphics.ColorMatrix;
 import android.graphics.ColorMatrixColorFilter;
 import android.graphics.Rect;
+import android.graphics.RectF;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
@@ -16,13 +17,16 @@ import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.ViewParent;
 import android.view.accessibility.AccessibilityNodeInfo;
 import android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 import java.util.ArrayList;
+import java.util.IdentityHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * The Recent view (SRS 4.4, ADR 0023): its title, then the card that asks for usage access, "No
@@ -38,6 +42,12 @@ import java.util.List;
  * <p>A tap on a card names it by its place in the cards last read, and passes where it is on the
  * screen, so the app grows from it (REC-06, ANIM-08). Cards aren't long-clickable: a long-press
  * anywhere in Recent is the shell's, for close mode (REC-07, #24).
+ *
+ * <p>The rows hold as many cards as the frame says, three or two on a phone, and the plates are
+ * no taller than lets that many rows fit on one screen below the title (REC-05). This view
+ * reports how wide its cards are, and the Rust app picks the columns. While two fingers pinch
+ * the cards, they scale about where the fingers met; then they reflow from where they were
+ * drawn to their places, as the frame's progress says (ANIM-17, ADR 0024).
  */
 final class RecentList extends LinearLayout {
     // What shows, the frame's slot 94, mirrored in src/android.rs.
@@ -96,6 +106,9 @@ final class RecentList extends LinearLayout {
 
         /** Card {@code index} of the cards last read was tapped, at {@code onScreen} (REC-06). */
         void tapped(int index, Rect onScreen);
+
+        /** The cards were laid out {@code widthPx} wide, inside the margins (REC-05). */
+        void laidOut(int widthPx);
     }
 
     private final AppIcons icons;
@@ -107,7 +120,20 @@ final class RecentList extends LinearLayout {
     private final Grid grid;
     private final List<Card> shown = new ArrayList<>();
     private int columns = 3;
+    /** How many rows of cards one screen holds (REC-05). */
+    private int rows = 3;
+    /** How tall the page's content is, inside the safe area, in px; 0 until it is known. */
+    private int viewport;
     private float ratio = PHONE_RATIO;
+    /** The reflow last started, as the frame's slot 100, or -1 before the first frame. */
+    private long reflowShown = -1;
+    /** How far the reflow has come, from 0 to 1. */
+    private float progress = 1f;
+    /** Where each card was drawn as the reflow started, in the grid's coordinates. */
+    private final Map<Card, RectF> drawn = new IdentityHashMap<>();
+    /** Each card's offset and scale at the start of the reflow, once laid out in its place. */
+    private final Map<Card, float[]> starts = new IdentityHashMap<>();
+    private final float[] point = new float[2];
     private int foreground = -1;
     private int dim = -1;
     private int surface = -1;
@@ -122,6 +148,9 @@ final class RecentList extends LinearLayout {
         int margin = dp(MARGIN_DP);
         setOrientation(VERTICAL);
         setPadding(margin, dp(GAP_DP), margin, dp(MARGIN_DP));
+        // Pinched cards may grow past the margins (ANIM-17).
+        setClipToPadding(false);
+        setClipChildren(false);
 
         // REC-01: the view's name, also a heading for screen readers.
         title = new SectionHeader(context, R.string.view_recent);
@@ -168,6 +197,118 @@ final class RecentList extends LinearLayout {
         if (next != this.columns) {
             this.columns = next;
             grid.requestLayout();
+        }
+    }
+
+    /** How many rows of cards one screen holds, as the frame's slot 102 says (REC-05). */
+    void rows(int rows) {
+        int next = Math.max(1, rows);
+        if (next != this.rows) {
+            this.rows = next;
+            grid.requestLayout();
+        }
+    }
+
+    /** How tall the page's content is, inside the safe area, in px (REC-05). */
+    void viewport(int height) {
+        int next = Math.max(0, height);
+        if (next != viewport) {
+            viewport = next;
+            grid.requestLayout();
+        }
+    }
+
+    /**
+     * The cards' scale while two fingers pinch them, about ({@code x}, {@code y}) in {@code
+     * ancestor}'s coordinates, where the fingers met (ANIM-17).
+     */
+    void pinch(float scale, float x, float y, View ancestor) {
+        if (scale == 1f && grid.getScaleX() == 1f) {
+            return;
+        }
+        point[0] = x;
+        point[1] = y;
+        toGrid(ancestor);
+        grid.setPivotX(point[0]);
+        grid.setPivotY(point[1]);
+        grid.setScaleX(scale);
+        grid.setScaleY(scale);
+    }
+
+    /**
+     * The frame's reflow, slot 100: when it changes, each card is about to move from where it
+     * is drawn now to its place, so this records where that is. Call it before the scale and the
+     * columns change.
+     */
+    void reflow(long reflow) {
+        if (reflow == reflowShown) {
+            return;
+        }
+        boolean first = reflowShown < 0;
+        reflowShown = reflow;
+        if (first) {
+            return;
+        }
+        drawn.clear();
+        starts.clear();
+        float scale = grid.getScaleX();
+        float pivotX = grid.getPivotX();
+        float pivotY = grid.getPivotY();
+        for (Card card : shown) {
+            float left = card.getLeft() + card.getTranslationX();
+            float top = card.getTop() + card.getTranslationY();
+            float width = card.getWidth() * card.getScaleX();
+            float height = card.getHeight() * card.getScaleY();
+            left = pivotX + (left - pivotX) * scale;
+            top = pivotY + (top - pivotY) * scale;
+            drawn.put(card, new RectF(left, top, left + width * scale, top + height * scale));
+        }
+        // The cards are laid out again, even if their columns stay, so each finds its start.
+        grid.requestLayout();
+    }
+
+    /** How far the reflow has come, from 0 to 10 000, as the frame's slot 101 says (ANIM-17). */
+    void progress(int progress) {
+        float next = Math.max(0f, Math.min(1f, progress / 10_000f));
+        if (next != this.progress) {
+            this.progress = next;
+            place();
+        }
+    }
+
+    /** Moves each card from where it was drawn towards its place, as far as the reflow says. */
+    private void place() {
+        boolean done = progress >= 1f;
+        for (Card card : shown) {
+            float[] start = done ? null : starts.get(card);
+            float rest = 1f - progress;
+            card.setPivotX(0f);
+            card.setPivotY(0f);
+            card.setTranslationX(start == null ? 0f : start[0] * rest);
+            card.setTranslationY(start == null ? 0f : start[1] * rest);
+            float scale = start == null ? 1f : start[2] + (1f - start[2]) * progress;
+            card.setScaleX(scale);
+            card.setScaleY(scale);
+        }
+        if (done) {
+            drawn.clear();
+            starts.clear();
+        }
+    }
+
+    /** {@link #point}, in {@code ancestor}'s coordinates, in the grid's, by layout and scroll. */
+    private void toGrid(View ancestor) {
+        View view = grid;
+        while (view != ancestor) {
+            point[0] -= view.getLeft();
+            point[1] -= view.getTop();
+            ViewParent parent = view.getParent();
+            if (!(parent instanceof View)) {
+                return;
+            }
+            view = (View) parent;
+            point[0] += view.getScrollX();
+            point[1] += view.getScrollY();
         }
     }
 
@@ -274,14 +415,23 @@ final class RecentList extends LinearLayout {
         }
 
         @Override
+        protected void onSizeChanged(int width, int height, int oldWidth, int oldHeight) {
+            super.onSizeChanged(width, height, oldWidth, oldHeight);
+            if (width != oldWidth && width > 0) {
+                // Not during layout: the columns it picks lay the cards out again.
+                post(() -> listener.laidOut(getWidth()));
+            }
+        }
+
+        @Override
         protected void onMeasure(int widthSpec, int heightSpec) {
             int width = MeasureSpec.getSize(widthSpec);
             int gap = dp(GAP_DP);
             int cellWidth = Math.max(0, (width - (columns - 1) * gap) / columns);
-            int plate = Math.round(cellWidth * ratio);
             int icon = Math.min(dp(ICON_DP), Math.round(cellWidth * ICON_SHARE));
             int childWidth = MeasureSpec.makeMeasureSpec(cellWidth, MeasureSpec.EXACTLY);
             int childHeight = MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED);
+            int plate = plateHeight(cellWidth, icon, childWidth, childHeight);
             int height = 0;
             int rowHeight = 0;
             for (int i = 0; i < getChildCount(); i++) {
@@ -297,6 +447,29 @@ final class RecentList extends LinearLayout {
             setMeasuredDimension(width, resolveSize(height, heightSpec));
         }
 
+        /**
+         * A plate's height: the window's proportions, but no taller than lets {@link #rows} rows
+         * fit on one screen below the title, with their labels at the current font size (REC-05),
+         * and never squatter than {@link #MIN_RATIO}.
+         */
+        private int plateHeight(int cellWidth, int icon, int childWidth, int childHeight) {
+            int byWindow = Math.round(cellWidth * ratio);
+            if (viewport <= 0 || getChildCount() == 0) {
+                return byWindow;
+            }
+            // The label and the age under a plate, measured on a card with no plate.
+            Card sample = (Card) getChildAt(0);
+            sample.size(0, icon);
+            sample.measure(childWidth, childHeight);
+            int caption = sample.getMeasuredHeight();
+            int above = RecentList.this.getPaddingTop() + title.getMeasuredHeight()
+                    + ((MarginLayoutParams) getLayoutParams()).topMargin;
+            int room = viewport - above - RecentList.this.getPaddingBottom()
+                    - (rows - 1) * dp(ROW_GAP_DP);
+            int fit = room / rows - caption;
+            return Math.max(Math.round(cellWidth * MIN_RATIO), Math.min(byWindow, fit));
+        }
+
         @Override
         protected void onLayout(boolean changed, int left, int top, int right, int bottom) {
             int width = right - left;
@@ -305,7 +478,7 @@ final class RecentList extends LinearLayout {
             int y = 0;
             int rowHeight = 0;
             for (int i = 0; i < getChildCount(); i++) {
-                View card = getChildAt(i);
+                Card card = (Card) getChildAt(i);
                 int column = i % columns;
                 int cardWidth = card.getMeasuredWidth();
                 int x = column * (cardWidth + gap);
@@ -318,7 +491,15 @@ final class RecentList extends LinearLayout {
                     y += rowHeight + dp(ROW_GAP_DP);
                     rowHeight = 0;
                 }
+                // A card in a reflow starts where it was drawn (ANIM-17).
+                RectF from = drawn.remove(card);
+                if (from != null && cardWidth > 0) {
+                    starts.put(card, new float[] {
+                        from.left - x, from.top - card.getTop(), from.width() / cardWidth
+                    });
+                }
             }
+            place();
         }
     }
 

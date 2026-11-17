@@ -5,6 +5,9 @@
     <item name="action_previous_view" type="id" />
     <item name="action_home_menu" type="id" />
     <item name="action_search" type="id" />
+    <!-- Recent's density, without a pinch (A11Y-05, REC-05). -->
+    <item name="action_bigger_cards" type="id" />
+    <item name="action_more_cards" type="id" />
     <!-- An app's screen-reader actions in edit mode (A11Y-01, A11Y-05). -->
     <item name="action_uninstall" type="id" />
     <item name="action_move_first" type="id" />

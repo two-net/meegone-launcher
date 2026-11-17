@@ -238,4 +238,8 @@
     <string name="recent_card_description">%1$s, %2$s</string>
     <!-- What screen readers say a tap on a Recent card does (REC-06, A11Y-01). -->
     <string name="action_open_app">Open</string>
+    <!-- Screen-reader actions that switch Recent between two cards to a row and three, as a
+         pinch does (REC-05, A11Y-05). Also read out once the cards have changed. -->
+    <string name="action_bigger_cards">Bigger cards</string>
+    <string name="action_more_cards">More cards</string>
 </resources>

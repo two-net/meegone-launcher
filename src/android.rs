@@ -16,7 +16,9 @@
 //! (ADR 0014). Search's field sends each change of its text, and its results are a third grid
 //! (ADR 0016). Events' rows are read the same way, with `nativeEventsList`, and named by
 //! revision and place when tapped or long-pressed (ADR 0020, ADR 0021). So are Recent's cards,
-//! with `nativeRecentCards`, named by revision and place when tapped (ADR 0023).
+//! with `nativeRecentCards`, named by revision and place when tapped (ADR 0023). Two fingers on
+//! the home views reach the shell through `nativePinch`, which may pinch Recent's cards (ADR
+//! 0024).
 //!
 //! A bug in MeeGone becomes a Java `RuntimeException` instead of an abort, so its message
 //! reaches logcat. Containing it keeps `panic = "unwind"`, as ARCH-09 already requires.
@@ -29,13 +31,13 @@ use std::panic::{self, AssertUnwindSafe};
 use std::time::Duration;
 
 use meegone_core_data::android::{self, Env, JObject, LocalRef, RawEnv};
-use meegone_core_data::{App, Rect, Rgb, accent};
+use meegone_core_data::{App, RecentDensity, Rect, Rgb, accent};
 
 use crate::{
     Age, AppMenuItem, BADGE_ROWS, Bounds, Cell, CellKey, Direction, EventsListMode, EventsRow,
     FOLDER_COLUMNS, FolderId, GridLayout, HomeFrame, HomeView, Launcher, Layout, MenuItem,
-    NotificationMenuItem, PREVIEW_APPS, PointerEvent, PointerKind, RecentMode, RowTarget,
-    SavedHome, SettingsGroup, ShellIntent, ShownCard, Surface,
+    NotificationMenuItem, PREVIEW_APPS, PinchEvent, PinchKind, PointerEvent, PointerKind,
+    RecentMode, RowTarget, SavedHome, SettingsGroup, ShellIntent, ShownCard, Surface,
 };
 
 /// JNI's `jboolean`.
@@ -347,9 +349,9 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeLayo
 }
 
 /// `boolean nativePointer(int action, float x, float y, long timeNanos)`: the first finger on
-/// the home views, with `MotionEvent`'s action. Returns whether the carousel, a long-press or
-/// the search field's pull has taken the gesture, so the content below gets no more of it
-/// (HOME-03, HOME-10, SRCH-01).
+/// the home views, with `MotionEvent`'s action. Returns whether the carousel, a long-press, the
+/// search field's pull or a pinch has taken the gesture, so the content below gets no more of it
+/// (HOME-03, HOME-10, SRCH-01, ANIM-17).
 ///
 /// # Safety
 ///
@@ -383,9 +385,55 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativePoin
         }));
         launcher.frame();
         let state = launcher.shell().state();
-        taken = state.carousel.dragging || state.carousel.held || state.search.pulling;
+        taken = state.carousel.dragging
+            || state.carousel.held
+            || state.search.pulling
+            || state.pinch.holding;
     });
     JBoolean::from(taken)
+}
+
+/// `boolean nativePinch(int action, float span, float x, float y, long timeNanos)`: two fingers
+/// on the home views (ANIM-17, ADR 0024). `action` is 0 when the second finger goes down, 1 as
+/// either moves, 2 when one of them lifts and 3 when the system takes the gesture; `span` is how
+/// far apart they are and (`x`, `y`) the point halfway between them, in px. Returns whether a
+/// pinch holds the gesture, so the carousel and the content below get no more of it.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativePinch(
+    env: RawEnv,
+    _views: JObject,
+    action: i32,
+    span: f32,
+    x: f32,
+    y: f32,
+    time_nanos: i64,
+) -> JBoolean {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    let kind = match action {
+        0 => PinchKind::Start,
+        1 => PinchKind::Move,
+        2 => PinchKind::End,
+        3 => PinchKind::Cancel,
+        _ => return 0,
+    };
+    let mut holding = false;
+    with_launcher(env, |launcher| {
+        launcher.dispatch(ShellIntent::Pinch(PinchEvent {
+            kind,
+            span_px: f64::from(span),
+            x: f64::from(x),
+            y: f64::from(y),
+            at: uptime(time_nanos),
+        }));
+        launcher.frame();
+        holding = launcher.shell().state().pinch.holding;
+    });
+    JBoolean::from(holding)
 }
 
 /// `boolean nativeLongPress()`: the finger that is down has stayed on empty space for the
@@ -1103,6 +1151,60 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRece
             .view()
             .recent()
             .card_tapped(revision as u32, index, from)
+    })
+}
+
+/// `void nativeRecentLayout(int widthPx)`: Recent's cards were laid out `widthPx` wide, inside
+/// their margins, so it picks their columns (REC-05).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRecentLayout(
+    env: RawEnv,
+    _views: JObject,
+    width_px: i32,
+) {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_launcher(env, |launcher| {
+        let density = launcher.shell().state().carousel.layout.density;
+        launcher
+            .view()
+            .recent()
+            .laid_out(f64::from(width_px), density);
+        launcher.frame();
+    });
+}
+
+/// `String nativeRecentDensity(int rows)`: a screen reader chose bigger cards, 2, or more cards,
+/// 3, without a pinch (A11Y-05). The choice is saved, and the cards reflow (ANIM-17). Returns
+/// `null`, or a short message to show when it couldn't be saved. Does nothing unless the cards
+/// show with nothing covering them.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRecentDensity(
+    env: RawEnv,
+    _views: JObject,
+    rows: i32,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_recent_message(env, |launcher| {
+        let density = match rows {
+            2 => RecentDensity::TwoColumns,
+            3 => RecentDensity::ThreeColumns,
+            _ => return false,
+        };
+        if !launcher.shell().state().density_offered {
+            return false;
+        }
+        launcher.view().recent().density_chosen(density);
+        true
     })
 }
 
@@ -2131,7 +2233,7 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRead
 }
 
 /// How many slots the frame has.
-const FRAME_SLOTS: usize = 97;
+const FRAME_SLOTS: usize = 104;
 
 /// A `HomeFrame` as the `int[]` that `HomeViews.java` reads, slot by slot:
 ///
@@ -2215,6 +2317,12 @@ const FRAME_SLOTS: usize = 97;
 /// | 94 | What Recent shows below its title: 0 nothing, while Recent isn't working (ARCH-09); 1 the usage-access card (REC-02); 2 "No recent apps" (REC-10); 3 the cards (REC-03) |
 /// | 95 | Recent's revision: when it changes, the cards are read again with `nativeRecentCards` |
 /// | 96 | How many cards each of Recent's rows holds (REC-05) |
+/// | 97 | Recent's cards' scale in ten-thousandths while two fingers pinch them; 10 000 otherwise (ANIM-17) |
+/// | 98–99 | Where the fingers first met, in px from the home views' top left: the cards scale about it |
+/// | 100 | Changes each time Recent's cards start to reflow from where they are drawn to their places (ANIM-17) |
+/// | 101 | How far that reflow has come, 0 to 10 000 |
+/// | 102 | How many rows of cards one phone screen shows: 3, or 2 for bigger cards (REC-05) |
+/// | 103 | 1 while screen readers can switch between more and bigger cards (A11Y-05); otherwise 0 |
 fn frame_slots(frame: &HomeFrame) -> [i32; FRAME_SLOTS] {
     let [events, applications, recent] = frame.pages;
     let menu_items = frame.menu.map_or(0, |menu| {
@@ -2371,6 +2479,21 @@ fn frame_slots(frame: &HomeFrame) -> [i32; FRAME_SLOTS] {
         }),
         frame.recent.map_or(0, |recent| recent.revision as i32),
         frame.recent.map_or(0, |recent| i32::from(recent.columns)),
+        frame
+            .recent
+            .map_or(10_000, |recent| i32::from(recent.scale)),
+        frame.recent.map_or(0, |recent| recent.pivot.0),
+        frame.recent.map_or(0, |recent| recent.pivot.1),
+        frame.recent.map_or(0, |recent| recent.reflow as i32),
+        frame
+            .recent
+            .map_or(10_000, |recent| i32::from(recent.reflow_progress)),
+        frame
+            .recent
+            .map_or(3, |recent| i32::from(recent.rows_per_screen)),
+        frame
+            .recent
+            .map_or(0, |recent| i32::from(recent.density_offered)),
     ];
     slots[40 + BADGE_ROWS..].copy_from_slice(&rest);
     slots

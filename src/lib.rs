@@ -11,8 +11,8 @@ mod android;
 pub use meegone_core_data::{Platform, Rect};
 pub use meegone_shell_state::{
     Direction, EventsChangeState, FOLDER_COLUMNS, GridChangeState, HomeMenu, HomeShell, HomeView,
-    ImageChangeState, Layout, LiftState, MenuItem, PREVIEW_APPS, PointerEvent, PointerKind,
-    PressState, SavedHome, SettingsGroup, ShellIntent,
+    ImageChangeState, Layout, LiftState, MenuItem, PREVIEW_APPS, PinchEvent, PinchKind, PinchState,
+    PointerEvent, PointerKind, PressState, SavedHome, SettingsGroup, ShellIntent,
 };
 use meegone_shell_ui::ShellView;
 pub use meegone_shell_ui::{

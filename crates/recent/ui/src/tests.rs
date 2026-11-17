@@ -232,6 +232,51 @@ fn the_columns_follow_the_density() {
     recent.density = RecentDensity::ThreeColumns;
     assert_eq!(view.show_cards(&recent, &LIGHT), revision);
     assert_eq!(view.columns(), 3);
+    assert_eq!(view.density(), RecentDensity::ThreeColumns);
+    assert_eq!(view.rows_per_screen(), 3);
+}
+
+#[test]
+fn a_large_screen_adds_columns_to_both_densities() {
+    // REC-05
+    let (mut view, _) = view();
+    let mut recent = mail_and_maps();
+    recent.width_dp = 1_000.0;
+
+    view.show_cards(&recent, &LIGHT);
+    assert_eq!(view.columns(), 6);
+
+    recent.density = RecentDensity::TwoColumns;
+    view.show_cards(&recent, &LIGHT);
+    assert_eq!(view.columns(), 4);
+    assert_eq!(view.rows_per_screen(), 2);
+}
+
+#[test]
+fn the_host_says_how_wide_the_cards_are_in_dp() {
+    // REC-05
+    let (view, sent) = view();
+
+    view.laid_out(990.0, 2.75);
+    view.laid_out(0.0, 2.75);
+    view.laid_out(990.0, 0.0);
+
+    let sent = sent.borrow();
+    assert_eq!(sent.len(), 1, "nothing until the size is known");
+    assert!(matches!(sent[0], RecentIntent::Layout { width_dp } if width_dp == 360.0));
+}
+
+#[test]
+fn a_screen_reader_chooses_the_density_without_a_pinch() {
+    // A11Y-05
+    let (view, sent) = view();
+
+    view.density_chosen(RecentDensity::TwoColumns);
+
+    assert!(matches!(
+        sent.borrow()[..],
+        [RecentIntent::SetDensity(RecentDensity::TwoColumns)]
+    ));
 }
 
 #[test]

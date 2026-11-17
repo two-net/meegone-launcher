@@ -43,7 +43,8 @@ import java.util.List;
  * The three home views, Events, Applications and Recent, in a wrap-around carousel (HOME-02 to
  * HOME-04), drawn with Android's own views (ADR 0006). They come back from an app with a short
  * scale and fade (ANIM-09, ADR 0007). A long-press on empty space opens the home menu, or enters
- * close mode in Recent (HOME-10, ADR 0008). A long-press on an app's or a folder's icon opens
+ * close mode in Recent (HOME-10, ADR 0008). Two fingers on Recent's cards pinch them between
+ * more and bigger ones (REC-05, ADR 0024). A long-press on an app's or a folder's icon opens
  * its menu, and dragging on picks the icon up (APPS-11, ADR 0013), which {@link DragShadow}
  * draws above the pages. A tap on a folder opens it in a {@link FolderPanel} inside the
  * Applications page, with its own {@link AppsGrid}; renaming it asks for the name in a dialog
@@ -174,7 +175,15 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private static final int RECENT = 94; // RecentList.NOTHING, EXPLAINER, EMPTY or CARDS
     private static final int RECENT_REVISION = 95; // changes when its cards change
     private static final int RECENT_COLUMNS = 96; // cards in each row
-    private static final int FRAME_SIZE = 97;
+    // Recent's pinch and its cards' reflow (REC-05, ANIM-17, ADR 0024):
+    private static final int RECENT_SCALE = 97; // ten-thousandths; 10 000 at rest
+    private static final int RECENT_PIVOT_X = 98; // where the fingers met, in px
+    private static final int RECENT_PIVOT_Y = 99;
+    private static final int RECENT_REFLOW = 100; // changes when a reflow starts
+    private static final int RECENT_REFLOW_PROGRESS = 101; // 0 to 10 000
+    private static final int RECENT_ROWS = 102; // rows on one screen: 3, or 2 for bigger cards
+    private static final int RECENT_DENSITY_OFFERED = 103; // 1 while screen readers can switch
+    private static final int FRAME_SIZE = 104;
     private static final int SEARCH_OPEN = 1; // the field has the keyboard
     private static final int SEARCH_RESULTS = 2; // the results show instead of the grid
     private static final int SEARCH_NOTHING = 4; // nothing matches
@@ -197,6 +206,11 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         R.string.menu_lock_screen_image,
         R.string.menu_edit_applications
     };
+    // A pinch's actions in nativePinch, mirrored in src/android.rs.
+    private static final int PINCH_START = 0;
+    private static final int PINCH_MOVE = 1;
+    private static final int PINCH_END = 2;
+    private static final int PINCH_CANCEL = 3;
     /** Passed to {@link #nativeMenu} for a touch outside the menu. */
     private static final int CLOSE_MENU = -1;
     /** The app menu's slot while it is closed. */
@@ -300,6 +314,9 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private boolean swallowing;
     /** The finger that drives the carousel. */
     private int pointerId = MotionEvent.INVALID_POINTER_ID;
+    /** The two fingers of a pinch, while both are down (ANIM-17). */
+    private int pinchFirst = MotionEvent.INVALID_POINTER_ID;
+    private int pinchSecond = MotionEvent.INVALID_POINTER_ID;
     /** Where the driving finger went down, for finding what is under it after a long-press. */
     private float downX;
     private float downY;
@@ -336,6 +353,8 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private long recentShown = -1;
     private int imageDetailsShown;
     private int menuOffered = -1;
+    /** The density action screen readers were last offered: its rows, or 0 for none. */
+    private int densityOffered = -1;
     /** Whether screen readers can open search, as last told, or -1 before the first frame. */
     private int searchOffered = -1;
     /** Whether search was open as last drawn: the field has the keyboard. */
@@ -423,6 +442,12 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             @Override
             public void tapped(int index, Rect onScreen) {
                 recentCardTapped(index, onScreen);
+            }
+
+            @Override
+            public void laidOut(int widthPx) {
+                nativeRecentLayout(widthPx);
+                apply();
             }
         });
         doneMargin = dp(16);
@@ -613,8 +638,10 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     @Override
     protected void onSizeChanged(int width, int height, int oldWidth, int oldHeight) {
         super.onSizeChanged(width, height, oldWidth, oldHeight);
-        // Recent's cards take the window's proportions (REC-04).
+        // Recent's cards take the window's proportions, and fit their rows on screen (REC-04,
+        // REC-05).
         recentList.window(width, height);
+        recentList.viewport(height - safe.top - safe.bottom);
         sendLayout();
         apply();
     }
@@ -658,6 +685,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         }
         settings.setPadding(safe.left, safe.top, safe.right, safe.bottom);
         imageDetails.setPadding(safe.left, safe.top, safe.right, safe.bottom);
+        recentList.viewport(getHeight() - safe.top - safe.bottom);
         LayoutParams params = (LayoutParams) indicator.getLayoutParams();
         if (params.topMargin != safe.top + indicatorMargin) {
             params.topMargin = safe.top + indicatorMargin;
@@ -766,6 +794,9 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         }
         if (!childClaimed) {
             claimed = forward(event);
+            if (pinch(event)) {
+                claimed = true;
+            }
             apply();
         }
         watchForLongPress(event);
@@ -830,6 +861,66 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             default:
                 return claimed;
         }
+    }
+
+    /**
+     * Passes the first two fingers to the Rust app, which may pinch Recent's cards with them
+     * (REC-05, ANIM-17). Returns whether a pinch holds the gesture, so the content below gets no
+     * more of it. A third finger changes nothing.
+     */
+    private boolean pinch(MotionEvent event) {
+        switch (event.getActionMasked()) {
+            case MotionEvent.ACTION_POINTER_DOWN:
+                if (pinchFirst != MotionEvent.INVALID_POINTER_ID || event.getPointerCount() != 2) {
+                    return false;
+                }
+                pinchFirst = event.getPointerId(0);
+                pinchSecond = event.getPointerId(1);
+                return sendPinch(PINCH_START, event);
+            case MotionEvent.ACTION_MOVE:
+                return pinchFirst != MotionEvent.INVALID_POINTER_ID
+                        && sendPinch(PINCH_MOVE, event);
+            case MotionEvent.ACTION_POINTER_UP: {
+                int id = event.getPointerId(event.getActionIndex());
+                if (pinchFirst == MotionEvent.INVALID_POINTER_ID
+                        || (id != pinchFirst && id != pinchSecond)) {
+                    return false;
+                }
+                boolean holding = sendPinch(PINCH_END, event);
+                pinchFirst = MotionEvent.INVALID_POINTER_ID;
+                pinchSecond = MotionEvent.INVALID_POINTER_ID;
+                return holding;
+            }
+            case MotionEvent.ACTION_CANCEL:
+                if (pinchFirst != MotionEvent.INVALID_POINTER_ID) {
+                    nativePinch(PINCH_CANCEL, 0f, 0f, 0f, eventNanos(event));
+                }
+                pinchFirst = MotionEvent.INVALID_POINTER_ID;
+                pinchSecond = MotionEvent.INVALID_POINTER_ID;
+                return false;
+            case MotionEvent.ACTION_DOWN:
+            case MotionEvent.ACTION_UP:
+                pinchFirst = MotionEvent.INVALID_POINTER_ID;
+                pinchSecond = MotionEvent.INVALID_POINTER_ID;
+                return false;
+            default:
+                return false;
+        }
+    }
+
+    /** The pinch's two fingers: how far apart they are, and the point halfway between them. */
+    private boolean sendPinch(int action, MotionEvent event) {
+        int first = event.findPointerIndex(pinchFirst);
+        int second = event.findPointerIndex(pinchSecond);
+        if (first < 0 || second < 0) {
+            return false;
+        }
+        float x1 = event.getX(first);
+        float y1 = event.getY(first);
+        float x2 = event.getX(second);
+        float y2 = event.getY(second);
+        float span = (float) Math.hypot(x2 - x1, y2 - y1);
+        return nativePinch(action, span, (x1 + x2) / 2f, (y1 + y2) / 2f, eventNanos(event));
     }
 
     /**
@@ -1056,10 +1147,13 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         applyMenu();
         applyRename();
         int offered = (frame[SEARCH] & SEARCH_OFFERED) != 0 ? 1 : 0;
-        if (frame[MENU_OFFERED] != menuOffered || offered != searchOffered) {
+        int density = frame[RECENT_DENSITY_OFFERED] != 0 ? frame[RECENT_ROWS] : 0;
+        if (frame[MENU_OFFERED] != menuOffered || offered != searchOffered
+                || density != densityOffered) {
             // Screen readers ask again which actions the home views offer.
             menuOffered = frame[MENU_OFFERED];
             searchOffered = offered;
+            densityOffered = density;
             sendAccessibilityEvent(AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED);
         }
         if (frame[ANIMATING] != 0 && !framePosted && isAttachedToWindow()) {
@@ -1344,12 +1438,33 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         int mode = frame[RECENT];
         recentList.show(mode);
         recentList.colour(foreground, dim, surface, frame[ACCENT], frame[DIVIDER]);
+        // Where each card is drawn, before the pinch lets go and the columns change (ANIM-17).
+        recentList.reflow(frame[RECENT_REFLOW] & 0xFFFF_FFFFL);
+        recentList.pinch(frame[RECENT_SCALE] / 10_000f, frame[RECENT_PIVOT_X],
+                frame[RECENT_PIVOT_Y], this);
         recentList.columns(frame[RECENT_COLUMNS]);
+        recentList.rows(frame[RECENT_ROWS]);
         long revision = frame[RECENT_REVISION] & 0xFFFF_FFFFL;
         if (mode != RecentList.NOTHING && revision != recentShown) {
             recentShown = revision;
             recentList.fill(nativeRecentCards());
         }
+        recentList.progress(frame[RECENT_REFLOW_PROGRESS]);
+    }
+
+    /**
+     * A screen reader chose bigger cards, with 2 rows to a screen, or more cards, with 3
+     * (A11Y-05). Returns whether Recent now shows them, which the status says (A11Y-08).
+     */
+    private boolean chooseDensity(int rows) {
+        String message = nativeRecentDensity(rows);
+        apply();
+        toast(message);
+        if (frame[RECENT_ROWS] != rows) {
+            return false;
+        }
+        status.setText(rows == 2 ? R.string.action_bigger_cards : R.string.action_more_cards);
+        return true;
     }
 
     /** Allow was tapped on Recent's card (REC-02): the system's usage-access screen opens. */
@@ -1747,8 +1862,8 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         }
     }
 
-    // Screen readers switch views, open the home menu and open search with actions instead of
-    // gestures (A11Y-05).
+    // Screen readers switch views, open the home menu, open search and switch Recent between more
+    // and bigger cards with actions instead of gestures (A11Y-05).
     @Override
     public void onInitializeAccessibilityNodeInfo(AccessibilityNodeInfo info) {
         super.onInitializeAccessibilityNodeInfo(info);
@@ -1769,6 +1884,14 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             info.addAction(new AccessibilityAction(
                     R.id.action_search, getResources().getString(R.string.search_action)));
         }
+        if (frame[RECENT_DENSITY_OFFERED] != 0) {
+            // The other density from the one shown (REC-05).
+            boolean bigger = frame[RECENT_ROWS] != 2;
+            info.addAction(new AccessibilityAction(
+                    bigger ? R.id.action_bigger_cards : R.id.action_more_cards,
+                    getResources().getString(
+                            bigger ? R.string.action_bigger_cards : R.string.action_more_cards)));
+        }
     }
 
     @Override
@@ -1782,6 +1905,12 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             nativeOpenSearch();
             apply();
             return (frame[SEARCH] & SEARCH_OPEN) != 0;
+        }
+        if (action == R.id.action_bigger_cards) {
+            return chooseDensity(2);
+        }
+        if (action == R.id.action_more_cards) {
+            return chooseDensity(3);
         }
         boolean rtl = getLayoutDirection() == LAYOUT_DIRECTION_RTL;
         Boolean next = null;
@@ -1827,10 +1956,18 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
 
     /**
      * The driving finger, with a {@code MotionEvent} action and a time in the {@code
-     * System.nanoTime()} base. Returns whether the carousel, a long-press or the search field's
-     * pull has taken the gesture.
+     * System.nanoTime()} base. Returns whether the carousel, a long-press, the search field's
+     * pull or a pinch has taken the gesture.
      */
     private native boolean nativePointer(int action, float x, float y, long timeNanos);
+
+    /**
+     * A pinch's two fingers, with one of the {@code PINCH_} actions: how far apart they are and
+     * the point halfway between them, in px, at a time in the {@code System.nanoTime()} base
+     * (ANIM-17). Returns whether a pinch holds the gesture.
+     */
+    private native boolean nativePinch(int action, float span, float x, float y,
+            long timeNanos);
 
     /** The display is about to draw a frame at this {@code System.nanoTime()}. */
     private native void nativeFrame(long frameTimeNanos);
@@ -1950,6 +2087,15 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
      * to show when no system screen could open.
      */
     private native String nativeAllowUsage();
+
+    /** Recent's cards were laid out this wide, inside their margins (REC-05). */
+    private native void nativeRecentLayout(int widthPx);
+
+    /**
+     * A screen reader chose bigger cards, 2, or more cards, 3 (A11Y-05). Returns null, or a
+     * short message to show when the choice couldn't be saved.
+     */
+    private native String nativeRecentDensity(int rows);
 
     /**
      * Row {@code index} of the Events rows at {@code revision} was tapped, at this rect on the

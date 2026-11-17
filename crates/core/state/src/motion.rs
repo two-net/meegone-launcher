@@ -116,6 +116,14 @@ pub const SEARCH_PULL_RESISTANCE: f64 = 1.0 / 3.0;
 /// …and never stretches further than this fraction of the field's band.
 pub const SEARCH_PULL_STRETCH: f64 = 0.5;
 
+/// A pinch on Recent switches its density once the cards have gone past this fraction of the
+/// way to the other density's size (REC-05, ANIM-17).
+pub const RECENT_PINCH_THRESHOLD: f64 = 0.35;
+/// Pinched past either density's size, the cards follow the fingers this much (ANIM-17)…
+pub const RECENT_PINCH_RESISTANCE: f64 = 1.0 / 3.0;
+/// …and never stretch further than this fraction of the way between the two sizes.
+pub const RECENT_PINCH_STRETCH: f64 = 0.25;
+
 /// Motion closer to its target than this, in pixels, and slower than [`REST_SPEED_PX`] has
 /// finished: what is left would move less than half a pixel per 60 Hz frame.
 pub const REST_DISTANCE_PX: f64 = 0.5;
