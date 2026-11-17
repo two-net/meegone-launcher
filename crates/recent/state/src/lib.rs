@@ -2,8 +2,8 @@
 //! mode.
 //!
 //! Usage history stays in memory. The only things stored are the density, more cards or bigger
-//! ones, and the list of apps the user removed from Recent, both in the settings store (PRIV-03,
-//! REC-05, ADR 0002).
+//! ones, and the list of apps the user removed from Recent with when, both in the settings store
+//! (PRIV-03, REC-05, ADR 0002). A removal is forgotten once it can no longer hide anything.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -15,6 +15,8 @@ use meegone_core_state::{Access, App, AppId, ProfileId, RecentDensity, Rect, Sta
 
 /// At most this many cards (REC-03).
 pub const MAX_CARDS: usize = 18;
+/// At most this many rows of cards: rows always hold two cards or more (REC-05).
+pub const MAX_ROWS: usize = MAX_CARDS.div_ceil(2);
 /// With more cards, columns are added so no card is wider than this, in dp (REC-05). A phone's
 /// cards area is under 504 dp, so it always has three.
 pub const MAX_CARD_DP: f64 = 160.0;
@@ -24,6 +26,9 @@ pub const CARD_GAP_DP: f64 = 12.0;
 const MINUTE_MS: u64 = 60 * 1000;
 const HOUR_MS: u64 = 60 * MINUTE_MS;
 const DAY_MS: u64 = 24 * HOUR_MS;
+/// A removal older than this is forgotten when Recent next saves one: the longest window Recent
+/// can show, three days (REC-11), holds no use from before it, so it hides nothing (PRIV-03).
+pub const REMOVALS_KEPT_MS: u64 = 3 * DAY_MS;
 
 /// How long ago an app was last used, as its card says (REC-04). Each unit counts whole ones.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -108,8 +113,11 @@ pub struct RecentState {
     pub access: Access,
     /// Most recently used first (REC-03).
     pub cards: Vec<RecentCard>,
-    /// REC-07
+    /// A ✕ on every card and Clear all (REC-07). Only while there are cards.
     pub close_mode: bool,
+    /// Changes each time apps are removed from Recent, by a ✕ or Clear all, so the host confirms
+    /// it: "Removed from Recent" (REC-08, A11Y-08).
+    pub removals: u32,
     /// More cards or bigger ones, as last chosen by a pinch or from a screen reader (REC-05).
     pub density: RecentDensity,
     /// How wide the cards area is, inside its margins, in dp, as the host last laid it out; 0
@@ -141,14 +149,20 @@ pub enum RecentIntent {
     /// The user tapped Allow on the explainer card (REC-02).
     OpenAccessSettings,
     /// The user tapped a card: the app comes to the front, resumed if the system kept it, and
-    /// its window grows from `from`, the card (REC-06, ANIM-08).
+    /// its window grows from `from`, the card (REC-06, ANIM-08). In close mode it does nothing.
     Launch {
         app: AppId,
         from: Option<Rect>,
     },
+    /// A long-press on the grid, or a screen reader, enters close mode while there are cards
+    /// (REC-07, A11Y-05).
     EnterCloseMode,
+    /// A tap on empty space leaves close mode (REC-07).
+    ExitCloseMode,
     /// Removes a card from Recent only; the app keeps running (REC-08).
     Remove(AppId),
+    /// Removes every card from Recent, in one save; no app is stopped (REC-08, AC-14).
+    ClearAll,
     /// The host laid the cards out `width_dp` wide, inside their margins (REC-05).
     Layout {
         width_dp: f64,
@@ -248,6 +262,12 @@ impl RecentHolder {
     }
 
     fn refresh(&mut self) {
+        self.read();
+        // Close mode needs cards to close (REC-07).
+        self.state.close_mode &= self.state.shows_cards();
+    }
+
+    fn read(&mut self) {
         let settings = self.settings.get();
         self.state.density = settings.recent_density;
         self.state.access = self.usage.access();
@@ -296,13 +316,26 @@ impl RecentHolder {
         }
     }
 
-    fn remove(&mut self, app: AppId) {
+    /// Saves `apps` as removed from Recent now, in one write, forgetting removals that can no
+    /// longer hide anything (PRIV-03). Their cards go, and close mode ends with the last one.
+    /// A failed save keeps the cards and says why (ARCH-09).
+    fn remove(&mut self, apps: &[AppId]) {
+        if apps.is_empty() {
+            return;
+        }
         let now = self.system.now_ms();
         let saved = self.settings.update(&mut |settings| {
-            settings.removed_from_recent.insert(app.clone(), now);
+            let removed = &mut settings.removed_from_recent;
+            removed.retain(|_, removed_ms| now.saturating_sub(*removed_ms) < REMOVALS_KEPT_MS);
+            removed.extend(apps.iter().map(|app| (app.clone(), now)));
         });
         match saved {
-            Ok(_) => self.state.cards.retain(|card| card.app.id != app),
+            Ok(_) => {
+                self.state.cards.retain(|card| !apps.contains(&card.app.id));
+                self.state.close_mode &= self.state.shows_cards();
+                self.state.removals = self.state.removals.wrapping_add(1);
+                self.state.problem = None;
+            }
             Err(error) => self.state.problem = Some(error.to_string()),
         }
     }
@@ -326,6 +359,7 @@ impl StateHolder for RecentHolder {
                     .err()
                     .map(|error| error.to_string());
             }
+            RecentIntent::Launch { .. } if self.state.close_mode => {}
             RecentIntent::Launch { app, from } => {
                 self.state.problem = self
                     .apps
@@ -333,8 +367,17 @@ impl StateHolder for RecentHolder {
                     .err()
                     .map(|error| error.to_string());
             }
-            RecentIntent::EnterCloseMode => self.state.close_mode = true,
-            RecentIntent::Remove(app) => self.remove(app),
+            RecentIntent::EnterCloseMode => self.state.close_mode = self.state.shows_cards(),
+            RecentIntent::ExitCloseMode => self.state.close_mode = false,
+            RecentIntent::Remove(app) => {
+                if self.state.cards.iter().any(|card| card.app.id == app) {
+                    self.remove(&[app]);
+                }
+            }
+            RecentIntent::ClearAll => {
+                let apps: Vec<AppId> = self.state.cards.iter().map(|c| c.app.id.clone()).collect();
+                self.remove(&apps);
+            }
             RecentIntent::Layout { width_dp } => {
                 self.state.width_dp = if width_dp.is_finite() {
                     width_dp.max(0.0)
@@ -799,11 +842,185 @@ mod tests {
     #[test]
     fn back_leaves_close_mode() {
         // REC-07
-        let (_, _, mut holder) = setup(vec![]);
+        let (_, _, mut holder) = setup(vec![used("mail", 1)]);
+        holder.handle(RecentIntent::Refresh);
         holder.handle(RecentIntent::EnterCloseMode);
 
         assert!(holder.on_back());
         assert!(!holder.state().close_mode);
         assert!(!holder.on_back());
+    }
+
+    #[test]
+    fn close_mode_needs_cards_and_a_tap_on_empty_space_leaves_it() {
+        // REC-07
+        let (fakes, _, mut holder) = setup(vec![]);
+        holder.handle(RecentIntent::Refresh);
+        holder.handle(RecentIntent::EnterCloseMode);
+        assert!(!holder.state().close_mode);
+
+        *fakes.usage.uses.lock().unwrap() = vec![used("mail", 1)];
+        holder.handle(RecentIntent::Refresh);
+        holder.handle(RecentIntent::EnterCloseMode);
+        assert!(holder.state().close_mode);
+
+        holder.handle(RecentIntent::ExitCloseMode);
+        assert!(!holder.state().close_mode);
+    }
+
+    #[test]
+    fn close_mode_ends_when_the_cards_go() {
+        // REC-07: without access, or with nothing left to remove.
+        let (fakes, _, mut holder) = setup(vec![used("mail", 1)]);
+        holder.handle(RecentIntent::Refresh);
+        holder.handle(RecentIntent::EnterCloseMode);
+
+        *fakes.usage.access.lock().unwrap() = Access::Missing;
+        holder.handle(RecentIntent::Refresh);
+        assert!(!holder.state().close_mode);
+
+        *fakes.usage.access.lock().unwrap() = Access::Granted;
+        holder.handle(RecentIntent::Refresh);
+        holder.handle(RecentIntent::EnterCloseMode);
+        *fakes.usage.uses.lock().unwrap() = vec![];
+        holder.handle(RecentIntent::Refresh);
+        assert!(!holder.state().close_mode);
+    }
+
+    #[test]
+    fn a_card_tapped_in_close_mode_opens_nothing() {
+        // REC-07, as in edit mode (ADR 0014).
+        let (fakes, _, mut holder) = setup(vec![used("mail", 1)]);
+        holder.handle(RecentIntent::Refresh);
+        holder.handle(RecentIntent::EnterCloseMode);
+
+        holder.handle(RecentIntent::Launch {
+            app: app_id("mail"),
+            from: None,
+        });
+
+        assert!(fakes.apps.launched.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn removing_a_card_keeps_close_mode_until_the_last_one_goes() {
+        // REC-07, REC-08
+        let (_, settings, mut holder) = setup(vec![used("mail", 2), used("maps", 1)]);
+        holder.handle(RecentIntent::Refresh);
+        holder.handle(RecentIntent::EnterCloseMode);
+
+        holder.handle(RecentIntent::Remove(app_id("maps")));
+        assert_eq!(packages(&holder), ["mail"]);
+        assert!(holder.state().close_mode);
+        assert_eq!(holder.state().removals, 1);
+        assert_eq!(
+            settings.get().removed_from_recent.get(&app_id("maps")),
+            Some(&NOW)
+        );
+
+        holder.handle(RecentIntent::Remove(app_id("mail")));
+        assert!(holder.state().cards.is_empty());
+        assert!(!holder.state().close_mode);
+        assert_eq!(holder.state().removals, 2);
+    }
+
+    #[test]
+    fn removing_an_app_that_shows_no_card_saves_nothing() {
+        let (fakes, _, mut holder) = setup(vec![used("mail", 1)]);
+        holder.handle(RecentIntent::Refresh);
+
+        holder.handle(RecentIntent::Remove(app_id("maps")));
+
+        assert!(fakes.storage.writes.lock().unwrap().is_empty());
+        assert_eq!(holder.state().removals, 0);
+    }
+
+    #[test]
+    fn clear_all_removes_every_card_in_one_save_and_stops_nothing() {
+        // REC-08, AC-14
+        let (fakes, settings, mut holder) =
+            setup(vec![used("mail", 3), used("maps", 2), used("music", 1)]);
+        holder.handle(RecentIntent::Refresh);
+        holder.handle(RecentIntent::EnterCloseMode);
+
+        holder.handle(RecentIntent::ClearAll);
+
+        assert!(holder.state().cards.is_empty());
+        assert!(!holder.state().close_mode);
+        assert_eq!(holder.state().removals, 1);
+        assert_eq!(
+            *fakes.storage.writes.lock().unwrap(),
+            [meegone_core_data::StoredFile::Settings]
+        );
+        let removed = settings.get().removed_from_recent;
+        assert_eq!(removed.len(), 3);
+        assert!(removed.values().all(|removed_ms| *removed_ms == NOW));
+        assert!(fakes.apps.launched.lock().unwrap().is_empty());
+        assert!(fakes.apps.uninstall_requested.lock().unwrap().is_empty());
+
+        // Each comes back when it is next used.
+        *fakes.system.now_ms.lock().unwrap() = NOW + HOUR_MS;
+        fakes.usage.uses.lock().unwrap()[1].last_used_ms = NOW + HOUR_MS;
+        holder.handle(RecentIntent::Refresh);
+        assert_eq!(packages(&holder), ["maps"]);
+    }
+
+    #[test]
+    fn a_removal_that_cant_be_saved_keeps_the_cards_and_says_why() {
+        // ARCH-09
+        let (fakes, settings, mut holder) = setup(vec![used("mail", 2), used("maps", 1)]);
+        holder.handle(RecentIntent::Refresh);
+        holder.handle(RecentIntent::EnterCloseMode);
+        *fakes.storage.error.lock().unwrap() = Some(DataError::Failed("Storage full".into()));
+
+        holder.handle(RecentIntent::Remove(app_id("maps")));
+        holder.handle(RecentIntent::ClearAll);
+
+        assert_eq!(packages(&holder), ["maps", "mail"]);
+        assert!(holder.state().close_mode);
+        assert_eq!(holder.state().removals, 0);
+        assert_eq!(holder.state().problem.as_deref(), Some("Storage full"));
+        assert!(settings.get().removed_from_recent.is_empty());
+
+        *fakes.storage.error.lock().unwrap() = None;
+        holder.handle(RecentIntent::ClearAll);
+        assert_eq!(holder.state().problem, None);
+    }
+
+    #[test]
+    fn removals_that_can_no_longer_hide_anything_are_forgotten() {
+        // PRIV-03: no window reaches back past three days, so older removals go at the next save.
+        let (_, settings, mut holder) = setup(vec![used("mail", 1)]);
+        settings
+            .update(&mut |s| {
+                s.removed_from_recent
+                    .insert(app_id("maps"), NOW - REMOVALS_KEPT_MS);
+                s.removed_from_recent
+                    .insert(app_id("music"), NOW - REMOVALS_KEPT_MS + 1);
+            })
+            .unwrap();
+        holder.handle(RecentIntent::Refresh);
+
+        holder.handle(RecentIntent::Remove(app_id("mail")));
+
+        let removed = settings.get().removed_from_recent;
+        assert_eq!(
+            removed
+                .keys()
+                .map(|app| app.package.as_str())
+                .collect::<Vec<_>>(),
+            ["mail", "music"]
+        );
+    }
+
+    #[test]
+    fn rows_always_hold_two_cards_or_more() {
+        // REC-05: so MAX_ROWS rows hold every card.
+        for width in [0.0, 300.0, 1_000.0, 2_560.0] {
+            for density in [RecentDensity::ThreeColumns, RecentDensity::TwoColumns] {
+                assert!(columns_for(density, width) >= 2);
+            }
+        }
+        const { assert!(MAX_ROWS * 2 >= MAX_CARDS) };
     }
 }

@@ -182,7 +182,15 @@ fn notification_content_and_usage_history_are_never_stored() {
         "Dinner with Robin"
     );
     assert_eq!(launcher.shell().recent().state().cards.len(), 2);
-    launcher.view().recent().remove_tapped(app_id("chat"));
+    let revision = launcher.frame().recent.expect("Recent works").revision;
+    let chat = launcher
+        .view()
+        .recent()
+        .cards()
+        .iter()
+        .position(|card| card.app == app_id("chat"))
+        .expect("Chat's card");
+    assert!(launcher.view().recent().badge_tapped(revision, chat));
     launcher.dispatch(ShellIntent::OpenSettings);
     launcher.view().settings().wrap_around_toggled(false);
     launcher.frame();

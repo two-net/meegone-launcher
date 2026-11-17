@@ -6,7 +6,8 @@
 //! density's size they stretch with resistance. Released past [`RECENT_PINCH_THRESHOLD`] of the
 //! way, the cards switch density; either way they reflow from where they are drawn to their
 //! places in about 300 ms (ANIM-17). Any change of density reflows the same way, such as one
-//! made from a screen reader (A11Y-05).
+//! made from a screen reader (A11Y-05), and so do the cards closing the gap a removed card left,
+//! in 180 ms (ANIM-18, ADR 0025).
 //!
 //! Once a pinch starts, the rest of the gesture is its own: the carousel and the content below
 //! get none of it, until the next gesture starts. Like the other motions it is pure, takes the
@@ -201,15 +202,16 @@ impl PinchMotion {
 
     fn end(&mut self, animation_scale: f64) {
         self.gesture = Gesture::Idle;
-        self.reflow(animation_scale);
+        self.reflow(RECENT_PINCH, animation_scale);
     }
 
-    /// The cards reflow from where they are drawn to their places: after a pinch, and whenever
-    /// the density changes (ANIM-17).
-    pub fn reflow(&mut self, animation_scale: f64) {
+    /// The cards reflow from where they are drawn to their places over `length`: after a pinch
+    /// and whenever the density changes, [`RECENT_PINCH`] (ANIM-17), and after cards were
+    /// removed, `CARD_REMOVE` (ANIM-18).
+    pub fn reflow(&mut self, length: Duration, animation_scale: f64) {
         self.scale = 1.0;
         self.reflow = self.reflow.wrapping_add(1);
-        self.timed.start(RECENT_PINCH, animation_scale);
+        self.timed.start(length, animation_scale);
     }
 
     /// Advances the reflow to the display's frame time (ANIM-04).

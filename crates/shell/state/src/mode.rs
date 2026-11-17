@@ -1,10 +1,10 @@
-//! Entering and leaving edit mode (ANIM-12): the cells shrink to 92 % over 150 ms, decelerating,
-//! and the ✕ badges pop in row by row, the first visible row at once and the last at most
-//! 120 ms later, each over 150 ms. Leaving plays it backwards: the badges go, last row first,
-//! and the cells grow back.
+//! Entering and leaving edit mode, or Recent's close mode (ANIM-12): the cells or cards shrink to
+//! 92 % over 150 ms, decelerating, and the ✕ badges pop in row by row, the first visible row at
+//! once and the last at most 120 ms later, each over 150 ms. Leaving plays it backwards: the
+//! badges go, last row first, and the cells grow back.
 //!
 //! The badges stagger by visible row, so the host needs one value per row rather than per cell
-//! (ADR 0014). Like the other motions, it is pure, its clock starts at the first frame after the
+//! (ADR 0014). Recent's rows all count as visible: there are at most nine (ADR 0025). Like the other motions, it is pure, its clock starts at the first frame after the
 //! change, and with animations removed it is instant (ANIM-05). A change of mind part-way
 //! turns it back from where it is.
 
@@ -20,14 +20,16 @@ pub const BADGE_ROWS: usize = 12;
 /// The whole motion: the last row's badges start [`MODE_STAGGER`] after the first's.
 const TOTAL: Duration = MODE_CHANGE.saturating_add(MODE_STAGGER);
 
-/// Edit mode as it is drawn now: an immutable snapshot inside `ShellState`.
+/// Edit or close mode as it is drawn now: an immutable snapshot inside `ShellState`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ModeState {
-    /// Edit mode is on: badges can be tapped, icons don't launch, and Done shows.
+    /// The mode is on: badges can be tapped, icons and cards don't launch, and Done or Clear
+    /// all shows.
     pub on: bool,
-    /// The cells' scale: 1 out of edit mode, 0.92 in it (ANIM-12).
+    /// The cells' or cards' scale: 1 out of the mode, 0.92 in it (ANIM-12).
     pub scale: f64,
-    /// How far the cells have come into edit mode, eased, from 0 to 1. Done fades with it.
+    /// How far the cells have come into the mode, eased, from 0 to 1. Done and Clear all fade
+    /// with it.
     pub progress: f64,
     /// The grid's first visible row, which `badges[0]` is for.
     pub first_row: usize,
@@ -44,7 +46,8 @@ impl Default for ModeState {
     }
 }
 
-/// Runs edit mode's motion. `HomeShell` owns it and publishes its [`ModeState`].
+/// Runs edit mode's motion, or close mode's. `HomeShell` owns one of each and publishes their
+/// [`ModeState`]s.
 #[derive(Debug, Default)]
 pub(crate) struct Mode {
     on: bool,
@@ -60,7 +63,7 @@ impl Mode {
         self.on
     }
 
-    /// Edit mode turned on or off: the motion heads that way from where it is.
+    /// The mode turned on or off: the motion heads that way from where it is.
     pub fn set(&mut self, on: bool, animation_scale: f64) {
         self.on = on;
         self.last = None;

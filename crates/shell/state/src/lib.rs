@@ -2,7 +2,8 @@
 //! Home and Back, coming back to the home, the icon press, the dragged icon, the grid's motion
 //! as apps come, go and move, edit mode's motion, the open folder's motion, the search field's
 //! pull, the Events list's motion as notifications come and go, the image details screen and
-//! the image-of-the-day card's cross-fade, Recent's pinch and its cards' reflow, and the theme.
+//! the image-of-the-day card's cross-fade, Recent's pinch and its cards' reflow, Recent's close
+//! mode and its cards leaving, and the theme.
 //!
 //! [`HomeShell::compose`] is the only place features are put together (ARCH-03). Each feature
 //! runs in its own [`Store`], so a failing feature never takes down the shell (ARCH-09).
@@ -17,6 +18,7 @@ mod lift;
 mod mode;
 mod pinch;
 mod press;
+mod recent_change;
 mod return_home;
 mod search;
 mod timed;
@@ -31,14 +33,16 @@ use meegone_apps_state::{
 use meegone_core_data::{
     HomeTarget, PersistentSettingsStore, Platform, SettingsStore, SystemConfigAdapter,
 };
-use meegone_core_state::motion::{MODE_SCALE, VIEW_FLING_VELOCITY_DP};
-use meegone_core_state::{App, Health, RecentDensity, Store, ThemeHolder, ThemeIntent};
+use meegone_core_state::motion::{CARD_REMOVE, MODE_SCALE, RECENT_PINCH, VIEW_FLING_VELOCITY_DP};
+use meegone_core_state::{
+    Access, App, AppId, Health, RecentDensity, Store, ThemeHolder, ThemeIntent,
+};
 use meegone_events_state::{
     EventsHolder, EventsIntent, GroupId, NotificationGroup, RowKey, RowTarget, rows_came_or_went,
 };
 use meegone_lockimage_data::PersistentImageCache;
 use meegone_lockimage_state::{LockImageHolder, LockImageIntent, LockImageState};
-use meegone_recent_state::{RecentHolder, RecentIntent, other_density};
+use meegone_recent_state::{MAX_ROWS, RecentHolder, RecentIntent, other_density};
 use meegone_settings_state::{SettingsHolder, SettingsIntent, SettingsState};
 
 use carousel::{Carousel, Release};
@@ -55,13 +59,20 @@ pub use image_change::ImageChangeState;
 use lift::{DragSurfaces, DropAt, Lift, LiftEvent, SurfaceView};
 pub use lift::{HoverState, LiftState, MergeState};
 pub use meegone_apps_state::{FOLDER_COLUMNS, GridItem, PREVIEW_APPS, preview_slot};
+/// How many rows of Recent's cards there are at most: each has its own ✕ scale in close mode,
+/// and its own progress as its cards leave (ANIM-12, ANIM-18).
+pub use meegone_recent_state::MAX_ROWS as RECENT_ROWS;
 pub use meegone_settings_state::SettingsGroup;
 use mode::Mode;
 pub use mode::{BADGE_ROWS, ModeState};
+// Close mode's badges come from a `ModeState`, which has a scale for this many rows.
+const _: () = assert!(RECENT_ROWS <= BADGE_ROWS);
 use pinch::{Ended, PinchMotion};
 pub use pinch::{PinchEvent, PinchKind, PinchState};
 use press::Press;
 pub use press::PressState;
+use recent_change::RecentChange;
+pub use recent_change::RecentChangeState;
 use return_home::ReturnHome;
 pub use return_home::ReturnHomeState;
 pub use search::SearchState;
@@ -180,10 +191,18 @@ pub struct ShellState {
     /// Recent's cards as two fingers pinch them, and as they reflow to their places (REC-05,
     /// ANIM-17).
     pub pinch: PinchState,
-    /// Recent shows its cards with nothing covering them, so a pinch, or a screen reader, can
-    /// switch between more cards and bigger ones (REC-05, A11Y-05). A failed Recent never
-    /// offers it (ARCH-09).
+    /// Recent shows its cards with nothing covering them, out of close mode, so a pinch, or a
+    /// screen reader, can switch between more cards and bigger ones (REC-05, A11Y-05). A failed
+    /// Recent never offers it (ARCH-09).
     pub density_offered: bool,
+    /// Recent's close mode, with its motion: the cards' size, the ✕ badges, one row of cards at
+    /// a time, and Clear all (REC-07, ANIM-12). A failed Recent never shows it (ARCH-09).
+    pub close: ModeState,
+    /// Recent shows its cards with nothing covering them, out of close mode, so a screen reader
+    /// can enter it (REC-07, A11Y-05). A failed Recent never offers it (ARCH-09).
+    pub close_offered: bool,
+    /// Cards removed from Recent shrinking and fading where they were, row by row (ANIM-18).
+    pub recent_change: RecentChangeState,
 }
 
 impl ShellState {
@@ -366,6 +385,12 @@ pub struct HomeShell {
     pinch: PinchMotion,
     /// Recent's density as of the last intent, so the cards reflow when it changes (ANIM-17).
     seen_density: RecentDensity,
+    /// Recent's close mode (ANIM-12).
+    close: Mode,
+    recent_change: RecentChange,
+    /// The apps of Recent's cards as of the last intent, and its columns then, to tell which
+    /// rows cards left (ANIM-18).
+    seen_recent: (Vec<AppId>, usize),
     events_change: EventsChange,
     image_change: ImageChange,
     /// Events' groups and expanded group as of the last intent, to tell cheaply whether its
@@ -406,6 +431,9 @@ impl HomeShell {
             search: SearchMotion::default(),
             pinch: PinchMotion::default(),
             seen_density: RecentDensity::default(),
+            close: Mode::default(),
+            recent_change: RecentChange::default(),
+            seen_recent: (Vec::new(), 0),
             events_change: EventsChange::default(),
             image_change: ImageChange::default(),
             seen_groups: Arc::new([]),
@@ -459,9 +487,11 @@ impl HomeShell {
         shell.configure_carousel();
         // The grid as it starts is shown as it is: nothing moves (ANIM-21).
         shell.seen_cells = shell.apps.state().items.clone();
-        // Recent read the hidden apps and its density as it loaded: nothing reflows.
+        // Recent read the hidden apps and its density as it loaded: nothing reflows, and no
+        // card leaves.
         shell.seen_hidden = shell.apps.state().hidden_apps.clone();
         shell.seen_density = shell.recent.state().density;
+        shell.seen_recent = shell.recent_cards();
         // Events' list as it starts is shown as it is too (ANIM-20).
         let events = shell.events.state();
         shell.seen_groups = events.groups.clone();
@@ -605,6 +635,8 @@ impl HomeShell {
                 self.events_change.frame(at);
                 self.image_change.frame(at);
                 self.mode.frame(at);
+                self.close.frame(at);
+                self.recent_change.frame(at);
                 self.folder.frame(at);
                 self.search.frame(at);
                 self.drag_frame(at);
@@ -673,6 +705,7 @@ impl HomeShell {
         self.keep_cells_in_step();
         self.keep_events_in_step();
         self.keep_recent_in_step();
+        self.keep_close_in_step();
         self.lift.sync(&self.drag_surfaces());
         self.state.carousel = self.carousel.state();
         self.state.return_home = self.return_home.state();
@@ -694,6 +727,9 @@ impl HomeShell {
         self.state.search = self.search.state();
         self.state.pinch = self.pinch.state();
         self.state.density_offered = self.density_offered();
+        self.state.close = self.close_state();
+        self.state.close_offered = self.close_offered();
+        self.state.recent_change = self.recent_change.state();
     }
 
     /// Whether Settings, the image details or a menu covers the home views, so they get no new
@@ -936,16 +972,96 @@ impl HomeShell {
         let scale = self.carousel.animation_scale();
         let density = self.recent.state().density;
         if density != std::mem::replace(&mut self.seen_density, density) {
-            self.pinch.reflow(scale);
+            self.pinch.reflow(RECENT_PINCH, scale);
         }
         if self.pinch.pinching() && !self.density_offered() {
             self.pinch.end_gesture(scale);
         }
+        self.keep_recent_cards_in_step();
+    }
+
+    /// When cards leave Recent while it shows, by a ✕, Clear all or a refresh, they shrink and
+    /// fade where they were, row by row, and the others close the gap (ANIM-18). Cards that go
+    /// because access went, or while Recent is out of sight, just go.
+    fn keep_recent_cards_in_step(&mut self) {
+        let (cards, columns) = self.recent_cards();
+        if cards == self.seen_recent.0 {
+            self.seen_recent.1 = columns;
+            return;
+        }
+        let (seen, seen_columns) = std::mem::replace(&mut self.seen_recent, (cards, columns));
+        let cards = &self.seen_recent.0;
+        let shows = self.state.current == HomeView::Recent
+            && self.recent_ready()
+            && self.recent.state().access == Access::Granted;
+        if !shows {
+            return;
+        }
+        let rows: Vec<usize> = seen
+            .iter()
+            .enumerate()
+            .filter(|(_, app)| !cards.contains(app))
+            .map(|(at, _)| at / seen_columns.max(1))
+            .collect();
+        if rows.is_empty() {
+            return;
+        }
+        let scale = self.carousel.animation_scale();
+        self.recent_change.start(rows, scale);
+        // A pinch reflows the cards as it ends.
+        if !cards.is_empty() && !self.pinch.pinching() {
+            self.pinch.reflow(CARD_REMOVE, scale);
+        }
+    }
+
+    /// The apps of Recent's cards, and how many each row holds.
+    fn recent_cards(&self) -> (Vec<AppId>, usize) {
+        let recent = self.recent.state();
+        let cards = recent
+            .cards
+            .iter()
+            .map(|card| card.app.id.clone())
+            .collect();
+        (cards, usize::from(recent.columns()))
+    }
+
+    /// Close mode's motion follows Recent (ANIM-12). Entering it doesn't tick here: the
+    /// long-press that entered it just did, and a screen reader's request doesn't (ANIM-24).
+    fn keep_close_in_step(&mut self) {
+        let closing = self.close_shown();
+        if closing != self.close.is_on() {
+            self.close.set(closing, self.carousel.animation_scale());
+        }
+    }
+
+    /// Whether Recent is in close mode. A failed Recent never shows it (ARCH-09).
+    fn close_shown(&self) -> bool {
+        self.recent_ready() && self.recent.state().close_mode
+    }
+
+    /// Close mode's motion for Recent's rows of cards: the badges stagger from the first.
+    fn close_state(&self) -> ModeState {
+        let recent = self.recent.state();
+        let columns = usize::from(recent.columns()).max(1);
+        let rows = recent.cards.len().div_ceil(columns);
+        self.close.state(0, rows.clamp(1, MAX_ROWS))
     }
 
     /// Whether Recent shows its cards on screen with nothing covering them, so its density can
-    /// change (REC-05, A11Y-05). A failed Recent never offers it (ARCH-09).
+    /// change (REC-05, A11Y-05). Not in close mode, whose cards are being tidied. A failed Recent
+    /// never offers it (ARCH-09).
     fn density_offered(&self) -> bool {
+        self.recent_cards_offered() && !self.close_shown()
+    }
+
+    /// Whether a screen reader can enter Recent's close mode, as a long-press on its cards
+    /// does (REC-07, A11Y-05).
+    fn close_offered(&self) -> bool {
+        self.recent_cards_offered() && !self.close_shown()
+    }
+
+    /// Whether Recent shows its cards on screen with nothing covering them.
+    fn recent_cards_offered(&self) -> bool {
         self.state.current == HomeView::Recent
             && self.recent_ready()
             && self.recent.state().shows_cards()
@@ -1193,9 +1309,14 @@ impl HomeShell {
     }
 
     /// HOME-10: a long-press on empty space opens the home menu where the finger is, or, in
-    /// Recent, enters close mode (REC-07). Either way it ticks (ANIM-24).
+    /// Recent, anywhere on its cards, enters close mode (REC-07). Either way it ticks
+    /// (ANIM-24). In Recent it counts only while it can enter close mode, so a long-press with
+    /// no card, or already in close mode, takes nothing.
     fn long_press(&mut self) {
         if self.covered() || self.folder_shown() || self.search_shown() {
+            return;
+        }
+        if self.state.current == HomeView::Recent && !self.close_offered() {
             return;
         }
         let Some(at) = self.carousel.long_press() else {
@@ -1473,6 +1594,10 @@ impl HomeShell {
                 self.apps.dispatch(AppsIntent::ExitEditMode);
             }
         }
+        // Close mode, like edit mode, is never left out of sight (REC-07).
+        if view != HomeView::Recent && self.close_shown() {
+            self.recent.dispatch(RecentIntent::ExitCloseMode);
+        }
         // Recent refreshes whenever it becomes visible (REC-09); Events does too, to stay live.
         match view {
             HomeView::Events => {
@@ -1592,9 +1717,10 @@ mod tests {
     #[test]
     fn home_first_closes_everything_open_in_the_current_view() {
         // HOME-07
-        let mut shell = HomeShell::compose(Fakes::default().platform());
+        let mut shell = with_recent_maps_and_mail(&Fakes::default());
         shell.dispatch(ShellIntent::Swipe(Direction::Next));
         shell.dispatch(ShellIntent::Recent(RecentIntent::EnterCloseMode));
+        assert!(shell.recent().state().close_mode);
 
         shell.dispatch(ShellIntent::Home);
         assert_eq!(shell.state().current, HomeView::Recent);
@@ -2273,8 +2399,8 @@ mod tests {
         assert_eq!(cards[0].app.label, "Mail");
     }
 
-    /// A shell on Applications, with usage access, where Maps and then Mail were used.
-    fn with_recent_maps_and_mail(fakes: &Fakes) -> HomeShell {
+    /// Usage access, where Maps and then Mail were used.
+    fn maps_and_mail_used(fakes: &Fakes) {
         *fakes.usage.access.lock().unwrap() = Access::Granted;
         *fakes.apps.apps.lock().unwrap() = vec![app("maps", "Maps"), app("mail", "Mail")];
         *fakes.system.now_ms.lock().unwrap() = 1_000_000;
@@ -2283,6 +2409,11 @@ mod tests {
             .zip([900_000, 999_000])
             .map(|(package, at)| used(package, at))
             .collect();
+    }
+
+    /// A shell on Applications, with usage access, where Maps and then Mail were used.
+    fn with_recent_maps_and_mail(fakes: &Fakes) -> HomeShell {
+        maps_and_mail_used(fakes);
         HomeShell::compose(fakes.platform())
     }
 
@@ -2821,6 +2952,7 @@ mod tests {
     fn in_recent_a_long_press_enters_close_mode_instead() {
         // HOME-10, REC-07, ANIM-24
         let fakes = Fakes::default();
+        maps_and_mail_used(&fakes);
         let mut shell = laid_out(&fakes);
         go(&mut shell, Direction::Next);
 
@@ -2829,6 +2961,203 @@ mod tests {
         assert_eq!(shell.state().menu, None);
         assert!(shell.recent().state().close_mode);
         assert_eq!(ticks(&fakes), 1);
+    }
+
+    /// A finger held still at `(x, y)` from `at` ms until the long-press time has passed, then
+    /// lifted.
+    fn hold_and_lift(shell: &mut HomeShell, x: f64, y: f64, at: u64) {
+        let pointer = |kind, at| {
+            ShellIntent::Pointer(PointerEvent {
+                kind,
+                x,
+                y,
+                at: ms(at),
+            })
+        };
+        shell.dispatch(pointer(PointerKind::Down, at));
+        shell.dispatch(ShellIntent::LongPress);
+        shell.dispatch(pointer(PointerKind::Up, at + 500));
+    }
+
+    #[test]
+    fn a_long_press_on_recent_counts_only_where_close_mode_can_start() {
+        // REC-07, ANIM-24: with no card to remove, or in close mode already, it takes nothing,
+        // and nothing ticks.
+        let fakes = Fakes::default();
+        let mut shell = laid_out(&fakes);
+        go(&mut shell, Direction::Next);
+        hold(&mut shell, 500.0, 900.0);
+        assert!(!shell.state().carousel.held);
+        assert!(!shell.recent().state().close_mode);
+        assert_eq!(ticks(&fakes), 0);
+
+        let fakes = Fakes::default();
+        let mut shell = on_recent(&fakes);
+        hold_and_lift(&mut shell, 500.0, 900.0, 10_000);
+        assert!(shell.recent().state().close_mode);
+        shell.dispatch(ShellIntent::Pointer(PointerEvent {
+            kind: PointerKind::Down,
+            x: 500.0,
+            y: 900.0,
+            at: ms(11_000),
+        }));
+        shell.dispatch(ShellIntent::LongPress);
+        assert!(!shell.state().carousel.held);
+        assert_eq!(ticks(&fakes), 1);
+    }
+
+    #[test]
+    fn close_mode_shrinks_the_cards_and_pops_their_badges() {
+        // REC-07, ANIM-12
+        let fakes = Fakes::default();
+        let mut shell = on_recent(&fakes);
+        assert!(shell.state().close_offered);
+        assert!(shell.state().density_offered);
+
+        hold_and_lift(&mut shell, 500.0, 900.0, 10_000);
+        let state = shell.state();
+        assert!(state.close.on && state.close.animating);
+        assert!(!state.close_offered);
+        assert!(!state.density_offered, "no pinch while removing cards");
+        come_to_rest(&mut shell, 20_000);
+        let close = shell.state().close;
+        assert_eq!(close.scale, MODE_SCALE);
+        assert_eq!(close.badges[0], 1.0);
+        assert_eq!(
+            shell.state().mode,
+            ModeState::default(),
+            "edit mode is Applications'"
+        );
+
+        // Reversed on exit.
+        shell.dispatch(ShellIntent::Back);
+        let close = shell.state().close;
+        assert!(!close.on && close.animating);
+        come_to_rest(&mut shell, 30_000);
+        assert_eq!(shell.state().close, ModeState::default());
+        assert!(shell.state().close_offered);
+        assert_eq!(ticks(&fakes), 1);
+    }
+
+    #[test]
+    fn a_tap_on_empty_space_back_home_or_another_view_leaves_close_mode() {
+        // REC-07. A screen reader enters it without a tick (A11Y-05, ANIM-24).
+        let fakes = Fakes::default();
+        let mut shell = on_recent(&fakes);
+        let enter = |shell: &mut HomeShell| {
+            shell.dispatch(ShellIntent::Recent(RecentIntent::EnterCloseMode));
+            assert!(shell.state().close.on);
+        };
+
+        enter(&mut shell);
+        shell.dispatch(ShellIntent::Recent(RecentIntent::ExitCloseMode));
+        assert!(!shell.state().close.on);
+
+        enter(&mut shell);
+        shell.dispatch(ShellIntent::Back);
+        assert!(!shell.state().close.on);
+
+        enter(&mut shell);
+        shell.dispatch(ShellIntent::Home);
+        assert!(!shell.state().close.on);
+        assert_eq!(shell.state().current, HomeView::Recent);
+
+        enter(&mut shell);
+        shell.dispatch(ShellIntent::Swipe(Direction::Previous));
+        assert!(!shell.recent().state().close_mode);
+        assert!(!shell.state().close.on);
+        assert_eq!(ticks(&fakes), 0);
+    }
+
+    #[test]
+    fn a_removed_card_shrinks_away_and_the_others_close_the_gap() {
+        // REC-08, ANIM-18
+        let fakes = Fakes::default();
+        let mut shell = on_recent(&fakes);
+        shell.dispatch(ShellIntent::Recent(RecentIntent::EnterCloseMode));
+        come_to_rest(&mut shell, 20_000);
+        let reflow = shell.state().pinch.reflow;
+
+        shell.dispatch(ShellIntent::Recent(RecentIntent::Remove(app_id("mail"))));
+
+        let state = shell.state();
+        assert_eq!(recent_labels(&shell), ["Maps"]);
+        assert!(state.recent_change.animating);
+        assert_eq!(state.recent_change.leave[0], 0.0);
+        assert_ne!(state.pinch.reflow, reflow, "Maps closes the gap");
+        assert!(state.close.on, "Maps can still be removed");
+        come_to_rest(&mut shell, 30_000);
+        assert_eq!(shell.state().recent_change, RecentChangeState::default());
+        assert!(!shell.state().pinch.animating);
+    }
+
+    #[test]
+    fn clear_all_collapses_the_cards_row_by_row() {
+        // REC-08, ANIM-18, AC-14: seven cards, three rows of three.
+        let fakes = Fakes::default();
+        let packages = ["a", "b", "c", "d", "e", "f", "g"];
+        *fakes.usage.access.lock().unwrap() = Access::Granted;
+        *fakes.apps.apps.lock().unwrap() = packages.iter().map(|p| app(p, p)).collect();
+        *fakes.system.now_ms.lock().unwrap() = 1_000_000;
+        *fakes.usage.uses.lock().unwrap() = (0..)
+            .zip(packages)
+            .map(|(at, package)| used(package, 900_000 + at))
+            .collect();
+        let mut shell = laid_out(&fakes);
+        go(&mut shell, Direction::Next);
+        shell.dispatch(ShellIntent::Recent(RecentIntent::EnterCloseMode));
+        let reflow = shell.state().pinch.reflow;
+
+        shell.dispatch(ShellIntent::Recent(RecentIntent::ClearAll));
+
+        let state = shell.state();
+        assert!(recent_labels(&shell).is_empty());
+        assert!(!state.close.on, "nothing is left to remove");
+        assert!(state.recent_change.animating);
+        assert_eq!(state.recent_change.leave[..3], [0.0; 3]);
+        assert_eq!(state.recent_change.leave[3], 1.0, "only three rows");
+        assert_eq!(state.pinch.reflow, reflow, "no card is left to move");
+        // Within 400 ms.
+        for frame in 0..=50 {
+            shell.dispatch(ShellIntent::Frame(ms(20_000 + frame * 8)));
+        }
+        assert!(!shell.state().recent_change.animating);
+    }
+
+    #[test]
+    fn cards_that_go_out_of_sight_just_go() {
+        // ANIM-18: hiding Maps in Applications takes its card out of Recent, unseen.
+        let fakes = Fakes::default();
+        let mut shell = with_recent_maps_and_mail(&fakes);
+
+        hide_maps(&mut shell);
+
+        assert_eq!(recent_labels(&shell), ["Mail"]);
+        assert!(!shell.state().recent_change.animating);
+    }
+
+    #[test]
+    fn a_failing_recent_offers_no_close_mode() {
+        // ARCH-09
+        let fakes = Fakes::default();
+        let mut platform = fakes.platform();
+        platform.usage = Arc::new(BrokenUsage);
+        let mut shell = HomeShell::compose(platform);
+        shell.dispatch(ShellIntent::Layout(Layout {
+            width_px: 1000.0,
+            density: 2.0,
+            touch_slop_px: 16.0,
+            rtl: false,
+        }));
+        go(&mut shell, Direction::Next);
+
+        hold(&mut shell, 500.0, 900.0);
+
+        let state = shell.state();
+        assert!(!state.close_offered);
+        assert_eq!(state.close, ModeState::default());
+        assert!(!state.carousel.held);
+        assert_eq!(ticks(&fakes), 0);
     }
 
     #[test]

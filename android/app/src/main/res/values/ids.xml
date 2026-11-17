@@ -8,6 +8,9 @@
     <!-- Recent's density, without a pinch (A11Y-05, REC-05). -->
     <item name="action_bigger_cards" type="id" />
     <item name="action_more_cards" type="id" />
+    <!-- Recent's close mode, without a long-press, and a card's ✕ in it (A11Y-01, A11Y-05). -->
+    <item name="action_edit_recent" type="id" />
+    <item name="action_remove_from_recent" type="id" />
     <!-- An app's screen-reader actions in edit mode (A11Y-01, A11Y-05). -->
     <item name="action_uninstall" type="id" />
     <item name="action_move_first" type="id" />

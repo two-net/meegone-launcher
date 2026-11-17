@@ -625,7 +625,7 @@ impl Carousel {
 
 #[cfg(test)]
 mod tests {
-    use meegone_core_data::fakes::Fakes;
+    use meegone_core_data::fakes::{self, Fakes};
     use meegone_settings_state::SettingsIntent;
 
     use super::*;
@@ -1293,7 +1293,12 @@ mod tests {
     #[test]
     fn after_a_long_press_the_finger_moves_nothing_until_it_lifts() {
         // HOME-10, REC-07: in Recent, which has no menu to cover the views.
-        let mut shell = shell();
+        let fakes = Fakes::default();
+        *fakes.usage.access.lock().unwrap() = meegone_core_data::Access::Granted;
+        *fakes.apps.apps.lock().unwrap() = vec![fakes::app("mail", "Mail")];
+        *fakes.system.now_ms.lock().unwrap() = 1_000_000;
+        *fakes.usage.uses.lock().unwrap() = vec![fakes::used("mail", 900_000)];
+        let mut shell = laid_out(&fakes, false);
         shell.dispatch(ShellIntent::Swipe(Direction::Next));
         settle(&mut shell, 0);
         touch(&mut shell, PointerKind::Down, 500.0, 1000);

@@ -242,4 +242,23 @@
          pinch does (REC-05, A11Y-05). Also read out once the cards have changed. -->
     <string name="action_bigger_cards">Bigger cards</string>
     <string name="action_more_cards">More cards</string>
+    <!-- Recent's close mode (REC-07): the button at the end of the Recent section header that
+         removes every card from Recent, and what screen readers read for it. It never says
+         apps are closed (REC-01, REC-08). -->
+    <string name="recent_clear_all">Clear all</string>
+    <string name="recent_clear_all_description">Remove all apps from Recent</string>
+    <!-- Shown briefly once cards are removed from Recent by their ✕ or Clear all (REC-08). The
+         apps keep running. -->
+    <string name="recent_removed">Removed from Recent</string>
+    <!-- Read by screen readers once one card is removed from Recent (A11Y-08). %1$s is the
+         app's name. -->
+    <string name="recent_removed_app">%1$s removed from Recent</string>
+    <!-- Read by screen readers when close mode starts (A11Y-08). -->
+    <string name="recent_close_mode">Editing Recent</string>
+    <!-- The screen-reader action that enters close mode, as a long-press on Recent's cards does
+         (REC-07, A11Y-05). -->
+    <string name="action_edit_recent">Edit Recent</string>
+    <!-- The name of a card's ✕ in close mode, which removes it from Recent (REC-08, A11Y-01).
+         Screen readers offer it as an action. %1$s is the app's name. -->
+    <string name="action_remove_from_recent">Remove %1$s from Recent</string>
 </resources>

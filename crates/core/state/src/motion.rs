@@ -181,11 +181,12 @@ pub const MODE_STAGGER: Duration = ms(120);
 pub const FOLDER: Duration = ms(250);
 /// ANIM-17
 pub const RECENT_PINCH: Duration = ms(300);
-/// ANIM-18
+/// ANIM-18: a card removed from Recent shrinks and fades this long, and the others close the gap
+/// in the same time. With Clear all, each row of cards collapses this long…
 pub const CARD_REMOVE: Duration = ms(180);
-/// ANIM-18
-pub const CARDS_CLOSE_GAP: Duration = ms(220);
-/// ANIM-18
+/// …and the last row starts this long after the first…
+pub const CLEAR_ALL_STAGGER: Duration = ms(220);
+/// …so Clear all takes no longer than this.
 pub const CLEAR_ALL_MAX: Duration = ms(400);
 /// ANIM-19
 pub const THEME_CROSSFADE: Duration = ms(250);
@@ -556,7 +557,7 @@ mod tests {
             FOLDER,
             RECENT_PINCH,
             CARD_REMOVE,
-            CARDS_CLOSE_GAP,
+            CLEAR_ALL_STAGGER,
             CLEAR_ALL_MAX,
             THEME_CROSSFADE,
             NOTIFICATIONS_CHANGE,
@@ -565,6 +566,12 @@ mod tests {
         ] {
             assert!(duration <= DECORATIVE_MAX, "{duration:?}");
         }
+    }
+
+    #[test]
+    fn clear_all_ends_within_its_limit() {
+        // ANIM-18: the last row starts after the stagger and collapses as one card does.
+        assert!(CARD_REMOVE + CLEAR_ALL_STAGGER <= CLEAR_ALL_MAX);
     }
 
     #[test]

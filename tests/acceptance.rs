@@ -3,7 +3,6 @@
 //!
 //! Not automated yet, because the behaviour isn't built:
 //! - AC-01: first-run setup (#35)
-//! - AC-14: Recent's close mode (#24). Its density (AC-13, #23) is automated below.
 //! - AC-15 to AC-17: the daily image (#27 to #30). Its card in Events (EVT-12, #21) is
 //!   automated below.
 //!
@@ -28,8 +27,8 @@ use meegone_core_ui::tokens;
 use meegone_launcher::{
     Age, AppMenuItem, BADGE_ROWS, Bounds, CardContent, CellKey, Direction, EventsListMode,
     EventsMenuFrame, FolderId, GridLayout, HomeView, Launcher, Layout, LiftFrame, MenuItem,
-    NotificationMenuItem, PinchEvent, PinchKind, PointerEvent, PointerKind, RecentMode,
-    SettingsGroup, ShellIntent, Surface,
+    NotificationMenuItem, PinchEvent, PinchKind, PointerEvent, PointerKind, RECENT_ROWS,
+    RecentFrame, RecentMode, SettingsGroup, ShellIntent, Surface,
 };
 
 /// A phone 1080 × 2400 px at 2.75 px per dp.
@@ -320,9 +319,7 @@ fn home10_in_events_the_home_menu_has_no_edit_applications() {
 fn home10_in_recent_a_long_press_enters_close_mode_instead() {
     // Issue #7, REC-07
     let fakes = Fakes::default();
-    let (mut launcher, mut clock) = on_a_phone(&fakes);
-    swipe(&mut launcher, &mut clock, 900.0, 300.0, 400, 100);
-    assert_eq!(launcher.shell().state().current, HomeView::Recent);
+    let (mut launcher, mut clock) = six_on_recent(&fakes);
 
     long_press(&mut launcher, &mut clock, 540.0, 1200.0);
 
@@ -3390,5 +3387,211 @@ fn a11y05_a_screen_reader_switches_recent_between_more_and_bigger_cards() {
             .recent
             .expect("Recent works")
             .density_offered
+    );
+}
+
+/// Recent as the host draws it now.
+fn recent_frame(launcher: &mut Launcher) -> RecentFrame {
+    launcher.frame().recent.expect("Recent works")
+}
+
+/// Where each of Recent's cards was in the cards the host read before, as the host reads them.
+fn recent_froms(launcher: &mut Launcher) -> Vec<Option<usize>> {
+    launcher.frame();
+    let cards = launcher.view().recent().cards();
+    cards.iter().map(|card| card.from).collect()
+}
+
+#[test]
+fn ac14_given_recent_a_long_press_and_clear_all_remove_every_card_and_stop_no_app() {
+    // Issue #24: REC-07, REC-08, PRIV-03.
+    let fakes = Fakes::default();
+    let (mut launcher, mut clock) = six_on_recent(&fakes);
+    fakes.storage.writes.lock().unwrap().clear();
+
+    long_press(&mut launcher, &mut clock, 540.0, 1200.0);
+    assert!(recent_frame(&mut launcher).close.on);
+    launcher.view().recent().clear_all_tapped();
+    come_to_rest(&mut launcher, &mut clock);
+
+    assert_eq!(recent_cards(&mut launcher), (RecentMode::Empty, Vec::new()));
+    let recent = recent_frame(&mut launcher);
+    assert!(!recent.close.on, "nothing is left to remove");
+    assert_eq!(recent.removals, 1);
+    // No app was stopped, opened or asked about: only the list of removals was saved.
+    assert!(fakes.apps.launched.lock().unwrap().is_empty());
+    assert!(fakes.apps.uninstall_requested.lock().unwrap().is_empty());
+    assert!(fakes.apps.app_info_opened.lock().unwrap().is_empty());
+    assert_eq!(
+        *fakes.storage.writes.lock().unwrap(),
+        [StoredFile::Settings]
+    );
+    let stored = fakes.storage.stored_text();
+    let removals = stored.lines().filter(|line| line.starts_with("removed "));
+    assert_eq!(removals.count(), 6, "{stored}");
+
+    // Each app returns to Recent when it is next used.
+    *fakes.system.now_ms.lock().unwrap() = 10_100_000;
+    fakes.usage.uses.lock().unwrap()[2].last_used_ms = 10_050_000;
+    launcher.dispatch(ShellIntent::Returned { home: false });
+    assert_eq!(labels(&recent_cards(&mut launcher).1), ["music"]);
+}
+
+#[test]
+fn rec07_a_tap_on_empty_space_back_home_or_another_view_leaves_close_mode() {
+    // Issue #24: REC-07, ANIM-24.
+    let fakes = Fakes::default();
+    let (mut launcher, mut clock) = six_on_recent(&fakes);
+    let close_on = |launcher: &mut Launcher| recent_frame(launcher).close.on;
+
+    long_press(&mut launcher, &mut clock, 540.0, 1200.0);
+    assert!(close_on(&mut launcher));
+    launcher.view().recent().empty_tapped();
+    assert!(!close_on(&mut launcher));
+
+    long_press(&mut launcher, &mut clock, 540.0, 1200.0);
+    launcher.dispatch(ShellIntent::Back);
+    assert!(!close_on(&mut launcher));
+
+    long_press(&mut launcher, &mut clock, 540.0, 1200.0);
+    launcher.dispatch(ShellIntent::Home);
+    assert!(!close_on(&mut launcher));
+    assert_eq!(launcher.shell().state().current, HomeView::Recent);
+
+    long_press(&mut launcher, &mut clock, 540.0, 1200.0);
+    swipe(&mut launcher, &mut clock, 300.0, 900.0, 400, 100);
+    assert_eq!(launcher.shell().state().current, HomeView::Applications);
+    assert!(!launcher.shell().recent().state().close_mode);
+    assert_eq!(*fakes.system.haptic_ticks.lock().unwrap(), 4);
+
+    // A card tapped in close mode opens nothing.
+    swipe(&mut launcher, &mut clock, 900.0, 300.0, 400, 100);
+    long_press(&mut launcher, &mut clock, 540.0, 1200.0);
+    let revision = recent_frame(&mut launcher).revision;
+    assert!(launcher.view().recent().card_tapped(revision, 0, CARD));
+    launcher.frame();
+    assert!(fakes.apps.launched.lock().unwrap().is_empty());
+}
+
+#[test]
+fn rec08_a_badge_removes_its_card_and_the_others_close_the_gap() {
+    // Issue #24: REC-08, ANIM-12, ANIM-18.
+    let fakes = Fakes::default();
+    let (mut launcher, mut clock) = six_on_recent(&fakes);
+    long_press(&mut launcher, &mut clock, 540.0, 1200.0);
+    come_to_rest(&mut launcher, &mut clock);
+
+    // ANIM-12: the cards at 92 %, and every row's ✕ at full size.
+    let recent = recent_frame(&mut launcher);
+    assert_eq!(recent.close.scale, 9_200);
+    assert_eq!(recent.close.progress, 10_000);
+    assert_eq!(recent.close.badges, [10_000; RECENT_ROWS]);
+    recent_froms(&mut launcher);
+
+    assert!(launcher.view().recent().badge_tapped(recent.revision, 1));
+    let start = clock;
+    let recent = recent_frame(&mut launcher);
+    assert_eq!(recent.removals, 1);
+    assert_eq!(recent.leave[0], 0, "Maps shrinks away in the first row");
+    assert_eq!(recent.leave[1], 10_000);
+    assert!(recent.close.on, "the others can still be removed");
+    assert_eq!(
+        recent_froms(&mut launcher),
+        [Some(0), Some(2), Some(3), Some(4), Some(5)]
+    );
+    come_to_rest(&mut launcher, &mut clock);
+    // ANIM-18: 180 ms.
+    assert!(
+        (180..=210).contains(&(clock - start)),
+        "{} ms",
+        clock - start
+    );
+    let (_, cards) = recent_cards(&mut launcher);
+    assert_eq!(
+        labels(&cards),
+        ["mail", "music", "camera", "clock", "notes"]
+    );
+}
+
+#[test]
+fn anim18_clear_all_collapses_the_cards_within_400_ms() {
+    // Issue #24: ANIM-18. Six cards in two rows: the second starts 220 ms after the first.
+    let fakes = Fakes::default();
+    let (mut launcher, mut clock) = six_on_recent(&fakes);
+    long_press(&mut launcher, &mut clock, 540.0, 1200.0);
+    come_to_rest(&mut launcher, &mut clock);
+    recent_froms(&mut launcher);
+
+    launcher.view().recent().clear_all_tapped();
+    let start = clock;
+    let recent = recent_frame(&mut launcher);
+    assert_eq!(recent.leave[..3], [0, 0, 10_000]);
+    wait(&mut launcher, &mut clock, 160);
+    let recent = recent_frame(&mut launcher);
+    assert!(
+        recent.leave[0] > 5_000 && recent.leave[1] == 0,
+        "{:?}",
+        recent.leave
+    );
+    come_to_rest(&mut launcher, &mut clock);
+
+    assert!(
+        (400..=420).contains(&(clock - start)),
+        "{} ms",
+        clock - start
+    );
+    assert_eq!(recent_frame(&mut launcher).leave, [10_000; RECENT_ROWS]);
+}
+
+#[test]
+fn ac18_with_animations_removed_close_mode_and_removals_are_instant() {
+    // Issue #24: ANIM-05, AC-18.
+    let fakes = Fakes::default();
+    *fakes.system.animation_scale.lock().unwrap() = 0.0;
+    let (mut launcher, mut clock) = six_on_recent(&fakes);
+
+    long_press(&mut launcher, &mut clock, 540.0, 1200.0);
+    let frame = launcher.frame();
+    assert!(!frame.animating);
+    let recent = frame.recent.expect("Recent works");
+    assert_eq!(recent.close.scale, 9_200);
+    assert_eq!(recent.close.badges, [10_000; RECENT_ROWS]);
+
+    assert!(launcher.view().recent().badge_tapped(recent.revision, 0));
+    let frame = launcher.frame();
+    assert!(!frame.animating);
+    assert_eq!(
+        frame.recent.expect("Recent works").leave,
+        [10_000; RECENT_ROWS]
+    );
+
+    launcher.view().recent().clear_all_tapped();
+    assert!(!launcher.frame().animating);
+    assert_eq!(recent_cards(&mut launcher).0, RecentMode::Empty);
+}
+
+#[test]
+fn a11y05_a_screen_reader_clears_recent_without_gestures() {
+    // Issue #24: A11Y-05, AC-19. "Edit Recent" enters close mode without a tick, and the cards'
+    // "Remove ‹app› from Recent" and Clear all work as the ✕ and the button do.
+    let fakes = Fakes::default();
+    let (mut launcher, _) = six_on_recent(&fakes);
+    assert!(recent_frame(&mut launcher).close_offered);
+
+    launcher.view().recent().close_mode_requested();
+    let recent = recent_frame(&mut launcher);
+    assert!(recent.close.on);
+    assert!(!recent.close_offered);
+    assert!(!recent.density_offered, "no pinch while removing cards");
+    assert_eq!(*fakes.system.haptic_ticks.lock().unwrap(), 0);
+
+    recent_froms(&mut launcher);
+    assert!(launcher.view().recent().badge_tapped(recent.revision, 0));
+    assert_eq!(recent_cards(&mut launcher).1.len(), 5);
+    launcher.view().recent().clear_all_tapped();
+    assert_eq!(recent_cards(&mut launcher), (RecentMode::Empty, Vec::new()));
+    assert!(
+        !recent_frame(&mut launcher).close_offered,
+        "nothing to remove"
     );
 }

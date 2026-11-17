@@ -37,7 +37,7 @@ use crate::{
     Age, AppMenuItem, BADGE_ROWS, Bounds, Cell, CellKey, Direction, EventsListMode, EventsRow,
     FOLDER_COLUMNS, FolderId, GridLayout, HomeFrame, HomeView, Launcher, Layout, MenuItem,
     NotificationMenuItem, PREVIEW_APPS, PinchEvent, PinchKind, PointerEvent, PointerKind,
-    RecentMode, RowTarget, SavedHome, SettingsGroup, ShellIntent, ShownCard, Surface,
+    RECENT_ROWS, RecentMode, RowTarget, SavedHome, SettingsGroup, ShellIntent, ShownCard, Surface,
 };
 
 /// JNI's `jboolean`.
@@ -1074,8 +1074,10 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRece
 ///    by;
 /// 6. the card's fill, the app's accent as opaque ARGB in decimal (REC-04);
 /// 7. and 8. how long ago the app was used: the unit, 0 just now, 1 minutes, 2 hours or 3 days,
-///    and how many of it (REC-04).
-fn recent_card_fields(card: &ShownCard) -> [String; 8] {
+///    and how many of it (REC-04);
+/// 9. where the card was in the cards last read, or -1 for a card that comes in: a card the
+///    host had that no card keeps has gone, and shrinks away where it was (ANIM-18).
+fn recent_card_fields(card: &ShownCard) -> [String; 9] {
     let flags = u8::from(card.work) | u8::from(!card.available) << 1;
     let (unit, count) = match card.age {
         Age::JustNow => (0, 0),
@@ -1092,6 +1094,7 @@ fn recent_card_fields(card: &ShownCard) -> [String; 8] {
         argb(card.fill).to_string(),
         unit.to_string(),
         count.to_string(),
+        card.from.map_or(-1, |from| from as i64).to_string(),
     ]
 }
 
@@ -1206,6 +1209,105 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRece
         launcher.view().recent().density_chosen(density);
         true
     })
+}
+
+/// `String nativeRecentBadgeTapped(int revision, int index)`: in close mode, the ✕ of card
+/// `index` of Recent's cards at `revision` was tapped, or a screen reader chose "Remove ‹app›
+/// from Recent". The card goes from Recent; its app keeps running (REC-08). Returns `null`, or a
+/// short message to show when it couldn't be saved. The frame's slot 108 says when it went.
+/// Cards that changed since the host drew them do nothing.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRecentBadgeTapped(
+    env: RawEnv,
+    _views: JObject,
+    revision: i32,
+    index: i32,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_recent_message(env, |launcher| {
+        let Ok(index) = usize::try_from(index) else {
+            return false;
+        };
+        if !launcher.shell().state().close.on {
+            return false;
+        }
+        // The revision travels as Java's `int`.
+        launcher
+            .view()
+            .recent()
+            .badge_tapped(revision as u32, index)
+    })
+}
+
+/// `String nativeRecentClearAll()`: in close mode, Clear all was tapped. Every card goes from
+/// Recent, in one save; no app is stopped (REC-08, AC-14). Returns `null`, or a short message
+/// to show when it couldn't be saved. The frame's slot 108 says when they went.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRecentClearAll(
+    env: RawEnv,
+    _views: JObject,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_recent_message(env, |launcher| {
+        if !launcher.shell().state().close.on {
+            return false;
+        }
+        launcher.view().recent().clear_all_tapped();
+        true
+    })
+}
+
+/// `void nativeRecentEmptyTapped()`: in close mode, a tap on Recent landed where nothing takes
+/// taps. It leaves close mode (REC-07).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRecentEmptyTapped(
+    env: RawEnv,
+    _views: JObject,
+) {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_launcher(env, |launcher| {
+        if launcher.shell().recent_ready() && launcher.shell().state().close.on {
+            launcher.view().recent().empty_tapped();
+            launcher.frame();
+        }
+    });
+}
+
+/// `void nativeRecentEditRequested()`: a screen reader chose "Edit Recent", which enters close
+/// mode as a long-press on the cards does, without the tick (REC-07, A11Y-05). Does nothing
+/// unless the frame's slot 107 offers it.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRecentEditRequested(
+    env: RawEnv,
+    _views: JObject,
+) {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_launcher(env, |launcher| {
+        if launcher.shell().recent_ready() && launcher.shell().state().close_offered {
+            launcher.view().recent().close_mode_requested();
+            launcher.frame();
+        }
+    });
 }
 
 /// `String nativeAllowUsage()`: the user tapped Allow on Recent's usage-access card, which
@@ -2233,7 +2335,9 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRead
 }
 
 /// How many slots the frame has.
-const FRAME_SLOTS: usize = 104;
+const FRAME_SLOTS: usize = 127;
+/// The first of Recent's close-mode slots.
+const CLOSE_SLOTS: usize = 104;
 
 /// A `HomeFrame` as the `int[]` that `HomeViews.java` reads, slot by slot:
 ///
@@ -2323,6 +2427,13 @@ const FRAME_SLOTS: usize = 104;
 /// | 101 | How far that reflow has come, 0 to 10 000 |
 /// | 102 | How many rows of cards one phone screen shows: 3, or 2 for bigger cards (REC-05) |
 /// | 103 | 1 while screen readers can switch between more and bigger cards (A11Y-05); otherwise 0 |
+/// | 104 | 1 while Recent's close mode is on (REC-07); otherwise 0 |
+/// | 105 | Every card's scale in ten-thousandths: 10 000, or 9 200 in close mode (ANIM-12) |
+/// | 106 | How far into close mode the cards are, 0 to 10 000: Clear all's opacity |
+/// | 107 | 1 while screen readers can enter close mode with "Edit Recent" (A11Y-05); otherwise 0 |
+/// | 108 | Changes each time apps are removed from Recent, so the host confirms it (REC-08, A11Y-08) |
+/// | 109–117 | The ✕ scale of each row of cards, in ten-thousandths (ANIM-12) |
+/// | 118–126 | How far the cards that left each row of the cards last read have gone, 0 to 10 000: they shrink and fade (ANIM-18) |
 fn frame_slots(frame: &HomeFrame) -> [i32; FRAME_SLOTS] {
     let [events, applications, recent] = frame.pages;
     let menu_items = frame.menu.map_or(0, |menu| {
@@ -2495,7 +2606,26 @@ fn frame_slots(frame: &HomeFrame) -> [i32; FRAME_SLOTS] {
             .recent
             .map_or(0, |recent| i32::from(recent.density_offered)),
     ];
-    slots[40 + BADGE_ROWS..].copy_from_slice(&rest);
+    slots[40 + BADGE_ROWS..CLOSE_SLOTS].copy_from_slice(&rest);
+    let recent = frame.recent;
+    let close = recent.map(|recent| recent.close);
+    let fixed = [
+        close.map_or(0, |close| i32::from(close.on)),
+        close.map_or(10_000, |close| i32::from(close.scale)),
+        close.map_or(0, |close| i32::from(close.progress)),
+        recent.map_or(0, |recent| i32::from(recent.close_offered)),
+        // A counter, which travels as Java's `int`; the host only compares it.
+        recent.map_or(0, |recent| recent.removals as i32),
+    ];
+    let badges = CLOSE_SLOTS + fixed.len();
+    let leave = badges + RECENT_ROWS;
+    slots[CLOSE_SLOTS..badges].copy_from_slice(&fixed);
+    for (row, slot) in slots[badges..leave].iter_mut().enumerate() {
+        *slot = close.map_or(0, |close| i32::from(close.badges[row]));
+    }
+    for (row, slot) in slots[leave..].iter_mut().enumerate() {
+        *slot = recent.map_or(10_000, |recent| i32::from(recent.leave[row]));
+    }
     slots
 }
 

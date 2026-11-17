@@ -31,7 +31,7 @@ use meegone_lockimage_ui::{ImageCard, ImageSettingsSection};
 use meegone_recent_ui::RecentView;
 pub use meegone_recent_ui::{Age, RecentMode, ShownCard};
 use meegone_settings_ui::{HomeBanner, SettingsView};
-pub use meegone_shell_state::BADGE_ROWS;
+pub use meegone_shell_state::{BADGE_ROWS, RECENT_ROWS};
 use meegone_shell_state::{HomeShell, HomeView, MenuItem, SettingsGroup, ShellIntent};
 
 type Outbox = Rc<RefCell<VecDeque<ShellIntent>>>;
@@ -96,10 +96,37 @@ pub struct RecentFrame {
     /// scale about it.
     pub pivot: (i32, i32),
     /// Changes each time the cards start to reflow from where they are drawn to their places:
-    /// after a pinch, and whenever the density changes (ANIM-17).
+    /// after a pinch, whenever the density changes (ANIM-17), and after cards were removed
+    /// (ANIM-18).
     pub reflow: u32,
     /// How far that reflow has come, from 0 to 10 000.
     pub reflow_progress: u16,
+    /// Close mode and its motion (REC-07, ANIM-12).
+    pub close: CloseFrame,
+    /// Screen readers can enter close mode (A11Y-05).
+    pub close_offered: bool,
+    /// Changes each time apps are removed from Recent, so the host confirms it (REC-08,
+    /// A11Y-08).
+    pub removals: u32,
+    /// How far the cards that left each row of the cards the host last read have gone, in
+    /// ten-thousandths: they shrink and fade as it grows. 10 000 for a row no card left
+    /// (ANIM-18).
+    pub leave: [u16; RECENT_ROWS],
+}
+
+/// Recent's close mode as the host draws it (REC-07, ANIM-12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CloseFrame {
+    /// Close mode is on: a tap on a ✕ removes its card, a tap on a card does nothing, and Clear
+    /// all and the screen-reader actions are offered.
+    pub on: bool,
+    /// Every card's scale in ten-thousandths: 10 000 out of close mode, 9 200 in it.
+    pub scale: u16,
+    /// How far into close mode the cards are, from 0 to 10 000. Clear all fades with it.
+    pub progress: u16,
+    /// The ✕ scale, in ten-thousandths, of each row of cards. 0 while none shows, and a little
+    /// over 10 000 as one pops in.
+    pub badges: [u16; RECENT_ROWS],
 }
 
 /// The dragged icon, as the host draws it above everything (APPS-11, APPS-12, ADR 0015).
@@ -486,7 +513,9 @@ impl ShellView {
                 || state.search.animating
                 || state.events_change.animating
                 || state.image_change.animating
-                || state.pinch.animating,
+                || state.pinch.animating
+                || state.close.animating
+                || state.recent_change.animating,
             menu: state.menu.map(|menu| MenuFrame {
                 items: menu.items,
                 anchor: menu
@@ -534,6 +563,15 @@ impl ShellView {
                     pivot: (pinch.pivot_x.round() as i32, pinch.pivot_y.round() as i32),
                     reflow: pinch.reflow,
                     reflow_progress: ten_thousandths(pinch.progress),
+                    close: CloseFrame {
+                        on: state.close.on,
+                        scale: scale(state.close.scale),
+                        progress: ten_thousandths(state.close.progress),
+                        badges: std::array::from_fn(|row| scale(state.close.badges[row])),
+                    },
+                    close_offered: state.close_offered,
+                    removals: shell.recent().state().removals,
+                    leave: state.recent_change.leave.map(ten_thousandths),
                 }
             }),
             background: tokens.background,

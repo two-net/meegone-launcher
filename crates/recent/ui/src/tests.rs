@@ -113,6 +113,7 @@ fn the_cards_show_in_order_with_their_label_and_age() {
         view.cards(),
         [
             ShownCard {
+                from: None,
                 app: recent.cards[0].app.id.clone(),
                 label: "Mail".into(),
                 work: false,
@@ -121,6 +122,7 @@ fn the_cards_show_in_order_with_their_label_and_age() {
                 age: Age::Minutes(5),
             },
             ShownCard {
+                from: None,
                 app: recent.cards[1].app.id.clone(),
                 label: "Maps".into(),
                 work: true,
@@ -289,5 +291,71 @@ fn allow_asks_for_usage_access() {
     assert!(matches!(
         sent.borrow()[..],
         [RecentIntent::OpenAccessSettings]
+    ));
+}
+
+fn froms(view: &RecentView) -> Vec<Option<usize>> {
+    view.cards().iter().map(|card| card.from).collect()
+}
+
+#[test]
+fn each_card_says_where_it_was_in_the_cards_last_read() {
+    // ANIM-18: the host keeps the views of cards that stay, and shrinks away those that went.
+    let (mut view, _) = view();
+    let mut recent = state(
+        Access::Granted,
+        vec![
+            card("mail", "Mail", Age::JustNow),
+            card("maps", "Maps", Age::JustNow),
+            card("music", "Music", Age::JustNow),
+        ],
+    );
+    view.show_cards(&recent, &LIGHT);
+    assert_eq!(froms(&view), [None, None, None]);
+
+    // Two revisions before the host reads again: places are in the cards it last read.
+    recent.cards.remove(1);
+    view.show_cards(&recent, &LIGHT);
+    recent.cards.insert(0, card("chat", "Chat", Age::JustNow));
+    view.show_cards(&recent, &LIGHT);
+    assert_eq!(froms(&view), [None, Some(0), Some(2)]);
+
+    recent.cards.remove(0);
+    view.show_cards(&recent, &LIGHT);
+    assert_eq!(froms(&view), [Some(1), Some(2)]);
+}
+
+#[test]
+fn a_badge_removes_its_card_from_recent() {
+    // REC-08
+    let (mut view, sent) = view();
+    let recent = mail_and_maps();
+    let revision = view.show_cards(&recent, &LIGHT);
+
+    assert!(view.badge_tapped(revision, 1));
+    assert!(!view.badge_tapped(revision, 2));
+    assert!(!view.badge_tapped(revision.wrapping_add(1), 0));
+
+    let sent = sent.borrow();
+    assert_eq!(sent.len(), 1);
+    assert!(matches!(&sent[0], RecentIntent::Remove(app) if *app == recent.cards[1].app.id));
+}
+
+#[test]
+fn close_mode_is_entered_left_and_cleared_without_a_gesture() {
+    // REC-07, REC-08, A11Y-05
+    let (view, sent) = view();
+
+    view.close_mode_requested();
+    view.clear_all_tapped();
+    view.empty_tapped();
+
+    assert!(matches!(
+        sent.borrow()[..],
+        [
+            RecentIntent::EnterCloseMode,
+            RecentIntent::ClearAll,
+            RecentIntent::ExitCloseMode
+        ]
     ));
 }

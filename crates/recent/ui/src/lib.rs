@@ -2,8 +2,13 @@
 //!
 //! The host draws what Recent shows from what [`RecentView::show_cards`] last told it: the
 //! explainer card, "No recent apps" or the cards (ADR 0023). It reads the cards again whenever
-//! that revision changes, and names a tapped card by the revision and its place, so a card that
-//! changed meanwhile opens nothing.
+//! that revision changes, and names a tapped card or ✕ by the revision and its place, so a card
+//! that changed meanwhile opens or removes nothing. Each card says where it was in the cards the
+//! host last read, so a card that went shrinks away where it was and the others close the gap
+//! (ANIM-18, ADR 0025).
+
+use std::cell::RefCell;
+use std::collections::HashMap;
 
 use meegone_core_state::{Access, AppId, RecentDensity, Rect};
 use meegone_core_ui::{Dispatch, Rgb, Tokens, View};
@@ -26,6 +31,9 @@ pub enum RecentMode {
 /// A card as the host draws it (REC-04).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShownCard {
+    /// Where the card was in the cards the host last read, if it keeps its view; `None` for a
+    /// card that comes in. A card the host had that no card keeps has gone (ANIM-18).
+    pub from: Option<usize>,
     /// Which app, for its icon and for opening it.
     pub app: AppId,
     pub label: String,
@@ -49,6 +57,9 @@ struct Told {
     tokens: Option<Tokens>,
     mode: RecentMode,
     cards: Vec<ShownCard>,
+    /// The apps of the cards the host last read. Two revisions can come between its reads, so
+    /// each card says where it was in these, not in the revision before.
+    read: RefCell<Vec<AppId>>,
     revision: u32,
 }
 
@@ -69,6 +80,7 @@ impl RecentView {
                 tokens: None,
                 mode: RecentMode::Explainer,
                 cards: Vec::new(),
+                read: RefCell::new(Vec::new()),
                 revision: 0,
             },
             columns: phone_columns(RecentDensity::default()),
@@ -100,7 +112,16 @@ impl RecentView {
             Access::Granted => RecentMode::Cards,
         };
         let cards: Vec<ShownCard> = match mode {
-            RecentMode::Cards => state.cards.iter().map(|card| shown(card, tokens)).collect(),
+            RecentMode::Cards => {
+                let read = told.read.borrow();
+                let places: HashMap<&AppId, usize> =
+                    read.iter().enumerate().map(|(at, app)| (app, at)).collect();
+                state
+                    .cards
+                    .iter()
+                    .map(|card| shown(places.get(&card.app.id).copied(), card, tokens))
+                    .collect()
+            }
             RecentMode::Explainer | RecentMode::Empty => Vec::new(),
         };
         if mode != told.mode || cards != told.cards {
@@ -117,8 +138,17 @@ impl RecentView {
     }
 
     /// The cards as of the last [`RecentView::show_cards`], newest first, filling rows left to
-    /// right and top to bottom (REC-03). None unless the mode is [`RecentMode::Cards`].
+    /// right and top to bottom (REC-03). None unless the mode is [`RecentMode::Cards`]. The host
+    /// reads them when the revision changes; each card of a later revision says where it was in
+    /// these.
     pub fn cards(&self) -> &[ShownCard] {
+        self.told.read.replace(
+            self.told
+                .cards
+                .iter()
+                .map(|card| card.app.clone())
+                .collect(),
+        );
         &self.told.cards
     }
 
@@ -176,19 +206,41 @@ impl RecentView {
         self.dispatch.send(RecentIntent::OpenAccessSettings);
     }
 
-    /// A long-press anywhere on the grid enters close mode (REC-07).
-    pub fn grid_long_pressed(&self) {
+    /// A screen reader asked for close mode, as a long-press on the grid enters it (REC-07,
+    /// A11Y-05).
+    pub fn close_mode_requested(&self) {
         self.dispatch.send(RecentIntent::EnterCloseMode);
     }
 
-    /// REC-08
-    pub fn remove_tapped(&self, app: AppId) {
-        self.dispatch.send(RecentIntent::Remove(app));
+    /// A tap on empty space, in close mode, leaves it (REC-07).
+    pub fn empty_tapped(&self) {
+        self.dispatch.send(RecentIntent::ExitCloseMode);
+    }
+
+    /// The ✕ of card `index` of the cards at `revision` was tapped, or a screen reader chose
+    /// "Remove ‹app› from Recent": the card goes from Recent, and the app keeps running
+    /// (REC-08). Returns whether it does anything: not when the cards changed since the host
+    /// drew them.
+    pub fn badge_tapped(&self, revision: u32, index: usize) -> bool {
+        if revision != self.told.revision {
+            return false;
+        }
+        let Some(card) = self.told.cards.get(index) else {
+            return false;
+        };
+        self.dispatch.send(RecentIntent::Remove(card.app.clone()));
+        true
+    }
+
+    /// Clear all removes every card from Recent; no app is stopped (REC-08, AC-14).
+    pub fn clear_all_tapped(&self) {
+        self.dispatch.send(RecentIntent::ClearAll);
     }
 }
 
-fn shown(card: &RecentCard, tokens: &Tokens) -> ShownCard {
+fn shown(from: Option<usize>, card: &RecentCard, tokens: &Tokens) -> ShownCard {
     ShownCard {
+        from,
         app: card.app.id.clone(),
         label: card.app.label.clone(),
         work: card.app.work,

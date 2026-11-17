@@ -28,6 +28,7 @@ import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 import android.view.WindowManager;
 import android.view.accessibility.AccessibilityEvent;
+import android.view.accessibility.AccessibilityManager;
 import android.view.accessibility.AccessibilityNodeInfo;
 import android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction;
 import android.widget.EditText;
@@ -183,7 +184,15 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private static final int RECENT_REFLOW_PROGRESS = 101; // 0 to 10 000
     private static final int RECENT_ROWS = 102; // rows on one screen: 3, or 2 for bigger cards
     private static final int RECENT_DENSITY_OFFERED = 103; // 1 while screen readers can switch
-    private static final int FRAME_SIZE = 104;
+    // Recent's close mode and its cards leaving (REC-07, REC-08, ANIM-12, ANIM-18, ADR 0025):
+    private static final int RECENT_CLOSE = 104; // 1 while close mode is on
+    private static final int RECENT_CLOSE_SCALE = 105; // every card's, in ten-thousandths
+    private static final int RECENT_CLOSE_PROGRESS = 106; // 0 to 10 000: Clear all's opacity
+    private static final int RECENT_EDIT_OFFERED = 107; // 1 while screen readers can enter it
+    private static final int RECENT_REMOVALS = 108; // changes when apps were removed
+    private static final int RECENT_BADGES = 109; // the ✕ scale of each row, RecentList.ROWS
+    private static final int RECENT_LEAVE = 118; // how far each row's cards have gone
+    private static final int FRAME_SIZE = 127;
     private static final int SEARCH_OPEN = 1; // the field has the keyboard
     private static final int SEARCH_RESULTS = 2; // the results show instead of the grid
     private static final int SEARCH_NOTHING = 4; // nothing matches
@@ -197,6 +206,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private static final int VIEWS = 3;
     private static final int EVENTS = 0;
     private static final int APPLICATIONS = 1;
+    private static final int RECENT_VIEW = 2;
     private static final int[] NAMES = {
         R.string.view_events, R.string.view_applications, R.string.view_recent
     };
@@ -320,10 +330,23 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     /** Where the driving finger went down, for finding what is under it after a long-press. */
     private float downX;
     private float downY;
+    /** Where and when the current gesture began, and whether it is still a tap (REC-07). */
+    private float tapX;
+    private float tapY;
+    private long tapTime;
+    private boolean tapping;
     private boolean framePosted;
     private int announced = -1;
     /** Edit mode as last drawn, or -1 before the first frame. */
     private int editingShown = -1;
+    /** Recent's close mode as last drawn, or -1 before the first frame. */
+    private int closingShown = -1;
+    /** Recent's removals as last confirmed, or -1 before the first frame (REC-08). */
+    private int removalsShown = -1;
+    /** Whether screen readers can enter close mode, as last told, or -1 (A11Y-05). */
+    private int editRecentOffered = -1;
+    /** The confirmation of the last removal from Recent, while it may still show (REC-08). */
+    private Toast removedToast;
     /** Done's colours as drawn: the accent behind, and the background's for its text. */
     private int doneAccent;
     private int doneText;
@@ -448,6 +471,16 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             public void laidOut(int widthPx) {
                 nativeRecentLayout(widthPx);
                 apply();
+            }
+
+            @Override
+            public void badgeTapped(int index) {
+                recentBadgeTapped(index);
+            }
+
+            @Override
+            public void clearAll() {
+                clearRecent();
             }
         });
         doneMargin = dp(16);
@@ -800,7 +833,39 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             apply();
         }
         watchForLongPress(event);
+        watchForTap(event);
         return super.dispatchTouchEvent(event);
+    }
+
+    /**
+     * In Recent's close mode, a tap where nothing takes taps leaves it (REC-07): a finger lifted
+     * within the touch slop, before the long-press time, with nothing else having taken the
+     * gesture.
+     */
+    private void watchForTap(MotionEvent event) {
+        switch (event.getActionMasked()) {
+            case MotionEvent.ACTION_DOWN:
+                tapping = true;
+                tapX = event.getX();
+                tapY = event.getY();
+                tapTime = event.getEventTime();
+                break;
+            case MotionEvent.ACTION_MOVE:
+                tapping &= Math.hypot(event.getX() - tapX, event.getY() - tapY) <= touchSlop;
+                break;
+            case MotionEvent.ACTION_UP:
+                boolean tap = tapping && !claimed && !childClaimed
+                        && event.getEventTime() - tapTime < ViewConfiguration.getLongPressTimeout();
+                tapping = false;
+                if (tap && frame[CURRENT] == RECENT_VIEW && frame[RECENT_CLOSE] != 0
+                        && touchTarget(this, pages[RECENT_VIEW], tapX, tapY) == null) {
+                    nativeRecentEmptyTapped();
+                    apply();
+                }
+                break;
+            default:
+                tapping = false;
+        }
     }
 
     @Override
@@ -950,8 +1015,9 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
 
     /**
      * The finger has been held long enough. On empty space, the Rust app decides: the home menu
-     * or close mode (HOME-10). On a cell, of the grid or of the open folder, it decides whether
-     * its menu opens (APPS-11).
+     * or close mode (HOME-10). Anywhere on Recent's cards, it decides whether close mode starts
+     * (REC-07). On a cell, of the grid or of the open folder, it decides whether its menu opens
+     * (APPS-11).
      * Any other element handles touches itself. If the Rust app takes the long-press, the
      * content gets no more of the gesture, so lifting the finger taps nothing.
      */
@@ -961,7 +1027,9 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         }
         View target = touchTarget(this, pages[frame[CURRENT]], downX, downY);
         int row = frame[CURRENT] == EVENTS ? eventsList.indexOfRow(target) : -1;
-        if (target == null) {
+        boolean onRecentCard =
+                frame[CURRENT] == RECENT_VIEW && recentList.indexOfCard(target) >= 0;
+        if (target == null || onRecentCard) {
             claimed = nativeLongPress();
         } else if (target instanceof AppCell && frame[CURRENT] == APPLICATIONS) {
             AppCell cell = (AppCell) target;
@@ -1138,6 +1206,15 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             }
             editingShown = frame[EDITING];
         }
+        if (frame[RECENT_CLOSE] != closingShown) {
+            // A11Y-08: "Editing Recent", read again each time close mode starts, as edit mode.
+            if (closingShown >= 0) {
+                status.setText(frame[RECENT_CLOSE] != 0
+                        ? getResources().getString(R.string.recent_close_mode)
+                        : viewPosition(current));
+            }
+            closingShown = frame[RECENT_CLOSE];
+        }
         applyEventsHeader();
         applyEventsList();
         applyImageCard();
@@ -1149,11 +1226,12 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         int offered = (frame[SEARCH] & SEARCH_OFFERED) != 0 ? 1 : 0;
         int density = frame[RECENT_DENSITY_OFFERED] != 0 ? frame[RECENT_ROWS] : 0;
         if (frame[MENU_OFFERED] != menuOffered || offered != searchOffered
-                || density != densityOffered) {
+                || density != densityOffered || frame[RECENT_EDIT_OFFERED] != editRecentOffered) {
             // Screen readers ask again which actions the home views offer.
             menuOffered = frame[MENU_OFFERED];
             searchOffered = offered;
             densityOffered = density;
+            editRecentOffered = frame[RECENT_EDIT_OFFERED];
             sendAccessibilityEvent(AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED);
         }
         if (frame[ANIMATING] != 0 && !framePosted && isAttachedToWindow()) {
@@ -1450,6 +1528,55 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             recentList.fill(nativeRecentCards());
         }
         recentList.progress(frame[RECENT_REFLOW_PROGRESS]);
+        recentList.close(frame[RECENT_CLOSE] != 0, frame[RECENT_CLOSE_SCALE],
+                frame[RECENT_CLOSE_PROGRESS], frame, RECENT_BADGES);
+        recentList.leave(frame, RECENT_LEAVE);
+        if (frame[RECENT_REMOVALS] != removalsShown) {
+            if (removalsShown >= 0) {
+                confirmRemoval(recentList.left());
+            }
+            removalsShown = frame[RECENT_REMOVALS];
+        }
+    }
+
+    /**
+     * Says apps were removed from Recent, never that they were closed (REC-01, REC-08): briefly,
+     * "Removed from Recent", replacing a confirmation still showing so quick removals don't
+     * queue. With a screen reader, the status says it instead, with the app's name when one went:
+     * "Mail removed from Recent" (A11Y-08). It would read the brief message too.
+     */
+    private void confirmRemoval(String label) {
+        AccessibilityManager access = getContext().getSystemService(AccessibilityManager.class);
+        if (access != null && access.isTouchExplorationEnabled()) {
+            status.setText(label != null
+                    ? getResources().getString(R.string.recent_removed_app, label)
+                    : getResources().getString(R.string.recent_removed));
+            return;
+        }
+        if (removedToast != null) {
+            removedToast.cancel();
+        }
+        removedToast = Toast.makeText(getContext(), R.string.recent_removed, Toast.LENGTH_SHORT);
+        removedToast.show();
+    }
+
+    /**
+     * In close mode, the ✕ of card {@code index} of Recent's cards last read was tapped, or a
+     * screen reader chose "Remove ‹app› from Recent" (REC-08): the card goes from Recent, and
+     * the app keeps running.
+     */
+    private void recentBadgeTapped(int index) {
+        // The revision is unsigned in Rust and travels as Java's int.
+        String message = nativeRecentBadgeTapped((int) recentShown, index);
+        apply();
+        toast(message);
+    }
+
+    /** In close mode, Clear all was tapped (REC-08): every card goes from Recent. */
+    private void clearRecent() {
+        String message = nativeRecentClearAll();
+        apply();
+        toast(message);
     }
 
     /**
@@ -1862,8 +1989,8 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         }
     }
 
-    // Screen readers switch views, open the home menu, open search and switch Recent between more
-    // and bigger cards with actions instead of gestures (A11Y-05).
+    // Screen readers switch views, open the home menu, open search, switch Recent between more
+    // and bigger cards and enter its close mode with actions instead of gestures (A11Y-05).
     @Override
     public void onInitializeAccessibilityNodeInfo(AccessibilityNodeInfo info) {
         super.onInitializeAccessibilityNodeInfo(info);
@@ -1892,6 +2019,11 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
                     getResources().getString(
                             bigger ? R.string.action_bigger_cards : R.string.action_more_cards)));
         }
+        if (frame[RECENT_EDIT_OFFERED] != 0) {
+            // A long-press on Recent's cards enters close mode (REC-07).
+            info.addAction(new AccessibilityAction(R.id.action_edit_recent,
+                    getResources().getString(R.string.action_edit_recent)));
+        }
     }
 
     @Override
@@ -1911,6 +2043,11 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         }
         if (action == R.id.action_more_cards) {
             return chooseDensity(3);
+        }
+        if (action == R.id.action_edit_recent) {
+            nativeRecentEditRequested();
+            apply();
+            return frame[RECENT_CLOSE] != 0;
         }
         boolean rtl = getLayoutDirection() == LAYOUT_DIRECTION_RTL;
         Boolean next = null;
@@ -2096,6 +2233,24 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
      * short message to show when the choice couldn't be saved.
      */
     private native String nativeRecentDensity(int rows);
+
+    /**
+     * In close mode, the ✕ of card {@code index} of Recent's cards at {@code revision} was
+     * tapped (REC-08). Returns null, or a short message to show when it couldn't be saved.
+     */
+    private native String nativeRecentBadgeTapped(int revision, int index);
+
+    /**
+     * In close mode, Clear all was tapped (REC-08). Returns null, or a short message to show when
+     * it couldn't be saved.
+     */
+    private native String nativeRecentClearAll();
+
+    /** In close mode, a tap on Recent landed where nothing takes taps, which leaves it (REC-07). */
+    private native void nativeRecentEmptyTapped();
+
+    /** A screen reader chose "Edit Recent", which enters close mode (REC-07, A11Y-05). */
+    private native void nativeRecentEditRequested();
 
     /**
      * Row {@code index} of the Events rows at {@code revision} was tapped, at this rect on the

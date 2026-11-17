@@ -70,14 +70,8 @@ final class AppCell extends View {
     private static final float PREVIEW_INSET = 0.14f;
     private static final float PREVIEW_GAP = 0.06f;
     private static final int NONE = -1;
-    /** The ✕: a disc this wide, its centre this far inside the icon's top-start corner. */
-    private static final float BADGE_DP = 24f;
+    /** The ✕'s centre is this far inside the icon's top-start corner. */
     private static final float BADGE_INSET_DP = 4f;
-    /** Half the length of each stroke of the ✕, and its width. */
-    private static final float BADGE_ARM_DP = 4.5f;
-    private static final float BADGE_STROKE_DP = 2f;
-    /** A tap within this square at the cell's top-start corner taps the ✕ (A11Y-02). */
-    private static final float BADGE_TARGET_DP = 48f;
     private static final ColorMatrixColorFilter GREYED;
 
     static {
@@ -93,9 +87,9 @@ final class AppCell extends View {
     private final Paint folderFill = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint folderRing = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint dot = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint badgeFill = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint badgeRing = new Paint(Paint.ANTI_ALIAS_FLAG);
-    private final Paint badgeCross = new Paint(Paint.ANTI_ALIAS_FLAG);
+    /** The ✕ over the icon in edit mode (ANIM-12). */
+    private final Badge badge;
+    private final int badgeInsetPx;
     private final RectF plateBounds = new RectF();
     /** The font size only changes with a new configuration, which recreates the views. */
     private final int heightPx;
@@ -105,10 +99,6 @@ final class AppCell extends View {
     private final int sidePaddingPx;
     private final int dotPx;
     private final int dotGapPx;
-    private final int badgePx;
-    private final int badgeInsetPx;
-    private final int badgeArmPx;
-    private final int badgeTargetPx;
 
     /** Its place in the grid's cells. */
     private int index;
@@ -166,17 +156,10 @@ final class AppCell extends View {
         sidePaddingPx = Math.round(SIDE_PADDING_DP * density);
         dotPx = Math.round(DOT_DP * density);
         dotGapPx = Math.round(DOT_GAP_DP * density);
-        badgePx = Math.round(BADGE_DP * density);
+        badge = new Badge(density);
         badgeInsetPx = Math.round(BADGE_INSET_DP * density);
-        badgeArmPx = Math.round(BADGE_ARM_DP * density);
-        badgeTargetPx = Math.round(BADGE_TARGET_DP * density);
-        badgeRing.setStyle(Paint.Style.STROKE);
-        badgeRing.setStrokeWidth(Math.max(1f, density));
         folderRing.setStyle(Paint.Style.STROKE);
         folderRing.setStrokeWidth(Math.max(1f, density));
-        badgeCross.setStyle(Paint.Style.STROKE);
-        badgeCross.setStrokeWidth(BADGE_STROKE_DP * density);
-        badgeCross.setStrokeCap(Paint.Cap.ROUND);
         text.setTextSize(TypedValue.applyDimension(
                 TypedValue.COMPLEX_UNIT_SP, LABEL_SP, getResources().getDisplayMetrics()));
         heightPx = heightPx(context);
@@ -324,9 +307,7 @@ final class AppCell extends View {
         // A faint plate in the secondary text colour.
         plate.setColor((dim & 0x00FFFFFF) | 0x33000000);
         dot.setColor(accent);
-        badgeFill.setColor(surface);
-        badgeRing.setColor((dim & 0x00FFFFFF) | 0x66000000);
-        badgeCross.setColor(foreground);
+        badge.colour(foreground, dim, surface);
         invalidate();
     }
 
@@ -334,7 +315,7 @@ final class AppCell extends View {
      * Edit mode as the frame says (APPS-12, ANIM-12): whether it is on, the whole cell's scale,
      * and its ✕'s scale, which counts only for an app the user can uninstall.
      */
-    void setEdit(boolean editing, float scale, float badge) {
+    void setEdit(boolean editing, float scale, float popped) {
         if (editing != this.editing) {
             this.editing = editing;
             badgeDown = false;
@@ -343,7 +324,7 @@ final class AppCell extends View {
             editScale = scale;
             applyTransform();
         }
-        float shown = hasBadge() ? badge : 0f;
+        float shown = hasBadge() ? popped : 0f;
         if (shown != badgeScale) {
             badgeScale = shown;
             invalidate();
@@ -456,9 +437,7 @@ final class AppCell extends View {
 
     /** Whether ({@code x}, {@code y}) is in the ✕'s target: the cell's top-start square. */
     private boolean onBadge(float x, float y) {
-        boolean rtl = getLayoutDirection() == LAYOUT_DIRECTION_RTL;
-        boolean across = rtl ? x >= getWidth() - badgeTargetPx : x >= 0 && x < badgeTargetPx;
-        return across && y >= 0 && y < badgeTargetPx;
+        return badge.hit(x, y, getWidth(), getLayoutDirection() == LAYOUT_DIRECTION_RTL);
     }
 
     // In edit mode only the ✕ acts on an app: a tap on it asks the system to uninstall the app
@@ -622,9 +601,10 @@ final class AppCell extends View {
             }
             canvas.restore();
         }
-        if (badgeScale > 0f) {
-            drawBadge(canvas, iconLeft, iconTop);
-        }
+        // The ✕ over the icon's top-start corner, inside the cell (ANIM-12).
+        boolean rtl = getLayoutDirection() == LAYOUT_DIRECTION_RTL;
+        badge.draw(canvas, rtl ? iconLeft + iconPx - badgeInsetPx : iconLeft + badgeInsetPx,
+                iconTop + badgeInsetPx, badgeScale);
     }
 
     /**
@@ -697,26 +677,6 @@ final class AppCell extends View {
                 canvas.drawRoundRect(x, y, x + width, y + width, slotCorner, slotCorner, plate);
             }
         }
-    }
-
-    /**
-     * The ✕ over the icon's top-start corner, inside the cell, at its pop-in scale (ANIM-12):
-     * a surface disc with a faint ring and a cross in the text colour, mirrored right to left.
-     */
-    private void drawBadge(Canvas canvas, int iconLeft, int iconTop) {
-        boolean rtl = getLayoutDirection() == LAYOUT_DIRECTION_RTL;
-        float x = rtl ? iconLeft + iconPx - badgeInsetPx : iconLeft + badgeInsetPx;
-        float y = iconTop + badgeInsetPx;
-        float radius = badgePx / 2f;
-        canvas.save();
-        canvas.scale(badgeScale, badgeScale, x, y);
-        canvas.drawCircle(x, y, radius, badgeFill);
-        canvas.drawCircle(x, y, radius - badgeRing.getStrokeWidth() / 2f, badgeRing);
-        canvas.drawLine(x - badgeArmPx, y - badgeArmPx, x + badgeArmPx, y + badgeArmPx,
-                badgeCross);
-        canvas.drawLine(x - badgeArmPx, y + badgeArmPx, x + badgeArmPx, y - badgeArmPx,
-                badgeCross);
-        canvas.restore();
     }
 
     /** The room kept at each side of a new app's label, so the label and its dot stay centred. */
