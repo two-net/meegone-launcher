@@ -40,7 +40,7 @@ use meegone_core_state::{
 use meegone_events_state::{
     EventsHolder, EventsIntent, GroupId, NotificationGroup, RowKey, RowTarget, rows_came_or_went,
 };
-use meegone_lockimage_data::PersistentImageCache;
+use meegone_lockimage_data::{BingFeed, PersistentImageCache};
 use meegone_lockimage_state::{LockImageHolder, LockImageIntent, LockImageState};
 use meegone_recent_state::{MAX_ROWS, RecentHolder, RecentIntent, RecentState, other_density};
 use meegone_settings_state::{SettingsHolder, SettingsIntent, SettingsState};
@@ -465,8 +465,11 @@ impl HomeShell {
             lockimage: Store::new(LockImageHolder::new(
                 settings_store.clone(),
                 Arc::new(PersistentImageCache::new(platform.storage.clone())),
+                // The feed's only implementation, which alone knows its format (ADR 0027).
+                Arc::new(BingFeed::new(platform.network.clone())),
                 platform.wallpaper.clone(),
                 platform.scheduler.clone(),
+                platform.system.clone(),
             )),
             settings: Store::new(SettingsHolder::new(
                 settings_store.clone(),

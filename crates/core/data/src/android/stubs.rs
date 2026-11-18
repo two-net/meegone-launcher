@@ -1,12 +1,12 @@
 //! The platform adapters whose Android implementations arrive with later issues.
 //!
 //! Each answers with its "if unavailable" value from SRS 8.1, so every feature shows its
-//! reduced state meanwhile: no lock-screen image, offline. The app catalogue (`apps.rs`),
-//! notifications (`notifications.rs`) and usage (`usage.rs`) are built.
+//! reduced state meanwhile: no lock-screen image. The app catalogue (`apps.rs`), notifications
+//! (`notifications.rs`), usage (`usage.rs`) and the network (`network.rs`) are built.
 
 use super::not_yet;
-use crate::adapters::{NetworkAdapter, SchedulerAdapter, WallpaperAdapter};
-use crate::model::{DataError, ImageJob, NetworkState, Size};
+use crate::adapters::{SchedulerAdapter, WallpaperAdapter};
+use crate::model::{DataError, ImageJob, Size};
 
 /// Every adapter not built yet.
 pub struct NotBuiltYet;
@@ -31,17 +31,6 @@ impl WallpaperAdapter for NotBuiltYet {
 
     fn open_wallpaper_settings(&self) -> Result<(), DataError> {
         Err(not_yet())
-    }
-}
-
-/// Downloads arrive with #26 and #27.
-impl NetworkAdapter for NotBuiltYet {
-    fn state(&self) -> NetworkState {
-        NetworkState::Offline
-    }
-
-    fn get(&self, _https_url: &str, _max_bytes: usize) -> Result<Vec<u8>, DataError> {
-        Err(DataError::Offline)
     }
 }
 

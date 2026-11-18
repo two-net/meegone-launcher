@@ -2,15 +2,18 @@
 //!
 //! - the image cache, the one store this feature owns: the current and previous images and
 //!   their details;
-//! - [`ImageFeed`], the interface to the image-of-the-day feed. Only its implementation knows
-//!   the feed's format (ARCH-04).
+//! - [`ImageFeed`], the interface to the image-of-the-day feed, and [`BingFeed`], its one
+//!   implementation and the only code that knows the feed's format (ARCH-04, ADR 0027);
+//! - [`region`]: the feed region, Automatic or chosen (WALL-05).
 //!
-//! The Bing implementation of the feed (#26) and the daily updater (SRS 7.5) arrive with the
-//! WALL requirements.
+//! The daily updater (SRS 7.5) arrives with #27 and #28.
 
+mod bing;
 #[cfg(feature = "fakes")]
 pub mod fakes;
 mod feed;
+mod json;
+pub mod region;
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -18,7 +21,8 @@ use meegone_core_data::storage::format::{Fields, Line};
 use meegone_core_data::storage::{Decode, Encode, Format, Migration, Reader, Writer, load, save};
 use meegone_core_data::{DataError, StorageAdapter, StoredFile};
 
-pub use feed::{FeedImage, ImageFeed, ImageVersion};
+pub use bing::BingFeed;
+pub use feed::{FORMAT_CHANGED, FeedImage, ImageFeed, ImageVersion};
 
 /// Version of the saved image-details format (MAINT-04). Changing the format means a new
 /// version, a migration in [`IMAGE_CACHE_MIGRATIONS`] and a fixture (ARCHITECTURE.md,

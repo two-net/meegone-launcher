@@ -16,6 +16,12 @@
         android:name="android.permission.PACKAGE_USAGE_STATS"
         tools:ignore="ProtectedPermissions" />
 
+    <!-- Network and network state (SRS 8.1), granted at install, for the daily image: its one
+         destination is the image feed (PRIV-02, ADR 0027). Only HTTPS is allowed, as
+         network_security_config.xml says (SEC-01). -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
     <!-- Applications lists every app with a launcher entry (APPS-01), and the first grid puts
          the default browser and camera first (APPS-05). From Android 11, other apps are hidden
          from MeeGone unless it declares them here. It is not a permission (SEC-03). -->
@@ -37,13 +43,16 @@
     <!-- The system's backup and device-to-device transfer keep the layout and the settings, and
          nothing else (APPS-21, ADR 0018): backup_rules.xml up to Android 11,
          data_extraction_rules.xml from Android 12. Back reaches the home through
-         OnBackInvokedCallback from Android 13 (HOME-08, ADR 0007). -->
+         OnBackInvokedCallback from Android 13 (HOME-08, ADR 0007). The network security config
+         refuses cleartext traffic and trusts only the system's certificates (SEC-01,
+         ADR 0027). -->
     <application
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:enableOnBackInvokedCallback="true"
         android:fullBackupContent="@xml/backup_rules"
         android:label="@string/app_name"
+        android:networkSecurityConfig="@xml/network_security_config"
         android:supportsRtl="true"
         android:theme="@style/Theme.MeeGone">
 

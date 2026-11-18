@@ -1,11 +1,15 @@
 //! The image-feed interface (SRS 8.2).
 //!
 //! The feed is public but undocumented and may change (A2), so only the one implementation of
-//! [`ImageFeed`] knows its format (ARCH-04). Everything else sees the format-free
-//! [`FeedImage`]. That implementation, for Bing's image of the day, arrives with #26 and fetches
-//! through the `NetworkAdapter`.
+//! [`ImageFeed`], [`BingFeed`](crate::BingFeed), knows its format (ARCH-04, ADR 0027).
+//! Everything else sees the format-free [`FeedImage`]. It fetches through the `NetworkAdapter`.
 
 use meegone_core_data::DataError;
+
+/// What [`ImageFeed::today`] fails with, as [`DataError::Invalid`], when a response can't be
+/// read: the feed's format has changed, or the response is malformed, truncated or too large. A
+/// failure of its own for the status line, never a crash (SRS 8.2, WALL-16).
+pub const FORMAT_CHANGED: &str = "The feed's format has changed";
 
 /// One size of an image that the feed offers (WALL-06).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,18 +30,25 @@ pub struct FeedImage {
     pub title: String,
     /// Shown as the source provides it, as plain text (LEGAL-03, SEC-02).
     pub attribution: String,
+    /// An `https://` link to more about the image, when the feed gives one (WALL-15).
     pub info_link: Option<String>,
+    /// Whether the source offers the image for use as a wallpaper. The updater leaves one that
+    /// isn't, and keeps the current wallpaper (LEGAL-04, ADR 0027).
+    pub offered_as_wallpaper: bool,
     /// Every size on offer, in no particular order.
     pub versions: Vec<ImageVersion>,
 }
 
 /// The image-of-the-day feed.
 pub trait ImageFeed: Send + Sync {
-    /// The region codes the feed supports, for the Region setting (WALL-05).
+    /// The regions the feed supports, for the Region setting, as BCP 47 `language-REGION` tags
+    /// such as `en-GB` (WALL-05). Makes no request.
     fn regions(&self) -> Vec<String>;
-    /// Today's image for `region`.
+    /// Today's image for `region`, one of [`regions`](Self::regions), in exactly one request.
+    /// Never retries: the updater keeps to the call budget (REL-04).
     ///
     /// Fails with [`DataError::Offline`] without a connection, and with
-    /// [`DataError::Invalid`] if the response is malformed or its format has changed.
+    /// [`DataError::Invalid`] for a region the feed doesn't list, without a request, or with
+    /// [`FORMAT_CHANGED`] if the response can't be read.
     fn today(&self, region: &str) -> Result<FeedImage, DataError>;
 }

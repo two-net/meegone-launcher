@@ -31,6 +31,9 @@ import android.icu.lang.UCharacter;
 import android.icu.text.Collator;
 import android.icu.text.DateFormat;
 import android.icu.text.DisplayContext;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
@@ -51,6 +54,11 @@ import android.util.Log;
 import android.view.HapticFeedbackConstants;
 import android.view.View;
 import android.view.WindowInsets;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.URL;
+import java.net.UnknownServiceException;
 import java.text.Normalizer;
 import java.util.ArrayList;
 import java.util.Date;
@@ -61,13 +69,15 @@ import java.util.Map;
 import java.util.TimeZone;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
+import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SSLException;
 
 /**
  * What the Rust platform adapters ask of Android (ADR 0005).
  *
  * <p>Rust looks these methods up by name and signature on the main thread, so keep them in step
  * with {@code crates/core/data/src/android/system.rs}, {@code apps.rs}, {@code
- * notifications.rs} and {@code usage.rs}. Every method catches what Android may throw: an
+ * notifications.rs}, {@code usage.rs} and {@code network.rs}. Every method catches what Android may throw: an
  * exception must never reach Rust. Logs hold only yes/no answers and the kinds of errors, never
  * user data such as which apps are installed or used, or what a notification says (EVT-13,
  * PRIV-03).
@@ -97,6 +107,28 @@ final class Bridge {
     // package, the class of the activity last resumed, profile serial number and when it was
     // last used.
     private static final int USE_FIELDS = 4;
+    // What httpsGet reports in its outcome array (ADR 0027), mirrored in
+    // crates/core/data/src/https.rs: the body follows; a redirect, to the detail's absolute URL;
+    // no connection; a body over the limit; not HTTPS; a secure connection that failed, such as
+    // a certificate that didn't validate; anything else.
+    private static final String GET_OK = "ok";
+    private static final String GET_REDIRECT = "redirect";
+    private static final String GET_OFFLINE = "offline";
+    private static final String GET_TOO_LARGE = "too-large";
+    private static final String GET_NOT_HTTPS = "not-https";
+    private static final String GET_INSECURE = "insecure";
+    private static final String GET_FAILED = "failed";
+    // What networkState answers, mirrored in crates/core/data/src/android/network.rs.
+    private static final int NETWORK_OFFLINE = 0;
+    private static final int NETWORK_METERED = 1;
+    private static final int NETWORK_UNMETERED = 2;
+    /**
+     * The user agent of every request. It names the app and nothing else, where the platform's
+     * default names the device's model and build (PRIV-02).
+     */
+    private static final String USER_AGENT = "MeeGone";
+    private static final int CONNECT_TIMEOUT_MS = 15_000;
+    private static final int READ_TIMEOUT_MS = 30_000;
     /**
      * The extra by which the system's notification settings learn which profile's copy of an app
      * to show: the app's uid there. Settings reads it with the package (ADR 0021).
@@ -1389,6 +1421,143 @@ final class Bridge {
         } catch (PackageManager.NameNotFoundException | RuntimeException e) {
             Log.w(TAG, "Couldn't read MeeGone's install time: " + e.getClass().getSimpleName());
             return 0;
+        }
+    }
+
+    /**
+     * The device's first language as a BCP 47 tag, such as "de-AT", from which the image feed's
+     * Automatic region is derived (WALL-05, ADR 0027). Null if the system can't say. Called from
+     * Rust.
+     */
+    String locale() {
+        try {
+            return Locale.getDefault().toLanguageTag();
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    /**
+     * Whether the device is online, and if so whether its network may cost the user (WALL-04):
+     * {@link #NETWORK_OFFLINE}, {@link #NETWORK_METERED} or {@link #NETWORK_UNMETERED}. Offline
+     * if the system can't say. Called from Rust.
+     */
+    int networkState() {
+        try {
+            ConnectivityManager connectivity =
+                    context.getSystemService(ConnectivityManager.class);
+            Network network = connectivity.getActiveNetwork();
+            NetworkCapabilities capabilities =
+                    network != null ? connectivity.getNetworkCapabilities(network) : null;
+            if (capabilities == null
+                    || !capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)) {
+                return NETWORK_OFFLINE;
+            }
+            return capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+                    ? NETWORK_UNMETERED
+                    : NETWORK_METERED;
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Couldn't read the network state: " + e.getClass().getSimpleName());
+            return NETWORK_OFFLINE;
+        }
+    }
+
+    /**
+     * Makes one HTTPS GET request and returns its body, or null (SEC-01, SEC-02, PRIV-02, ADR
+     * 0027). {@code outcome}, two elements long, gets what happened and a detail: {@link
+     * #GET_OK} with the body, or why there is none, such as {@link #GET_REDIRECT} with the
+     * absolute URL to go to instead. Rust decides which redirects to follow: only to https.
+     *
+     * <p>The platform validates the certificate and the host name, and the network security
+     * config refuses cleartext. The request carries the URL and nothing else that could tell
+     * the device or the user apart: a fixed user agent, no cookies, as MeeGone never installs a
+     * cookie handler, and no cache. A body longer than {@code maxBytes} is never read in full.
+     * It blocks, so it answers {@link #GET_FAILED} on the main thread without a request. Logs
+     * hold only the kind of failure. Called from Rust, off the main thread.
+     */
+    byte[] httpsGet(String url, int maxBytes, String[] outcome) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            Log.w(TAG, "Refused a network request on the main thread");
+            return answer(outcome, GET_FAILED, null);
+        }
+        HttpsURLConnection connection = null;
+        try {
+            URL target = new URL(url);
+            if (!"https".equals(target.getProtocol())) {
+                return answer(outcome, GET_NOT_HTTPS, null);
+            }
+            connection = (HttpsURLConnection) target.openConnection();
+            connection.setInstanceFollowRedirects(false);
+            connection.setUseCaches(false);
+            connection.setConnectTimeout(CONNECT_TIMEOUT_MS);
+            connection.setReadTimeout(READ_TIMEOUT_MS);
+            connection.setRequestProperty("User-Agent", USER_AGENT);
+            int status = connection.getResponseCode();
+            if (status >= 300 && status < 400) {
+                String location = connection.getHeaderField("Location");
+                if (location == null) {
+                    Log.w(TAG, "A redirect had no location: HTTP " + status);
+                    return answer(outcome, GET_FAILED, null);
+                }
+                return answer(outcome, GET_REDIRECT, new URL(target, location).toString());
+            }
+            if (status < 200 || status >= 300) {
+                Log.w(TAG, "A request failed: HTTP " + status);
+                return answer(outcome, GET_FAILED, null);
+            }
+            if (connection.getContentLengthLong() > maxBytes) {
+                return answer(outcome, GET_TOO_LARGE, null);
+            }
+            byte[] body = readAtMost(connection.getInputStream(), maxBytes);
+            if (body == null) {
+                return answer(outcome, GET_TOO_LARGE, null);
+            }
+            answer(outcome, GET_OK, null);
+            return body;
+        } catch (UnknownServiceException e) {
+            // The network security config refused cleartext (SEC-01).
+            return answer(outcome, GET_NOT_HTTPS, null);
+        } catch (SSLException e) {
+            Log.w(TAG, "A secure connection failed: " + e.getClass().getSimpleName());
+            return answer(outcome, GET_INSECURE, null);
+        } catch (IOException e) {
+            if (networkState() == NETWORK_OFFLINE) {
+                return answer(outcome, GET_OFFLINE, null);
+            }
+            Log.w(TAG, "A request failed: " + e.getClass().getSimpleName());
+            return answer(outcome, GET_FAILED, null);
+        } catch (RuntimeException e) {
+            Log.w(TAG, "A request failed: " + e.getClass().getSimpleName());
+            return answer(outcome, GET_FAILED, null);
+        } finally {
+            if (connection != null) {
+                connection.disconnect();
+            }
+        }
+    }
+
+    /** Fills {@code outcome} with {@code kind} and {@code detail}, and returns no body. */
+    private static byte[] answer(String[] outcome, String kind, String detail) {
+        if (outcome != null && outcome.length >= 2) {
+            outcome[0] = kind;
+            outcome[1] = detail;
+        }
+        return null;
+    }
+
+    /** All of {@code in}, or null if it holds more than {@code maxBytes} (SEC-02). */
+    private static byte[] readAtMost(InputStream in, int maxBytes) throws IOException {
+        try (InputStream stream = in) {
+            ByteArrayOutputStream body = new ByteArrayOutputStream();
+            byte[] buffer = new byte[16 * 1024];
+            int read;
+            while ((read = stream.read(buffer)) != -1) {
+                if ((long) body.size() + read > maxBytes) {
+                    return null;
+                }
+                body.write(buffer, 0, read);
+            }
+            return body.toByteArray();
         }
     }
 

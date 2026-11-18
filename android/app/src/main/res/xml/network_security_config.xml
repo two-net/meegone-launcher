@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Every connection is HTTPS, validated against the system's certificates only: cleartext is
+     refused, and certificates the user or an app added aren't trusted. No domain and no debug
+     build is an exception (SEC-01, ADR 0027). -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

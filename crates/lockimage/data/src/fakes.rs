@@ -6,7 +6,7 @@ use std::sync::Mutex;
 
 use meegone_core_data::DataError;
 
-use crate::feed::{FeedImage, ImageFeed, ImageVersion};
+use crate::feed::{FORMAT_CHANGED, FeedImage, ImageFeed, ImageVersion};
 
 /// An image with one portrait and one landscape version.
 pub fn feed_image(id: &str, date: &str) -> FeedImage {
@@ -16,6 +16,7 @@ pub fn feed_image(id: &str, date: &str) -> FeedImage {
         title: format!("Image {id}"),
         attribution: "© Someone".to_owned(),
         info_link: Some(format!("https://example.com/{id}")),
+        offered_as_wallpaper: true,
         versions: vec![
             ImageVersion {
                 width: 1080,
@@ -67,7 +68,7 @@ impl ImageFeed for FakeFeed {
             .lock()
             .unwrap()
             .clone()
-            .ok_or_else(|| DataError::Invalid("The feed's format has changed".into()))
+            .ok_or_else(|| DataError::Invalid(FORMAT_CHANGED.into()))
     }
 }
 

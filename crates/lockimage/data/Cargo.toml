@@ -1,6 +1,6 @@
 [package]
 name = "meegone-lockimage-data"
-description = "Lock-screen image data layer: the image cache and the image-feed interface."
+description = "Lock-screen image data layer: the image cache, the image feed and its region."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

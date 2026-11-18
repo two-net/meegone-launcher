@@ -21,6 +21,7 @@ pub type RawEnv = *mut *const *const c_void;
 type RawVm = *mut *const *const c_void;
 type JMethodId = *mut c_void;
 type JBoolean = u8;
+type JByte = i8;
 type JInt = i32;
 type JLong = i64;
 
@@ -40,6 +41,7 @@ mod env_slot {
     pub const GET_METHOD_ID: usize = 33;
     pub const CALL_OBJECT_METHOD_A: usize = 36;
     pub const CALL_BOOLEAN_METHOD_A: usize = 39;
+    pub const CALL_INT_METHOD_A: usize = 51;
     pub const CALL_LONG_METHOD_A: usize = 54;
     pub const NEW_STRING: usize = 163;
     pub const GET_STRING_LENGTH: usize = 164;
@@ -49,6 +51,7 @@ mod env_slot {
     pub const NEW_OBJECT_ARRAY: usize = 172;
     pub const GET_OBJECT_ARRAY_ELEMENT: usize = 173;
     pub const SET_OBJECT_ARRAY_ELEMENT: usize = 174;
+    pub const GET_BYTE_ARRAY_REGION: usize = 200;
     pub const GET_INT_ARRAY_REGION: usize = 203;
     pub const SET_INT_ARRAY_REGION: usize = 211;
     pub const GET_JAVA_VM: usize = 219;
@@ -325,6 +328,28 @@ impl Env {
         Ok(result != 0)
     }
 
+    /// Calls a method returning `int`.
+    pub fn call_int(
+        &self,
+        object: &GlobalRef,
+        method: MethodId,
+        args: &[JValue],
+    ) -> Result<i32, DataError> {
+        type CallIntMethodA =
+            unsafe extern "system" fn(RawEnv, JObject, JMethodId, *const JValue) -> JInt;
+        // SAFETY: as for `call_bool`, for an `int` return type.
+        let result = unsafe {
+            self.function::<CallIntMethodA>(env_slot::CALL_INT_METHOD_A)(
+                self.0,
+                object.raw,
+                method.0,
+                args.as_ptr(),
+            )
+        };
+        self.check()?;
+        Ok(result)
+    }
+
     /// Calls a method returning `long`.
     pub fn call_long(
         &self,
@@ -391,7 +416,20 @@ impl Env {
         args: &[JValue],
     ) -> Result<Option<Vec<Option<String>>>, DataError> {
         match self.call_object(object, method, args)? {
-            Some(array) => self.strings(&array).map(Some),
+            Some(array) => self.string_array(&array).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Calls a method returning `byte[]`, which may be `null`.
+    pub fn call_bytes(
+        &self,
+        object: &GlobalRef,
+        method: MethodId,
+        args: &[JValue],
+    ) -> Result<Option<Vec<u8>>, DataError> {
+        match self.call_object(object, method, args)? {
+            Some(array) => self.bytes(&array).map(Some),
             None => Ok(None),
         }
     }
@@ -401,8 +439,9 @@ impl Env {
         (!raw.is_null()).then_some(Local { env: *self, raw })
     }
 
-    /// Every element of `array`, a `String[]`, deleting each element's reference once read.
-    fn strings(&self, array: &Local) -> Result<Vec<Option<String>>, DataError> {
+    /// Every element of `array`, a `String[]`, deleting each element's reference once read. A
+    /// `null` element is `None`.
+    pub fn string_array(&self, array: &Local) -> Result<Vec<Option<String>>, DataError> {
         type GetArrayLength = unsafe extern "system" fn(RawEnv, JObject) -> JInt;
         type GetObjectArrayElement = unsafe extern "system" fn(RawEnv, JObject, JInt) -> JObject;
         // SAFETY: the signature matches `jni.h`, and `array` is a live array reference.
@@ -426,6 +465,32 @@ impl Env {
             });
         }
         Ok(strings)
+    }
+
+    /// Every byte of `array`, a `byte[]`.
+    fn bytes(&self, array: &Local) -> Result<Vec<u8>, DataError> {
+        type GetArrayLength = unsafe extern "system" fn(RawEnv, JObject) -> JInt;
+        type GetByteArrayRegion =
+            unsafe extern "system" fn(RawEnv, JObject, JInt, JInt, *mut JByte);
+        // SAFETY: the signature matches `jni.h`, and `array` is a live array reference.
+        let length = unsafe {
+            self.function::<GetArrayLength>(env_slot::GET_ARRAY_LENGTH)(self.0, array.raw)
+        };
+        self.check()?;
+        let mut bytes = vec![0_u8; usize::try_from(length).unwrap_or(0)];
+        // SAFETY: the signature matches `jni.h`; `array` is a live `byte[]` of `length` bytes,
+        // `bytes` has room for all of them, and a `jbyte` has a `u8`'s size and alignment.
+        unsafe {
+            self.function::<GetByteArrayRegion>(env_slot::GET_BYTE_ARRAY_REGION)(
+                self.0,
+                array.raw,
+                0,
+                length,
+                bytes.as_mut_ptr().cast(),
+            );
+        }
+        self.check()?;
+        Ok(bytes)
     }
 
     /// A new Java string holding `text`, built from UTF-16 so every character survives.

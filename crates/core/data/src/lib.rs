@@ -21,6 +21,8 @@ mod catalogue;
 mod colour;
 #[cfg(any(test, feature = "fakes"))]
 pub mod fakes;
+#[cfg(any(test, target_os = "android"))]
+mod https;
 pub mod model;
 #[cfg(any(test, target_os = "android"))]
 mod notification_records;

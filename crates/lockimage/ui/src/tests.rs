@@ -27,7 +27,7 @@ fn on() -> LockImageState {
         status: ImageStatus::On,
         current: Some(record("20261116", Some(ImageFile::A))),
         show_card: true,
-        problem: None,
+        ..LockImageState::default()
     }
 }
 
@@ -199,5 +199,38 @@ fn settings_show_and_switch_the_card() {
     assert!(matches!(
         sent.borrow()[..],
         [LockImageIntent::SetShowCard(true)]
+    ));
+}
+
+#[test]
+fn settings_show_and_choose_the_region() {
+    // WALL-05, SET-02
+    let latest = Latest::new(Arc::new(LockImageState {
+        regions: vec!["en-US".into(), "de-DE".into(), "ja-JP".into()],
+        region: Some("ja-JP".into()),
+        automatic_region: "de-DE".into(),
+        ..on()
+    }));
+    let sent: Sent = Rc::default();
+    let section = ImageSettingsSection::new(
+        latest,
+        Dispatch::new({
+            let sent = sent.clone();
+            move |intent| sent.borrow_mut().push(intent)
+        }),
+    );
+
+    assert_eq!(section.regions(), ["en-US", "de-DE", "ja-JP"]);
+    assert_eq!(section.region().as_deref(), Some("ja-JP"));
+    assert_eq!(section.automatic_region(), "de-DE");
+    section.region_chosen(None);
+    section.region_chosen(Some("en-US".into()));
+
+    assert!(matches!(
+        &sent.borrow()[..],
+        [
+            LockImageIntent::SetRegion(None),
+            LockImageIntent::SetRegion(Some(region)),
+        ] if region == "en-US"
     ));
 }

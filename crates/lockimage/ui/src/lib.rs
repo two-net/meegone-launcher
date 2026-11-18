@@ -151,11 +151,31 @@ impl ImageSettingsSection {
     pub fn show_card_toggled(&self, on: bool) {
         self.dispatch.send(LockImageIntent::SetShowCard(on));
     }
+
+    /// The regions offered besides Automatic, as BCP 47 tags such as `en-GB` (WALL-05).
+    pub fn regions(&self) -> Vec<String> {
+        self.latest.get().regions.clone()
+    }
+
+    /// The region chosen, or `None` for Automatic (WALL-05).
+    pub fn region(&self) -> Option<String> {
+        self.latest.get().region.clone()
+    }
+
+    /// The region Automatic stands for on this device, to show with it (WALL-05).
+    pub fn automatic_region(&self) -> String {
+        self.latest.get().automatic_region.clone()
+    }
+
+    /// A region was chosen, or Automatic with `None` (WALL-05, SET-03).
+    pub fn region_chosen(&self, region: Option<String>) {
+        self.dispatch.send(LockImageIntent::SetRegion(region));
+    }
 }
 
 impl Slot for ImageSettingsSection {
     fn render(&mut self, _tokens: &Tokens) {
-        // The host draws "Show card in Events" until the Settings screen, #34, draws the rest
-        // (ADR 0006, ADR 0022).
+        // The host draws "Show card in Events" until the Settings screen, #34, draws the rest,
+        // Region included (ADR 0006, ADR 0022, ADR 0027).
     }
 }

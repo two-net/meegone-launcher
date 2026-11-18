@@ -101,7 +101,10 @@ pub trait WallpaperAdapter: Send + Sync {
 /// HTTPS downloads and network state (SEC-01, WALL-04, WALL-11).
 pub trait NetworkAdapter: Send + Sync {
     fn state(&self) -> NetworkState;
-    /// Fetches an `https://` URL with the platform's certificate validation.
+    /// Fetches an `https://` URL with the platform's certificate validation, following only
+    /// `https://` redirects. The request carries the URL and nothing that tells the device or
+    /// the user apart (PRIV-02). It blocks: on Android, call it from a JVM thread other than the
+    /// main one (ADR 0027).
     ///
     /// Fails with [`DataError::Offline`] without a connection, and with
     /// [`DataError::Invalid`] for a URL or redirect that isn't HTTPS, or a body larger than
