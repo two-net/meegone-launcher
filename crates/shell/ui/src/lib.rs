@@ -8,9 +8,9 @@
 //! apps come, go and move, a cell's long-press menu, the dragged icon, edit mode, the open
 //! folder, search, the Events header, list and a notification's long-press menu, the
 //! image-of-the-day card, the image details screen and the image's update status, Recent's
-//! cards, the theme chosen and the cross-fade to a new theme, and Settings' groups (ADR 0006 to
-//! ADR 0008, ADR 0010, ADR 0012 to ADR 0017, ADR 0019 to ADR 0023, ADR 0031, ADR 0033,
-//! ADR 0035).
+//! cards, the theme chosen and the cross-fade to a new theme, Settings' groups, first-run setup
+//! and the home-app banner (ADR 0006 to ADR 0008, ADR 0010, ADR 0012 to ADR 0017, ADR 0019 to
+//! ADR 0023, ADR 0031, ADR 0033, ADR 0035, ADR 0036).
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -29,13 +29,17 @@ pub use meegone_events_ui::{
 };
 pub use meegone_lockimage_ui::{
     CardContent, CheckStatus, DailyImage, DetailsContent, PastAction, PastContent,
-    PastImageContent, Preview, UpdateStatus,
+    PastImageContent, Preview, SetupImageContent, TodayEntry, UpdateStatus,
 };
-use meegone_lockimage_ui::{ImageCard, ImageDetailsScreen, ImageSettingsSection, PastImagesScreen};
+use meegone_lockimage_ui::{
+    ImageCard, ImageDetailsScreen, ImageSettingsSection, ImageSetupStep, PastImagesScreen,
+};
 pub use meegone_recent_ui::{Age, RecentMode, RecentWindow, ShownCard};
 use meegone_recent_ui::{RecentSettingsSection, RecentView};
-pub use meegone_settings_ui::{AccessItem, AccessStatus, HomeTarget, ThemeChoice};
-use meegone_settings_ui::{HomeBanner, SettingsView};
+pub use meegone_settings_ui::{
+    AccessItem, AccessStatus, HomeTarget, SetupFrame, SetupStep, ThemeChoice,
+};
+use meegone_settings_ui::{HomeBanner, SettingsView, SetupView};
 pub use meegone_shell_state::{BADGE_ROWS, RECENT_ROWS};
 use meegone_shell_state::{HomeShell, HomeView, MenuItem, SettingsGroup, ShellIntent};
 
@@ -388,6 +392,18 @@ pub struct HomeFrame {
     pub region: Option<usize>,
     /// Settings → About offers Reset launcher: every feature it resets works (SET-06).
     pub reset_offered: bool,
+    /// First-run setup, while it covers the home views, or `None` (ONB-01, ADR 0036). A failed
+    /// Settings ends it (ARCH-09).
+    pub setup: Option<SetupFrame>,
+    /// The switch of setup's lock-screen image step, while setup shows that step and the
+    /// lock-screen image works; otherwise the step offers Continue alone (ARCH-09).
+    pub setup_image_switch: Option<DailyImage>,
+    /// The revision of what setup's lock-screen image step shows, under the same conditions:
+    /// the host reads [`ImageSetupStep::content`] again when it changes (ONB-01).
+    pub setup_image: Option<u32>,
+    /// The banner that offers to make MeeGone the default home app shows over the home views
+    /// (ONB-04).
+    pub home_banner: bool,
     /// The home views' solid background (HOME-11, THEME-04).
     pub background: Rgb,
     /// Menus and Settings (THEME-03).
@@ -416,6 +432,8 @@ pub struct ShellView {
     past_images: PastImagesScreen,
     image_settings: ImageSettingsSection,
     recent_settings: RecentSettingsSection,
+    setup: SetupView,
+    image_setup: ImageSetupStep,
     home_banner: HomeBanner,
 }
 
@@ -439,7 +457,8 @@ impl ShellView {
         let past_images =
             PastImagesScreen::new(image.clone(), dispatch(&outbox, ShellIntent::LockImage));
         let image_settings =
-            ImageSettingsSection::new(image, dispatch(&outbox, ShellIntent::LockImage));
+            ImageSettingsSection::new(image.clone(), dispatch(&outbox, ShellIntent::LockImage));
+        let image_setup = ImageSetupStep::new(image, dispatch(&outbox, ShellIntent::LockImage));
 
         let mut events = EventsView::new(dispatch(&outbox, ShellIntent::Events));
         events.add_card(Box::new(image_card.clone()));
@@ -470,6 +489,10 @@ impl ShellView {
         settings.add_section(Box::new(recent_settings.clone()));
         settings.add_section(Box::new(image_settings.clone()));
 
+        // Setup shows the lock-screen image's step as its third (ONB-01, ADR 0036).
+        let mut setup = SetupView::new(dispatch(&outbox, ShellIntent::Settings));
+        setup.set_image_step(Box::new(image_setup.clone()));
+
         // Settings and setup offers to make MeeGone the default home app on the home views
         // (ONB-04).
         let settings_state = Latest::new(shell.settings().state());
@@ -490,6 +513,8 @@ impl ShellView {
             past_images,
             image_settings,
             recent_settings,
+            setup,
+            image_setup,
             home_banner,
             outbox,
         }
@@ -560,6 +585,14 @@ impl ShellView {
             web_offered: open && apps.nothing_found && apps.web_search_offered,
             offered: state.search_offered(),
         };
+        // Setup's lock-screen image step, drawn while the lock-screen image works (ARCH-09).
+        let image_step = shell.lockimage_ready()
+            && shell
+                .settings()
+                .state()
+                .setup
+                .is_some_and(|setup| setup.step == SetupStep::LockScreenImage)
+            && shell.setup_shown();
         HomeFrame {
             pages: HomeView::ALL.map(|view| state.page_offset_px(view).round() as i32),
             indicator_alpha: (state.carousel.indicator.clamp(0.0, 1.0) * 255.0).round() as u8,
@@ -707,6 +740,13 @@ impl ShellView {
                 .lockimage_ready()
                 .then(|| self.image_settings.region_choice()),
             reset_offered: shell.reset_offered(),
+            setup: shell
+                .setup_shown()
+                .then(|| SetupFrame::of(&shell.settings().state()))
+                .flatten(),
+            setup_image_switch: image_step.then(|| self.image_setup.switch()).flatten(),
+            setup_image: image_step.then(|| self.image_setup.revision()),
+            home_banner: shell.banner_shown(),
             background: tokens.background,
             surface: tokens.surface,
             foreground: tokens.text_primary,
@@ -720,6 +760,10 @@ impl ShellView {
     /// Draws what is on screen in the current theme (THEME-03).
     pub fn render(&mut self, shell: &HomeShell) {
         let tokens = tokens(shell.theme().state().theme);
+        if shell.setup_shown() {
+            self.setup.render(&shell.settings().state(), tokens);
+            return;
+        }
         if shell.state().past_images_open {
             // The host draws the past week's images from `past_images` (ADR 0032).
             return;
@@ -790,7 +834,18 @@ impl ShellView {
         &self.recent_settings
     }
 
-    /// Shown over the home views, never over Settings (ONB-04).
+    /// First-run setup (ONB-01). Shown only while [`HomeFrame::setup`] is.
+    pub fn setup(&self) -> &SetupView {
+        &self.setup
+    }
+
+    /// Setup's lock-screen image step (ONB-01). Shown only while [`HomeFrame::setup_image`] is.
+    pub fn image_setup(&self) -> &ImageSetupStep {
+        &self.image_setup
+    }
+
+    /// Shown over the home views while [`HomeFrame::home_banner`] is, never over setup,
+    /// Settings or a menu (ONB-04).
     pub fn home_banner(&self) -> &HomeBanner {
         &self.home_banner
     }

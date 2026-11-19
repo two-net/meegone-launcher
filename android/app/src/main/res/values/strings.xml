@@ -432,4 +432,32 @@
     <string name="reset_launcher_confirm">Reset</string>
     <!-- Shown briefly once the launcher has been reset. -->
     <string name="launcher_reset">Launcher reset</string>
+    <!-- First-run setup (ONB-01, ADR 0036): at most four screens, which cover the home views
+         until it is finished. It never asks about the theme (ONB-05). -->
+    <string name="setup_welcome_title">Welcome to MeeGone</string>
+    <string name="setup_welcome_body">Your notifications, your apps and the apps you used recently, side by side. Swipe between them. Setting up takes less than a minute.</string>
+    <!-- Moves on to the next screen of setup. -->
+    <string name="setup_continue">Continue</string>
+    <!-- Declines one thing setup asks for; it can be allowed later in Settings (ONB-02). -->
+    <string name="setup_not_now">Not now</string>
+    <!-- Setup's second screen: make MeeGone the default home app, with the system's dialog
+         (HOME-01). -->
+    <string name="setup_default_home_title">Make MeeGone your home screen</string>
+    <string name="setup_default_home_body">Then the Home button always brings you back here. Android asks you to confirm.</string>
+    <!-- Setup's third screen: the daily lock-screen image, with today's image when online
+         (WALL-02). The switch is Settings' own label, "Daily lock-screen image". -->
+    <string name="setup_image_body">Each day, MeeGone can put Bing\'s image of the day on your lock screen. Your home screen stays as it is.</string>
+    <!-- Setup's last screen: the optional access for Events and Recent (ONB-02). -->
+    <string name="setup_access_title">Notifications and recent apps</string>
+    <string name="setup_access_body">Both are optional, and you can change them later in Settings.</string>
+    <!-- The one plain sentence before each access request: what is read and why (ONB-02). -->
+    <string name="setup_notifications_why">MeeGone reads your notifications only to list them in Events, and they never leave this phone.</string>
+    <string name="setup_usage_why">MeeGone reads which apps you used recently only to show them in Recent, and that never leaves this phone.</string>
+    <!-- Below an access request answered with Not now. -->
+    <string name="setup_put_off">Not now. You can allow it later in Settings.</string>
+
+    <!-- The banner over the home views while MeeGone isn't the default home app, at most once a
+         day (ONB-04). Its buttons are "Make default" and this dismiss button. -->
+    <string name="home_banner_text">MeeGone isn\'t your home screen yet.</string>
+    <string name="home_banner_dismiss">Dismiss</string>
 </resources>

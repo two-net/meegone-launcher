@@ -1,8 +1,9 @@
 //! Lock-screen image UI (SRS 4.5).
 //!
-//! This feature shows its content inside other features' views: the card in Events (EVT-12)
-//! and a section in Settings (SET-02). Both are [`Slot`]s that the shell puts in place, so
-//! neither Events nor Settings depends on this feature (ARCH-03, ADR 0002). Its own screens,
+//! This feature shows its content inside other features' views: the card in Events (EVT-12),
+//! a section in Settings (SET-02) and a step of first-run setup (ONB-01). Each is a [`Slot`]
+//! that the shell puts in place, so neither Events nor Settings depends on this feature
+//! (ARCH-03, ADR 0002, ADR 0036). Its own screens,
 //! the image details (WALL-15) and the past week's images (WALL-17), cover the home views, so
 //! the shell opens them and keeps a handle on them for the host (ADR 0031, ADR 0032).
 
@@ -12,7 +13,7 @@ use std::rc::Rc;
 use meegone_core_ui::{Dispatch, Latest, Slot, Tokens};
 use meegone_lockimage_state::{ImageStatus, LockImageIntent, LockImageState};
 
-pub use meegone_lockimage_state::{CheckStatus, Preview};
+pub use meegone_lockimage_state::{CheckStatus, Preview, TodayEntry};
 
 #[cfg(test)]
 mod tests;
@@ -659,6 +660,98 @@ impl ImageSettingsSection {
     /// Try again was tapped (SRS 7.6).
     pub fn try_again(&self) {
         self.dispatch.send(LockImageIntent::TryAgain);
+    }
+}
+
+/// What setup's lock-screen image step shows besides its switch and Region (ONB-01).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetupImageContent {
+    /// Today's image, with its title, attribution (LEGAL-03) and preview, once read; never
+    /// while offline.
+    pub today: Option<TodayEntry>,
+    /// Whether today's image is being read.
+    pub loading: bool,
+}
+
+/// Setup's lock-screen image step (ONB-01, ADR 0036): today's image, the switch, on until the
+/// user turns it off, and Region; Continue applies the switch (WALL-02). Settings' setup shows
+/// it as its third step, and the shell puts it in place (ADR 0002).
+///
+/// The host draws it as it draws the past week (ADR 0032): [`ImageSetupStep::revision`]
+/// changes whenever today's image does, and the host then reads [`ImageSetupStep::content`]
+/// and, by that revision, [`ImageSetupStep::preview`]. Region is the Settings section's.
+///
+/// Clones share what the host was last told.
+#[derive(Clone)]
+pub struct ImageSetupStep {
+    latest: Latest<LockImageState>,
+    dispatch: Dispatch<LockImageIntent>,
+    told: Rc<RefCell<Told<SetupImageContent>>>,
+}
+
+impl ImageSetupStep {
+    pub fn new(latest: Latest<LockImageState>, dispatch: Dispatch<LockImageIntent>) -> Self {
+        Self {
+            latest,
+            dispatch,
+            told: Rc::default(),
+        }
+    }
+
+    /// The step's switch, while setup is at the step: its own, saved by nothing until
+    /// Continue, or unavailable, disabled with Settings' reason (WALL-02, WALL-13).
+    pub fn switch(&self) -> Option<DailyImage> {
+        let state = self.latest.get();
+        let setup = state.setup.as_ref()?;
+        Some(match state.status {
+            ImageStatus::Unavailable(_) => DailyImage::Unavailable,
+            _ if setup.on => DailyImage::On,
+            _ => DailyImage::Off,
+        })
+    }
+
+    /// The switch was tapped. Returns whether that was taken: not while the device can't set
+    /// the lock screen (WALL-13).
+    pub fn switched(&self, on: bool) -> bool {
+        let offered = matches!(self.switch(), Some(DailyImage::On | DailyImage::Off));
+        if offered {
+            self.dispatch.send(LockImageIntent::SetupSwitched(on));
+        }
+        offered
+    }
+
+    /// The step's revision, which changes whenever today's image does, so the host reads
+    /// [`ImageSetupStep::content`] again.
+    pub fn revision(&self) -> u32 {
+        self.told.borrow_mut().take(Self::shown(&self.latest.get()))
+    }
+
+    /// What the step shows, as of the last [`ImageSetupStep::revision`].
+    pub fn content(&self) -> Option<SetupImageContent> {
+        self.told.borrow().content.clone()
+    }
+
+    /// Today's preview, as shown at `revision`, if that is still current.
+    pub fn preview(&self, revision: u32) -> Option<Preview> {
+        let told = self.told.borrow();
+        if told.revision != revision {
+            return None;
+        }
+        told.content.as_ref()?.today.as_ref()?.preview.clone()
+    }
+
+    fn shown(state: &LockImageState) -> Option<SetupImageContent> {
+        state.setup.as_ref().map(|setup| SetupImageContent {
+            today: setup.today.clone(),
+            loading: setup.loading,
+        })
+    }
+}
+
+impl Slot for ImageSetupStep {
+    fn render(&mut self, _tokens: &Tokens) {
+        // The host draws the step from `switch`, `revision` and `content`, and Region from the
+        // Settings section (ADR 0006, ADR 0036).
     }
 }
 

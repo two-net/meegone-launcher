@@ -45,7 +45,7 @@ use meegone_events_state::{
 };
 use meegone_lockimage_state::{LockImageHolder, LockImageIntent, LockImageState};
 use meegone_recent_state::{MAX_ROWS, RecentHolder, RecentIntent, RecentState, other_density};
-use meegone_settings_state::{SettingsHolder, SettingsIntent, SettingsState};
+use meegone_settings_state::{SettingsHolder, SettingsIntent, SettingsState, SetupStep};
 
 use carousel::{Carousel, Release};
 pub use carousel::{CarouselState, Layout, PointerEvent, PointerKind};
@@ -139,6 +139,9 @@ impl HomeView {
 pub struct ShellState {
     /// The view on screen, or the one the carousel is settling on.
     pub current: HomeView,
+    /// First-run setup covers the home views until it is finished (ONB-01). A failed Settings
+    /// never counts (ARCH-09).
+    pub setup_open: bool,
     /// Settings covers the home views.
     pub settings_open: bool,
     /// The group Settings opened at, or `None` for its top.
@@ -229,7 +232,8 @@ impl ShellState {
     /// Whether the current view offers the home menu now, which it can open without a gesture
     /// (A11Y-05): Events and Applications do, while nothing covers them.
     pub fn menu_offered(&self) -> bool {
-        !self.settings_open
+        !self.setup_open
+            && !self.settings_open
             && !self.image_details_open
             && !self.past_images_open
             && self.menu.is_none()
@@ -245,6 +249,7 @@ impl ShellState {
     /// and search not open already.
     pub fn search_offered(&self) -> bool {
         self.current == HomeView::Applications
+            && !self.setup_open
             && !self.settings_open
             && !self.image_details_open
             && !self.past_images_open
@@ -425,6 +430,8 @@ pub struct HomeShell {
     seen_groups: Arc<[NotificationGroup]>,
     seen_expanded: Option<GroupId>,
     seen_rows: Vec<RowKey>,
+    /// Setup's step as of the last intent, to tell when it moves on or ends (ONB-01).
+    seen_setup: Option<SetupStep>,
     theme: Store<ThemeHolder>,
     apps: Store<AppsHolder>,
     events: Store<EventsHolder>,
@@ -476,6 +483,7 @@ impl HomeShell {
             seen_groups: Arc::new([]),
             seen_expanded: None,
             seen_rows: Vec::new(),
+            seen_setup: None,
             theme: Store::new(ThemeHolder::new(
                 settings_store.clone(),
                 platform.system.clone(),
@@ -539,6 +547,9 @@ impl HomeShell {
         shell.seen_groups = events.groups.clone();
         shell.seen_expanded = events.expanded.clone();
         shell.seen_rows = events.row_keys();
+        // A fresh install starts in setup, at Welcome (ONB-01).
+        shell.seen_setup = shell.setup_step();
+        shell.state.setup_open = shell.setup_shown();
         shell
     }
 
@@ -587,6 +598,32 @@ impl HomeShell {
     /// Whether Settings works. Its own items, such as Theme, are offered only then (ARCH-09).
     pub fn settings_ready(&self) -> bool {
         *self.settings.health() == Health::Ready
+    }
+
+    /// Whether first-run setup covers the home views (ONB-01). A failed Settings can't finish
+    /// it, so it never counts: the home must never be left covered for good (ARCH-09).
+    pub fn setup_shown(&self) -> bool {
+        self.setup_step().is_some()
+    }
+
+    /// Setup's step, while it shows.
+    fn setup_step(&self) -> Option<SetupStep> {
+        self.settings_ready()
+            .then(|| self.settings.state().setup.map(|setup| setup.step))
+            .flatten()
+    }
+
+    /// Whether the home views show the banner that offers to make MeeGone the default home app
+    /// (ONB-04): Settings says so, and the views show with nothing covering them or open over
+    /// them, outside edit mode, close mode and search.
+    pub fn banner_shown(&self) -> bool {
+        self.settings_ready()
+            && self.settings.state().home_banner
+            && !self.covered()
+            && !self.folder_shown()
+            && !self.search_shown()
+            && !self.editing_shown()
+            && !self.close_shown()
     }
 
     /// Whether Settings offers Reset launcher: only while every feature it resets works, so a
@@ -775,6 +812,7 @@ impl HomeShell {
             ShellIntent::LockImage(LockImageIntent::OpenPastImages) => self.open_past_images(),
             ShellIntent::LockImage(intent) => self.lockimage.dispatch(intent),
             ShellIntent::Settings(SettingsIntent::ResetLauncher) => self.reset_launcher(),
+            ShellIntent::Settings(SettingsIntent::SetupContinue) => self.setup_continue(),
             ShellIntent::Settings(intent) => {
                 self.settings.dispatch(intent);
                 // The theme choice and wrap-around live in the settings store; take them on
@@ -783,6 +821,7 @@ impl HomeShell {
                 self.configure_carousel();
             }
         }
+        self.keep_setup_in_step();
         self.keep_folder_in_step();
         self.keep_search_in_step();
         self.keep_lift_in_step();
@@ -821,10 +860,11 @@ impl HomeShell {
         self.state.recent_change = self.recent_change.state();
     }
 
-    /// Whether Settings, the image details, the past week's images or a menu covers the home
-    /// views, so they get no new touches.
+    /// Whether setup, Settings, the image details, the past week's images or a menu covers the
+    /// home views, so they get no new touches.
     fn covered(&self) -> bool {
-        self.state.settings_open
+        self.setup_shown()
+            || self.state.settings_open
             || self.state.image_details_open
             || self.state.past_images_open
             || self.state.menu.is_some()
@@ -1410,6 +1450,9 @@ impl HomeShell {
     }
 
     fn swipe(&mut self, direction: Direction) {
+        if self.setup_shown() {
+            return;
+        }
         let wrap = self.state.carousel.wrap;
         if let Some(view) = self.state.current.neighbour(direction, wrap) {
             self.move_to(view, 0.0, None);
@@ -1594,8 +1637,12 @@ impl HomeShell {
         }
     }
 
-    /// Opens Settings over the home views, at `group` or at its top.
+    /// Opens Settings over the home views, at `group` or at its top. Not during setup, which
+    /// stays as it is, even for the system's settings entry (ADR 0036).
     fn open_settings(&mut self, group: Option<SettingsGroup>) {
+        if self.setup_shown() {
+            return;
+        }
         self.cover_views();
         self.settings.dispatch(SettingsIntent::Refresh);
         self.state.settings_open = true;
@@ -1626,13 +1673,7 @@ impl HomeShell {
         if !self.reset_offered() {
             return;
         }
-        self.cover_views();
-        self.close_past_images();
-        self.close_settings();
-        self.close_image_details();
-        for view in HomeView::ALL {
-            self.close_everything_in(view);
-        }
+        self.close_all();
         self.apps.dispatch(AppsIntent::Reset);
         self.recent.dispatch(RecentIntent::Reset);
         self.lockimage.dispatch(LockImageIntent::Reset);
@@ -1640,6 +1681,52 @@ impl HomeShell {
         self.theme.dispatch(ThemeIntent::Refresh);
         self.configure_carousel();
         self.jump_to(HomeView::Applications);
+    }
+
+    /// Closes every screen, the menus, and everything open in every view, as a reset or the
+    /// end of setup does.
+    fn close_all(&mut self) {
+        self.cover_views();
+        self.close_past_images();
+        self.close_settings();
+        self.close_image_details();
+        for view in HomeView::ALL {
+            self.close_everything_in(view);
+        }
+    }
+
+    /// Shows Applications at its top, at once (HOME-05).
+    fn show_applications_at_top(&mut self) {
+        self.jump_to(HomeView::Applications);
+        self.apps.dispatch(AppsIntent::ScrollToTop);
+    }
+
+    /// Continue in setup (ONB-01). On the lock-screen image's step, that feature applies its
+    /// switch first, as the user's confirmation (WALL-02, ADR 0036); then Settings moves on.
+    fn setup_continue(&mut self) {
+        if self.setup_step() == Some(SetupStep::LockScreenImage) && self.lockimage_ready() {
+            self.lockimage.dispatch(LockImageIntent::ConfirmSetup);
+        }
+        self.settings.dispatch(SettingsIntent::SetupContinue);
+    }
+
+    /// Setup covers the home views until it ends (ONB-01). On reaching the lock-screen image's
+    /// step, that feature opens its step (ADR 0002). Once setup ends, whether finished or
+    /// because Settings failed (ARCH-09), everything closes and Applications shows at its top
+    /// (HOME-05).
+    fn keep_setup_in_step(&mut self) {
+        let step = self.setup_step();
+        if step != self.seen_setup {
+            if step == Some(SetupStep::LockScreenImage) && self.lockimage_ready() {
+                self.lockimage.dispatch(LockImageIntent::OpenSetup);
+            }
+            if step.is_none() {
+                self.close_all();
+                self.show_applications_at_top();
+            }
+            self.seen_setup = step;
+        }
+        self.state.setup_open = step.is_some();
     }
 
     /// Closes Settings. Returns whether it was open.
@@ -1657,7 +1744,7 @@ impl HomeShell {
     /// Opens the image details screen over the home views (EVT-12, WALL-15), while it has
     /// something to show. The image and its status are read again, so they are current.
     fn open_image_details(&mut self) {
-        if !self.image_details_offered() {
+        if self.setup_shown() || !self.image_details_offered() {
             return;
         }
         self.lockimage.dispatch(LockImageIntent::Refresh);
@@ -1683,7 +1770,7 @@ impl HomeShell {
     /// Opens the past week's images over the image details screen or Settings, which offer
     /// them, and asks for the week, which is read unless it was already today (WALL-17).
     fn open_past_images(&mut self) {
-        if !self.past_images_offered() {
+        if self.setup_shown() || !self.past_images_offered() {
             return;
         }
         self.cover_views();
@@ -1706,7 +1793,8 @@ impl HomeShell {
     /// HOME-07: close what is open; otherwise go to Applications, or, on Applications, scroll
     /// it to the top.
     fn home(&mut self) {
-        if self.close_screen() {
+        // Setup stays as it is (ONB-01).
+        if self.setup_shown() || self.close_screen() {
             return;
         }
         // The menu and everything open in the view close together.
@@ -1727,6 +1815,11 @@ impl HomeShell {
     /// HOME-08: close the topmost open element (the past week's images, then Settings, then the
     /// image details, then the home menu, then the view's own); otherwise do nothing.
     fn back(&mut self) {
+        // In setup, Back returns to the previous step, and does nothing on Welcome (ONB-01).
+        if self.setup_shown() {
+            self.settings.back();
+            return;
+        }
         if !self.close_screen() && self.state.menu.take().is_none() {
             self.close_topmost(self.state.current);
         }
@@ -1845,6 +1938,7 @@ mod tests {
     use meegone_events_state::NotificationMenuItem;
     use meegone_lockimage_data::{ImageCache, PersistentImageCache};
     use meegone_lockimage_state::{CheckStatus, ImageFile, ImageRecord};
+    use meegone_settings_state::AccessItem;
 
     use super::*;
 
@@ -1854,7 +1948,7 @@ mod tests {
 
     /// A shell whose Applications grid holds one folder, with Maps and Mail.
     fn with_a_folder() -> (Fakes, HomeShell) {
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         *fakes.apps.apps.lock().unwrap() = vec![app("maps", "Maps"), app("mail", "Mail")];
         PersistentLayoutStore::new(fakes.storage.clone())
             .save(&SavedLayout {
@@ -1888,7 +1982,7 @@ mod tests {
     #[test]
     fn starts_on_applications() {
         // HOME-05
-        let shell = HomeShell::compose(Fakes::default().platform());
+        let shell = HomeShell::compose(Fakes::after_setup().platform());
 
         assert_eq!(shell.state().current, HomeView::Applications);
     }
@@ -1896,7 +1990,7 @@ mod tests {
     #[test]
     fn views_wrap_around_in_both_directions() {
         // HOME-02, HOME-04, AC-02
-        let mut shell = HomeShell::compose(Fakes::default().platform());
+        let mut shell = HomeShell::compose(Fakes::after_setup().platform());
 
         assert_eq!(
             swipes(&mut shell, Direction::Next, 3),
@@ -1911,7 +2005,7 @@ mod tests {
     #[test]
     fn with_wrap_around_off_the_ends_stay_put() {
         // HOME-04
-        let mut shell = HomeShell::compose(Fakes::default().platform());
+        let mut shell = HomeShell::compose(Fakes::after_setup().platform());
         shell.dispatch(ShellIntent::Settings(SettingsIntent::SetWrapAround(false)));
 
         assert_eq!(
@@ -1923,7 +2017,7 @@ mod tests {
     #[test]
     fn home_goes_to_applications() {
         // HOME-07, AC-04
-        let mut shell = HomeShell::compose(Fakes::default().platform());
+        let mut shell = HomeShell::compose(Fakes::after_setup().platform());
         shell.dispatch(ShellIntent::Swipe(Direction::Previous));
         assert_eq!(shell.state().current, HomeView::Events);
 
@@ -1935,7 +2029,7 @@ mod tests {
     #[test]
     fn home_first_closes_everything_open_in_the_current_view() {
         // HOME-07
-        let mut shell = with_recent_maps_and_mail(&Fakes::default());
+        let mut shell = with_recent_maps_and_mail(&Fakes::after_setup());
         shell.dispatch(ShellIntent::Swipe(Direction::Next));
         shell.dispatch(ShellIntent::Recent(RecentIntent::EnterCloseMode));
         assert!(shell.recent().state().close_mode);
@@ -1951,7 +2045,7 @@ mod tests {
     #[test]
     fn back_closes_the_topmost_element_and_otherwise_does_nothing() {
         // HOME-08
-        let mut shell = HomeShell::compose(Fakes::default().platform());
+        let mut shell = HomeShell::compose(Fakes::after_setup().platform());
         shell.dispatch(ShellIntent::Apps(AppsIntent::EnterEditMode));
         shell.dispatch(ShellIntent::OpenSettings);
 
@@ -1969,7 +2063,7 @@ mod tests {
     #[test]
     fn a_theme_chosen_in_settings_is_applied_by_the_shell() {
         // THEME-01, THEME-06; Settings and the shell share theme through core (ADR 0002).
-        let mut shell = HomeShell::compose(Fakes::default().platform());
+        let mut shell = HomeShell::compose(Fakes::after_setup().platform());
 
         shell.dispatch(ShellIntent::Settings(SettingsIntent::SetTheme(
             ThemeChoice::Dark,
@@ -1981,7 +2075,7 @@ mod tests {
     #[test]
     fn the_system_theme_is_followed_by_default() {
         // THEME-02
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = HomeShell::compose(fakes.platform());
 
         *fakes.system.dark.lock().unwrap() = true;
@@ -1993,7 +2087,7 @@ mod tests {
     #[test]
     fn a_new_theme_cross_fades_the_whole_screen_in_250_ms() {
         // THEME-06, ANIM-19
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = laid_out(&fakes);
         assert_eq!(shell.state().theme_change, CrossFadeState::default());
 
@@ -2032,7 +2126,7 @@ mod tests {
     fn only_a_change_in_the_theme_drawn_cross_fades() {
         // ANIM-19: MeeGone starts in its theme, and a refresh that resolves to the theme
         // already drawn changes nothing on screen.
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         *fakes.system.dark.lock().unwrap() = true;
         let mut shell = laid_out(&fakes);
         assert_eq!(shell.theme().state().theme, Theme::Dark);
@@ -2056,7 +2150,7 @@ mod tests {
     #[test]
     fn a_device_theme_changed_while_meegone_was_away_is_taken_on_when_it_comes_back() {
         // THEME-02: the host may not hear of a change made while another app showed.
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = laid_out(&fakes);
 
         *fakes.system.dark.lock().unwrap() = true;
@@ -2069,7 +2163,7 @@ mod tests {
     #[test]
     fn an_installed_app_reaches_applications_and_a_removed_one_leaves() {
         // APPS-06, APPS-08: the system reports the change and the shell refreshes.
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         fakes.apps.apps.lock().unwrap().push(app("mail", "Mail"));
         let mut shell = HomeShell::compose(fakes.platform());
 
@@ -2085,7 +2179,7 @@ mod tests {
     #[test]
     fn apps_coming_or_going_move_the_grid_and_nothing_else_does() {
         // ANIM-21: the start's grid and an update's new label appear as they are.
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail"), app("maps", "Maps")];
         let mut shell = HomeShell::compose(fakes.platform());
         assert!(!shell.state().grid_change.animating);
@@ -2119,7 +2213,7 @@ mod tests {
     #[test]
     fn coming_back_to_the_foreground_rechecks_the_default_home_app() {
         // HOME-01, ONB-04: the role may have changed in the system dialog or in system settings.
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = HomeShell::compose(fakes.platform());
         assert!(shell.settings().state().home_banner);
 
@@ -2133,7 +2227,7 @@ mod tests {
     #[test]
     fn notification_changes_refresh_events() {
         // EVT-10
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = HomeShell::compose(fakes.platform());
         *fakes.notifications.access.lock().unwrap() = Access::Granted;
 
@@ -2145,7 +2239,7 @@ mod tests {
     #[test]
     fn clock_changes_and_coming_back_refresh_the_events_header() {
         // EVT-01, EVT-02
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = HomeShell::compose(fakes.platform());
         assert_eq!(shell.events().state().header.weekday, "Thursday");
 
@@ -2167,7 +2261,7 @@ mod tests {
     #[test]
     fn coming_back_reads_notification_access_again() {
         // EVT-03, AC-11: granted in system settings while MeeGone was away.
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = HomeShell::compose(fakes.platform());
         assert_eq!(shell.events().state().access, Access::Missing);
 
@@ -2182,7 +2276,7 @@ mod tests {
     #[test]
     fn app_changes_reach_the_events_groups() {
         // APPS-17: a new label, or an accent read late, shows in Events too.
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail")];
         *fakes.notifications.access.lock().unwrap() = Access::Granted;
         *fakes.notifications.active.lock().unwrap() = vec![notification("m1", "mail")];
@@ -2198,7 +2292,7 @@ mod tests {
     #[test]
     fn groups_coming_and_going_move_the_events_list_and_a_new_count_doesnt() {
         // ANIM-20: Events as it starts shows as it is.
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let posted = |key: &str, package: &str, posted_at_ms| Notification {
             posted_at_ms,
             ..notification(key, package)
@@ -2287,7 +2381,7 @@ mod tests {
     #[test]
     fn the_image_card_opens_its_details_over_the_home_views() {
         // EVT-12, WALL-15: they cover the views as Settings does, and Back or Home closes them.
-        let mut shell = with_an_image(&Fakes::default());
+        let mut shell = with_an_image(&Fakes::after_setup());
         go(&mut shell, Direction::Previous);
         shell.dispatch(ShellIntent::OpenMenu);
 
@@ -2312,7 +2406,7 @@ mod tests {
     #[test]
     fn the_past_week_opens_over_the_details_or_settings_and_back_returns_to_them() {
         // WALL-17, HOME-08
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = with_an_image(&fakes);
         go(&mut shell, Direction::Previous);
 
@@ -2352,7 +2446,7 @@ mod tests {
     #[test]
     fn the_past_week_is_offered_while_the_daily_image_is_on_even_before_the_first_image() {
         // WALL-17, WALL-02
-        let mut shell = laid_out(&Fakes::default());
+        let mut shell = laid_out(&Fakes::after_setup());
         shell.dispatch(ShellIntent::LockImage(LockImageIntent::OpenPastImages));
         assert!(!shell.state().past_images_open);
 
@@ -2369,7 +2463,7 @@ mod tests {
     #[test]
     fn coming_back_home_to_applications_closes_the_past_week() {
         // HOME-06
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = with_an_image(&fakes);
         always_applications(&mut shell);
         shell.dispatch(ShellIntent::LockImage(LockImageIntent::OpenPastImages));
@@ -2383,7 +2477,7 @@ mod tests {
     #[test]
     fn the_image_details_open_only_with_an_image_to_show() {
         // WALL-15, WALL-02, WALL-10
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = laid_out(&fakes);
         cache_image(&fakes, "20261116");
         shell.dispatch(ShellIntent::LockImage(LockImageIntent::Refresh));
@@ -2394,12 +2488,12 @@ mod tests {
         assert!(!shell.state().image_details_open);
 
         // On, but before the first image.
-        let mut shell = laid_out(&Fakes::default());
+        let mut shell = laid_out(&Fakes::after_setup());
         shell.dispatch(ShellIntent::LockImage(LockImageIntent::SetEnabled(true)));
         shell.dispatch(ShellIntent::LockImage(LockImageIntent::OpenDetails));
         assert!(!shell.state().image_details_open);
 
-        let mut shell = with_an_image(&Fakes::default());
+        let mut shell = with_an_image(&Fakes::after_setup());
         assert!(shell.image_details_offered());
         shell.dispatch(ShellIntent::LockImage(LockImageIntent::OpenDetails));
         assert!(shell.state().image_details_open);
@@ -2408,7 +2502,7 @@ mod tests {
     #[test]
     fn settings_on_the_image_details_opens_at_the_lock_screen_image_over_them() {
         // WALL-15, HOME-08
-        let mut shell = with_an_image(&Fakes::default());
+        let mut shell = with_an_image(&Fakes::after_setup());
         shell.dispatch(ShellIntent::LockImage(LockImageIntent::OpenSettings));
         assert!(!shell.state().settings_open);
 
@@ -2430,7 +2524,7 @@ mod tests {
     fn the_image_details_close_once_there_is_nothing_to_show() {
         // WALL-15, WALL-12: turned off in Settings over them, Back goes home, not to an empty
         // screen.
-        let mut shell = with_an_image(&Fakes::default());
+        let mut shell = with_an_image(&Fakes::after_setup());
         shell.dispatch(ShellIntent::LockImage(LockImageIntent::OpenDetails));
         shell.dispatch(ShellIntent::LockImage(LockImageIntent::OpenSettings));
 
@@ -2446,7 +2540,7 @@ mod tests {
     #[test]
     fn a_change_of_clock_writes_the_images_times_again() {
         // WALL-16, L10N-03
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = with_an_image(&fakes);
         let set_at = 1_795_046_400_000 + 7 * 3_600_000;
         PersistentImageCache::new(fakes.storage.clone())
@@ -2466,7 +2560,7 @@ mod tests {
     #[test]
     fn settings_opened_over_the_image_details_close_first() {
         // HOME-08: Back closes the topmost screen.
-        let mut shell = with_an_image(&Fakes::default());
+        let mut shell = with_an_image(&Fakes::after_setup());
         shell.dispatch(ShellIntent::LockImage(LockImageIntent::OpenDetails));
         shell.dispatch(ShellIntent::OpenSettings);
 
@@ -2481,7 +2575,7 @@ mod tests {
     #[test]
     fn home_from_an_app_closes_the_image_details_for_always_applications() {
         // HOME-06
-        let mut shell = with_an_image(&Fakes::default());
+        let mut shell = with_an_image(&Fakes::after_setup());
         go(&mut shell, Direction::Previous);
         shell.dispatch(ShellIntent::Settings(SettingsIntent::SetHomeTarget(
             HomeTarget::Applications,
@@ -2535,7 +2629,7 @@ mod tests {
     #[test]
     fn a_failing_lock_screen_image_never_covers_the_home() {
         // ARCH-09: its details never open, and Events still works.
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut platform = fakes.platform();
         platform.wallpaper = Arc::new(BrokenWallpaper);
         let mut shell = HomeShell::compose(platform);
@@ -2554,7 +2648,7 @@ mod tests {
     #[test]
     fn coming_back_and_showing_events_read_the_image_again() {
         // EVT-12: the daily job may have cached a new image while MeeGone was away.
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = laid_out(&fakes);
         shell.dispatch(ShellIntent::LockImage(LockImageIntent::SetEnabled(true)));
         assert_eq!(shell.lockimage().state().current, None);
@@ -2572,7 +2666,7 @@ mod tests {
     #[test]
     fn the_home_reads_what_the_daily_images_job_did_once_it_has_checked() {
         // ADR 0029: the job runs on a thread of its own, through the same stores.
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let shared = Shared::new(fakes.platform());
         let mut shell = HomeShell::compose_shared(&shared);
         shell.dispatch(ShellIntent::LockImage(LockImageIntent::SetEnabled(true)));
@@ -2601,7 +2695,7 @@ mod tests {
     #[test]
     fn update_now_runs_on_the_jobs_thread_and_the_home_hears_when_it_is_done() {
         // WALL-11, ADR 0030
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let shared = Shared::new(fakes.platform());
         let mut shell = HomeShell::compose_shared(&shared);
         shell.dispatch(ShellIntent::LockImage(LockImageIntent::SetEnabled(true)));
@@ -2629,7 +2723,7 @@ mod tests {
     #[test]
     fn a_new_thumbnail_cross_fades_in_300_ms() {
         // ANIM-22
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = laid_out(&fakes);
         assert_eq!(shell.state().image_change, CrossFadeState::default());
 
@@ -2686,7 +2780,7 @@ mod tests {
     #[test]
     fn a_failing_events_never_stops_applications() {
         // REL-01, AC-21
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail")];
         let mut platform = fakes.platform();
         let broken = FakeNotifications::default();
@@ -2756,7 +2850,7 @@ mod tests {
     #[test]
     fn a_failing_feature_never_takes_down_the_shell_or_the_others() {
         // ARCH-09, REL-01
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut platform = fakes.platform();
         let broken = FakeApps::default();
         broken.apps.lock().unwrap().push(app("mail", "Mail"));
@@ -2787,7 +2881,7 @@ mod tests {
     #[test]
     fn home_on_applications_scrolls_it_to_the_top() {
         // HOME-07, AC-04
-        let mut shell = HomeShell::compose(Fakes::default().platform());
+        let mut shell = HomeShell::compose(Fakes::after_setup().platform());
         shell.dispatch(ShellIntent::Apps(AppsIntent::Scrolled(900.0)));
 
         shell.dispatch(ShellIntent::Home);
@@ -2800,7 +2894,7 @@ mod tests {
     fn a_second_quick_home_scrolls_while_the_views_still_settle() {
         // HOME-07, AC-04: Home on Events moves to Applications; Home again scrolls it to the
         // top, even before the row has come to rest.
-        let mut shell = HomeShell::compose(Fakes::default().platform());
+        let mut shell = HomeShell::compose(Fakes::after_setup().platform());
         shell.dispatch(ShellIntent::Layout(Layout {
             width_px: 1000.0,
             density: 2.0,
@@ -2846,7 +2940,7 @@ mod tests {
     #[test]
     fn back_with_nothing_open_does_nothing() {
         // HOME-08, issue #6
-        let mut shell = HomeShell::compose(Fakes::default().platform());
+        let mut shell = HomeShell::compose(Fakes::after_setup().platform());
         shell.dispatch(ShellIntent::Apps(AppsIntent::Scrolled(480.0)));
         shell.dispatch(ShellIntent::Swipe(Direction::Next));
         let before = shell.state().clone();
@@ -2860,7 +2954,7 @@ mod tests {
     #[test]
     fn coming_back_shows_the_view_the_user_left_as_it_was() {
         // HOME-06: by default, Home from an app shows the last view, with what was open.
-        let mut shell = HomeShell::compose(Fakes::default().platform());
+        let mut shell = HomeShell::compose(Fakes::after_setup().platform());
         shell.dispatch(ShellIntent::Apps(AppsIntent::EnterEditMode));
         shell.dispatch(ShellIntent::Returned { home: true });
         assert_eq!(shell.state().current, HomeView::Applications);
@@ -2901,7 +2995,7 @@ mod tests {
     fn coming_back_without_home_keeps_the_last_view_even_with_always_applications() {
         // HOME-06, ADR 0007: the setting is "Home button opens", so Back from an app, such as
         // the system screen that grants notification access, returns to the view it left.
-        let mut shell = HomeShell::compose(Fakes::default().platform());
+        let mut shell = HomeShell::compose(Fakes::after_setup().platform());
         always_applications(&mut shell);
         shell.dispatch(ShellIntent::Swipe(Direction::Previous));
 
@@ -2913,7 +3007,7 @@ mod tests {
     #[test]
     fn coming_back_refreshes_recent() {
         // REC-09: Recent refreshes when MeeGone returns to the foreground.
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         *fakes.usage.access.lock().unwrap() = Access::Granted;
         *fakes.apps.apps.lock().unwrap() = vec![app("maps", "Maps"), app("mail", "Mail")];
         *fakes.system.now_ms.lock().unwrap() = 1_000_000;
@@ -2950,7 +3044,7 @@ mod tests {
     fn recent_follows_usage_access_as_it_changes() {
         // REC-02: access revoked while Recent shows brings the explainer back, and granted
         // brings the cards.
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = with_recent_maps_and_mail(&fakes);
         shell.dispatch(ShellIntent::Swipe(Direction::Next));
         assert_eq!(shell.state().current, HomeView::Recent);
@@ -2988,7 +3082,7 @@ mod tests {
     #[test]
     fn a_failing_recent_never_stops_applications() {
         // REL-01, ARCH-09
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail")];
         let mut platform = fakes.platform();
         platform.usage = Arc::new(BrokenUsage);
@@ -3026,7 +3120,7 @@ mod tests {
     #[test]
     fn hiding_or_unhiding_an_app_takes_it_out_of_recent_and_back_at_once() {
         // APPS-19, REC-03: without waiting for Recent to show, so a swipe never shows it.
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = with_recent_maps_and_mail(&fakes);
         assert_eq!(recent_labels(&shell), ["Mail", "Maps"]);
 
@@ -3041,7 +3135,7 @@ mod tests {
     #[test]
     fn a_hide_that_cant_be_saved_leaves_recent_as_it_was() {
         // APPS-19, REL-03
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = with_recent_maps_and_mail(&fakes);
         *fakes.storage.error.lock().unwrap() = Some(DataError::Failed("disk full".into()));
 
@@ -3054,7 +3148,7 @@ mod tests {
     #[test]
     fn hidden_apps_reach_recent_from_the_start() {
         // APPS-19: Recent reads them as it loads, and nothing refreshes it twice.
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         hide_maps(&mut with_recent_maps_and_mail(&fakes));
 
         let restarted = HomeShell::compose(fakes.platform());
@@ -3069,7 +3163,7 @@ mod tests {
     #[test]
     fn the_home_content_comes_back_with_its_own_motion_unless_the_system_animates_it() {
         // ANIM-09
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = HomeShell::compose(fakes.platform());
         assert_eq!(shell.state().return_home, ReturnHomeState::default());
 
@@ -3091,7 +3185,7 @@ mod tests {
     #[test]
     fn with_animations_removed_the_content_comes_back_at_once() {
         // ANIM-05, ANIM-09
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         *fakes.system.animation_scale.lock().unwrap() = 0.0;
         let mut shell = HomeShell::compose(fakes.platform());
 
@@ -3103,7 +3197,7 @@ mod tests {
     #[test]
     fn a_touch_shows_the_returning_content_at_once() {
         // ANIM-03: no animation blocks input.
-        let mut shell = HomeShell::compose(Fakes::default().platform());
+        let mut shell = HomeShell::compose(Fakes::after_setup().platform());
         shell.dispatch(ShellIntent::Returned { home: true });
         shell.dispatch(ShellIntent::Frame(ms(0)));
 
@@ -3120,7 +3214,7 @@ mod tests {
     #[test]
     fn after_the_system_ends_the_process_the_home_comes_back_as_it_was() {
         // REL-05: the view and the scroll position come back; edit and close mode don't.
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut before = HomeShell::compose(fakes.platform());
         before.dispatch(ShellIntent::Apps(AppsIntent::Scrolled(720.0)));
         before.dispatch(ShellIntent::Apps(AppsIntent::EnterEditMode));
@@ -3150,7 +3244,7 @@ mod tests {
     #[test]
     fn a_restart_shows_applications_whatever_showed_before() {
         // HOME-05: after a device restart nothing is restored.
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut before = HomeShell::compose(fakes.platform());
         before.dispatch(ShellIntent::Swipe(Direction::Next));
 
@@ -3213,7 +3307,7 @@ mod tests {
     #[test]
     fn spreading_two_fingers_on_recent_shows_bigger_cards_and_saves_them() {
         // REC-05, ANIM-17
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = on_recent(&fakes);
         assert!(shell.state().density_offered);
         let reflow = shell.state().pinch.reflow;
@@ -3242,7 +3336,7 @@ mod tests {
     #[test]
     fn a_small_pinch_lets_the_cards_go_back() {
         // ANIM-17
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = on_recent(&fakes);
         let writes = fakes.storage.writes.lock().unwrap().len();
 
@@ -3265,7 +3359,7 @@ mod tests {
     #[test]
     fn the_cards_scale_with_the_fingers_and_the_views_stay_put() {
         // ANIM-01, ANIM-17, HOME-03
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = on_recent(&fakes);
         touch_recent(&mut shell, PointerKind::Down, 350.0, 2_000);
         fingers(&mut shell, PinchKind::Start, 300.0, 2_010);
@@ -3295,7 +3389,7 @@ mod tests {
     #[test]
     fn a_long_press_never_counts_once_a_pinch_starts() {
         // HOME-10, REC-07
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = on_recent(&fakes);
         touch_recent(&mut shell, PointerKind::Down, 350.0, 2_000);
         fingers(&mut shell, PinchKind::Start, 300.0, 2_010);
@@ -3315,8 +3409,8 @@ mod tests {
             touch_recent(shell, PointerKind::Up, 350.0, 2_030);
             holding
         };
-        assert!(starts(&mut on_recent(&Fakes::default())));
-        let fakes = Fakes::default();
+        assert!(starts(&mut on_recent(&Fakes::after_setup())));
+        let fakes = Fakes::after_setup();
         let mut shell = on_recent(&fakes);
 
         // Other views.
@@ -3341,7 +3435,7 @@ mod tests {
     #[test]
     fn a_failing_recent_offers_no_pinch() {
         // ARCH-09
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut platform = fakes.platform();
         platform.usage = Arc::new(BrokenUsage);
         let mut shell = HomeShell::compose(platform);
@@ -3355,7 +3449,7 @@ mod tests {
 
     #[test]
     fn home_during_a_pinch_lets_the_cards_go_back() {
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = on_recent(&fakes);
         touch_recent(&mut shell, PointerKind::Down, 350.0, 2_000);
         fingers(&mut shell, PinchKind::Start, 300.0, 2_010);
@@ -3373,7 +3467,7 @@ mod tests {
         // REC-11, SET-03: Recent reads its cards again as the choice is saved, so a swipe after
         // Settings closes already shows them.
         const HOUR_MS: u64 = 60 * 60 * 1000;
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         *fakes.usage.access.lock().unwrap() = Access::Granted;
         *fakes.apps.apps.lock().unwrap() = vec![app("maps", "Maps"), app("mail", "Mail")];
         *fakes.system.now_ms.lock().unwrap() = 100 * HOUR_MS;
@@ -3394,7 +3488,7 @@ mod tests {
     #[test]
     fn a_density_chosen_from_a_screen_reader_reflows_the_cards() {
         // A11Y-05, ANIM-17
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = on_recent(&fakes);
         let reflow = shell.state().pinch.reflow;
 
@@ -3464,7 +3558,7 @@ mod tests {
     #[test]
     fn a_long_press_on_applications_opens_the_home_menu_where_the_finger_is() {
         // HOME-10, ANIM-24
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = laid_out(&fakes);
 
         hold(&mut shell, 300.0, 1200.0);
@@ -3487,7 +3581,7 @@ mod tests {
     #[test]
     fn on_events_the_home_menu_has_no_edit_applications() {
         // HOME-10, the issue's acceptance criteria
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = laid_out(&fakes);
         go(&mut shell, Direction::Previous);
 
@@ -3503,7 +3597,7 @@ mod tests {
     #[test]
     fn in_recent_a_long_press_enters_close_mode_instead() {
         // HOME-10, REC-07, ANIM-24
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         maps_and_mail_used(&fakes);
         let mut shell = laid_out(&fakes);
         go(&mut shell, Direction::Next);
@@ -3535,7 +3629,7 @@ mod tests {
     fn a_long_press_on_recent_counts_only_where_close_mode_can_start() {
         // REC-07, ANIM-24: with no card to remove, or in close mode already, it takes nothing,
         // and nothing ticks.
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = laid_out(&fakes);
         go(&mut shell, Direction::Next);
         hold(&mut shell, 500.0, 900.0);
@@ -3543,7 +3637,7 @@ mod tests {
         assert!(!shell.recent().state().close_mode);
         assert_eq!(ticks(&fakes), 0);
 
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = on_recent(&fakes);
         hold_and_lift(&mut shell, 500.0, 900.0, 10_000);
         assert!(shell.recent().state().close_mode);
@@ -3561,7 +3655,7 @@ mod tests {
     #[test]
     fn close_mode_shrinks_the_cards_and_pops_their_badges() {
         // REC-07, ANIM-12
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = on_recent(&fakes);
         assert!(shell.state().close_offered);
         assert!(shell.state().density_offered);
@@ -3594,7 +3688,7 @@ mod tests {
     #[test]
     fn a_tap_on_empty_space_back_home_or_another_view_leaves_close_mode() {
         // REC-07. A screen reader enters it with a tick, as edit mode (A11Y-05, ANIM-24).
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = on_recent(&fakes);
         let enter = |shell: &mut HomeShell| {
             shell.dispatch(ShellIntent::Recent(RecentIntent::EnterCloseMode));
@@ -3625,7 +3719,7 @@ mod tests {
     #[test]
     fn a_removed_card_shrinks_away_and_the_others_close_the_gap() {
         // REC-08, ANIM-18
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = on_recent(&fakes);
         shell.dispatch(ShellIntent::Recent(RecentIntent::EnterCloseMode));
         come_to_rest(&mut shell, 20_000);
@@ -3647,7 +3741,7 @@ mod tests {
     #[test]
     fn clear_all_collapses_the_cards_row_by_row() {
         // REC-08, ANIM-18, AC-14: seven cards, three rows of three.
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let packages = ["a", "b", "c", "d", "e", "f", "g"];
         *fakes.usage.access.lock().unwrap() = Access::Granted;
         *fakes.apps.apps.lock().unwrap() = packages.iter().map(|p| app(p, p)).collect();
@@ -3680,7 +3774,7 @@ mod tests {
     #[test]
     fn cards_that_go_out_of_sight_just_go() {
         // ANIM-18: hiding Maps in Applications takes its card out of Recent, unseen.
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = with_recent_maps_and_mail(&fakes);
 
         hide_maps(&mut shell);
@@ -3692,7 +3786,7 @@ mod tests {
     #[test]
     fn a_failing_recent_offers_no_close_mode() {
         // ARCH-09
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut platform = fakes.platform();
         platform.usage = Arc::new(BrokenUsage);
         let mut shell = HomeShell::compose(platform);
@@ -3715,7 +3809,7 @@ mod tests {
 
     #[test]
     fn under_settings_or_the_menu_a_long_press_does_nothing() {
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = laid_out(&fakes);
         shell.dispatch(ShellIntent::OpenSettings);
         hold(&mut shell, 500.0, 900.0);
@@ -3734,7 +3828,7 @@ mod tests {
     #[test]
     fn back_closes_the_menu_before_edit_mode() {
         // HOME-08
-        let mut shell = laid_out(&Fakes::default());
+        let mut shell = laid_out(&Fakes::after_setup());
         shell.dispatch(ShellIntent::Apps(AppsIntent::EnterEditMode));
         shell.dispatch(ShellIntent::OpenMenu);
 
@@ -3749,7 +3843,7 @@ mod tests {
     #[test]
     fn home_closes_the_menu_and_everything_open_with_it_and_goes_no_further() {
         // HOME-07: Home first closes any open menu, and only then moves or scrolls.
-        let mut shell = laid_out(&Fakes::default());
+        let mut shell = laid_out(&Fakes::after_setup());
         shell.dispatch(ShellIntent::Apps(AppsIntent::Scrolled(480.0)));
         shell.dispatch(ShellIntent::Apps(AppsIntent::EnterEditMode));
         hold(&mut shell, 500.0, 900.0);
@@ -3774,7 +3868,7 @@ mod tests {
     #[test]
     fn the_systems_settings_entry_opens_settings_at_its_top_over_whatever_is_open() {
         // SET-01: from the system's home-app settings, through the host.
-        let mut shell = laid_out(&Fakes::default());
+        let mut shell = laid_out(&Fakes::after_setup());
         shell.dispatch(ShellIntent::OpenMenu);
         shell.dispatch(ShellIntent::ChooseMenuItem(MenuItem::EditApplications));
 
@@ -3789,7 +3883,7 @@ mod tests {
     #[test]
     fn reset_launcher_restores_every_features_defaults_and_shows_applications_at_its_top() {
         // SET-06, ADR 0002: each feature restores its own fields.
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail"), app("maps", "Maps")];
         let mut shell = laid_out(&fakes);
         hide_maps(&mut shell);
@@ -3811,11 +3905,14 @@ mod tests {
         shell.dispatch(ShellIntent::Settings(SettingsIntent::ResetLauncher));
 
         let saved = PersistentSettingsStore::new(fakes.storage.clone()).get();
+        // When the banner was answered isn't a setting, and setup doesn't come back (ADR 0036).
         let defaults = Settings {
             home_banner_dismissed_ms: saved.home_banner_dismissed_ms,
+            setup_install_ms: Some(0),
             ..Settings::default()
         };
         assert_eq!(saved, defaults);
+        assert!(!shell.state().setup_open);
         assert!(!shell.state().settings_open);
         assert_eq!(shell.state().current, HomeView::Applications);
         assert_eq!(shell.theme().state().theme, Theme::Light);
@@ -3827,7 +3924,7 @@ mod tests {
     #[test]
     fn reset_launcher_is_offered_only_while_every_feature_it_resets_works() {
         // SET-06, ARCH-09: a failed Recent can't restore its own fields, so nothing is reset.
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut platform = fakes.platform();
         platform.usage = Arc::new(BrokenUsage);
         let mut shell = HomeShell::compose(platform);
@@ -3847,7 +3944,7 @@ mod tests {
     #[test]
     fn each_menu_item_does_what_it_says() {
         // HOME-10, SET-01
-        let mut shell = laid_out(&Fakes::default());
+        let mut shell = laid_out(&Fakes::after_setup());
 
         shell.dispatch(ShellIntent::OpenMenu);
         shell.dispatch(ShellIntent::ChooseMenuItem(MenuItem::LauncherSettings));
@@ -3878,7 +3975,7 @@ mod tests {
     #[test]
     fn lock_screen_image_opens_the_image_details_once_there_is_an_image() {
         // HOME-10, WALL-15: before the first image it opens Settings, as above.
-        let mut shell = with_an_image(&Fakes::default());
+        let mut shell = with_an_image(&Fakes::after_setup());
         go(&mut shell, Direction::Previous);
 
         shell.dispatch(ShellIntent::OpenMenu);
@@ -3893,7 +3990,7 @@ mod tests {
 
     #[test]
     fn an_item_the_menu_doesnt_offer_or_with_no_menu_open_does_nothing() {
-        let mut shell = laid_out(&Fakes::default());
+        let mut shell = laid_out(&Fakes::after_setup());
         shell.dispatch(ShellIntent::ChooseMenuItem(MenuItem::LauncherSettings));
         assert!(!shell.state().settings_open);
 
@@ -3908,7 +4005,7 @@ mod tests {
     #[test]
     fn a_screen_reader_opens_the_menu_in_events_and_applications_only() {
         // A11Y-05: centred, since no finger says where; no long-press, so no tick.
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = laid_out(&fakes);
         assert!(shell.state().menu_offered());
 
@@ -3934,7 +4031,7 @@ mod tests {
     #[test]
     fn while_the_menu_is_open_a_drag_moves_nothing() {
         // The menu covers the home views.
-        let mut shell = laid_out(&Fakes::default());
+        let mut shell = laid_out(&Fakes::after_setup());
         shell.dispatch(ShellIntent::OpenMenu);
 
         for (kind, x, at) in [
@@ -3957,7 +4054,7 @@ mod tests {
 
     #[test]
     fn opening_the_menu_ends_a_drag() {
-        let mut shell = laid_out(&Fakes::default());
+        let mut shell = laid_out(&Fakes::after_setup());
         for (kind, x, at) in [
             (PointerKind::Down, 800.0, 0),
             (PointerKind::Move, 600.0, 16),
@@ -3979,7 +4076,7 @@ mod tests {
 
     #[test]
     fn the_menu_closes_when_the_view_changes() {
-        let mut shell = laid_out(&Fakes::default());
+        let mut shell = laid_out(&Fakes::after_setup());
         shell.dispatch(ShellIntent::OpenMenu);
         shell.dispatch(ShellIntent::Swipe(Direction::Previous));
         assert_eq!(shell.state().menu, None);
@@ -3989,7 +4086,7 @@ mod tests {
     fn the_menu_stays_open_and_centred_when_the_layout_changes() {
         // COMP-03, issue #8: folding, rotating or resizing keeps it open, but the finger's
         // place means nothing in the new layout.
-        let mut shell = laid_out(&Fakes::default());
+        let mut shell = laid_out(&Fakes::after_setup());
         hold(&mut shell, 300.0, 700.0);
         lift(&mut shell);
         let layout = shell.state().carousel.layout;
@@ -4052,7 +4149,7 @@ mod tests {
     fn coming_back_keeps_the_menu_unless_home_opens_applications() {
         // HOME-06: by default the home comes back as it was; with Always Applications, Home
         // from an app closes everything.
-        let mut shell = laid_out(&Fakes::default());
+        let mut shell = laid_out(&Fakes::after_setup());
         shell.dispatch(ShellIntent::OpenMenu);
         shell.dispatch(ShellIntent::Returned { home: true });
         assert!(shell.state().menu.is_some());
@@ -4066,7 +4163,7 @@ mod tests {
     #[test]
     fn a_pressed_icon_shrinks_and_springs_back_with_the_frames() {
         // ANIM-10: the host draws frames while it moves, and none while it is held.
-        let mut shell = laid_out(&Fakes::default());
+        let mut shell = laid_out(&Fakes::after_setup());
 
         shell.dispatch(ShellIntent::Press {
             surface: Surface::Grid,
@@ -4091,7 +4188,7 @@ mod tests {
     #[test]
     fn a_drag_on_the_views_lets_the_pressed_icon_go() {
         // HOME-03: the views move instead, so the icon springs back.
-        let mut shell = laid_out(&Fakes::default());
+        let mut shell = laid_out(&Fakes::after_setup());
         shell.dispatch(ShellIntent::Pointer(PointerEvent {
             kind: PointerKind::Down,
             x: 800.0,
@@ -4127,7 +4224,7 @@ mod tests {
 
     #[test]
     fn the_menu_settings_or_another_view_let_the_pressed_icon_go_at_once() {
-        let mut shell = laid_out(&Fakes::default());
+        let mut shell = laid_out(&Fakes::after_setup());
         let press = |shell: &mut HomeShell| {
             shell.dispatch(ShellIntent::Press {
                 surface: Surface::Grid,
@@ -4205,7 +4302,7 @@ mod tests {
     #[test]
     fn a_long_press_on_an_app_opens_its_menu_and_ticks() {
         // APPS-11, ANIM-24
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = with_mail(&fakes);
         shell.dispatch(ShellIntent::Press {
             surface: Surface::Grid,
@@ -4238,7 +4335,7 @@ mod tests {
             assert!(!shell.state().carousel.held);
             assert_eq!(ticks(fakes), 0);
         };
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = with_mail(&fakes);
 
         // The finger moved past the touch slop: a scroll that stopped.
@@ -4278,7 +4375,7 @@ mod tests {
     fn dragging_after_a_long_press_lifts_the_icon_and_enters_edit_mode() {
         // APPS-11: the menu closes, edit mode starts, and the icon follows the finger. The
         // views stay put, even for a sideways drag.
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = with_mail(&fakes);
         hold_app(&mut shell, "mail", 300.0, 400.0);
 
@@ -4320,7 +4417,7 @@ mod tests {
     #[test]
     fn once_the_menu_is_closed_a_drag_picks_nothing_up() {
         // HOME-08: Back closes the menu while the finger is still down.
-        let mut shell = with_mail(&Fakes::default());
+        let mut shell = with_mail(&Fakes::after_setup());
         hold_app(&mut shell, "mail", 300.0, 400.0);
 
         shell.dispatch(ShellIntent::Back);
@@ -4332,7 +4429,7 @@ mod tests {
 
     #[test]
     fn a_lifted_icon_goes_back_on_back_a_new_layout_or_apps_coming_and_going() {
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let pick_up = |shell: &mut HomeShell| {
             hold_app(shell, "mail", 300.0, 400.0);
             finger(shell, PointerKind::Move, 300.0, 600.0);
@@ -4377,7 +4474,7 @@ mod tests {
     #[test]
     fn back_and_home_close_the_app_menu() {
         // HOME-07, HOME-08: Home goes no further than closing it.
-        let mut shell = with_mail(&Fakes::default());
+        let mut shell = with_mail(&Fakes::after_setup());
         shell.dispatch(ShellIntent::Apps(AppsIntent::Scrolled(480.0)));
         hold_app(&mut shell, "mail", 300.0, 400.0);
         lift(&mut shell);
@@ -4397,7 +4494,7 @@ mod tests {
 
     #[test]
     fn a_touch_outside_another_view_or_settings_close_the_app_menu() {
-        let mut shell = with_mail(&Fakes::default());
+        let mut shell = with_mail(&Fakes::after_setup());
         let open = |shell: &mut HomeShell| {
             shell.dispatch(ShellIntent::OpenCellMenu(CellKey::App(app_id("maps"))));
             assert!(shell.state().app_menu_open);
@@ -4422,7 +4519,7 @@ mod tests {
     #[test]
     fn a_screen_reader_opens_an_apps_menu_without_a_tick() {
         // A11Y-05: in Applications only, and with nothing to pick up.
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = with_mail(&fakes);
 
         shell.dispatch(ShellIntent::OpenCellMenu(CellKey::App(app_id("mail"))));
@@ -4442,7 +4539,7 @@ mod tests {
     #[test]
     fn while_an_apps_menu_is_open_the_views_get_no_touches() {
         // It covers the home views, as the home menu does.
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = with_mail(&fakes);
         shell.dispatch(ShellIntent::OpenCellMenu(CellKey::App(app_id("mail"))));
 
@@ -4465,7 +4562,7 @@ mod tests {
     #[test]
     fn the_app_menu_stays_open_when_the_layout_changes() {
         // COMP-03: it is drawn at its icon, wherever that is now.
-        let mut shell = with_mail(&Fakes::default());
+        let mut shell = with_mail(&Fakes::after_setup());
         hold_app(&mut shell, "mail", 300.0, 400.0);
         lift(&mut shell);
         let layout = shell.state().carousel.layout;
@@ -4481,7 +4578,7 @@ mod tests {
     #[test]
     fn a_failing_applications_never_leaves_the_home_covered() {
         // ARCH-09: a menu Applications can no longer close doesn't count.
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut platform = fakes.platform();
         let broken = FakeApps::default();
         broken.apps.lock().unwrap().push(app("mail", "Mail"));
@@ -4553,7 +4650,7 @@ mod tests {
     #[test]
     fn a_long_press_on_a_notification_opens_its_menu_and_ticks() {
         // EVT-08, ANIM-24
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = on_events(&fakes);
 
         hold_row(&mut shell, row_of("mail"));
@@ -4578,7 +4675,7 @@ mod tests {
             assert!(!shell.state().carousel.held);
             assert_eq!(ticks(fakes), 0);
         };
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = on_events(&fakes);
 
         // The finger moved past the touch slop: a scroll that stopped.
@@ -4616,7 +4713,7 @@ mod tests {
     #[test]
     fn a_screen_reader_opens_a_notifications_menu_without_a_tick() {
         // A11Y-05
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = on_events(&fakes);
 
         shell.dispatch(ShellIntent::OpenNotificationMenu(row_of("chat")));
@@ -4629,7 +4726,7 @@ mod tests {
     #[test]
     fn the_notification_menu_covers_the_views_and_closes_like_the_others() {
         // EVT-08, HOME-07, HOME-08
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = on_events(&fakes);
         shell.dispatch(ShellIntent::OpenNotificationMenu(row_of("mail")));
 
@@ -4667,7 +4764,7 @@ mod tests {
     #[test]
     fn leaving_events_collapses_its_group_and_closes_its_menu() {
         // EVT-06: as an open folder closes on leaving Applications.
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = on_events(&fakes);
         expand(&mut shell, "mail");
         assert!(shell.events().state().expanded.is_some());
@@ -4680,7 +4777,7 @@ mod tests {
     #[test]
     fn expanding_and_collapsing_a_group_moves_the_events_list() {
         // EVT-06, ANIM-20
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = on_events(&fakes);
         come_to_rest(&mut shell, 20_000);
         assert!(!shell.state().events_change.animating);
@@ -4726,7 +4823,7 @@ mod tests {
     #[test]
     fn a_failing_events_never_leaves_the_home_covered() {
         // ARCH-09: a menu Events can no longer close doesn't count.
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut platform = fakes.platform();
         let broken = FakeNotifications::default();
         *broken.access.lock().unwrap() = Access::Granted;
@@ -4831,7 +4928,7 @@ mod tests {
     #[test]
     fn a_dragged_icon_moves_the_others_aside_and_a_drop_keeps_the_new_order() {
         // APPS-12, APPS-18, ANIM-13, AC-07
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = with_four(&fakes);
 
         maps_moved_first(&mut shell);
@@ -4860,7 +4957,7 @@ mod tests {
     fn a_finger_on_a_settling_icon_picks_it_up_again_and_keeps_the_gesture() {
         // ANIM-03, ANIM-13: the icon stops where it is drawn and follows the finger; the row
         // never moves, and the next drop is kept as the first was.
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = with_four(&fakes);
         maps_moved_first(&mut shell);
         pointer_at(&mut shell, PointerKind::Up, 110.0, 290.0, 10_300);
@@ -4941,7 +5038,7 @@ mod tests {
     #[test]
     fn a_drop_before_the_wait_is_over_still_takes_the_place_under_it() {
         // APPS-12
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = with_four(&fakes);
         hold_app(&mut shell, "maps", 500.0, 300.0);
         pointer_at(&mut shell, PointerKind::Move, 100.0, 300.0, 10_050);
@@ -4968,7 +5065,7 @@ mod tests {
             |shell| shell.dispatch(ShellIntent::Swipe(Direction::Next)),
         ];
         for end in ends {
-            let fakes = Fakes::default();
+            let fakes = Fakes::after_setup();
             let mut shell = with_four(&fakes);
             maps_moved_first(&mut shell);
 
@@ -4983,7 +5080,7 @@ mod tests {
     #[test]
     fn near_the_bottom_a_dragged_icon_scrolls_the_grid() {
         // APPS-12: 40 apps in 11 rows of 200 px; 1400 px of grid show.
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         *fakes.apps.apps.lock().unwrap() = (0..40)
             .map(|i| app(&format!("app{i:02}"), &format!("App {i:02}")))
             .collect();
@@ -5003,7 +5100,7 @@ mod tests {
     #[test]
     fn entering_edit_mode_ticks_once() {
         // ANIM-24: from a menu it ticks; picking an icon up ticks only for its long-press.
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = with_mail(&fakes);
         shell.dispatch(ShellIntent::OpenMenu);
         shell.dispatch(ShellIntent::ChooseMenuItem(MenuItem::EditApplications));
@@ -5023,7 +5120,7 @@ mod tests {
     #[test]
     fn edit_mode_shrinks_the_icons_and_pops_the_badges_in_then_back_out() {
         // ANIM-12
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = with_four(&fakes);
         shell.dispatch(ShellIntent::Apps(AppsIntent::EnterEditMode));
         assert!(shell.state().mode.animating);
@@ -5041,7 +5138,7 @@ mod tests {
     #[test]
     fn leaving_applications_ends_edit_mode() {
         // So Done is never left out of sight, and Home from Events shows a plain grid.
-        let mut shell = with_mail(&Fakes::default());
+        let mut shell = with_mail(&Fakes::after_setup());
         shell.dispatch(ShellIntent::Apps(AppsIntent::EnterEditMode));
 
         go(&mut shell, Direction::Previous);
@@ -5054,7 +5151,7 @@ mod tests {
     #[test]
     fn in_edit_mode_an_icon_doesnt_shrink_under_the_finger() {
         // APPS-12: a tap launches nothing, so nothing says it would.
-        let mut shell = with_mail(&Fakes::default());
+        let mut shell = with_mail(&Fakes::after_setup());
         shell.dispatch(ShellIntent::Apps(AppsIntent::EnterEditMode));
 
         shell.dispatch(ShellIntent::Press {
@@ -5068,7 +5165,7 @@ mod tests {
 
     #[test]
     fn in_edit_mode_the_home_menu_has_no_edit_applications() {
-        let mut shell = with_mail(&Fakes::default());
+        let mut shell = with_mail(&Fakes::after_setup());
         shell.dispatch(ShellIntent::Apps(AppsIntent::EnterEditMode));
 
         shell.dispatch(ShellIntent::OpenMenu);
@@ -5082,7 +5179,7 @@ mod tests {
     #[test]
     fn moving_an_icon_moves_the_grid_but_a_refresh_in_the_same_order_doesnt() {
         // ANIM-13, ANIM-21: one rule for every change of the cells.
-        let mut shell = with_four(&Fakes::default());
+        let mut shell = with_four(&Fakes::after_setup());
         shell.dispatch(ShellIntent::Apps(AppsIntent::EnterEditMode));
         come_to_rest(&mut shell, 0);
 
@@ -5100,7 +5197,7 @@ mod tests {
     #[test]
     fn a_failing_applications_ends_edit_mode_and_the_drag() {
         // ARCH-09: nothing Applications can no longer end is left on screen.
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut platform = fakes.platform();
         let broken = FakeApps::default();
         broken.apps.lock().unwrap().push(app("mail", "Mail"));
@@ -5149,7 +5246,7 @@ mod tests {
     #[test]
     fn holding_an_app_over_another_and_dropping_it_makes_a_folder_and_ticks() {
         // FOLD-01, FOLD-03, ANIM-14, ANIM-24, AC-08
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = with_four(&fakes);
         shell.dispatch(ShellIntent::Apps(AppsIntent::Layout(GRID_ICONS)));
         let (mx, my) = icon_at(2);
@@ -5286,7 +5383,7 @@ mod tests {
     #[test]
     fn a_failing_applications_never_leaves_a_folder_open() {
         // ARCH-09
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut platform = fakes.platform();
         let broken = FakeApps::default();
         *broken.apps.lock().unwrap() = vec![app("maps", "Maps"), app("mail", "Mail")];
@@ -5373,7 +5470,7 @@ mod tests {
     fn pulling_down_at_the_top_of_applications_opens_search() {
         // SRCH-01, ANIM-16: the field shows in step with the pull, and the gesture is the
         // shell's, so the grid below gets none of it.
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = ready_to_search(&fakes);
         assert_eq!(shell.state().search, SearchState::default());
 
@@ -5415,7 +5512,7 @@ mod tests {
 
     #[test]
     fn a_pull_short_of_the_whole_field_springs_back_and_opens_nothing() {
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = ready_to_search(&fakes);
 
         let t = pull_field(&mut shell, 400.0, 400.0 + 16.0 + 120.0, 0);
@@ -5437,7 +5534,7 @@ mod tests {
             |shell| go(shell, Direction::Next),
         ];
         for case in cases {
-            let fakes = Fakes::default();
+            let fakes = Fakes::after_setup();
             let mut shell = ready_to_search(&fakes);
             case(&mut shell);
 
@@ -5448,7 +5545,7 @@ mod tests {
         }
 
         // Nor before the host has laid the field out.
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = with_four(&fakes);
         drag_down(&mut shell, 400.0, 800.0, 0);
         assert!(!shell.state().search.pulling);
@@ -5457,7 +5554,7 @@ mod tests {
     #[test]
     fn a_pull_lets_the_pressed_icon_go_and_no_long_press_follows() {
         // ANIM-10, HOME-10
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = ready_to_search(&fakes);
         pointer_at(&mut shell, PointerKind::Down, 500.0, 400.0, 0);
         shell.dispatch(ShellIntent::Press {
@@ -5478,7 +5575,7 @@ mod tests {
     #[test]
     fn open_search_keeps_the_views_still_and_offers_no_menus() {
         // SRCH-01: a sideways drag over the field or the results never swipes the views.
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = ready_to_search(&fakes);
         shell.dispatch(ShellIntent::Apps(AppsIntent::OpenSearch));
         assert!(!shell.state().menu_offered());
@@ -5503,7 +5600,7 @@ mod tests {
 
     #[test]
     fn while_search_is_open_its_results_take_presses_or_the_grid_below_an_empty_field() {
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = ready_to_search(&fakes);
         shell.dispatch(ShellIntent::Apps(AppsIntent::OpenSearch));
         let press = |shell: &mut HomeShell, surface: Surface| {
@@ -5534,7 +5631,7 @@ mod tests {
             |shell| shell.dispatch(ShellIntent::OpenSettings),
         ];
         for end in ends {
-            let fakes = Fakes::default();
+            let fakes = Fakes::after_setup();
             let mut shell = ready_to_search(&fakes);
             shell.dispatch(ShellIntent::Apps(AppsIntent::OpenSearch));
             shell.dispatch(ShellIntent::Apps(AppsIntent::Search("ma".into())));
@@ -5554,7 +5651,7 @@ mod tests {
     fn home_closes_search_first_then_scrolls_to_the_top() {
         // HOME-07, SRCH-04: a screen reader can open search anywhere in the grid, and closing it
         // leaves the grid where it was.
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = ready_to_search(&fakes);
         shell.dispatch(ShellIntent::Apps(AppsIntent::Scrolled(600.0)));
         shell.dispatch(ShellIntent::Apps(AppsIntent::OpenSearch));
@@ -5572,7 +5669,7 @@ mod tests {
     #[test]
     fn pushing_the_field_away_with_nothing_typed_closes_search() {
         // SRCH-04: "scrolling down past the field".
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = ready_to_search(&fakes);
         let t = pull_field(&mut shell, 400.0, 400.0 + 16.0 + 200.0, 0);
         let t = field_rests(&mut shell, t);
@@ -5587,7 +5684,7 @@ mod tests {
 
     #[test]
     fn with_a_query_typed_the_results_scroll_and_the_field_stays() {
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = ready_to_search(&fakes);
         shell.dispatch(ShellIntent::Apps(AppsIntent::OpenSearch));
         shell.dispatch(ShellIntent::Apps(AppsIntent::Search("ma".into())));
@@ -5603,7 +5700,7 @@ mod tests {
     #[test]
     fn launching_from_search_springs_the_field_away() {
         // SRCH-03
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = ready_to_search(&fakes);
         shell.dispatch(ShellIntent::Apps(AppsIntent::OpenSearch));
         shell.dispatch(ShellIntent::Apps(AppsIntent::Search("ma".into())));
@@ -5617,7 +5714,7 @@ mod tests {
     #[test]
     fn a_new_layout_keeps_search_open_and_ends_a_pull() {
         // COMP-03
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = ready_to_search(&fakes);
         shell.dispatch(ShellIntent::Apps(AppsIntent::OpenSearch));
         shell.dispatch(ShellIntent::Apps(AppsIntent::Search("ma".into())));
@@ -5629,7 +5726,7 @@ mod tests {
         }));
         assert_eq!(query(&shell).as_deref(), Some("ma"));
 
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = ready_to_search(&fakes);
         drag_down(&mut shell, 400.0, 600.0, 0);
         assert!(shell.state().search.pulling);
@@ -5646,7 +5743,7 @@ mod tests {
     #[test]
     fn a_failing_applications_never_leaves_search_open() {
         // ARCH-09
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut platform = fakes.platform();
         let broken = FakeApps::default();
         *broken.apps.lock().unwrap() = vec![app("maps", "Maps"), app("mail", "Mail")];
@@ -5667,7 +5764,7 @@ mod tests {
     #[test]
     fn a_screen_reader_opens_search_only_where_it_is_offered() {
         // A11Y-05
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = ready_to_search(&fakes);
         assert!(shell.state().search_offered());
 
@@ -5685,5 +5782,179 @@ mod tests {
         shell.dispatch(ShellIntent::Apps(AppsIntent::OpenSearch));
         assert_eq!(query(&shell).as_deref(), Some(""));
         assert!(!shell.state().search_offered());
+    }
+
+    fn setup_step(shell: &HomeShell) -> Option<SetupStep> {
+        shell.settings().state().setup.map(|setup| setup.step)
+    }
+
+    /// Continue, through the shell, as setup's screens send it.
+    fn setup_continue(shell: &mut HomeShell) {
+        shell.dispatch(ShellIntent::Settings(SettingsIntent::SetupContinue));
+    }
+
+    fn not_now(shell: &mut HomeShell, item: AccessItem) {
+        shell.dispatch(ShellIntent::Settings(SettingsIntent::SetupNotNow(item)));
+    }
+
+    #[test]
+    fn a_fresh_install_starts_in_setup_which_covers_the_home() {
+        // ONB-01: nothing reaches the home views, and Home leaves setup as it is.
+        let fakes = Fakes::default();
+        *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail")];
+        let mut shell = laid_out(&fakes);
+        assert!(shell.state().setup_open);
+        assert_eq!(setup_step(&shell), Some(SetupStep::Welcome));
+        assert!(!shell.state().menu_offered());
+        assert!(!shell.state().search_offered());
+
+        shell.dispatch(ShellIntent::Swipe(Direction::Next));
+        shell.dispatch(ShellIntent::LongPress);
+        shell.dispatch(ShellIntent::OpenMenu);
+        shell.dispatch(ShellIntent::OpenSettings);
+        shell.dispatch(ShellIntent::Home);
+        shell.dispatch(ShellIntent::Back);
+
+        assert_eq!(shell.state().current, HomeView::Applications);
+        assert_eq!(shell.state().menu, None);
+        assert!(!shell.state().settings_open);
+        assert_eq!(setup_step(&shell), Some(SetupStep::Welcome));
+        assert!(!shell.banner_shown());
+    }
+
+    #[test]
+    fn back_in_setup_returns_to_the_previous_step() {
+        // ONB-01, HOME-08
+        let mut shell = laid_out(&Fakes::default());
+        setup_continue(&mut shell);
+        assert_eq!(setup_step(&shell), Some(SetupStep::DefaultHome));
+
+        shell.dispatch(ShellIntent::Back);
+
+        assert_eq!(setup_step(&shell), Some(SetupStep::Welcome));
+        assert!(shell.state().setup_open);
+    }
+
+    #[test]
+    fn the_lock_screen_images_step_opens_with_it_and_continue_confirms_it_first() {
+        // ONB-01, WALL-02, ADR 0036: the shell puts the features together.
+        let mut shell = laid_out(&Fakes::default());
+        setup_continue(&mut shell);
+        not_now(&mut shell, AccessItem::DefaultHome);
+        assert_eq!(setup_step(&shell), Some(SetupStep::LockScreenImage));
+        let step = shell.lockimage().state().setup.clone().unwrap();
+        assert!(step.on);
+        assert_eq!(
+            shell.lockimage().state().status,
+            meegone_lockimage_state::ImageStatus::Off
+        );
+
+        setup_continue(&mut shell);
+
+        assert_eq!(shell.lockimage().state().setup, None);
+        assert_eq!(
+            shell.lockimage().state().status,
+            meegone_lockimage_state::ImageStatus::On
+        );
+        assert_eq!(setup_step(&shell), Some(SetupStep::Access));
+    }
+
+    #[test]
+    fn when_setup_ends_applications_shows_at_its_top() {
+        // HOME-05, ONB-02: "Not now" on both accesses ends it too.
+        let fakes = Fakes::default();
+        let mut shell = laid_out(&fakes);
+        shell.dispatch(ShellIntent::Restore(SavedHome {
+            view: HomeView::Recent,
+            apps_scroll_px: 300.0,
+        }));
+        for _ in 0..3 {
+            setup_continue(&mut shell);
+        }
+        assert_eq!(setup_step(&shell), Some(SetupStep::Access));
+
+        not_now(&mut shell, AccessItem::Notifications);
+        not_now(&mut shell, AccessItem::Usage);
+
+        assert!(!shell.state().setup_open);
+        assert_eq!(shell.state().current, HomeView::Applications);
+        assert_eq!(shell.apps().state().scroll_px, 0.0);
+        assert!(shell.state().menu_offered());
+    }
+
+    /// Usage access whose system screen panics when asked to open.
+    struct BrokenUsageScreen;
+
+    impl UsageAdapter for BrokenUsageScreen {
+        fn access(&self) -> Access {
+            Access::Missing
+        }
+
+        fn used_since(&self, _since_ms: u64) -> Result<Vec<RecentUse>, DataError> {
+            Ok(Vec::new())
+        }
+
+        fn open_access_settings(&self) -> Result<(), DataError> {
+            panic!("usage screen bug");
+        }
+    }
+
+    #[test]
+    fn a_failing_settings_never_leaves_setup_covering_the_home() {
+        // ARCH-09
+        let fakes = Fakes::default();
+        let mut platform = fakes.platform();
+        platform.usage = Arc::new(BrokenUsageScreen);
+        let mut shell = HomeShell::compose(platform);
+        for _ in 0..3 {
+            setup_continue(&mut shell);
+        }
+
+        shell.dispatch(ShellIntent::Settings(SettingsIntent::OpenUsageAccess));
+
+        assert!(!shell.settings_ready());
+        assert!(!shell.state().setup_open);
+        assert_eq!(shell.state().current, HomeView::Applications);
+        assert!(shell.state().menu_offered());
+    }
+
+    #[test]
+    fn a_failing_lock_screen_image_leaves_its_setup_step_with_continue_only() {
+        // ARCH-09: setup still ends.
+        let fakes = Fakes::default();
+        let mut platform = fakes.platform();
+        platform.wallpaper = Arc::new(BrokenWallpaper);
+        let mut shell = HomeShell::compose(platform);
+        setup_continue(&mut shell);
+        not_now(&mut shell, AccessItem::DefaultHome);
+        assert_eq!(setup_step(&shell), Some(SetupStep::LockScreenImage));
+
+        setup_continue(&mut shell);
+
+        assert_eq!(setup_step(&shell), Some(SetupStep::Access));
+    }
+
+    #[test]
+    fn the_banner_shows_only_on_the_home_views_with_nothing_over_them() {
+        // ONB-04
+        let fakes = Fakes::after_setup();
+        *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail")];
+        let mut shell = laid_out(&fakes);
+        assert!(shell.banner_shown());
+
+        shell.dispatch(ShellIntent::OpenSettings);
+        assert!(!shell.banner_shown());
+        shell.dispatch(ShellIntent::Back);
+        shell.dispatch(ShellIntent::OpenMenu);
+        assert!(!shell.banner_shown());
+        shell.dispatch(ShellIntent::CloseMenu);
+        shell.dispatch(ShellIntent::ChooseMenuItem(MenuItem::EditApplications));
+        shell.dispatch(ShellIntent::Apps(AppsIntent::EnterEditMode));
+        assert!(!shell.banner_shown());
+        shell.dispatch(ShellIntent::Back);
+        assert!(shell.banner_shown());
+
+        shell.dispatch(ShellIntent::Settings(SettingsIntent::DismissHomeBanner));
+        assert!(!shell.banner_shown());
     }
 }

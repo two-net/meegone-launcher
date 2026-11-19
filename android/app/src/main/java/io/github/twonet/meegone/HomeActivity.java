@@ -43,7 +43,6 @@ public final class HomeActivity extends Activity {
     private final int[] saved = new int[2];
     private Bridge bridge;
     private HomeViews views;
-    private boolean debugRequestHome;
     /**
      * An app or a system screen covers the home: from {@code onStop} until the next {@code
      * onResume}. An instance that comes back after the system ended the process starts out of
@@ -92,7 +91,6 @@ public final class HomeActivity extends Activity {
         views = new HomeViews(this);
         setContentView(views);
         listenForBack();
-        readDebugExtras(getIntent());
         if (opensSettings(getIntent())) {
             nativeOpenSettings();
         }
@@ -115,7 +113,6 @@ public final class HomeActivity extends Activity {
             nativeOpenSettings();
             views.refresh();
         }
-        readDebugExtras(intent);
     }
 
     @Override
@@ -126,10 +123,6 @@ public final class HomeActivity extends Activity {
         away = false;
         homeWhileAway = false;
         views.onResumed();
-        if (debugRequestHome) {
-            debugRequestHome = false;
-            nativeRequestDefaultHome();
-        }
     }
 
     @Override
@@ -333,12 +326,6 @@ public final class HomeActivity extends Activity {
         return Intent.ACTION_APPLICATION_PREFERENCES.equals(intent.getAction());
     }
 
-    private void readDebugExtras(Intent intent) {
-        if (DebugHooks.requestsHomeRole(intent)) {
-            debugRequestHome = true;
-        }
-    }
-
     /**
      * Starts MeeGone, once per process; later calls do nothing. {@code savedView} is the view
      * from the saved state, or -1. Returns whether this call started it.
@@ -385,7 +372,4 @@ public final class HomeActivity extends Activity {
 
     /** The system animation speed changed (ANIM-05, ADR 0034); nothing before MeeGone starts. */
     private static native void nativeAnimationScaleChanged();
-
-    /** Taps the banner's "make default" button; only debug builds' {@link DebugHooks} call it. */
-    private native void nativeRequestDefaultHome();
 }

@@ -144,6 +144,43 @@ impl PastImages {
     }
 }
 
+/// Today's image and its preview, for setup's lock-screen image step (ONB-01, ADR 0036), as
+/// read for one region on one local day. It is read while the daily image may still be off, and
+/// is only ever shown: it never becomes the wallpaper (WALL-02).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Today {
+    /// The region the feed was asked for (WALL-05).
+    pub region: String,
+    /// The local day it was read, in days since 1 January 1970.
+    pub day: u64,
+    pub image: PastImage,
+}
+
+/// The last [`Today`] read for setup. Memory only; clones of its `Arc` share it.
+#[derive(Debug, Default)]
+pub struct TodayImage {
+    today: Mutex<Option<Today>>,
+}
+
+impl TodayImage {
+    fn today(&self) -> MutexGuard<'_, Option<Today>> {
+        self.today.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub fn get(&self) -> Option<Today> {
+        self.today().clone()
+    }
+
+    pub fn set(&self, today: Today) {
+        *self.today() = Some(today);
+    }
+
+    /// Forgets it, once setup's step is answered or the daily image is turned off.
+    pub fn clear(&self) {
+        *self.today() = None;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use meegone_core_data::fakes;
@@ -244,5 +281,25 @@ mod tests {
         assert_eq!(past.problem().as_deref(), Some("No connection"));
         past.clear();
         assert_eq!((past.week(), past.problem()), (None, None));
+    }
+
+    #[test]
+    fn todays_image_is_kept_in_memory_until_cleared() {
+        // ONB-01, ADR 0036
+        let today = TodayImage::default();
+        assert_eq!(today.get(), None);
+        let read = Today {
+            region: "en-GB".into(),
+            day: 20_400,
+            image: PastImage {
+                image: feed_image("a1", "20251120"),
+                preview: Some(Preview::new(&header(800, 480)).unwrap()),
+            },
+        };
+
+        today.set(read.clone());
+        assert_eq!(today.get(), Some(read));
+        today.clear();
+        assert_eq!(today.get(), None);
     }
 }

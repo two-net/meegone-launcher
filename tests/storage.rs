@@ -35,7 +35,7 @@ fn stored_files(fakes: &Fakes) -> BTreeSet<StoredFile> {
 #[test]
 fn settings_and_the_layout_survive_a_restart() {
     // REL-03, APPS-18
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     *fakes.apps.apps.lock().unwrap() = vec![app("phone", "Phone"), app("mail", "Mail")];
     let mut launcher = Launcher::start(fakes.platform());
     launcher.dispatch(ShellIntent::OpenSettings);
@@ -58,7 +58,7 @@ fn settings_and_the_layout_survive_a_restart() {
 #[test]
 fn hidden_apps_stay_hidden_after_a_restart() {
     // APPS-19: they are kept in the settings store, and nowhere else.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     *fakes.apps.apps.lock().unwrap() = vec![app("phone", "Phone"), app("mail", "Mail")];
     let mut launcher = Launcher::start(fakes.platform());
     launcher.dispatch(ShellIntent::OpenCellMenu(CellKey::App(app_id("mail"))));
@@ -96,7 +96,7 @@ fn hidden_apps_stay_hidden_after_a_restart() {
 #[test]
 fn damaged_files_load_as_defaults_without_a_crash() {
     // MAINT-04
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     fakes.apps.apps.lock().unwrap().push(app("mail", "Mail"));
     for file in StoredFile::ALL {
         let damaged = b"meegone-\xff damaged".to_vec();
@@ -119,7 +119,7 @@ fn damaged_files_load_as_defaults_without_a_crash() {
 #[test]
 fn failing_storage_never_stops_the_app() {
     // REL-01, REL-03
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     fakes.apps.apps.lock().unwrap().push(app("mail", "Mail"));
     let full = DataError::Failed("Not enough storage space".into());
     *fakes.storage.error.lock().unwrap() = Some(full);
@@ -148,7 +148,7 @@ fn notification_content_and_usage_history_are_never_stored() {
     const NOW_MS: u64 = 1_763_299_999_999;
     const USED_MS: u64 = 1_763_299_123_456;
     const POSTED_MS: u64 = 1_763_298_765_432;
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     *fakes.system.now_ms.lock().unwrap() = NOW_MS;
     *fakes.apps.apps.lock().unwrap() = vec![app("chat", "Chat"), app("maps", "Maps")];
     *fakes.notifications.access.lock().unwrap() = Access::Granted;
@@ -236,7 +236,7 @@ fn the_backup_keeps_the_layout_and_the_settings_and_nothing_else() {
     let only_those = BTreeSet::from([StoredFile::Layout, StoredFile::Settings]);
     assert_eq!(backup::backed_up_files(), only_those);
 
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail")];
     let mut launcher = Launcher::start(fakes.platform());
     launcher.dispatch(ShellIntent::OpenSettings);
@@ -254,7 +254,7 @@ fn the_backup_keeps_the_layout_and_the_settings_and_nothing_else() {
 
     assert_eq!(backup.keys().copied().collect::<BTreeSet<_>>(), only_those);
     // Restored on another device, they are all MeeGone needs.
-    let other = Fakes::default();
+    let other = Fakes::after_setup();
     *other.apps.apps.lock().unwrap() = vec![app("mail", "Mail")];
     *other.system.installed_ms.lock().unwrap() = 1;
     backup::restore(&other.storage, &backup);

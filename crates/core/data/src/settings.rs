@@ -15,11 +15,11 @@ use crate::storage::{
 
 /// Version of the saved settings format (MAINT-04). Changing the format means a new version, a
 /// migration in [`SETTINGS_MIGRATIONS`] and a fixture (ARCHITECTURE.md, "Persistence").
-pub const SETTINGS_VERSION: u32 = 3;
+pub const SETTINGS_VERSION: u32 = 4;
 
 /// Brings settings saved by older versions up to date, one version at a time.
 const SETTINGS_MIGRATIONS: [Migration; SETTINGS_VERSION as usize - 1] =
-    [add_home_banner, name_recent_window];
+    [add_home_banner, name_recent_window, add_setup_install];
 
 /// Version 2 adds when the "make MeeGone the default" banner was last dismissed (ONB-04). Older
 /// settings never dismissed it.
@@ -49,6 +49,24 @@ fn name_recent_window(body: &str) -> Option<String> {
         }
     }
     Some(migrated)
+}
+
+/// Version 4 adds which install of MeeGone finished first-run setup (ONB-01, ADR 0036). Settings
+/// saved before it come from an install that was used before setup existed, so setup counts as
+/// done on any install: 0.
+fn add_setup_install(body: &str) -> Option<String> {
+    let mut added = Writer::default();
+    added.line("setup_install", Some(0_u64));
+    Some(format!("{body}{}", added.into_body()))
+}
+
+/// Whether first-run setup is done on this install (ONB-01, ADR 0036): it was finished by the
+/// install whose time is `saved`, and that is this one, `installed_ms`. 0 stands for any install:
+/// settings from before setup existed, or an install whose time the system didn't give. Settings
+/// restored from another device's backup (ADR 0018) carry that install's time, so setup runs
+/// again there.
+pub fn setup_done(saved: Option<u64>, installed_ms: u64) -> bool {
+    saved.is_some_and(|at| at == 0 || at == installed_ms)
 }
 
 /// The user's theme choice (THEME-01).
@@ -150,6 +168,10 @@ pub struct Settings {
     /// When the user last dismissed or answered the "make MeeGone the default" banner, so it
     /// shows at most once a day (ONB-04). Not a user-adjustable option (SET-04).
     pub home_banner_dismissed_ms: Option<u64>,
+    /// The time of the install that finished first-run setup, 0 for any install, or `None` while
+    /// setup has never been finished (ONB-01, [`setup_done`]). Not a user-adjustable option
+    /// (SET-04).
+    pub setup_install_ms: Option<u64>,
 }
 
 impl Default for Settings {
@@ -164,6 +186,7 @@ impl Default for Settings {
             image: ImageOptions::default(),
             removed_from_recent: BTreeMap::new(),
             home_banner_dismissed_ms: None,
+            setup_install_ms: None,
         }
     }
 }
@@ -241,7 +264,8 @@ impl Format for Settings {
         for removal in &self.removed_from_recent {
             out.line("removed", removal);
         }
-        out.line("home_banner_dismissed", self.home_banner_dismissed_ms);
+        out.line("home_banner_dismissed", self.home_banner_dismissed_ms)
+            .line("setup_install", self.setup_install_ms);
     }
 
     fn read(input: &mut Reader<'_>) -> Option<Self> {
@@ -260,6 +284,7 @@ impl Format for Settings {
             },
             removed_from_recent: input.lines("removed")?.into_iter().collect(),
             home_banner_dismissed_ms: input.line("home_banner_dismissed")?,
+            setup_install_ms: input.line("setup_install")?,
         })
     }
 }
@@ -337,6 +362,8 @@ mod tests {
             removed_from_recent: _,
             // When the banner was last answered, not an option (ADR 0005).
             home_banner_dismissed_ms: _,
+            // Which install finished setup, not an option (ADR 0036).
+            setup_install_ms: _,
         } = Settings::default();
         let options: &[&dyn std::fmt::Debug] = &[
             &theme,
@@ -363,11 +390,20 @@ mod tests {
         // 48 hours, which no choice is, becomes three days.
         (include_str!("../fixtures/settings-v1.txt"), || Settings {
             home_banner_dismissed_ms: None,
-            ..sample()
+            ..before_setup()
         }),
-        (include_str!("../fixtures/settings-v2.txt"), sample),
-        (include_str!("../fixtures/settings-v3.txt"), sample),
+        (include_str!("../fixtures/settings-v2.txt"), before_setup),
+        (include_str!("../fixtures/settings-v3.txt"), before_setup),
+        (include_str!("../fixtures/settings-v4.txt"), sample),
     ];
+
+    /// [`sample`] as saved before setup existed: done on any install (ADR 0036).
+    fn before_setup() -> Settings {
+        Settings {
+            setup_install_ms: Some(0),
+            ..sample()
+        }
+    }
 
     /// Settings with no default left in place.
     fn sample() -> Settings {
@@ -389,6 +425,7 @@ mod tests {
                 (app_id("maps"), 1_763_254_800_000),
             ]),
             home_banner_dismissed_ms: Some(1_763_290_000_000),
+            setup_install_ms: Some(1_763_200_000_000),
         }
     }
 
@@ -419,6 +456,23 @@ mod tests {
         assert!(settings.wrap_around); // HOME-04
         assert!(!settings.image.enabled); // WALL-02
         assert_eq!(settings.recent_window, RecentWindow::TwentyFourHours); // REC-03, REC-11
+        assert_eq!(settings.setup_install_ms, None); // ONB-01: setup runs
+    }
+
+    #[test]
+    fn setup_is_done_only_on_the_install_that_finished_it() {
+        // ONB-01, ADR 0036
+        let this = 1_763_200_000_000;
+
+        assert!(!setup_done(None, this), "never finished");
+        assert!(setup_done(Some(this), this), "finished here");
+        assert!(setup_done(Some(0), this), "finished before setup existed");
+        assert!(
+            !setup_done(Some(this - 1), this),
+            "restored from another install"
+        );
+        assert!(setup_done(Some(0), 0), "unknown install times");
+        assert!(!setup_done(Some(this), 0), "this install's time unknown");
     }
 
     #[test]
@@ -573,11 +627,13 @@ mod tests {
     fn an_older_window_becomes_the_shortest_choice_that_shows_as_much() {
         // MAINT-04, ADR 0026: the window saved in hours before version 3.
         let saved_at_v2 = |hours: &str| {
-            let v3 = body(&encode(&Settings::default()));
-            let v2 = v3.replace(
-                "recent_window twenty_four_hours\n",
-                &format!("recent_window_hours {hours}\n"),
-            );
+            let today = body(&encode(&Settings::default()));
+            let v2 = today
+                .replace(
+                    "recent_window twenty_four_hours\n",
+                    &format!("recent_window_hours {hours}\n"),
+                )
+                .replace("setup_install -\n", "");
             seal("settings", 2, &v2)
         };
 

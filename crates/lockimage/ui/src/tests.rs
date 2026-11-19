@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use meegone_core_ui::{Dispatch, Latest};
 use meegone_lockimage_state::{
-    CheckStatus, ImageFile, ImageRecord, ImageStatus, LockImageIntent, LockImageState, PastEntry,
+    CheckStatus, ImageFile, ImageRecord, ImageSetup, ImageStatus, LockImageIntent, LockImageState,
+    PastEntry,
 };
 
 use super::*;
@@ -821,4 +822,98 @@ fn settings(state: LockImageState) -> (Latest<LockImageState>, ImageSettingsSect
         Dispatch::new(move |intent| into.borrow_mut().push(intent)),
     );
     (latest, section, sent)
+}
+
+fn setup_step(state: LockImageState) -> (Latest<LockImageState>, ImageSetupStep, Sent) {
+    let latest = Latest::new(Arc::new(state));
+    let sent: Sent = Rc::default();
+    let dispatch = Dispatch::new({
+        let sent = sent.clone();
+        move |intent| sent.borrow_mut().push(intent)
+    });
+    (latest.clone(), ImageSetupStep::new(latest, dispatch), sent)
+}
+
+/// Setup at its lock-screen image step, the daily image still off.
+fn at_setups_step(today: Option<TodayEntry>, loading: bool) -> LockImageState {
+    LockImageState {
+        setup: Some(ImageSetup {
+            on: true,
+            today,
+            loading,
+        }),
+        ..LockImageState::default()
+    }
+}
+
+/// The header of an 800 × 480 JPEG, enough for a preview to be checked.
+fn preview_jpeg() -> Vec<u8> {
+    let mut bytes = vec![0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x11, 0x08];
+    bytes.extend(480_u16.to_be_bytes());
+    bytes.extend(800_u16.to_be_bytes());
+    bytes.extend([0x03, 0x01, 0x22, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01]);
+    bytes.extend([0xFF, 0xD9]);
+    bytes
+}
+
+fn puffins(preview: Option<Preview>) -> TodayEntry {
+    TodayEntry {
+        title: "Puffins on a cliff, Skomer".into(),
+        attribution: "© A Photographer / Agency".into(),
+        preview,
+    }
+}
+
+#[test]
+fn setups_step_shows_todays_image_once_read() {
+    // ONB-01, LEGAL-03
+    let (latest, step, _) = setup_step(at_setups_step(None, true));
+    let loading = step.revision();
+    assert_eq!(
+        step.content(),
+        Some(SetupImageContent {
+            today: None,
+            loading: true
+        })
+    );
+
+    let preview = Preview::new(&preview_jpeg()).unwrap();
+    latest.set(Arc::new(at_setups_step(
+        Some(puffins(Some(preview.clone()))),
+        false,
+    )));
+    let read = step.revision();
+
+    assert_ne!(read, loading);
+    assert_eq!(
+        step.content().unwrap().today,
+        Some(puffins(Some(preview.clone())))
+    );
+    assert_eq!(step.preview(read), Some(preview));
+    assert_eq!(step.preview(loading), None, "an old revision gives nothing");
+    assert_eq!(step.revision(), read, "nothing new");
+}
+
+#[test]
+fn setups_switch_is_its_own_until_continue() {
+    // WALL-02, WALL-13
+    let (latest, step, sent) = setup_step(LockImageState::default());
+    assert_eq!(step.switch(), None, "setup isn't at the step");
+    assert!(!step.switched(true));
+
+    latest.set(Arc::new(at_setups_step(None, false)));
+    assert_eq!(step.switch(), Some(DailyImage::On));
+    assert!(step.switched(false));
+    assert!(matches!(
+        sent.borrow().as_slice(),
+        [LockImageIntent::SetupSwitched(false)]
+    ));
+
+    latest.set(Arc::new(LockImageState {
+        status: ImageStatus::Unavailable("Not allowed".into()),
+        ..at_setups_step(None, false)
+    }));
+    assert_eq!(step.switch(), Some(DailyImage::Unavailable));
+    assert!(!step.switched(true));
+    assert_eq!(sent.borrow().len(), 1);
 }

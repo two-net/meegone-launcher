@@ -33,6 +33,10 @@
 //! [`ImageUpdater::pin`] makes one of them the lock-screen wallpaper until it is unpinned
 //! (WALL-17, ADR 0032). While an image is pinned, the daily check asks nothing and no job
 //! waits.
+//!
+//! [`ImageUpdater::preview_today`] reads today's image and its preview into memory for setup's
+//! lock-screen image step, while the daily image may still be off, and only ever shows it
+//! (ONB-01, WALL-02, ADR 0036).
 
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -42,7 +46,7 @@ use meegone_core_data::{
 };
 use meegone_lockimage_data::{
     Downloader, FeedImage, ImageCache, ImageFeed, ImageRecord, MAX_PREVIEW_BYTES, Marker,
-    PastImage, PastImages, Preview, Week, region,
+    PastImage, PastImages, Preview, Today, TodayImage, Week, region,
 };
 
 use crate::checks::{self, WAIT_MS};
@@ -353,6 +357,42 @@ impl ImageUpdater {
         match week {
             Ok(week) => past.set_week(week),
             Err(error) => past.set_problem(Some(error.to_string())),
+        }
+    }
+
+    /// Reads today's image for the region in use, and its preview if it is offered as a
+    /// wallpaper, into `today`, in memory, for setup's lock-screen image step (ONB-01,
+    /// LEGAL-04). Setup shows the image before the user turns the daily image on, so this runs
+    /// while it is off. It only ever shows it: it never touches the cache, the check log, the
+    /// job or the lock screen (WALL-02), and it isn't one of the day's checks (REL-04).
+    ///
+    /// Offline it asks nothing, and the step shows no preview. What it read is kept for the
+    /// rest of the local day and that region, so asking again costs nothing. If the feed
+    /// fails, there is nothing to show, and nothing to retry: setup goes on without it. It
+    /// blocks, as [`check`](Self::check) does.
+    pub fn preview_today(&self, today: &TodayImage) {
+        if self.wallpaper.lock_screen_support().is_err()
+            || self.network.state() == NetworkState::Offline
+        {
+            return;
+        }
+        let region = self.region(&self.settings.get().image);
+        let day = checks::local_day(self.system.now_ms(), &|at| self.system.utc_offset_ms(at));
+        if today
+            .get()
+            .is_some_and(|read| read.region == region && read.day == day)
+        {
+            return;
+        }
+        if let Ok(image) = self.feed.today(&region) {
+            today.set(Today {
+                image: PastImage {
+                    preview: self.preview(&image),
+                    image,
+                },
+                region,
+                day,
+            });
         }
     }
 
@@ -1775,5 +1815,132 @@ mod tests {
         assert_eq!(updater.pin("owls", &past), Checked::Pinned);
         let current = cache.current().unwrap();
         assert_eq!(lock_screen(&fakes), cache.image(&current).unwrap());
+    }
+
+    /// The daily image still off, as in setup, with today's image and its preview served.
+    fn before_setup(id: &str) -> (Setup, TodayImage) {
+        let setup = setup(id);
+        let image = setup.feed.image.lock().unwrap().clone().unwrap();
+        let preview = Size {
+            width: image.preview.width,
+            height: image.preview.height,
+        };
+        setup
+            .fakes
+            .network
+            .responses
+            .lock()
+            .unwrap()
+            .insert(image.preview.url.clone(), fakes::jpeg(preview));
+        setup
+            .settings
+            .update(&mut |s| s.image.enabled = false)
+            .unwrap();
+        (setup, TodayImage::default())
+    }
+
+    #[test]
+    fn setup_reads_todays_image_while_off_and_touches_nothing_else() {
+        // ONB-01, WALL-02: shown, never cached, counted, scheduled or set.
+        let (
+            Setup {
+                fakes,
+                feed,
+                cache,
+                updater,
+                ..
+            },
+            today,
+        ) = before_setup("puffins");
+
+        updater.preview_today(&today);
+
+        let read = today.get().unwrap();
+        assert_eq!(read.image.image.id, "puffins");
+        assert_eq!(read.region, "en-US");
+        assert!(read.image.preview.is_some());
+        assert_eq!(*feed.requests.lock().unwrap(), ["en-US"]);
+        assert_eq!(cache.current(), None);
+        assert_eq!(cache.checks(), Checks::default());
+        assert_eq!(job(&fakes), None);
+        assert!(fakes.wallpaper.lock_screen.lock().unwrap().is_none());
+        // Only the preview was downloaded, never the image itself.
+        assert_eq!(fakes.network.requests.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn setup_reads_todays_image_once_a_day_for_each_region() {
+        // ONB-01, PWR-03
+        let (
+            Setup {
+                feed,
+                settings,
+                updater,
+                ..
+            },
+            today,
+        ) = before_setup("puffins");
+
+        updater.preview_today(&today);
+        updater.preview_today(&today);
+        assert_eq!(feed_requests(&feed), 1);
+
+        settings
+            .update(&mut |s| s.image.region = Some("fi-FI".into()))
+            .unwrap();
+        updater.preview_today(&today);
+        assert_eq!(*feed.requests.lock().unwrap(), ["en-US", "fi-FI"]);
+        assert_eq!(today.get().unwrap().region, "fi-FI");
+    }
+
+    #[test]
+    fn setup_asks_nothing_offline_or_where_the_lock_screen_cant_be_set() {
+        // ONB-01: a preview only when online; WALL-13.
+        let (
+            Setup {
+                fakes,
+                feed,
+                updater,
+                ..
+            },
+            today,
+        ) = before_setup("puffins");
+        *fakes.network.state.lock().unwrap() = NetworkState::Offline;
+
+        updater.preview_today(&today);
+        assert_eq!(today.get(), None);
+
+        *fakes.network.state.lock().unwrap() = NetworkState::Unmetered;
+        *fakes.wallpaper.unsupported.lock().unwrap() = Some("Not allowed".into());
+        updater.preview_today(&today);
+        assert_eq!(today.get(), None);
+        assert_eq!(feed_requests(&feed), 0);
+    }
+
+    #[test]
+    fn setup_shows_no_preview_of_an_image_not_offered_as_a_wallpaper() {
+        // LEGAL-04
+        let (
+            Setup {
+                fakes,
+                feed,
+                updater,
+                ..
+            },
+            today,
+        ) = before_setup("sculpture");
+        feed.image
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .offered_as_wallpaper = false;
+
+        updater.preview_today(&today);
+
+        let read = today.get().unwrap();
+        assert_eq!(read.image.image.id, "sculpture");
+        assert_eq!(read.image.preview, None);
+        assert!(fakes.network.requests.lock().unwrap().is_empty());
     }
 }

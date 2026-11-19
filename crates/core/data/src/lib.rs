@@ -41,6 +41,6 @@ pub use model::{
 };
 pub use settings::{
     HomeTarget, ImageOptions, PersistentSettingsStore, RecentDensity, RecentWindow,
-    SETTINGS_VERSION, Settings, SettingsStore, ThemeChoice,
+    SETTINGS_VERSION, Settings, SettingsStore, ThemeChoice, setup_done,
 };
 pub use storage::{FileStorage, MAX_STORED_BYTES, StorageAdapter, StoredFile};

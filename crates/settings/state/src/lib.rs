@@ -1,5 +1,6 @@
 //! Settings and setup state (SRS 4.8, 4.9): the launcher's own settings, the status of each
-//! access, and the banner that offers to make MeeGone the default home app (ONB-04).
+//! access, first-run setup and which of its steps shows (ONB-01, ADR 0036), and the banner that
+//! offers to make MeeGone the default home app (ONB-04).
 //!
 //! Settings owns the screens; the values live in the shared settings store (ADR 0002). Each
 //! feature's own section, such as the lock-screen image, belongs to that feature and is put in
@@ -9,6 +10,7 @@ use std::sync::Arc;
 
 use meegone_core_data::{
     DataError, NotificationsAdapter, Settings, SettingsStore, SystemConfigAdapter, UsageAdapter,
+    setup_done,
 };
 use meegone_core_state::{Access, HomeTarget, StateHolder, ThemeChoice};
 
@@ -28,7 +30,45 @@ pub struct SettingsState {
     /// shown below that item until Settings is opened again or MeeGone comes back to the
     /// foreground (SRS 8.1).
     pub instructions: Option<(AccessItem, String)>,
+    /// First-run setup, while it shows (ONB-01). It covers the home views.
+    pub setup: Option<Setup>,
     pub problem: Option<String>,
+}
+
+/// A screen of first-run setup, in order (ONB-01). Setup has no theme step: System applies
+/// (ONB-05).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupStep {
+    Welcome,
+    /// Make MeeGone the default home app, with the system's dialog (HOME-01). Skipped while it
+    /// is already.
+    DefaultHome,
+    /// The daily lock-screen image, which that feature provides (WALL-02, ADR 0002).
+    LockScreenImage,
+    /// Notification access for Events and usage access for Recent, each with Allow and Not now
+    /// (ONB-02). Skipped while both are allowed.
+    Access,
+}
+
+/// First-run setup while it shows (ONB-01, ADR 0036). Nothing of it is saved until it is
+/// finished, so leaving MeeGone part-way starts it again at Welcome next time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Setup {
+    pub step: SetupStep,
+    /// "Not now" on notification access: answered, so setup doesn't wait for it (ONB-02).
+    pub notifications_put_off: bool,
+    /// "Not now" on usage access (ONB-02).
+    pub usage_put_off: bool,
+}
+
+impl Setup {
+    fn start() -> Self {
+        Self {
+            step: SetupStep::Welcome,
+            notifications_put_off: false,
+            usage_put_off: false,
+        }
+    }
 }
 
 /// A group of Settings (SET-02) that Settings can open at, rather than at its top. Only the
@@ -70,6 +110,14 @@ pub enum SettingsIntent {
     /// "Reset launcher", once confirmed (SET-06). Settings restores its own options to their
     /// defaults; the shell has every other feature restore its own (ADR 0002, ADR 0035).
     ResetLauncher,
+    /// Continue on Welcome or the lock-screen image step: the next step that still needs the
+    /// user, or the end of setup (ONB-01). The shell has the lock-screen image apply its step
+    /// first (ADR 0036).
+    SetupContinue,
+    /// "Not now" in setup (ONB-02): on the default-home step it moves on, and counts as today's
+    /// answer to the banner (ONB-04); on notification or usage access it answers that item.
+    /// Setup ends once both are answered, granted or put off.
+    SetupNotNow(AccessItem),
 }
 
 /// One day in milliseconds.
@@ -83,6 +131,9 @@ pub struct SettingsHolder {
     /// The last time the banner was dismissed in this session, even if saving it failed, so a
     /// failed save never brings the banner back (ONB-04).
     banner_dismissed_ms: Option<u64>,
+    /// Setup was finished in this session, even if saving that failed, so it never comes back
+    /// before MeeGone restarts (ONB-01).
+    setup_finished: bool,
     state: SettingsState,
 }
 
@@ -99,6 +150,7 @@ impl SettingsHolder {
             usage,
             system,
             banner_dismissed_ms: None,
+            setup_finished: false,
             state: SettingsState::default(),
         }
     }
@@ -116,6 +168,101 @@ impl SettingsHolder {
             .max(self.banner_dismissed_ms);
         self.state.home_banner =
             !self.state.default_home && dismissed.is_none_or(|at| !self.is_today(at));
+        self.follow_setup(settings.setup_install_ms);
+    }
+
+    /// Starts setup on an install that hasn't finished it (ONB-01), and moves it on with what
+    /// the system reports: the default-home step once MeeGone holds the role, as after the
+    /// system's dialog, and the end once both accesses are answered (ADR 0036).
+    fn follow_setup(&mut self, finished_by: Option<u64>) {
+        if self.setup_finished || setup_done(finished_by, self.system.installed_ms()) {
+            self.state.setup = None;
+            return;
+        }
+        let setup = *self.state.setup.get_or_insert_with(Setup::start);
+        match setup.step {
+            SetupStep::DefaultHome if self.state.default_home => self.advance(),
+            SetupStep::Access if self.both_answered(&setup) => self.finish_setup(),
+            _ => {}
+        }
+    }
+
+    /// Whether both accesses are allowed, or put off with "Not now" (ONB-02).
+    fn both_answered(&self, setup: &Setup) -> bool {
+        (setup.notifications_put_off || self.state.notification_access == Access::Granted)
+            && (setup.usage_put_off || self.state.usage_access == Access::Granted)
+    }
+
+    /// The step after `step` that still needs the user, or `None` at the end (ONB-01).
+    fn next_step(&self, step: SetupStep) -> Option<SetupStep> {
+        match step {
+            SetupStep::Welcome if self.state.default_home => Some(SetupStep::LockScreenImage),
+            SetupStep::Welcome => Some(SetupStep::DefaultHome),
+            SetupStep::DefaultHome => Some(SetupStep::LockScreenImage),
+            SetupStep::LockScreenImage
+                if self.state.notification_access == Access::Granted
+                    && self.state.usage_access == Access::Granted =>
+            {
+                None
+            }
+            SetupStep::LockScreenImage => Some(SetupStep::Access),
+            SetupStep::Access => None,
+        }
+    }
+
+    /// The step Back returns to from `step`, skipping the default-home step while MeeGone holds
+    /// the role.
+    fn previous_step(&self, step: SetupStep) -> Option<SetupStep> {
+        match step {
+            SetupStep::Welcome => None,
+            SetupStep::DefaultHome => Some(SetupStep::Welcome),
+            SetupStep::LockScreenImage if self.state.default_home => Some(SetupStep::Welcome),
+            SetupStep::LockScreenImage => Some(SetupStep::DefaultHome),
+            SetupStep::Access => Some(SetupStep::LockScreenImage),
+        }
+    }
+
+    fn advance(&mut self) {
+        let Some(setup) = self.state.setup else {
+            return;
+        };
+        match self.next_step(setup.step) {
+            Some(step) => self.state.setup = Some(Setup { step, ..setup }),
+            None => self.finish_setup(),
+        }
+    }
+
+    fn not_now(&mut self, item: AccessItem) {
+        let Some(mut setup) = self.state.setup else {
+            return;
+        };
+        match (setup.step, item) {
+            (SetupStep::DefaultHome, AccessItem::DefaultHome) => {
+                // Today's answer to the banner too, so it doesn't show as setup ends (ONB-04).
+                self.dismiss_banner();
+                self.advance();
+            }
+            (SetupStep::Access, AccessItem::Notifications) => {
+                setup.notifications_put_off = true;
+                self.state.setup = Some(setup);
+                self.refresh();
+            }
+            (SetupStep::Access, AccessItem::Usage) => {
+                setup.usage_put_off = true;
+                self.state.setup = Some(setup);
+                self.refresh();
+            }
+            _ => {}
+        }
+    }
+
+    /// Setup is done on this install, and Applications shows (HOME-05). A save that fails
+    /// still ends it until MeeGone restarts, and says why.
+    fn finish_setup(&mut self) {
+        self.setup_finished = true;
+        self.state.setup = None;
+        let install = self.system.installed_ms();
+        self.change(|s| s.setup_install_ms = Some(install));
     }
 
     /// Whether `at_ms` falls on today's local calendar day (ONB-04).
@@ -215,6 +362,22 @@ impl StateHolder for SettingsHolder {
             SettingsIntent::RequestDefaultHome => self.request_default_home(),
             SettingsIntent::DismissHomeBanner => self.dismiss_banner(),
             SettingsIntent::ResetLauncher => self.reset(),
+            SettingsIntent::SetupContinue => self.advance(),
+            SettingsIntent::SetupNotNow(item) => self.not_now(item),
+        }
+    }
+
+    /// Back in setup returns to the previous step; on Welcome there is none (ONB-01).
+    fn on_back(&mut self) -> bool {
+        let Some(setup) = self.state.setup else {
+            return false;
+        };
+        match self.previous_step(setup.step) {
+            Some(step) => {
+                self.state.setup = Some(Setup { step, ..setup });
+                true
+            }
+            None => false,
         }
     }
 }
@@ -450,7 +613,10 @@ mod tests {
         holder.handle(SettingsIntent::SetWrapAround(false));
         holder.handle(SettingsIntent::DismissHomeBanner);
         store
-            .update(&mut |s| s.image.use_mobile_data = true)
+            .update(&mut |s| {
+                s.image.use_mobile_data = true;
+                s.setup_install_ms = Some(0);
+            })
             .unwrap();
 
         holder.handle(SettingsIntent::ResetLauncher);
@@ -462,7 +628,207 @@ mod tests {
         assert_eq!(settings.wrap_around, defaults.wrap_around);
         assert!(settings.image.use_mobile_data);
         assert!(settings.home_banner_dismissed_ms.is_some());
+        // Setup isn't a setting: it doesn't come back (ADR 0036).
+        assert_eq!(settings.setup_install_ms, Some(0));
         assert_eq!(holder.state().theme, defaults.theme);
         assert!(holder.state().wrap_around);
+    }
+
+    const INSTALLED_MS: u64 = 1_763_200_000_000;
+
+    fn step(holder: &SettingsHolder) -> Option<SetupStep> {
+        holder.state().setup.map(|setup| setup.step)
+    }
+
+    /// A fresh install at [`INSTALLED_MS`], with `system` as the device reports it.
+    fn fresh_install(
+        system: impl FnOnce(&Fakes),
+    ) -> (Fakes, Arc<PersistentSettingsStore>, SettingsHolder) {
+        let fakes = Fakes::default();
+        *fakes.system.installed_ms.lock().unwrap() = INSTALLED_MS;
+        system(&fakes);
+        let (store, holder) = holder(&fakes);
+        (fakes, store, holder)
+    }
+
+    #[test]
+    fn a_fresh_install_starts_setup_at_welcome() {
+        // ONB-01
+        let (_, store, holder) = fresh_install(|_| {});
+
+        assert_eq!(
+            holder.state().setup,
+            Some(Setup {
+                step: SetupStep::Welcome,
+                notifications_put_off: false,
+                usage_put_off: false,
+            })
+        );
+        assert_eq!(store.get().setup_install_ms, None);
+    }
+
+    #[test]
+    fn setup_goes_through_its_steps_and_is_done_on_this_install() {
+        // ONB-01, ONB-02, HOME-01
+        let (fakes, store, mut holder) = fresh_install(|_| {});
+
+        holder.handle(SettingsIntent::SetupContinue);
+        assert_eq!(step(&holder), Some(SetupStep::DefaultHome));
+        holder.handle(SettingsIntent::RequestDefaultHome);
+        assert_eq!(*fakes.system.default_home_requested.lock().unwrap(), 1);
+        // MeeGone is chosen in the system's dialog, and comes back to the foreground.
+        *fakes.system.default_home.lock().unwrap() = true;
+        holder.handle(SettingsIntent::Refresh);
+        assert_eq!(step(&holder), Some(SetupStep::LockScreenImage));
+        holder.handle(SettingsIntent::SetupContinue);
+        assert_eq!(step(&holder), Some(SetupStep::Access));
+
+        holder.handle(SettingsIntent::OpenNotificationAccess);
+        *fakes.notifications.access.lock().unwrap() = Access::Granted;
+        holder.handle(SettingsIntent::Refresh);
+        assert_eq!(
+            step(&holder),
+            Some(SetupStep::Access),
+            "usage is unanswered"
+        );
+        holder.handle(SettingsIntent::OpenUsageAccess);
+        *fakes.usage.access.lock().unwrap() = Access::Granted;
+        holder.handle(SettingsIntent::Refresh);
+
+        assert_eq!(holder.state().setup, None);
+        assert_eq!(store.get().setup_install_ms, Some(INSTALLED_MS));
+        let (_, restarted) = self::holder(&fakes);
+        assert_eq!(restarted.state().setup, None);
+    }
+
+    #[test]
+    fn not_now_on_both_accesses_ends_setup() {
+        // ONB-02: declining never blocks.
+        let (_, store, mut holder) = fresh_install(|_| {});
+        holder.handle(SettingsIntent::SetupContinue);
+        holder.handle(SettingsIntent::SetupContinue);
+        holder.handle(SettingsIntent::SetupContinue);
+        assert_eq!(step(&holder), Some(SetupStep::Access));
+
+        holder.handle(SettingsIntent::SetupNotNow(AccessItem::Notifications));
+        assert!(holder.state().setup.unwrap().notifications_put_off);
+        holder.handle(SettingsIntent::SetupNotNow(AccessItem::Usage));
+
+        assert_eq!(holder.state().setup, None);
+        assert_eq!(store.get().setup_install_ms, Some(INSTALLED_MS));
+        assert_eq!(holder.state().notification_access, Access::Missing);
+    }
+
+    #[test]
+    fn not_now_on_the_default_home_step_moves_on_and_answers_the_banner_for_today() {
+        // ONB-04: the banner doesn't show as soon as setup ends.
+        let (fakes, store, mut holder) = fresh_install(|_| {});
+        holder.handle(SettingsIntent::SetupNotNow(AccessItem::DefaultHome));
+        assert_eq!(
+            step(&holder),
+            Some(SetupStep::Welcome),
+            "only on its own step"
+        );
+        holder.handle(SettingsIntent::SetupContinue);
+
+        holder.handle(SettingsIntent::SetupNotNow(AccessItem::DefaultHome));
+
+        assert_eq!(step(&holder), Some(SetupStep::LockScreenImage));
+        assert_eq!(*fakes.system.default_home_requested.lock().unwrap(), 0);
+        assert!(store.get().home_banner_dismissed_ms.is_some());
+        assert!(!holder.state().home_banner);
+    }
+
+    #[test]
+    fn setup_skips_the_steps_already_done() {
+        // ONB-01: MeeGone is the default and has both accesses, as when chosen at the Home key.
+        let (_, store, mut holder) = fresh_install(|fakes| {
+            *fakes.system.default_home.lock().unwrap() = true;
+            *fakes.notifications.access.lock().unwrap() = Access::Granted;
+            *fakes.usage.access.lock().unwrap() = Access::Granted;
+        });
+
+        holder.handle(SettingsIntent::SetupContinue);
+        assert_eq!(step(&holder), Some(SetupStep::LockScreenImage));
+        holder.handle(SettingsIntent::SetupContinue);
+
+        assert_eq!(holder.state().setup, None);
+        assert_eq!(store.get().setup_install_ms, Some(INSTALLED_MS));
+    }
+
+    #[test]
+    fn back_returns_to_the_previous_step_and_not_past_welcome() {
+        // ONB-01, HOME-08
+        let (fakes, _, mut holder) = fresh_install(|_| {});
+        assert!(!holder.on_back());
+        for _ in 0..3 {
+            holder.handle(SettingsIntent::SetupContinue);
+        }
+        assert_eq!(step(&holder), Some(SetupStep::Access));
+
+        let mut steps = Vec::new();
+        while holder.on_back() {
+            steps.push(step(&holder).unwrap());
+        }
+        assert_eq!(
+            steps,
+            [
+                SetupStep::LockScreenImage,
+                SetupStep::DefaultHome,
+                SetupStep::Welcome
+            ]
+        );
+
+        // The default-home step is skipped once MeeGone holds the role.
+        *fakes.system.default_home.lock().unwrap() = true;
+        holder.handle(SettingsIntent::Refresh);
+        holder.handle(SettingsIntent::SetupContinue);
+        assert_eq!(step(&holder), Some(SetupStep::LockScreenImage));
+        assert!(holder.on_back());
+        assert_eq!(step(&holder), Some(SetupStep::Welcome));
+    }
+
+    #[test]
+    fn setup_runs_once_per_install() {
+        // ADR 0036, ADR 0018: settings restored from another install's backup run setup again;
+        // settings from before setup existed don't.
+        for (finished_by, runs) in [
+            (None, true),
+            (Some(INSTALLED_MS), false),
+            (Some(0), false),
+            (Some(INSTALLED_MS - 1), true),
+        ] {
+            let fakes = Fakes::default();
+            *fakes.system.installed_ms.lock().unwrap() = INSTALLED_MS;
+            let store = PersistentSettingsStore::new(fakes.storage.clone());
+            store
+                .update(&mut |s| s.setup_install_ms = finished_by)
+                .unwrap();
+
+            let (_, holder) = holder(&fakes);
+
+            assert_eq!(holder.state().setup.is_some(), runs, "{finished_by:?}");
+        }
+    }
+
+    #[test]
+    fn a_setup_whose_end_cant_be_saved_still_ends_and_says_why() {
+        // REL-03: never stuck in setup, though it runs again after a restart.
+        let (fakes, store, mut holder) = fresh_install(|_| {});
+        for _ in 0..3 {
+            holder.handle(SettingsIntent::SetupContinue);
+        }
+        let failure = DataError::Failed("Not enough storage space".into());
+        *fakes.storage.error.lock().unwrap() = Some(failure.clone());
+
+        holder.handle(SettingsIntent::SetupNotNow(AccessItem::Notifications));
+        holder.handle(SettingsIntent::SetupNotNow(AccessItem::Usage));
+
+        assert_eq!(holder.state().setup, None);
+        assert_eq!(holder.state().problem, Some(failure.to_string()));
+        holder.handle(SettingsIntent::Refresh);
+        assert_eq!(holder.state().setup, None);
+        *fakes.storage.error.lock().unwrap() = None;
+        assert_eq!(store.get().setup_install_ms, None);
     }
 }

@@ -1,10 +1,6 @@
 //! The acceptance scenarios of SRS section 9, run on the whole app with fake platform adapters
 //! (MAINT-03). Each test carries its scenario's id; each feature adds its own here.
 //!
-//! Not automated yet, because the behaviour isn't built:
-//! - AC-01: first-run setup (#35). Its lock-screen image step's promise, that nothing changes
-//!   before Continue (WALL-02), is automated below.
-//!
 //! AC-18 to AC-20 (animation scale, screen reader, timing) need a device to check in full; they
 //! belong to the device matrix (#43) and the benchmarks (#40). Their core logic is tested
 //! without one: every flow with animations removed (AC-18, ANIM-05) and the screen-reader
@@ -31,7 +27,7 @@ use meegone_launcher::{
     CheckStatus, DailyImage, DetailsContent, Direction, EventsListMode, EventsMenuFrame, FolderId,
     GridLayout, HomeView, Launcher, Layout, LiftFrame, MenuItem, NotificationMenuItem, PastAction,
     PastContent, PinchEvent, PinchKind, PointerEvent, PointerKind, RECENT_ROWS, RecentFrame,
-    RecentMode, RecentWindow, SettingsGroup, Shared, ShellIntent, Surface, UpdateStatus,
+    RecentMode, RecentWindow, SettingsGroup, SetupStep, Shared, ShellIntent, Surface, UpdateStatus,
 };
 
 /// A phone 1080 × 2400 px at 2.75 px per dp.
@@ -124,7 +120,7 @@ fn grid(launcher: &Launcher) -> Vec<String> {
 
 #[test]
 fn ac02_swiping_right_to_left_three_times_goes_recent_events_applications() {
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let mut launcher = Launcher::start(fakes.platform());
     assert_eq!(launcher.shell().state().current, HomeView::Applications);
 
@@ -144,7 +140,7 @@ fn ac02_swiping_right_to_left_three_times_goes_recent_events_applications() {
 #[test]
 fn ac02_dragging_right_to_left_three_times_goes_recent_events_applications() {
     // HOME-03: the same scenario with the finger, each view settling in full view.
-    let (mut launcher, mut clock) = on_a_phone(&Fakes::default());
+    let (mut launcher, mut clock) = on_a_phone(&Fakes::after_setup());
 
     let mut seen = Vec::new();
     for _ in 0..3 {
@@ -163,7 +159,7 @@ fn ac02_dragging_right_to_left_three_times_goes_recent_events_applications() {
 #[test]
 fn anim07_a_drag_past_35_percent_or_a_fling_settles_and_a_short_slow_drag_returns() {
     // Issue #5: 35 % of 1080 px is 378 px, after the 22 px touch slop.
-    let (mut launcher, mut clock) = on_a_phone(&Fakes::default());
+    let (mut launcher, mut clock) = on_a_phone(&Fakes::after_setup());
     let current = |launcher: &Launcher| launcher.shell().state().current;
 
     swipe(&mut launcher, &mut clock, 900.0, 900.0 - 410.0, 400, 100);
@@ -180,7 +176,7 @@ fn anim07_a_drag_past_35_percent_or_a_fling_settles_and_a_short_slow_drag_return
 #[test]
 fn ac03_home_from_an_app_opened_from_recent_shows_recent_with_it_at_the_top_left() {
     // Issue #22: REC-03, REC-06, HOME-06. Mail is opened from its card, then Home is pressed.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     *fakes.usage.access.lock().unwrap() = Access::Granted;
     *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail"), app("maps", "Maps")];
     *fakes.system.now_ms.lock().unwrap() = 10_000_000;
@@ -210,7 +206,7 @@ fn ac03_home_from_an_app_opened_from_recent_shows_recent_with_it_at_the_top_left
 
 #[test]
 fn ac04_home_on_events_shows_applications_and_home_again_scrolls_it_to_the_top() {
-    let (mut launcher, mut clock) = on_a_phone(&Fakes::default());
+    let (mut launcher, mut clock) = on_a_phone(&Fakes::after_setup());
     launcher.view().apps().scrolled(Surface::Grid, 600.0);
     launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
     launcher.frame();
@@ -232,7 +228,7 @@ fn ac04_home_on_events_shows_applications_and_home_again_scrolls_it_to_the_top()
 #[test]
 fn home06_with_always_applications_home_from_an_app_shows_applications() {
     // Chosen in Settings as "Home button opens: Always Applications".
-    let (mut launcher, _) = on_a_phone(&Fakes::default());
+    let (mut launcher, _) = on_a_phone(&Fakes::after_setup());
     launcher.dispatch(ShellIntent::OpenSettings);
     launcher
         .view()
@@ -260,7 +256,7 @@ fn home06_with_always_applications_home_from_an_app_shows_applications() {
 fn home10_long_pressing_the_empty_row_below_a_long_grid_opens_the_home_menu() {
     // Issue #7, HOME-14. The grid's views (#9) find what is under the finger; here the host
     // reports a finger held on the empty row. Rows are 96 dp high, four to a row.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     *fakes.apps.apps.lock().unwrap() = (0..40)
         .map(|i| app(&format!("app{i:02}"), &format!("App {i:02}")))
         .collect();
@@ -295,7 +291,7 @@ fn home10_long_pressing_the_empty_row_below_a_long_grid_opens_the_home_menu() {
 #[test]
 fn home10_in_events_the_home_menu_has_no_edit_applications() {
     // Issue #7
-    let (mut launcher, mut clock) = on_a_phone(&Fakes::default());
+    let (mut launcher, mut clock) = on_a_phone(&Fakes::after_setup());
     swipe(&mut launcher, &mut clock, 200.0, 800.0, 400, 100);
     assert_eq!(launcher.shell().state().current, HomeView::Events);
 
@@ -321,7 +317,7 @@ fn home10_in_events_the_home_menu_has_no_edit_applications() {
 #[test]
 fn home10_in_recent_a_long_press_enters_close_mode_instead() {
     // Issue #7, REC-07
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let (mut launcher, mut clock) = six_on_recent(&fakes);
 
     long_press(&mut launcher, &mut clock, 540.0, 1200.0);
@@ -336,7 +332,7 @@ fn comp03_folding_or_unfolding_keeps_the_view_scroll_position_and_edit_mode() {
     // Issue #8. Folded, the cover screen is the phone; unfolded, the inner screen is wider, at
     // another density. Folders arrive with #14; `meegone-shell-state` checks that an open one
     // is kept too.
-    let (mut launcher, mut clock) = on_a_phone(&Fakes::default());
+    let (mut launcher, mut clock) = on_a_phone(&Fakes::after_setup());
     launcher.view().apps().scrolled(Surface::Grid, 600.0);
     long_press(&mut launcher, &mut clock, 540.0, 1800.0);
     launcher.dispatch(ShellIntent::ChooseMenuItem(MenuItem::EditApplications));
@@ -363,7 +359,7 @@ fn comp03_folding_or_unfolding_keeps_the_view_scroll_position_and_edit_mode() {
 #[test]
 fn home12_rotating_a_tablet_adapts_the_layout_and_keeps_state() {
     // Issue #8. A tablet 1600 × 2560 px at 2 px per dp, turned from portrait to landscape.
-    let mut launcher = Launcher::start(Fakes::default().platform());
+    let mut launcher = Launcher::start(Fakes::after_setup().platform());
     let mut clock = 0;
     let portrait = Layout {
         width_px: 1600.0,
@@ -400,7 +396,7 @@ fn comp02_home_and_back_behave_the_same_in_every_navigation_mode() {
     // mode: it does with gestures, and doesn't with two or three buttons (ADR 0007).
     let mut outcomes = Vec::new();
     for gestures in [true, false] {
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         *fakes.system.animates_return_home.lock().unwrap() = gestures;
         let (mut launcher, mut clock) = on_a_phone(&fakes);
         launcher.view().apps().scrolled(Surface::Grid, 600.0);
@@ -449,7 +445,7 @@ fn comp02_home_and_back_behave_the_same_in_every_navigation_mode() {
 
 #[test]
 fn ac05_with_theme_system_the_app_turns_dark_with_the_device() {
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let mut launcher = Launcher::start(fakes.platform());
     assert_eq!(launcher.shell().theme().state().theme, Theme::Light);
 
@@ -461,7 +457,7 @@ fn ac05_with_theme_system_the_app_turns_dark_with_the_device() {
 
 #[test]
 fn ac06_with_theme_light_the_app_stays_light_when_the_device_turns_dark() {
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let mut launcher = Launcher::start(fakes.platform());
     launcher.dispatch(ShellIntent::OpenSettings);
     launcher.view().settings().theme_chosen(ThemeChoice::Light);
@@ -476,7 +472,7 @@ fn ac06_with_theme_light_the_app_stays_light_when_the_device_turns_dark() {
 #[test]
 fn ac10_a_newly_installed_app_appears_at_the_end_of_the_grid() {
     // Issue #11: APPS-06, APPS-07, ANIM-21. It scales and fades in, with a dot.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail"), app("phone", "Phone")];
     let (mut launcher, mut clock) = on_a_phone(&fakes);
     assert_eq!(grid(&launcher), ["Mail", "Phone"]);
@@ -532,7 +528,7 @@ fn saved_layout(fakes: &Fakes, records: &str) {
 fn ac07_given_maps_was_moved_to_the_first_cell_after_a_restart_it_is_still_first() {
     // Issue #11: APPS-18. Moving it takes edit mode (#13); here the user's arrangement is
     // saved as edit mode will save it.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     *fakes.apps.apps.lock().unwrap() = vec![
         app("camera", "Camera"),
         app("mail", "Mail"),
@@ -555,7 +551,7 @@ fn ac07_given_maps_was_moved_to_the_first_cell_after_a_restart_it_is_still_first
 fn apps06_given_an_app_installed_while_meegone_wasnt_running_it_is_at_the_end() {
     // Issue #11: APPS-06, APPS-07, APPS-18. It keeps its dot until it is opened, and that
     // too survives a restart.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     *fakes.apps.apps.lock().unwrap() = vec![app("phone", "Phone"), app("mail", "Mail")];
     drop(Launcher::start(fakes.platform()));
 
@@ -586,7 +582,7 @@ fn apps06_given_an_app_installed_while_meegone_wasnt_running_it_is_at_the_end() 
 #[test]
 fn rel02_given_an_unreadable_layout_meegone_shows_an_alphabetical_grid_and_doesnt_crash() {
     // Issue #11: REL-02, MAINT-04. The rebuilt layout replaces the file at once.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     *fakes.apps.apps.lock().unwrap() = vec![
         app("zoom", "Zoom"),
         app("mail", "Mail"),
@@ -617,7 +613,7 @@ fn rel02_given_an_unreadable_layout_meegone_shows_an_alphabetical_grid_and_doesn
 fn rel02_a_partly_damaged_layout_keeps_what_can_be_recovered() {
     // Issue #11: REL-02. The record after Zoom's was damaged; Zoom stays first and the rest
     // is rebuilt alphabetically.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     *fakes.apps.apps.lock().unwrap() = vec![
         app("zoom", "Zoom"),
         app("mail", "Mail"),
@@ -648,7 +644,7 @@ fn rel02_a_partly_damaged_layout_keeps_what_can_be_recovered() {
 fn apps08_an_uninstalled_app_leaves_its_folder_and_the_grid_closes_up() {
     // Issue #11: APPS-08, FOLD-06, ANIM-21. Go leaves the games folder, which turns back into
     // Chess; Maps leaves the grid, and Phone slides into its place.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     *fakes.apps.apps.lock().unwrap() = vec![
         app("chess", "Chess"),
         app("go", "Go"),
@@ -694,7 +690,7 @@ fn apps08_an_uninstalled_app_leaves_its_folder_and_the_grid_closes_up() {
 #[test]
 fn apps08_an_updated_app_gets_its_new_label_without_moving() {
     // Issue #11: APPS-08. Also when the update renames its launcher activity.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     *fakes.apps.apps.lock().unwrap() = vec![
         app("mail", "Mail"),
         app("maps", "Maps"),
@@ -722,7 +718,7 @@ fn apps08_an_updated_app_gets_its_new_label_without_moving() {
 #[test]
 fn apps05_the_first_start_puts_the_default_phone_messaging_browser_and_camera_first() {
     // Issue #11: APPS-04, APPS-05. A tablet without a phone app leaves it out.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     *fakes.apps.apps.lock().unwrap() = vec![
         app("atlas", "Atlas"),
         app("browser", "Browser"),
@@ -745,7 +741,7 @@ fn apps05_the_first_start_puts_the_default_phone_messaging_browser_and_camera_fi
 fn l10n04_apps_are_sorted_in_the_locales_alphabetical_order() {
     // Issue #11: L10N-04. The platform's collation keys decide: here, a locale that sorts
     // "Ö" after "Z", as Swedish does, and ignores the accent of "Él".
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let with_key = |package: &str, label: &str, key: &[u8]| App {
         sort_key: key.to_vec(),
         ..app(package, label)
@@ -765,7 +761,7 @@ fn l10n04_apps_are_sorted_in_the_locales_alphabetical_order() {
 #[test]
 fn apps18_a_locked_work_profile_keeps_its_apps_places_until_it_unlocks() {
     // Issue #11: APPS-18. After a restart, a work profile with its own lock lists no apps.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let work_profile = |locked| {
         *fakes.apps.profiles.lock().unwrap() = vec![
             Profile {
@@ -820,7 +816,7 @@ fn events_list(launcher: &mut Launcher) -> (EventsListMode, Vec<(String, usize)>
 fn ac11_after_access_is_granted_notifications_replace_the_explainer_card() {
     // Issue #19: EVT-03, EVT-04, ONB-02. Access is granted in system settings, and the
     // listener's connection reports it.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail")];
     let mut launcher = Launcher::start(fakes.platform());
     launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
@@ -849,7 +845,7 @@ fn ac11_after_access_is_granted_notifications_replace_the_explainer_card() {
 #[test]
 fn ac11_given_access_granted_while_away_then_coming_back_shows_the_notifications() {
     // Issue #19: EVT-03. The system screen covered the home, and MeeGone resumes.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let mut launcher = Launcher::start(fakes.platform());
     launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
     assert_eq!(events_list(&mut launcher).0, EventsListMode::Explainer);
@@ -866,7 +862,7 @@ fn ac11_given_access_granted_while_away_then_coming_back_shows_the_notifications
 
 #[test]
 fn ac21_revoking_notification_access_shows_the_explainer_and_applications_still_works() {
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     fakes.apps.apps.lock().unwrap().push(app("mail", "Mail"));
     *fakes.notifications.access.lock().unwrap() = Access::Granted;
     *fakes.notifications.active.lock().unwrap() = vec![notification("m1", "mail")];
@@ -896,7 +892,7 @@ fn ac21_revoking_notification_access_shows_the_explainer_and_applications_still_
 fn evt04_given_notifications_from_several_apps_then_events_groups_them_newest_first() {
     // Issue #19: EVT-04, EVT-09, APPS-17, APPS-20. As the SRS's layout mock: Messages with three,
     // then Mail with one, and an app with no icon in the grid named as the system names it.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let messages = App {
         accent: Rgb::hex(0x34A853),
         ..app("messages", "Messages")
@@ -959,7 +955,7 @@ fn evt04_given_notifications_from_several_apps_then_events_groups_them_newest_fi
 #[test]
 fn evt05_given_a_media_playback_notification_then_it_isnt_listed() {
     // Issue #19: EVT-05. Playback, navigation and running services are ongoing.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     *fakes.notifications.access.lock().unwrap() = Access::Granted;
     *fakes.notifications.active.lock().unwrap() = vec![
         Notification {
@@ -994,7 +990,7 @@ fn evt05_given_a_media_playback_notification_then_it_isnt_listed() {
 #[test]
 fn evt10_given_events_showing_then_a_new_group_slides_in_and_a_dismissed_one_collapses() {
     // Issue #19: EVT-10, ANIM-20, EVT-11.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     *fakes.notifications.access.lock().unwrap() = Access::Granted;
     let (mut launcher, mut clock) = on_a_phone(&fakes);
     launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
@@ -1067,7 +1063,7 @@ fn sorted(keys: &std::sync::Mutex<Vec<String>>) -> Vec<String> {
 fn ac12_given_clearable_and_ongoing_notifications_when_clear_is_tapped_then_only_ongoing_remain() {
     // Issue #20: EVT-05, EVT-07. A paused player can be cleared in the system's shade, but it
     // is ongoing playback, so Events never showed it and Clear leaves it.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     *fakes.notifications.access.lock().unwrap() = Access::Granted;
     *fakes.notifications.active.lock().unwrap() = vec![
         notification("m1", "mail"),
@@ -1112,7 +1108,7 @@ fn ac12_given_clearable_and_ongoing_notifications_when_clear_is_tapped_then_only
 fn evt06_given_a_group_of_three_when_it_is_tapped_then_it_expands_and_tapping_one_item_opens_it() {
     // Issue #20's acceptance criterion: EVT-06, ANIM-08, ANIM-20. The opened notification is
     // meant to disappear when opened, so MeeGone removes it.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     *fakes.apps.apps.lock().unwrap() = vec![app("messages", "Messages")];
     let message = |key: &str, title: &str, posted_at_ms| Notification {
         title: title.into(),
@@ -1165,7 +1161,7 @@ fn evt06_given_a_group_of_three_when_it_is_tapped_then_it_expands_and_tapping_on
 #[test]
 fn evt06_given_a_group_of_one_when_it_is_tapped_then_its_notification_opens() {
     // Issue #20: EVT-06.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     *fakes.notifications.access.lock().unwrap() = Access::Granted;
     *fakes.notifications.active.lock().unwrap() = vec![notification("c1", "chat")];
     let (mut launcher, _) = on_a_phone(&fakes);
@@ -1185,7 +1181,7 @@ fn evt06_given_a_group_of_one_when_it_is_tapped_then_its_notification_opens() {
 #[test]
 fn evt08_given_a_long_press_on_a_notification_then_dismiss_and_notification_settings_are_offered() {
     // Issue #20: EVT-08, ANIM-24.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail")];
     *fakes.notifications.access.lock().unwrap() = Access::Granted;
     *fakes.notifications.active.lock().unwrap() = vec![
@@ -1274,7 +1270,7 @@ fn evt08_given_a_long_press_on_a_notification_then_dismiss_and_notification_sett
 #[test]
 fn a11y05_a_screen_reader_opens_a_notifications_menu_without_a_gesture() {
     // Issue #20: A11Y-05. Back closes it (HOME-08).
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     *fakes.notifications.access.lock().unwrap() = Access::Granted;
     *fakes.notifications.active.lock().unwrap() = vec![notification("c1", "chat")];
     let (mut launcher, _) = on_a_phone(&fakes);
@@ -1328,7 +1324,7 @@ impl NotificationsAdapter for BrokenListener {
 #[test]
 fn rel01_given_events_fails_then_nothing_shows_below_its_header_and_applications_works() {
     // Issue #19: REL-01, ARCH-09.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     fakes.apps.apps.lock().unwrap().push(app("mail", "Mail"));
     let mut platform = fakes.platform();
     platform.notifications = std::sync::Arc::new(BrokenListener);
@@ -1349,7 +1345,7 @@ fn rel01_given_events_fails_then_nothing_shows_below_its_header_and_applications
 fn evt13_given_notifications_showing_then_their_content_is_never_stored_or_printed() {
     // Issue #19: EVT-13, PRIV-03. Nothing on disk, and nothing a log could print: the state, the
     // frame and the rows leave it out of their debug output.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     *fakes.apps.apps.lock().unwrap() = vec![app("chat", "Chat")];
     *fakes.notifications.access.lock().unwrap() = Access::Granted;
     *fakes.notifications.active.lock().unwrap() = vec![Notification {
@@ -1402,7 +1398,7 @@ fn events_header(launcher: &mut Launcher) -> (Vec<String>, u32) {
 #[test]
 fn evt01_given_the_date_changes_at_midnight_or_the_time_zone_changes_then_the_header_updates() {
     // Issue #18: EVT-01. The host passes on the system's date, time and time-zone broadcasts.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     *fakes.system.now_ms.lock().unwrap() = SUNDAY_MS + DAY_MS - 60_000;
     let (mut launcher, _) = on_a_phone(&fakes);
     launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
@@ -1430,7 +1426,7 @@ fn evt01_given_the_date_changes_at_midnight_or_the_time_zone_changes_then_the_he
 #[test]
 fn evt01_the_header_shows_the_date_without_notification_access() {
     // Issue #18: EVT-01, EVT-03.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     *fakes.system.now_ms.lock().unwrap() = SUNDAY_MS + 9 * HOUR_MS;
     let (mut launcher, _) = on_a_phone(&fakes);
     launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
@@ -1442,7 +1438,7 @@ fn evt01_the_header_shows_the_date_without_notification_access() {
 #[test]
 fn evt02_given_an_alarm_at_7_on_a_24_hour_device_then_the_header_shows_07_00_and_opens_its_app() {
     // Issue #18: EVT-02, L10N-03. The alarm is set on Sunday evening for Monday morning.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     *fakes.system.hour_24.lock().unwrap() = true;
     *fakes.system.now_ms.lock().unwrap() = SUNDAY_MS + 22 * HOUR_MS;
     let (mut launcher, _) = on_a_phone(&fakes);
@@ -1466,7 +1462,7 @@ fn evt02_given_an_alarm_at_7_on_a_24_hour_device_then_the_header_shows_07_00_and
 fn evt02_without_a_next_alarm_the_alarm_row_is_hidden() {
     // Issue #18: EVT-02, SRS 8.1. The alarm rings at 07:00 on a 12-hour device, then is turned
     // off.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     *fakes.system.next_alarm_ms.lock().unwrap() = Some(SUNDAY_MS + 7 * HOUR_MS);
     *fakes.system.now_ms.lock().unwrap() = SUNDAY_MS;
     let (mut launcher, _) = on_a_phone(&fakes);
@@ -1517,7 +1513,7 @@ fn with_a_work_profile(fakes: &Fakes, paused: bool) {
 fn apps01_given_personal_and_work_profiles_every_launchable_app_from_both_appears() {
     // Issue #9: APPS-01, APPS-20. The system badges the work icons; the cell says "work" so
     // screen readers can (A11Y-01).
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     with_a_work_profile(&fakes, false);
     *fakes.apps.apps.lock().unwrap() = vec![
         app("mail", "Mail"),
@@ -1543,7 +1539,7 @@ fn apps01_given_personal_and_work_profiles_every_launchable_app_from_both_appear
 fn apps02_given_a_screen_600_dp_wide_or_more_every_cell_is_96_to_128_dp_wide() {
     // Issue #9. The grid sits inside the safe area and 16 dp margins at each side. Phones keep
     // four columns.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     *fakes.apps.apps.lock().unwrap() = (0..30)
         .map(|i| app(&format!("app{i:02}"), &format!("App {i:02}")))
         .collect();
@@ -1588,7 +1584,7 @@ fn apps02_given_a_screen_600_dp_wide_or_more_every_cell_is_96_to_128_dp_wide() {
 fn apps09_given_a_paused_work_profile_its_apps_are_dimmed_and_a_tap_defers_to_the_system() {
     // Issue #9. The system shows its own explanation when a paused or suspended app is
     // launched; MeeGone shows a short message only if the launch fails outright.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     with_a_work_profile(&fakes, true);
     let mut paused = work_app("mail", "Mail");
     paused.available = false;
@@ -1639,7 +1635,7 @@ fn apps09_given_a_paused_work_profile_its_apps_are_dimmed_and_a_tap_defers_to_th
 fn apps_changed_while_open_reach_the_grid() {
     // Issue #9: the system reports a resumed work profile while MeeGone shows; its apps are
     // no longer dimmed.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     with_a_work_profile(&fakes, true);
     let mut paused = work_app("mail", "Mail");
     paused.available = false;
@@ -1690,7 +1686,7 @@ fn icon_of(rgb: u32) -> Vec<u32> {
 #[test]
 fn apps17_given_a_near_white_icon_its_light_accent_reaches_3_to_1_against_the_background() {
     // Issue #10, THEME-07
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let launcher = mail_in_recent(&fakes, &icon_of(0xFAFAFA));
     assert_eq!(launcher.shell().theme().state().theme, Theme::Light);
 
@@ -1707,7 +1703,7 @@ fn apps17_given_a_near_white_icon_its_light_accent_reaches_3_to_1_against_the_ba
 #[test]
 fn apps17_given_a_near_black_icon_its_dark_accent_reaches_3_to_1_against_the_background() {
     // Issue #10, THEME-07
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     *fakes.system.dark.lock().unwrap() = true;
     let launcher = mail_in_recent(&fakes, &icon_of(0x080808));
     assert_eq!(launcher.shell().theme().state().theme, Theme::Dark);
@@ -1725,7 +1721,7 @@ fn apps17_given_a_near_black_icon_its_dark_accent_reaches_3_to_1_against_the_bac
 #[test]
 fn apps17_recent_shows_the_accent_derived_from_the_icon_and_an_update_derives_it_again() {
     // Issue #10: one accent per app, from the catalogue, so every view shows the same one.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let mut launcher = mail_in_recent(&fakes, &icon_of(0x1877F2));
     let card = |launcher: &Launcher| launcher.shell().recent().state().cards[0].app.accent;
     assert_eq!(card(&launcher), Rgb::hex(0x1877F2));
@@ -1810,7 +1806,7 @@ const FIXED: [AppMenuItem; 4] = [
 #[test]
 fn apps11_given_a_system_app_when_its_menu_opens_then_it_has_no_uninstall_item() {
     // Issue #12, APPS-13, ANIM-24
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     mail_and_settings(&fakes);
     let (mut launcher, mut clock) = on_a_phone(&fakes);
 
@@ -1841,7 +1837,7 @@ fn apps11_given_a_system_app_when_its_menu_opens_then_it_has_no_uninstall_item()
 #[test]
 fn apps11_given_meegone_isnt_the_default_home_app_then_no_shortcuts_appear() {
     // Issue #12: the system offers shortcuts only to the default home app (SRS 8.1).
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     mail_and_settings(&fakes);
     let compose = Shortcut {
         app: app_id("mail"),
@@ -1878,7 +1874,7 @@ fn apps11_given_meegone_isnt_the_default_home_app_then_no_shortcuts_appear() {
 fn apps11_given_a_long_press_followed_by_a_drag_then_the_icon_lifts_and_edit_mode_starts() {
     // Issues #12 to #14. With the grid not laid out yet, the icon's centre is the finger, and
     // it takes no new place: dropped, it is back in its cell at once.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     mail_and_settings(&fakes);
     let (mut launcher, mut clock) = on_a_phone(&fakes);
     assert!(long_press_cell(&mut launcher, &mut clock, 1, 400.0, 300.0));
@@ -1917,7 +1913,7 @@ fn apps11_given_a_long_press_followed_by_a_drag_then_the_icon_lifts_and_edit_mod
 #[test]
 fn apps13_uninstall_asks_the_system_and_the_app_leaves_only_when_the_system_removes_it() {
     // Issue #12: MeeGone never uninstalls anything itself. App info opens the system screen.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     mail_and_settings(&fakes);
     let (mut launcher, mut clock) = on_a_phone(&fakes);
 
@@ -1947,7 +1943,7 @@ fn apps13_uninstall_asks_the_system_and_the_app_leaves_only_when_the_system_remo
 #[test]
 fn home07_home08_back_or_home_closes_an_apps_menu() {
     // Issue #12: Home goes no further than closing it.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     mail_and_settings(&fakes);
     let (mut launcher, mut clock) = on_a_phone(&fakes);
     launcher.view().apps().scrolled(Surface::Grid, 120.0);
@@ -1970,7 +1966,7 @@ fn home07_home08_back_or_home_closes_an_apps_menu() {
 fn a11y05_a_screen_reader_opens_an_apps_menu_without_a_gesture() {
     // Issue #12: as `AppsGrid` reports the action, by revision and place. No long-press, so
     // no tick.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     mail_and_settings(&fakes);
     let (mut launcher, _) = on_a_phone(&fakes);
     let revision = launcher.frame().apps.revision;
@@ -2036,7 +2032,7 @@ fn ac07_given_edit_mode_when_maps_is_dragged_to_the_first_cell_then_the_others_m
  {
     // Issue #13: APPS-12, APPS-18, ANIM-13. "After a reboot" is a new start on the same
     // storage.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let (mut launcher, mut clock) = editing_four(&fakes);
     let frame = launcher.frame();
     assert!(frame.edit.on);
@@ -2076,7 +2072,7 @@ fn ac07_given_edit_mode_when_maps_is_dragged_to_the_first_cell_then_the_others_m
 #[test]
 fn apps12_dragging_an_icon_near_the_bottom_scrolls_the_grid() {
     // Issue #13: 40 apps in 11 rows; the icon is held at the very bottom of the screen.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     *fakes.apps.apps.lock().unwrap() = (0..40)
         .map(|i| app(&format!("app{i:02}"), &format!("App {i:02}")))
         .collect();
@@ -2105,7 +2101,7 @@ fn apps12_dragging_an_icon_near_the_bottom_scrolls_the_grid() {
 #[test]
 fn ac09_given_edit_mode_when_the_user_taps_the_cross_and_confirms_then_the_icon_animates_away() {
     // Issue #13: APPS-12, APPS-13, ANIM-21. System apps show no ✕.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let (mut launcher, _) = editing_four(&fakes);
     let crosses: Vec<bool> = launcher
         .view()
@@ -2150,7 +2146,7 @@ fn ac09_given_edit_mode_when_the_user_taps_the_cross_and_confirms_then_the_icon_
 fn apps12_done_home_or_back_ends_edit_mode() {
     // Issue #13: HOME-07, HOME-08. A tap on an icon launches nothing meanwhile.
     for end in 0..3 {
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let (mut launcher, mut clock) = editing_four(&fakes);
         let revision = launcher.frame().apps.revision;
         assert!(
@@ -2184,7 +2180,7 @@ fn apps12_done_home_or_back_ends_edit_mode() {
 #[test]
 fn a11y05_a_screen_reader_moves_an_icon_without_a_gesture() {
     // Issue #13: AC-19's "move an icon". The move is saved.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let (mut launcher, _) = editing_four(&fakes);
     let revision = launcher.frame().apps.revision;
 
@@ -2239,7 +2235,7 @@ fn folder_on_a_phone(launcher: &mut Launcher) {
 fn ac08_given_two_apps_when_one_is_dropped_on_the_other_then_a_folder_holds_both_and_moving_one_out_undoes_it()
  {
     // Issue #14: FOLD-01, FOLD-03, FOLD-05, FOLD-06, ANIM-14.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail"), app("maps", "Maps")];
     let (mut launcher, mut clock) = on_a_phone(&fakes);
     grid_on_a_phone(&mut launcher);
@@ -2297,7 +2293,7 @@ fn ac08_given_two_apps_when_one_is_dropped_on_the_other_then_a_folder_holds_both
 fn a11y05_a_screen_reader_makes_a_folder_and_takes_an_app_out_of_it() {
     // Issue #14: A11Y-05. "Make folder with Maps", then "Move out of folder". Each step ticks:
     // the long-press, entering edit mode, and the folder made (ANIM-24).
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let (mut launcher, _) = editing_four(&fakes);
     let revision = launcher.frame().apps.revision;
 
@@ -2352,7 +2348,7 @@ fn in_folder(launcher: &Launcher) -> Vec<String> {
 fn fold04_a_tap_opens_a_folder_and_back_home_or_a_tap_outside_closes_it() {
     // Issue #14: FOLD-04, HOME-07, HOME-08, ANIM-15.
     for end in 0..3 {
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let (mut launcher, mut clock) = games_and_maps(&fakes);
 
         open_folder(&mut launcher, 0);
@@ -2386,7 +2382,7 @@ fn fold04_a_tap_opens_a_folder_and_back_home_or_a_tap_outside_closes_it() {
 #[test]
 fn fold03_a_folders_new_name_survives_a_restart() {
     // Issue #14: FOLD-03. The host asks for the name in a dialog.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let (mut launcher, _) = games_and_maps(&fakes);
     open_folder(&mut launcher, 0);
 
@@ -2410,7 +2406,7 @@ fn fold03_a_folders_new_name_survives_a_restart() {
 #[test]
 fn fold05_apps_move_within_a_folder_and_the_order_is_kept() {
     // Issue #14: FOLD-05, in edit mode, with a screen reader's "Move earlier".
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let (mut launcher, mut clock) = games_and_maps(&fakes);
     long_press(&mut launcher, &mut clock, 500.0, 1500.0);
     launcher.dispatch(ShellIntent::ChooseMenuItem(MenuItem::EditApplications));
@@ -2430,7 +2426,7 @@ fn fold05_apps_move_within_a_folder_and_the_order_is_kept() {
 #[test]
 fn ac05_given_theme_system_and_an_open_folder_the_app_turns_dark_with_the_folder_still_open() {
     // Issue #14: THEME-02, THEME-06.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let (mut launcher, mut clock) = games_and_maps(&fakes);
     launcher.view().apps().scrolled(Surface::Grid, 120.0);
     open_folder(&mut launcher, 0);
@@ -2461,7 +2457,7 @@ fn ac05_given_theme_system_and_an_open_folder_the_app_turns_dark_with_the_folder
 #[test]
 fn theme01_settings_offers_system_light_and_dark_and_the_screen_takes_their_colours() {
     // Issue #32: THEME-01, THEME-02, THEME-04, SET-03, AC-06.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let (mut launcher, mut clock) = on_a_phone(&fakes);
     launcher.dispatch(ShellIntent::OpenSettings);
     let frame = launcher.frame();
@@ -2515,7 +2511,7 @@ fn theme01_settings_offers_system_light_and_dark_and_the_screen_takes_their_colo
 #[test]
 fn theme06_a_theme_chosen_in_settings_keeps_edit_mode_and_the_scroll_position_below_it() {
     // Issue #32: THEME-06, SET-03.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let (mut launcher, mut clock) = on_a_phone(&fakes);
     launcher.view().apps().scrolled(Surface::Grid, 600.0);
     long_press(&mut launcher, &mut clock, 540.0, 1800.0);
@@ -2538,7 +2534,7 @@ fn theme06_a_theme_chosen_in_settings_keeps_edit_mode_and_the_scroll_position_be
 #[test]
 fn theme06_the_device_turning_dark_keeps_search_open_with_its_query_and_results() {
     // Issue #32: THEME-02, THEME-06.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let (mut launcher, mut clock) = ready_to_search(&fakes);
     open_search(&mut launcher, &mut clock);
     type_in(&mut launcher, "ma");
@@ -2559,7 +2555,7 @@ fn theme06_the_device_turning_dark_keeps_search_open_with_its_query_and_results(
 #[test]
 fn theme06_the_device_turning_dark_keeps_recent_showing_in_close_mode() {
     // Issue #32: THEME-02, THEME-06.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let (mut launcher, mut clock) = six_on_recent(&fakes);
     long_press(&mut launcher, &mut clock, 540.0, 1200.0);
     assert!(recent_frame(&mut launcher).close.on);
@@ -2657,7 +2653,7 @@ fn results(launcher: &Launcher) -> Vec<String> {
 fn srch01_pulling_down_at_the_top_of_applications_reveals_search() {
     // Issue #15: SRCH-01, ANIM-16. The field shows in step with the pull, and past its whole
     // band it springs open: the field takes the keyboard.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let (mut launcher, mut clock) = ready_to_search(&fakes);
 
     let taken = pull(&mut launcher, &mut clock, 600.0, 600.0 + 22.0 + 100.0);
@@ -2675,7 +2671,7 @@ fn srch01_pulling_down_at_the_top_of_applications_reveals_search() {
 #[test]
 fn srch01_a_pull_counts_only_at_the_top_of_the_grid() {
     // Issue #15: SRCH-01. Further down, the grid scrolls instead.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let (mut launcher, mut clock) = ready_to_search(&fakes);
     launcher.view().apps().scrolled(Surface::Grid, 300.0);
 
@@ -2689,7 +2685,7 @@ fn srch01_a_pull_counts_only_at_the_top_of_the_grid() {
 fn srch02_given_mail_maps_and_gmail_when_the_user_types_ma_then_mail_and_maps_come_before_gmail() {
     // Issue #15: SRCH-02, the issue's first acceptance criterion. Matches at a word's start
     // come first, each group alphabetically.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let (mut launcher, mut clock) = ready_to_search(&fakes);
     open_search(&mut launcher, &mut clock);
 
@@ -2707,7 +2703,7 @@ fn srch02_given_mail_maps_and_gmail_when_the_user_types_ma_then_mail_and_maps_co
 fn srch02_given_an_app_labelled_cafe_when_the_user_types_cafe_then_it_matches() {
     // Issue #15: SRCH-02, L10N-04, the issue's second acceptance criterion: case and accents
     // are folded by the platform, here the fake's stand-in.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let (mut launcher, mut clock) = ready_to_search(&fakes);
     open_search(&mut launcher, &mut clock);
 
@@ -2721,7 +2717,7 @@ fn srch02_given_an_app_labelled_cafe_when_the_user_types_cafe_then_it_matches() 
 fn srch03_given_results_when_the_user_presses_the_action_key_then_the_first_result_launches() {
     // Issue #15: SRCH-03, the issue's third acceptance criterion, from the result's icon
     // (ANIM-08). Coming back shows the grid, not the old query (SRCH-04).
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let (mut launcher, mut clock) = ready_to_search(&fakes);
     open_search(&mut launcher, &mut clock);
     type_in(&mut launcher, "ma");
@@ -2748,7 +2744,7 @@ fn srch04_back_or_home_close_search_and_restore_the_grid_where_it_was() {
     // Issue #15: SRCH-04, HOME-07, HOME-08. A screen reader opens search anywhere in the grid
     // (A11Y-05); closing it leaves the grid where it was.
     for close in [ShellIntent::Back, ShellIntent::Home] {
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let (mut launcher, mut clock) = ready_to_search(&fakes);
         launcher.view().apps().scrolled(Surface::Grid, 300.0);
         assert!(launcher.frame().search.offered);
@@ -2770,7 +2766,7 @@ fn srch04_back_or_home_close_search_and_restore_the_grid_where_it_was() {
 #[test]
 fn srch04_pushing_the_empty_field_away_closes_search() {
     // Issue #15: SRCH-04, "scrolling down past the field".
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let (mut launcher, mut clock) = ready_to_search(&fakes);
     open_search(&mut launcher, &mut clock);
 
@@ -2789,7 +2785,7 @@ fn srch04_pushing_the_empty_field_away_closes_search() {
 #[test]
 fn srch05_given_no_match_then_a_web_search_is_offered_and_runs() {
     // Issue #15: SRCH-05, with the device's default search handler.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let (mut launcher, mut clock) = ready_to_search(&fakes);
     open_search(&mut launcher, &mut clock);
     type_in(&mut launcher, "zebra");
@@ -2806,7 +2802,7 @@ fn srch05_given_no_match_then_a_web_search_is_offered_and_runs() {
 #[test]
 fn srch05_without_a_browser_nothing_is_offered() {
     // Issue #15: SRCH-05, SRS 8.1: "has_browser is false: link hidden".
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     *fakes.system.browser.lock().unwrap() = false;
     let (mut launcher, mut clock) = ready_to_search(&fakes);
     open_search(&mut launcher, &mut clock);
@@ -2857,7 +2853,7 @@ fn hidden_apps(launcher: &Launcher) -> Vec<String> {
 #[test]
 fn apps19_given_an_app_is_hidden_then_it_doesnt_appear_in_the_grid_search_or_recent() {
     // Issue #16: APPS-19, REC-03. Mail is hidden from its long-press menu.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let (mut launcher, mut clock) = ready_to_hide(&fakes);
     assert_eq!(grid(&launcher), ["Café", "Gmail", "Mail", "Maps"]);
     assert_eq!(recent(&launcher), ["Mail", "Maps"]);
@@ -2876,7 +2872,7 @@ fn apps19_given_an_app_is_hidden_then_it_doesnt_appear_in_the_grid_search_or_rec
 #[test]
 fn apps19_given_a_hidden_app_is_unhidden_in_settings_then_it_returns_to_the_grid() {
     // Issue #16: APPS-19, SET-02, SET-03. It comes back in its old place, at once.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let (mut launcher, _) = ready_to_hide(&fakes);
     hide(&mut launcher, "mail");
 
@@ -2901,7 +2897,7 @@ const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 /// The backup of a user's old device (APPS-21): Phone, a Games folder with Chess and Go, Maps,
 /// Bank, which they hid, and Mail, in the dark theme. MeeGone was installed there at 1 000 ms.
 fn backed_up_home() -> BTreeMap<StoredFile, Vec<u8>> {
-    let old = Fakes::default();
+    let old = Fakes::after_setup();
     *old.system.installed_ms.lock().unwrap() = 1_000;
     *old.apps.apps.lock().unwrap() = vec![
         app("phone", "Phone"),
@@ -2931,7 +2927,7 @@ fn backed_up_home() -> BTreeMap<StoredFile, Vec<u8>> {
 /// A new device with `installed` apps, where the system restores `backup` as it installs
 /// MeeGone, at 5 000 ms, before MeeGone first runs (APPS-21).
 fn new_device(backup: &BTreeMap<StoredFile, Vec<u8>>, installed: Vec<App>) -> Fakes {
-    let new = Fakes::default();
+    let new = Fakes::after_setup();
     *new.system.installed_ms.lock().unwrap() = 5_000;
     *new.system.now_ms.lock().unwrap() = 6_000;
     *new.apps.apps.lock().unwrap() = installed;
@@ -3084,7 +3080,7 @@ fn image_details(launcher: &mut Launcher) -> Option<DetailsContent> {
 fn evt12_given_an_image_is_cached_then_events_shows_its_card_offline_and_without_access() {
     // Issue #21: EVT-12, LEGAL-03, EVT-03, REL-06. The network is offline, and MeeGone has no
     // notification access.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let mut launcher = with_the_daily_image(&fakes);
 
     assert_eq!(
@@ -3112,7 +3108,7 @@ fn evt12_given_an_image_is_cached_then_events_shows_its_card_offline_and_without
 #[test]
 fn evt12_given_show_card_in_events_is_off_then_the_card_isnt_shown() {
     // Issue #21: EVT-12, SET-03. The choice takes effect at once, and lasts.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let mut launcher = with_the_daily_image(&fakes);
     assert!(image_card(&mut launcher).is_some());
 
@@ -3135,7 +3131,7 @@ fn evt12_given_show_card_in_events_is_off_then_the_card_isnt_shown() {
 #[test]
 fn evt12_given_the_daily_image_is_off_then_there_is_no_card() {
     // Issue #21: EVT-12. An image left in the cache shows nothing while the feature is off.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     image_cached(&fakes);
     let mut launcher = Launcher::start(fakes.platform());
     launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
@@ -3148,7 +3144,7 @@ fn evt12_given_the_daily_image_is_off_then_there_is_no_card() {
 #[test]
 fn evt12_given_the_card_is_tapped_then_the_image_details_open_and_back_closes_them() {
     // Issue #21: EVT-12, WALL-15, HOME-08.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let mut launcher = with_the_daily_image(&fakes);
     let revision = launcher.frame().image_card.expect("the card shows");
 
@@ -3167,7 +3163,7 @@ fn evt12_given_the_card_is_tapped_then_the_image_details_open_and_back_closes_th
 fn evt12_given_a_new_image_arrives_then_the_card_shows_it_and_its_thumbnail_cross_fades() {
     // Issue #21: EVT-12, ANIM-22. The daily job cached a new image while MeeGone was away; the
     // host decodes it and fades it in over 300 ms.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let mut launcher = with_the_daily_image(&fakes);
     let first = launcher.frame().image_card.expect("the card shows");
     fakes.storage.files.lock().unwrap().insert(
@@ -3254,7 +3250,7 @@ fn ac16_given_no_connection_the_daily_check_keeps_the_wallpaper_says_it_will_try
  {
     // AC-16, issue #28: WALL-08, WALL-16, REL-04. Today's image is already cached; then the
     // connection goes for the whole day.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     image_cached(&fakes);
     let (shared, mut launcher) = with_the_daily_check(&fakes);
     let cached = fakes.storage.files.lock().unwrap()[&StoredFile::ImageA].clone();
@@ -3292,7 +3288,7 @@ fn ac16_given_no_connection_the_daily_check_keeps_the_wallpaper_says_it_will_try
 #[test]
 fn srs7_6_after_3_days_of_failures_settings_says_daily_image_unavailable_with_try_again() {
     // Issue #28, SRS 7.6: the connection is gone for three days, then comes back.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let (shared, mut launcher) = with_the_daily_check(&fakes);
     let three_days = NOV_19_MS + 72 * HOUR_MS;
 
@@ -3343,7 +3339,7 @@ fn serve_todays_image(fakes: &Fakes) {
 #[test]
 fn wall04_given_mobile_data_only_and_use_mobile_data_off_no_automatic_download_happens() {
     // Issue #28: WALL-04, PWR-04. Only mobile data all day, with "Use mobile data" off.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     serve_todays_image(&fakes);
     *fakes.network.state.lock().unwrap() = NetworkState::Metered;
     let (shared, mut launcher) = with_the_daily_check(&fakes);
@@ -3390,7 +3386,7 @@ fn wall03_a_new_image_is_fetched_once_a_day_after_local_midnight() {
     // Issue #28: WALL-03, PWR-03. On Wi-Fi in Bangkok, the image is fetched just after local
     // midnight, and the next day's checks find the same image and download nothing: one image
     // a day, about 4 MB from the feed, and a few small details responses.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     serve_todays_image(&fakes);
     *fakes.system.utc_offset_ms.lock().unwrap() = 7 * HOUR_MS as i64;
     let (shared, mut launcher) = with_the_daily_check(&fakes);
@@ -3448,7 +3444,7 @@ fn run_update_now(shared: &Shared, launcher: &mut Launcher) {
 fn ac15_given_the_daily_image_is_on_and_wifi_when_a_new_image_is_published_then_the_lock_screen_shows_it_and_the_details_its_title_and_attribution()
  {
     // AC-15, issue #29: WALL-01, WALL-03, WALL-15.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     serve_todays_image(&fakes);
     let (shared, mut launcher) = with_the_daily_check(&fakes);
     assert_eq!(lock_screen(&fakes), None);
@@ -3503,7 +3499,7 @@ fn wall15_given_a_cached_image_with_an_info_link_then_more_info_opens_it_in_the_
  {
     // Issue #30: WALL-15, SEC-02.
     let link = "https://www.bing.com/search?q=Atlantic+puffin&form=hpcapt";
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     image_cached_with_link(&fakes, Some(link));
     let mut launcher = daily_image_on(&fakes);
     tap_the_image_card(&mut launcher);
@@ -3518,7 +3514,7 @@ fn wall15_given_a_cached_image_with_an_info_link_then_more_info_opens_it_in_the_
     assert!(frame.image_details_open);
 
     // Without a link, More info is hidden, and nothing opens.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     image_cached(&fakes);
     let mut launcher = daily_image_on(&fakes);
     tap_the_image_card(&mut launcher);
@@ -3529,7 +3525,7 @@ fn wall15_given_a_cached_image_with_an_info_link_then_more_info_opens_it_in_the_
     assert!(fakes.system.opened_urls.lock().unwrap().is_empty());
 
     // Nor without a browser to open it (SRS 8.1).
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     image_cached_with_link(&fakes, Some(link));
     *fakes.system.browser.lock().unwrap() = false;
     let mut launcher = daily_image_on(&fakes);
@@ -3543,7 +3539,7 @@ fn wall16_given_the_last_attempt_failed_for_lack_of_connection_then_settings_say
     // Issue #30: WALL-16. Today's image went on the lock screen; then the next check found no
     // connection. The host words it: "Last updated 16 November, 6:00 AM" and "No connection.
     // Will try again later."
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     image_cached(&fakes);
     let (shared, mut launcher) = with_the_daily_check(&fakes);
 
@@ -3581,7 +3577,7 @@ fn wall15_given_an_image_then_the_home_menus_lock_screen_image_opens_its_details
  {
     // Issue #30: HOME-10, WALL-15, HOME-08. Before the first image, the item opens Settings
     // (home10_in_events_the_home_menu_has_no_edit_applications).
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let mut launcher = with_the_daily_image(&fakes);
     launcher.dispatch(ShellIntent::OpenMenu);
 
@@ -3631,7 +3627,7 @@ fn wall15_given_an_image_then_the_home_menus_lock_screen_image_opens_its_details
 fn ac17_given_the_feature_is_on_when_it_is_turned_off_and_the_lock_screen_reset_then_no_more_downloads_happen_the_images_are_deleted_and_the_lock_screen_shows_the_home_wallpaper()
  {
     // AC-17, issue #29: WALL-12.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     serve_todays_image(&fakes);
     let (shared, mut launcher) = with_the_daily_check(&fakes);
     run_the_daily_job(&fakes, &shared, &mut launcher, NOV_19_MS + HOUR_MS);
@@ -3686,7 +3682,7 @@ fn ac17_given_the_feature_is_on_when_it_is_turned_off_and_the_lock_screen_reset_
 fn wall02_given_the_daily_image_was_never_confirmed_then_the_lock_screen_is_unchanged() {
     // Issue #29: WALL-02. As when setup is left before Continue on the image screen: the
     // daily image was never turned on, and MeeGone's start checks as usual.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     serve_todays_image(&fakes);
     *fakes.system.now_ms.lock().unwrap() = NOV_19_MS;
     let shared = Shared::new(fakes.platform());
@@ -3708,7 +3704,7 @@ fn wall02_given_the_daily_image_was_never_confirmed_then_the_lock_screen_is_unch
 #[test]
 fn wall10_given_no_image_was_ever_downloaded_then_the_lock_screen_is_left_as_it_is() {
     // Issue #29: WALL-10, WALL-08. On, but offline all day: no placeholder is applied.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let (shared, mut launcher) = with_the_daily_check(&fakes);
 
     run_the_daily_job(&fakes, &shared, &mut launcher, NOV_19_MS + 24 * HOUR_MS);
@@ -3725,7 +3721,7 @@ fn wall10_given_no_image_was_ever_downloaded_then_the_lock_screen_is_left_as_it_
 fn wall11_update_now_fetches_the_image_at_once_over_mobile_data() {
     // Issue #29: WALL-11. Only mobile data, "Use mobile data" off: the daily check waits, but
     // "Update now" goes ahead.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     serve_todays_image(&fakes);
     *fakes.network.state.lock().unwrap() = NetworkState::Metered;
     let (shared, mut launcher) = with_the_daily_check(&fakes);
@@ -3751,7 +3747,7 @@ fn wall11_update_now_fetches_the_image_at_once_over_mobile_data() {
 #[test]
 fn wall13_given_the_device_cant_set_wallpapers_then_the_feature_is_unavailable_with_the_reason() {
     // Issue #29: WALL-13.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     *fakes.wallpaper.unsupported.lock().unwrap() =
         Some("Your organisation doesn't allow changing the wallpaper".into());
     let mut launcher = Launcher::start(fakes.platform());
@@ -3777,7 +3773,7 @@ fn wall13_given_the_device_cant_set_wallpapers_then_the_feature_is_unavailable_w
 #[test]
 fn wall14_given_someone_else_changes_the_lock_screen_then_daily_updates_pause_until_resumed() {
     // Issue #29: WALL-14.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     serve_todays_image(&fakes);
     let (shared, mut launcher) = with_the_daily_check(&fakes);
     run_the_daily_job(&fakes, &shared, &mut launcher, NOV_19_MS + HOUR_MS);
@@ -3844,7 +3840,7 @@ fn on_recent(fakes: &Fakes) -> Launcher {
 #[test]
 fn rec02_given_usage_access_is_revoked_while_recent_shows_then_the_explainer_appears() {
     // Issue #22: REC-02, REL-01. The system reports the change while Recent is on screen.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let mut launcher = on_recent(&fakes);
     assert_eq!(recent_cards(&mut launcher).0, RecentMode::Cards);
 
@@ -3867,7 +3863,7 @@ fn rec02_given_usage_access_is_revoked_while_recent_shows_then_the_explainer_app
 #[test]
 fn rec02_given_access_is_revoked_as_recent_reads_then_the_explainer_appears_without_a_problem() {
     // Issue #22: REC-02. Access goes between asking whether it is granted and reading the uses.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let mut launcher = on_recent(&fakes);
 
     *fakes.usage.error.lock().unwrap() = Some(DataError::AccessDenied);
@@ -3884,7 +3880,7 @@ fn rec02_given_access_is_revoked_as_recent_reads_then_the_explainer_appears_with
 #[test]
 fn rec02_without_usage_access_recent_explains_and_allow_opens_the_access_screen() {
     // Issue #22: REC-02, ONB-02. No placeholder cards; access is granted in system settings.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail")];
     *fakes.usage.uses.lock().unwrap() = vec![used("mail", 1)];
     let mut launcher = Launcher::start(fakes.platform());
@@ -3909,7 +3905,7 @@ fn rec02_without_usage_access_recent_explains_and_allow_opens_the_access_screen(
 #[test]
 fn rec03_given_twenty_apps_used_then_the_eighteen_newest_show_newest_first() {
     // Issue #22: REC-03. Three columns, filling rows left to right from the top left.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let packages: Vec<String> = (0..20).map(|i| format!("app{i:02}")).collect();
     *fakes.apps.apps.lock().unwrap() = packages.iter().map(|p| app(p, p)).collect();
     *fakes.usage.access.lock().unwrap() = Access::Granted;
@@ -3932,7 +3928,7 @@ fn rec03_given_twenty_apps_used_then_the_eighteen_newest_show_newest_first() {
 #[test]
 fn rec04_a_card_is_filled_with_its_apps_accent_and_says_when_it_was_used() {
     // Issue #22: REC-04, APPS-17, THEME-07.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let mut launcher = mail_in_recent(&fakes, &icon_of(0x1877F2));
 
     let (_, cards) = recent_cards(&mut launcher);
@@ -3948,7 +3944,7 @@ fn rec04_a_card_is_filled_with_its_apps_accent_and_says_when_it_was_used() {
 #[test]
 fn rec09_recent_refreshes_when_it_becomes_visible() {
     // Issue #22: REC-09. Nothing polls: the cards change only when Recent comes into view.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let mut launcher = on_recent(&fakes);
     assert_eq!(labels(&recent_cards(&mut launcher).1), ["Mail", "Maps"]);
 
@@ -3965,7 +3961,7 @@ fn rec09_recent_refreshes_when_it_becomes_visible() {
 #[test]
 fn rec10_given_no_app_was_used_then_recent_says_no_recent_apps() {
     // Issue #22: REC-10.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail")];
     *fakes.usage.access.lock().unwrap() = Access::Granted;
     let mut launcher = Launcher::start(fakes.platform());
@@ -3979,7 +3975,7 @@ fn rec11_given_an_app_used_30_hours_ago_then_it_shows_with_3_days_and_not_with_2
     // Issue #25: REC-11, SET-03. The window is chosen in Settings, takes effect at once, and
     // lasts.
     const HOUR_MS: u64 = 60 * 60 * 1000;
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail"), app("maps", "Maps")];
     *fakes.usage.access.lock().unwrap() = Access::Granted;
     *fakes.system.now_ms.lock().unwrap() = 100 * HOUR_MS;
@@ -4103,7 +4099,7 @@ fn pinch(launcher: &mut Launcher, clock: &mut u64, from: f64, to: f64) -> u16 {
 #[test]
 fn ac13_given_recent_with_six_apps_pinching_in_shows_two_columns_after_a_restart() {
     // Issue #23: REC-05. Spreading the fingers zooms in, to bigger cards.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let (mut launcher, mut clock) = six_on_recent(&fakes);
     let recent = launcher.frame().recent.expect("Recent works");
     assert_eq!((recent.columns, recent.rows_per_screen), (3, 3));
@@ -4126,7 +4122,7 @@ fn ac13_given_recent_with_six_apps_pinching_in_shows_two_columns_after_a_restart
 #[test]
 fn rec05_pinching_the_other_way_shows_more_cards_again() {
     // Issue #23: REC-05.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let (mut launcher, mut clock) = six_on_recent(&fakes);
     pinch(&mut launcher, &mut clock, 300.0, 600.0);
     come_to_rest(&mut launcher, &mut clock);
@@ -4144,7 +4140,7 @@ fn rec05_pinching_the_other_way_shows_more_cards_again() {
 #[test]
 fn rec05_a_tablet_adds_columns_to_both_densities() {
     // Issue #23: REC-05. A tablet 1 280 dp wide keeps cards about a phone's size.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let (mut launcher, mut clock) = six_on_recent(&fakes);
     launcher.view().recent().laid_out(1_248.0 * 2.0, 2.0);
     assert_eq!(launcher.frame().recent.expect("Recent works").columns, 8);
@@ -4158,7 +4154,7 @@ fn rec05_a_tablet_adds_columns_to_both_densities() {
 #[test]
 fn anim17_the_cards_scale_with_the_fingers_then_reflow_in_about_300_ms() {
     // Issue #23: ANIM-17, ANIM-01. The drawn scale is the fingers' as of the latest event.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let (mut launcher, mut clock) = six_on_recent(&fakes);
 
     let scale = pinch(&mut launcher, &mut clock, 300.0, 420.0);
@@ -4182,7 +4178,7 @@ fn anim17_the_cards_scale_with_the_fingers_then_reflow_in_about_300_ms() {
 #[test]
 fn a11y05_a_screen_reader_switches_recent_between_more_and_bigger_cards() {
     // Issue #23: A11Y-05. "Bigger cards" and "More cards" are offered while the cards show.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let (mut launcher, _) = six_on_recent(&fakes);
     let recent = launcher.frame().recent.expect("Recent works");
     assert!(recent.density_offered);
@@ -4227,7 +4223,7 @@ fn recent_froms(launcher: &mut Launcher) -> Vec<Option<usize>> {
 #[test]
 fn ac14_given_recent_a_long_press_and_clear_all_remove_every_card_and_stop_no_app() {
     // Issue #24: REC-07, REC-08, PRIV-03.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let (mut launcher, mut clock) = six_on_recent(&fakes);
     fakes.storage.writes.lock().unwrap().clear();
 
@@ -4262,7 +4258,7 @@ fn ac14_given_recent_a_long_press_and_clear_all_remove_every_card_and_stop_no_ap
 #[test]
 fn rec07_a_tap_on_empty_space_back_home_or_another_view_leaves_close_mode() {
     // Issue #24: REC-07, ANIM-24.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let (mut launcher, mut clock) = six_on_recent(&fakes);
     let close_on = |launcher: &mut Launcher| recent_frame(launcher).close.on;
 
@@ -4298,7 +4294,7 @@ fn rec07_a_tap_on_empty_space_back_home_or_another_view_leaves_close_mode() {
 #[test]
 fn rec08_a_badge_removes_its_card_and_the_others_close_the_gap() {
     // Issue #24: REC-08, ANIM-12, ANIM-18.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let (mut launcher, mut clock) = six_on_recent(&fakes);
     long_press(&mut launcher, &mut clock, 540.0, 1200.0);
     come_to_rest(&mut launcher, &mut clock);
@@ -4338,7 +4334,7 @@ fn rec08_a_badge_removes_its_card_and_the_others_close_the_gap() {
 #[test]
 fn anim18_clear_all_collapses_the_cards_within_400_ms() {
     // Issue #24: ANIM-18. Six cards in two rows: the second starts 220 ms after the first.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let (mut launcher, mut clock) = six_on_recent(&fakes);
     long_press(&mut launcher, &mut clock, 540.0, 1200.0);
     come_to_rest(&mut launcher, &mut clock);
@@ -4368,7 +4364,7 @@ fn anim18_clear_all_collapses_the_cards_within_400_ms() {
 #[test]
 fn ac18_with_animations_removed_close_mode_and_removals_are_instant() {
     // Issue #24: ANIM-05, AC-18.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     *fakes.system.animation_scale.lock().unwrap() = 0.0;
     let (mut launcher, mut clock) = six_on_recent(&fakes);
 
@@ -4394,7 +4390,7 @@ fn ac18_with_animations_removed_close_mode_and_removals_are_instant() {
 
 /// Fakes whose system has animations removed (ANIM-05).
 fn animations_removed() -> Fakes {
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     *fakes.system.animation_scale.lock().unwrap() = 0.0;
     fakes
 }
@@ -4551,7 +4547,7 @@ fn anim05_a_new_animation_speed_is_taken_on_at_once() {
     // Issue #33: ANIM-05, A11Y-07. Animations removed while the views move, such as from the
     // accessibility shortcut over the home, put them where they were going; a slower speed
     // makes what starts next take longer.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let (mut launcher, mut clock) = games_and_maps(&fakes);
     launcher.dispatch(ShellIntent::Swipe(Direction::Next));
     clock += 16;
@@ -4585,7 +4581,7 @@ fn anim05_a_new_animation_speed_is_taken_on_at_once() {
 fn anim03_a_touch_catches_the_moving_row_and_a_settling_icon_where_they_are() {
     // Issue #33: ANIM-03. The row is caught as it settles and follows the finger; so is an icon
     // settling into its cell after a drop, which the finger picks up again.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let (mut launcher, mut clock) = editing_four(&fakes);
     launcher.dispatch(ShellIntent::Swipe(Direction::Next));
     wait(&mut launcher, &mut clock, 48);
@@ -4629,7 +4625,7 @@ fn anim03_a_touch_catches_the_moving_row_and_a_settling_icon_where_they_are() {
 fn anim03_a_touch_on_the_last_sliver_of_a_settle_is_a_tap_on_what_is_under_it() {
     // Issue #33: ANIM-03. Within a third of the touch slop of rest, the views are as good as
     // there: a touch lands them and is the content's, so a tap on an icon launches it.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail")];
     let (mut launcher, mut clock) = on_a_phone(&fakes);
     grid_on_a_phone(&mut launcher);
@@ -4665,7 +4661,7 @@ fn a11y05_a_screen_reader_clears_recent_without_gestures() {
     // Issue #24: A11Y-05, AC-19. "Edit Recent" enters close mode, with a tick as edit mode's
     // (issue #33, ANIM-24), and the cards' "Remove ‹app› from Recent" and Clear all work as the
     // ✕ and the button do.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let (mut launcher, _) = six_on_recent(&fakes);
     assert!(recent_frame(&mut launcher).close_offered);
 
@@ -4756,7 +4752,7 @@ fn wall17_given_a_pinned_image_the_next_days_check_leaves_the_lock_screen_and_un
  {
     // Issue #31: WALL-17, LEGAL-03, LEGAL-04. Today's barn owls are on the lock screen; the user
     // browses the past week from the details screen and pins the cedars.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     serve_todays_image(&fakes);
     serve_the_past_week(&fakes, 1_000, 1_000);
     let (shared, mut launcher) = with_the_daily_check(&fakes);
@@ -4904,7 +4900,7 @@ fn current_image_bytes(fakes: &Fakes) -> Option<Vec<u8>> {
 fn wall17_the_past_week_opens_from_settings_before_any_image_is_cached() {
     // Issue #31: WALL-17, WALL-10. Today's image isn't offered as a wallpaper, so nothing is
     // cached yet; the user picks a recent one instead.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     serve_the_past_week(&fakes, 1_000, 1_000);
     *fakes.network.state.lock().unwrap() = NetworkState::Unmetered;
     let (shared, mut launcher) = with_the_daily_check(&fakes);
@@ -4934,7 +4930,7 @@ fn wall17_the_past_week_opens_from_settings_before_any_image_is_cached() {
 fn pwr03_browsing_and_pinning_keep_a_day_within_10_mb() {
     // Issue #31: PWR-03, WALL-17. The feed's real sizes: today's image about 3.7 MB, the
     // week's previews about 35 KB each. A day with a check, two browses, a pin and an unpin.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     serve_todays_image(&fakes);
     let uhd = Size {
         width: 3840,
@@ -4982,7 +4978,7 @@ fn pwr03_browsing_and_pinning_keep_a_day_within_10_mb() {
 #[test]
 fn set01_settings_opens_from_the_home_menu_and_from_the_systems_settings_entry() {
     // Issue #34: SET-01, AC-19. The menu opens without a gesture, as a screen reader opens it.
-    let (mut launcher, _) = on_a_phone(&Fakes::default());
+    let (mut launcher, _) = on_a_phone(&Fakes::after_setup());
     launcher.dispatch(ShellIntent::OpenMenu);
     launcher.dispatch(ShellIntent::ChooseMenuItem(MenuItem::LauncherSettings));
     let frame = launcher.frame();
@@ -5006,7 +5002,7 @@ fn set01_settings_opens_from_the_home_menu_and_from_the_systems_settings_entry()
 fn set02_settings_offers_every_group_with_the_status_of_each_access() {
     // Issue #34: SET-02. Appearance, Home, Applications, Recent, the lock-screen image, Access
     // and About, with Reset launcher (SET-06).
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     *fakes.notifications.access.lock().unwrap() = Access::Granted;
     *fakes.system.default_home.lock().unwrap() = true;
     let (mut launcher, _) = on_a_phone(&fakes);
@@ -5038,7 +5034,7 @@ fn set02_settings_offers_every_group_with_the_status_of_each_access() {
 #[test]
 fn set02_an_access_shortcut_opens_its_system_screen_or_shows_written_instructions() {
     // Issue #34: SET-02, SRS 8.1. Usage access has no screen on this device.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let instructions = "Open Settings, then Apps, Special app access, Usage access";
     *fakes.usage.error.lock().unwrap() = Some(DataError::Unsupported(instructions.into()));
     let (mut launcher, _) = on_a_phone(&fakes);
@@ -5068,7 +5064,7 @@ fn set02_an_access_shortcut_opens_its_system_screen_or_shows_written_instruction
 #[test]
 fn set02_the_region_is_automatic_or_one_the_feed_offers() {
     // Issue #34: SET-02, WALL-05. Settings lists Automatic first, then the feed's regions.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let (mut launcher, _) = on_a_phone(&fakes);
     launcher.dispatch(ShellIntent::OpenSettings);
     let section = launcher.view().image_settings();
@@ -5086,7 +5082,7 @@ fn set02_the_region_is_automatic_or_one_the_feed_offers() {
 #[test]
 fn set03_a_change_in_settings_shows_on_returning_home_without_a_restart() {
     // Issue #34: SET-03. No Save button: each change is saved and applied as it is made.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let (mut launcher, _) = on_a_phone(&fakes);
     launcher.dispatch(ShellIntent::OpenSettings);
     let settings = launcher.view().settings();
@@ -5122,7 +5118,7 @@ fn set03_a_change_in_settings_shows_on_returning_home_without_a_restart() {
 fn set06_reset_launcher_restores_the_default_layout_and_settings() {
     // Issue #34: SET-06, after the host's confirmation. Access, granted in system settings,
     // stays as it is.
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let (mut launcher, _) = ready_to_hide(&fakes);
     *fakes.system.default_home.lock().unwrap() = true;
     fakes.apps.apps.lock().unwrap().push(app("atlas", "Atlas"));
@@ -5174,4 +5170,268 @@ fn set06_reset_launcher_restores_the_default_layout_and_settings() {
     launcher.dispatch(ShellIntent::Layout(phone()));
     assert_eq!(grid(&launcher), first_grid);
     assert_eq!(launcher.frame().theme_choice, Some(ThemeChoice::System));
+}
+
+/// The preview of today's image in the feed, Barn owls (ONB-01).
+const PREVIEW_URL: &str =
+    "https://www.bing.com/th?id=OHR.BarnOwlsUnite_EN-US9661992435_800x480.jpg";
+
+/// MeeGone just installed, at 08:00 on 19 November, on Wi-Fi: no file of its own yet, a few
+/// apps, and Bing's feed serving today's image, its preview and its largest version. The home
+/// shares its stores with the daily image's job (ADR 0029), and has just come to the
+/// foreground.
+fn fresh_install() -> (Fakes, Shared, Launcher) {
+    let fakes = Fakes::default();
+    *fakes.system.installed_ms.lock().unwrap() = NOV_19_MS + 7 * HOUR_MS;
+    *fakes.system.now_ms.lock().unwrap() = NOV_19_MS + 8 * HOUR_MS;
+    *fakes.apps.apps.lock().unwrap() = vec![
+        app("maps", "Maps"),
+        app("calendar", "Calendar"),
+        app("bank", "Bank"),
+        app("mail", "Mail"),
+    ];
+    serve_todays_image(&fakes);
+    fakes.network.responses.lock().unwrap().insert(
+        PREVIEW_URL.into(),
+        fakes::jpeg(Size {
+            width: 800,
+            height: 480,
+        }),
+    );
+    let shared = Shared::new(fakes.platform());
+    let mut launcher = Launcher::start_shared(&shared);
+    launcher.dispatch(ShellIntent::Layout(phone()));
+    launcher.dispatch(ShellIntent::Resumed);
+    (fakes, shared, launcher)
+}
+
+fn setup_step(launcher: &mut Launcher) -> Option<SetupStep> {
+    launcher.frame().setup.map(|setup| setup.step)
+}
+
+/// The job's thread runs what the home asked of it, such as reading today's image for setup,
+/// then tells the home (ADR 0032, ADR 0036).
+fn run_image_tasks(shared: &Shared, launcher: &mut Launcher) {
+    run_update_now(shared, launcher);
+}
+
+#[test]
+fn ac01_given_a_fresh_install_on_wifi_when_every_setup_default_is_accepted_then_meegone_is_home_in_system_theme_on_applications_with_todays_image_on_the_lock_screen()
+ {
+    // AC-01, issue #35: ONB-01, ONB-03, ONB-05, THEME-01, WALL-01, HOME-05, APPS-04. No time
+    // passes on the device's clock: the lock screen has today's image long before 60 s.
+    let (fakes, shared, mut launcher) = fresh_install();
+    let started = *fakes.system.now_ms.lock().unwrap();
+    assert_eq!(setup_step(&mut launcher), Some(SetupStep::Welcome));
+
+    launcher.view().setup().continue_tapped();
+    assert_eq!(setup_step(&mut launcher), Some(SetupStep::DefaultHome));
+    launcher
+        .view()
+        .setup()
+        .allow_tapped(AccessItem::DefaultHome);
+    launcher.frame();
+    assert_eq!(*fakes.system.default_home_requested.lock().unwrap(), 1);
+    // MeeGone is chosen in the system's dialog, which closes: MeeGone resumes.
+    *fakes.system.default_home.lock().unwrap() = true;
+    launcher.dispatch(ShellIntent::Resumed);
+
+    assert_eq!(setup_step(&mut launcher), Some(SetupStep::LockScreenImage));
+    run_image_tasks(&shared, &mut launcher);
+    let frame = launcher.frame();
+    assert_eq!(frame.setup_image_switch, Some(DailyImage::On));
+    assert_eq!(frame.region, Some(0), "Automatic");
+    assert!(
+        launcher
+            .view()
+            .image_setup()
+            .preview(frame.setup_image.unwrap())
+            .is_some()
+    );
+    assert_eq!(
+        lock_screen(&fakes),
+        None,
+        "nothing before Continue (WALL-02)"
+    );
+    launcher.view().setup().continue_tapped();
+    assert_eq!(setup_step(&mut launcher), Some(SetupStep::Access));
+    // The first check runs at once on the job's thread, without waiting for the scheduler.
+    run_image_tasks(&shared, &mut launcher);
+    assert!(lock_screen(&fakes).is_some());
+
+    for item in [AccessItem::Notifications, AccessItem::Usage] {
+        launcher.view().setup().allow_tapped(item);
+        launcher.frame();
+        match item {
+            AccessItem::Notifications => {
+                *fakes.notifications.access.lock().unwrap() = Access::Granted;
+            }
+            _ => *fakes.usage.access.lock().unwrap() = Access::Granted,
+        }
+        launcher.dispatch(ShellIntent::Resumed);
+    }
+
+    let frame = launcher.frame();
+    assert_eq!(frame.setup, None);
+    assert_eq!(frame.current, HomeView::Applications);
+    assert_eq!(frame.theme_choice, Some(ThemeChoice::System));
+    assert!(launcher.shell().settings().state().default_home);
+    assert_eq!(grid(&launcher), ["Bank", "Calendar", "Mail", "Maps"]);
+    let current = launcher
+        .shell()
+        .lockimage()
+        .state()
+        .current
+        .clone()
+        .unwrap();
+    assert_eq!(current.title, "Hunting from dusk till dawn");
+    assert_eq!(*fakes.system.now_ms.lock().unwrap(), started);
+}
+
+#[test]
+fn onb01_setup_is_welcome_the_default_home_app_the_lock_screen_image_and_access_without_a_theme_question()
+ {
+    // Issue #35: ONB-01, ONB-05. At most four screens; System applies by default.
+    let (fakes, shared, mut launcher) = fresh_install();
+    let mut steps = vec![setup_step(&mut launcher).unwrap()];
+
+    launcher.view().setup().continue_tapped();
+    steps.push(setup_step(&mut launcher).unwrap());
+    launcher
+        .view()
+        .setup()
+        .not_now_tapped(AccessItem::DefaultHome);
+    steps.push(setup_step(&mut launcher).unwrap());
+    run_image_tasks(&shared, &mut launcher);
+    let frame = launcher.frame();
+    let content = launcher.view().image_setup().content().unwrap();
+    let today = content.today.unwrap();
+    assert_eq!(today.title, "Hunting from dusk till dawn");
+    assert_eq!(
+        today.attribution,
+        "Pair of barn owls (© Zahoor Salmi/Getty Images)"
+    );
+    assert!(!content.loading);
+    assert_eq!(frame.setup_image_switch, Some(DailyImage::On));
+    assert_eq!(frame.region, Some(0));
+    launcher.view().setup().continue_tapped();
+    steps.push(setup_step(&mut launcher).unwrap());
+
+    assert_eq!(
+        steps,
+        [
+            SetupStep::Welcome,
+            SetupStep::DefaultHome,
+            SetupStep::LockScreenImage,
+            SetupStep::Access
+        ]
+    );
+    assert_eq!(frame.theme_choice, Some(ThemeChoice::System));
+    assert_eq!(launcher.shell().theme().state().theme, Theme::Light);
+    // Only the feed and today's preview were asked for before Continue.
+    assert_eq!(
+        fakes.network.requests.lock().unwrap()[..2],
+        [FEED_URL, PREVIEW_URL]
+    );
+}
+
+#[test]
+fn onb02_given_not_now_on_both_access_requests_then_setup_completes_and_apps_launch_normally() {
+    // Issue #35: ONB-02. Each request says what is read and why; declining never blocks.
+    let (fakes, _, mut launcher) = fresh_install();
+    launcher.view().setup().continue_tapped();
+    launcher
+        .view()
+        .setup()
+        .not_now_tapped(AccessItem::DefaultHome);
+    launcher.view().setup().continue_tapped();
+    assert_eq!(setup_step(&mut launcher), Some(SetupStep::Access));
+
+    launcher
+        .view()
+        .setup()
+        .not_now_tapped(AccessItem::Notifications);
+    let frame = launcher.frame();
+    assert!(frame.setup.unwrap().notifications_put_off);
+    launcher.view().setup().not_now_tapped(AccessItem::Usage);
+    let frame = launcher.frame();
+    assert_eq!(frame.setup, None);
+    assert_eq!(frame.current, HomeView::Applications);
+
+    launcher.view().apps().icon_tapped(app_id("mail"), None);
+    launcher.frame();
+    assert_eq!(*fakes.apps.launched.lock().unwrap(), [app_id("mail")]);
+    assert_eq!(*fakes.notifications.access_screen_opened.lock().unwrap(), 0);
+    assert_eq!(*fakes.usage.access_screen_opened.lock().unwrap(), 0);
+
+    // Done on this install: a restart goes straight to the home.
+    let mut restarted = Launcher::start(fakes.platform());
+    assert_eq!(restarted.frame().setup, None);
+}
+
+#[test]
+fn wall02_given_setup_is_left_before_continue_on_the_image_screen_then_the_lock_screen_is_unchanged()
+ {
+    // Issue #35: WALL-02. The switch starts on, today's image shows, then the user goes back,
+    // and MeeGone is restarted: nothing was set, cached or scheduled, and setup starts again.
+    let (fakes, shared, mut launcher) = fresh_install();
+    launcher.view().setup().continue_tapped();
+    launcher
+        .view()
+        .setup()
+        .not_now_tapped(AccessItem::DefaultHome);
+    assert_eq!(setup_step(&mut launcher), Some(SetupStep::LockScreenImage));
+    run_image_tasks(&shared, &mut launcher);
+    launcher.frame();
+    assert!(
+        launcher
+            .view()
+            .image_setup()
+            .content()
+            .unwrap()
+            .today
+            .is_some()
+    );
+
+    launcher.dispatch(ShellIntent::Back);
+    assert_eq!(setup_step(&mut launcher), Some(SetupStep::DefaultHome));
+    let shared = Shared::new(fakes.platform());
+    let mut launcher = Launcher::start_shared(&shared);
+    assert!(!shared.check_image());
+
+    assert_eq!(setup_step(&mut launcher), Some(SetupStep::Welcome));
+    assert_eq!(launcher.frame().daily_image, Some(DailyImage::Off));
+    assert_eq!(lock_screen(&fakes), None);
+    assert_eq!(cached_image(&fakes), None);
+    assert_eq!(*fakes.scheduler.job.lock().unwrap(), None);
+    assert_eq!(
+        *fakes.network.requests.lock().unwrap(),
+        [FEED_URL, PREVIEW_URL]
+    );
+}
+
+#[test]
+fn adr0036_setup_runs_once_per_install_and_again_after_a_restore_on_another_device() {
+    // Issue #35, ADR 0018: settings from another install's backup run setup again; settings
+    // saved before setup existed don't.
+    let restored = Fakes::default();
+    *restored.system.installed_ms.lock().unwrap() = 5_000;
+    PersistentSettingsStore::new(restored.storage.clone())
+        .update(&mut |s| {
+            s.theme = ThemeChoice::Dark;
+            s.setup_install_ms = Some(1_000);
+        })
+        .unwrap();
+    let mut launcher = Launcher::start(restored.platform());
+    assert_eq!(setup_step(&mut launcher), Some(SetupStep::Welcome));
+    assert_eq!(launcher.frame().theme_choice, Some(ThemeChoice::Dark));
+
+    let upgraded = Fakes::default();
+    *upgraded.system.installed_ms.lock().unwrap() = 5_000;
+    upgraded.storage.files.lock().unwrap().insert(
+        StoredFile::Settings,
+        include_bytes!("../crates/core/data/fixtures/settings-v3.txt").to_vec(),
+    );
+    let mut launcher = Launcher::start(upgraded.platform());
+    assert_eq!(setup_step(&mut launcher), None);
 }

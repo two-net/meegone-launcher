@@ -13,8 +13,10 @@
 //! - [`Marker`]: how the lock screen took the image MeeGone set, so a change by someone else
 //!   can be told (WALL-14, ADR 0030).
 //! - [`ImageMemory`], kept in memory only: [`PastImages`], the past week's images and their
-//!   previews, for browsing and pinning one (WALL-17), and [`ImageTasks`], what the user asked
-//!   of the image job's thread: "Update now", browsing and pinning (ADR 0032).
+//!   previews, for browsing and pinning one (WALL-17); [`TodayImage`], today's image and its
+//!   preview for setup (ONB-01, ADR 0036); and [`ImageTasks`], what the user asked of the image
+//!   job's thread: "Update now", browsing, pinning, and setup's preview and first check
+//!   (ADR 0032, ADR 0036).
 //!
 //! The updater that decides when to check (SRS 7.5) is in `meegone-lockimage-state`.
 
@@ -43,17 +45,18 @@ pub use download::{
 };
 pub use feed::{FORMAT_CHANGED, FeedImage, ImageFeed, ImageVersion, PAST_WEEK_IMAGES};
 pub use past::{
-    MAX_PREVIEW_BYTES, MAX_PREVIEW_SIDE, PREVIEW_TOO_LARGE, PastImage, PastImages, Preview, Week,
-    check_preview,
+    MAX_PREVIEW_BYTES, MAX_PREVIEW_SIDE, PREVIEW_TOO_LARGE, PastImage, PastImages, Preview, Today,
+    TodayImage, Week, check_preview,
 };
 pub use tasks::{ImageTask, ImageTasks};
 
 /// What the lock-screen image keeps in memory only, which the home and the image job's thread
-/// share (ADR 0032): the past week as last browsed, and what the user asked of the job's
-/// thread. Nothing of it is stored (PERF-08).
+/// share (ADR 0032): the past week as last browsed, today's image as setup shows it (ADR 0036),
+/// and what the user asked of the job's thread. Nothing of it is stored (PERF-08).
 #[derive(Debug, Default)]
 pub struct ImageMemory {
     pub past: PastImages,
+    pub today: TodayImage,
     pub tasks: ImageTasks,
 }
 

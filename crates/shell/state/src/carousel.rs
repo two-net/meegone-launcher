@@ -689,7 +689,7 @@ mod tests {
     }
 
     fn shell() -> HomeShell {
-        laid_out(&Fakes::default(), false)
+        laid_out(&Fakes::after_setup(), false)
     }
 
     fn touch(shell: &mut HomeShell, kind: PointerKind, x: f64, at: u64) {
@@ -957,7 +957,7 @@ mod tests {
     #[test]
     fn a_right_to_left_layout_mirrors_the_order_and_the_swipe_directions() {
         // L10N-02: Recent is on the left, so a drag to the right shows it.
-        let mut shell = laid_out(&Fakes::default(), true);
+        let mut shell = laid_out(&Fakes::after_setup(), true);
 
         drag(&mut shell, 400.0, 600.0, 0, 80);
         assert_near(shell.state().page_offset_px(HomeView::Recent), -810.0);
@@ -1045,7 +1045,7 @@ mod tests {
     #[test]
     fn with_animations_removed_views_change_at_once() {
         // ANIM-05, A11Y-07
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         *fakes.system.animation_scale.lock().unwrap() = 0.0;
         let mut shell = laid_out(&fakes, false);
 
@@ -1069,7 +1069,7 @@ mod tests {
     #[test]
     fn animations_removed_while_the_row_moves_stop_it_at_once() {
         // ANIM-05: the speed is read again when MeeGone comes back to the foreground.
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let mut shell = laid_out(&fakes, false);
         let end = flick(&mut shell, 600.0, 500.0, 0);
 
@@ -1084,7 +1084,7 @@ mod tests {
     #[test]
     fn slower_animations_settle_more_slowly() {
         // ANIM-05
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         *fakes.system.animation_scale.lock().unwrap() = 2.0;
         let mut slow = laid_out(&fakes, false);
         let mut normal = shell();
@@ -1147,7 +1147,7 @@ mod tests {
 
     #[test]
     fn touches_before_layout_or_under_settings_are_ignored() {
-        let mut shell = HomeShell::compose(Fakes::default().platform());
+        let mut shell = HomeShell::compose(Fakes::after_setup().platform());
         drag(&mut shell, 600.0, 100.0, 0, 80);
         assert!(!shell.state().carousel.dragging);
 
@@ -1307,7 +1307,7 @@ mod tests {
             (1e-17, true),
             (-1.0, true),
         ] {
-            let fakes = Fakes::default();
+            let fakes = Fakes::after_setup();
             *fakes.system.animation_scale.lock().unwrap() = scale;
             let mut shell = laid_out(&fakes, false);
             shell.dispatch(ShellIntent::Swipe(Direction::Next));
@@ -1324,7 +1324,7 @@ mod tests {
     #[test]
     fn a_long_press_counts_only_while_the_finger_is_still_a_press() {
         // HOME-10: a finger that moved past the touch slop scrolls or drags instead.
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         let ticks = || *fakes.system.haptic_ticks.lock().unwrap();
         let held = |shell: &mut HomeShell| {
             shell.dispatch(ShellIntent::LongPress);
@@ -1379,7 +1379,7 @@ mod tests {
     #[test]
     fn after_a_long_press_the_finger_moves_nothing_until_it_lifts() {
         // HOME-10, REC-07: in Recent, which has no menu to cover the views.
-        let fakes = Fakes::default();
+        let fakes = Fakes::after_setup();
         *fakes.usage.access.lock().unwrap() = meegone_core_data::Access::Granted;
         *fakes.apps.apps.lock().unwrap() = vec![fakes::app("mail", "Mail")];
         *fakes.system.now_ms.lock().unwrap() = 1_000_000;

@@ -3,7 +3,8 @@
 //! checks are going (SRS 7.6), "Update now" (WALL-11), whether daily updates are paused
 //! because someone else changed the lock screen (WALL-14), resetting the lock screen once the
 //! image is off (WALL-12), what the image details screen shows and opens (WALL-15, WALL-16),
-//! and the past week's images, one of which can be pinned (WALL-17).
+//! the past week's images, one of which can be pinned (WALL-17), and setup's lock-screen image
+//! step: today's image, the switch, and what Continue applies (ONB-01, WALL-02, ADR 0036).
 //!
 //! Its options live in the settings store (ADR 0002); the image details, the pin and the check
 //! log live in this feature's image cache, and the past week in memory. [`ImageUpdater`] runs
@@ -26,7 +27,7 @@ use meegone_lockimage_data::{ImageCache, ImageFeed, region};
 pub use checks::CheckStatus;
 pub use meegone_lockimage_data::{
     ImageFile, ImageMemory, ImageRecord, ImageTask, ImageTasks, Marker, PAST_WEEK_IMAGES,
-    PastImages, Preview,
+    PastImages, Preview, TodayImage,
 };
 pub use updater::{Checked, ImageUpdater, NOT_LISTED, NOT_OFFERED, Wait};
 
@@ -83,7 +84,31 @@ pub struct LockImageState {
     pub pinning: Option<String>,
     /// The last problem browsing or pinning had, in plain words.
     pub past_problem: Option<String>,
+    /// Setup's lock-screen image step, from when setup reaches it until Continue (ONB-01).
+    pub setup: Option<ImageSetup>,
     pub problem: Option<String>,
+}
+
+/// Setup's lock-screen image step (ONB-01, ADR 0036). Nothing of it is saved, and nothing
+/// reaches the lock screen, until Continue (WALL-02).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageSetup {
+    /// The step's switch: on until the user turns it off (WALL-02).
+    pub on: bool,
+    /// Today's image in the region in use, once read; never while offline.
+    pub today: Option<TodayEntry>,
+    /// Whether today's image is being read.
+    pub loading: bool,
+}
+
+/// Today's image as setup's lock-screen image step shows it (ONB-01).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TodayEntry {
+    pub title: String,
+    /// As the source provides it (LEGAL-03).
+    pub attribution: String,
+    /// Its preview, when it is offered as a wallpaper and the preview checked out (LEGAL-04).
+    pub preview: Option<Preview>,
 }
 
 /// One of the past week's images, as browsing shows it (WALL-17).
@@ -188,6 +213,17 @@ pub enum LockImageIntent {
     /// Opens Settings at its Lock-screen image group, from the details screen (WALL-15).
     /// Settings covers the home views, so the shell opens it (ADR 0031); the holder ignores it.
     OpenSettings,
+    /// Setup has reached its lock-screen image step (ONB-01): the step's switch starts on, and
+    /// today's image is read on the job's thread, for the region in use. Nothing is saved or
+    /// scheduled, while the daily image may still be off (WALL-02). The shell sends it.
+    OpenSetup,
+    /// The step's switch: only the step changes, nothing is saved (WALL-02).
+    SetupSwitched(bool),
+    /// Continue on the step: the daily image is turned on, if the switch is on, and today's
+    /// check runs at once on the job's thread, within its rules, so the image is on the lock
+    /// screen within a minute on Wi-Fi (ONB-03, WALL-04). With the switch off, the daily image
+    /// stays off. The step closes either way.
+    ConfirmSetup,
     /// Settings → Reset launcher (SET-06): the options go back to their defaults in one save.
     /// The daily image is off, as switching it off leaves it, with nothing cached or scheduled;
     /// the region is Automatic, mobile data isn't used and the card shows. The lock screen keeps
@@ -301,6 +337,7 @@ impl LockImageHolder {
             ImageTask::Pin(id) => Some(id),
             _ => None,
         });
+        self.show_today();
     }
 
     /// The feed's `yyyymmdd` written in the device's language, at noon so a time zone far from
@@ -371,8 +408,13 @@ impl LockImageHolder {
         let result = self
             .settings
             .update(&mut |settings| settings.image.region = choice.clone());
+        let saved = result.is_ok();
         self.state.problem = result.err().map(|error| error.to_string());
         self.refresh();
+        // Setup's step shows today's image in the region chosen (ONB-01).
+        if saved {
+            self.read_today();
+        }
     }
 
     /// The lock-screen image is the one writer of "Use mobile data" (ARCH-06). The waiting job
@@ -409,6 +451,78 @@ impl LockImageHolder {
     fn browse(&mut self) {
         if self.state.past_offered() {
             self.ask(ImageTask::Browse);
+        }
+    }
+
+    /// Setup has reached its step: a switch that starts on, kept if the user comes back to the
+    /// step, and today's image (ONB-01, WALL-02).
+    fn open_setup(&mut self) {
+        if self.state.setup.is_none() {
+            self.state.setup = Some(ImageSetup {
+                on: true,
+                today: None,
+                loading: false,
+            });
+        }
+        self.read_today();
+    }
+
+    fn setup_switched(&mut self, on: bool) {
+        if let Some(setup) = &mut self.state.setup {
+            setup.on = on;
+        }
+    }
+
+    /// Continue: applies the step's switch, the user's confirmation (WALL-02). On, the daily
+    /// check runs at once rather than whenever the system's scheduler gets to it (ONB-03).
+    fn confirm_setup(&mut self) {
+        let Some(setup) = self.state.setup.take() else {
+            return;
+        };
+        self.memory.today.clear();
+        if setup.on {
+            self.set_enabled(true);
+            if self.state.status == ImageStatus::On && self.state.problem.is_none() {
+                self.ask(ImageTask::Check);
+            }
+        } else if self.state.status == ImageStatus::On {
+            // On already, as restored from a backup (ADR 0018): the switch turns it off.
+            self.set_enabled(false);
+        } else {
+            self.refresh();
+        }
+    }
+
+    /// Reads today's image for setup's step on the job's thread, where the device can set the
+    /// lock screen (ONB-01, WALL-13).
+    fn read_today(&mut self) {
+        if self.state.setup.is_some() && !matches!(self.state.status, ImageStatus::Unavailable(_)) {
+            self.ask(ImageTask::PreviewToday);
+        }
+    }
+
+    /// Today's image for setup's step, as the job's thread read it for the region in use, and
+    /// whether it is being read.
+    fn show_today(&mut self) {
+        let loading = self
+            .memory
+            .tasks
+            .pending()
+            .contains(&ImageTask::PreviewToday);
+        let region = self.state.region_in_use().to_owned();
+        let today = self
+            .memory
+            .today
+            .get()
+            .filter(|today| today.region == region)
+            .map(|today| TodayEntry {
+                title: today.image.image.title,
+                attribution: today.image.image.attribution,
+                preview: today.image.preview,
+            });
+        if let Some(setup) = &mut self.state.setup {
+            setup.loading = loading;
+            setup.today = today;
         }
     }
 
@@ -479,6 +593,7 @@ impl LockImageHolder {
             // The current lock-screen wallpaper stays as it is (WALL-12). Nothing browsed stays
             // either.
             self.memory.past.clear();
+            self.memory.today.clear();
             self.scheduler.cancel_image_job()?;
             self.cache.clear()
         }
@@ -524,6 +639,9 @@ impl StateHolder for LockImageHolder {
             LockImageIntent::Browse => self.browse(),
             LockImageIntent::Pin(id) => self.pin(id),
             LockImageIntent::Reset => self.reset(),
+            LockImageIntent::OpenSetup => self.open_setup(),
+            LockImageIntent::SetupSwitched(on) => self.setup_switched(on),
+            LockImageIntent::ConfirmSetup => self.confirm_setup(),
             LockImageIntent::OpenDetails
             | LockImageIntent::OpenSettings
             | LockImageIntent::OpenPastImages => {}
@@ -618,6 +736,11 @@ mod tests {
                     Checked::NotDue
                 }
                 ImageTask::Pin(id) => updater.pin(id, past),
+                ImageTask::PreviewToday => {
+                    updater.preview_today(&setup.memory.today);
+                    Checked::NotDue
+                }
+                ImageTask::Check => updater.check(),
             };
         });
         setup.holder.handle(LockImageIntent::Checked);
@@ -1527,5 +1650,153 @@ mod tests {
 
         assert!(setup.holder.state().past.is_empty());
         assert_eq!(setup.memory.past.week(), None);
+    }
+
+    /// On Wi-Fi, with today's `id` in the feed, its preview and its full-size versions served.
+    fn todays_image_served(setup: &Setup, id: &str) {
+        *setup.fakes.network.state.lock().unwrap() = meegone_core_data::NetworkState::Unmetered;
+        let image = meegone_lockimage_data::fakes::feed_image(id, "20261119");
+        let mut responses = setup.fakes.network.responses.lock().unwrap();
+        for version in image.versions.iter().chain([&image.preview]) {
+            let size = meegone_core_data::Size {
+                width: version.width,
+                height: version.height,
+            };
+            responses.insert(version.url.clone(), meegone_core_data::fakes::jpeg(size));
+        }
+        *setup.feed.image.lock().unwrap() = Some(image);
+    }
+
+    #[test]
+    fn setups_step_starts_on_and_saves_nothing() {
+        // ONB-01, WALL-02: the switch starts on, but nothing is applied before Continue.
+        let Setup {
+            fakes,
+            settings,
+            memory,
+            mut holder,
+            ..
+        } = setup();
+
+        holder.handle(LockImageIntent::OpenSetup);
+        holder.handle(LockImageIntent::SetupSwitched(false));
+        holder.handle(LockImageIntent::SetupSwitched(true));
+
+        let step = holder.state().setup.clone().unwrap();
+        assert!(step.on);
+        assert!(step.loading, "today's image is on its way");
+        assert_eq!(memory.tasks.pending(), [ImageTask::PreviewToday]);
+        assert_eq!(*fakes.scheduler.task_runs.lock().unwrap(), 1);
+        assert_eq!(holder.state().status, ImageStatus::Off);
+        assert!(!settings.get().image.enabled);
+        assert_eq!(*fakes.scheduler.job.lock().unwrap(), None);
+        assert!(fakes.storage.writes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn setups_step_shows_todays_image_once_read() {
+        // ONB-01, LEGAL-03
+        let mut setup = setup();
+        todays_image_served(&setup, "puffins");
+        setup.holder.handle(LockImageIntent::OpenSetup);
+
+        run_tasks(&mut setup);
+
+        let step = setup.holder.state().setup.clone().unwrap();
+        let today = step.today.unwrap();
+        assert!(!step.loading);
+        assert_eq!(today.title, "Image puffins");
+        assert_eq!(today.attribution, "© Someone");
+        assert!(today.preview.is_some());
+        assert_eq!(setup.holder.state().status, ImageStatus::Off);
+        assert!(setup.fakes.wallpaper.lock_screen.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn choosing_a_region_at_setups_step_shows_its_image() {
+        // ONB-01, WALL-05
+        let mut setup = setup();
+        todays_image_served(&setup, "puffins");
+        setup.holder.handle(LockImageIntent::OpenSetup);
+        run_tasks(&mut setup);
+
+        setup
+            .holder
+            .handle(LockImageIntent::SetRegion(Some("fi-FI".into())));
+        assert_eq!(setup.holder.state().setup.as_ref().unwrap().today, None);
+        run_tasks(&mut setup);
+
+        assert!(setup.holder.state().setup.as_ref().unwrap().today.is_some());
+        assert_eq!(*setup.feed.requests.lock().unwrap(), ["en-US", "fi-FI"]);
+        assert!(!setup.settings.get().image.enabled);
+    }
+
+    #[test]
+    fn continue_turns_the_daily_image_on_and_checks_at_once() {
+        // ONB-03, WALL-02: Continue is the confirmation; the check runs within its rules.
+        let mut setup = setup();
+        todays_image_served(&setup, "puffins");
+        setup.holder.handle(LockImageIntent::OpenSetup);
+        run_tasks(&mut setup);
+
+        setup.holder.handle(LockImageIntent::ConfirmSetup);
+
+        assert_eq!(setup.holder.state().setup, None);
+        assert_eq!(setup.holder.state().status, ImageStatus::On);
+        assert!(setup.settings.get().image.enabled);
+        assert!(setup.fakes.scheduler.job.lock().unwrap().is_some());
+        assert_eq!(setup.memory.tasks.pending(), [ImageTask::Check]);
+        assert_eq!(setup.memory.today.get(), None);
+
+        run_tasks(&mut setup);
+
+        assert!(setup.fakes.wallpaper.lock_screen.lock().unwrap().is_some());
+        let current = setup.holder.state().current.clone().unwrap();
+        assert_eq!(current.id.as_deref(), Some("puffins"));
+    }
+
+    #[test]
+    fn continue_with_the_switch_off_leaves_the_daily_image_off() {
+        // WALL-02
+        let Setup {
+            fakes,
+            settings,
+            memory,
+            mut holder,
+            ..
+        } = setup();
+        holder.handle(LockImageIntent::OpenSetup);
+        holder.handle(LockImageIntent::SetupSwitched(false));
+
+        holder.handle(LockImageIntent::ConfirmSetup);
+
+        assert_eq!(holder.state().setup, None);
+        assert_eq!(holder.state().status, ImageStatus::Off);
+        assert!(!settings.get().image.enabled);
+        assert_eq!(*fakes.scheduler.job.lock().unwrap(), None);
+        assert!(!memory.tasks.pending().contains(&ImageTask::Check));
+        assert!(fakes.storage.writes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn where_the_lock_screen_cant_be_set_setups_step_reads_and_applies_nothing() {
+        // WALL-13
+        let Setup {
+            fakes,
+            settings,
+            memory,
+            mut holder,
+            ..
+        } = setup();
+        *fakes.wallpaper.unsupported.lock().unwrap() = Some("Not allowed".into());
+        holder.handle(LockImageIntent::Refresh);
+
+        holder.handle(LockImageIntent::OpenSetup);
+        assert!(memory.tasks.pending().is_empty());
+        holder.handle(LockImageIntent::ConfirmSetup);
+
+        assert!(matches!(holder.state().status, ImageStatus::Unavailable(_)));
+        assert!(!settings.get().image.enabled);
+        assert_eq!(*fakes.scheduler.job.lock().unwrap(), None);
     }
 }

@@ -1,6 +1,7 @@
 //! Work the user asks of the lock-screen image that runs on the image job's thread (ADR 0030,
-//! ADR 0032): "Update now", which Resume and Unpin are too (WALL-11, WALL-14, WALL-17),
-//! browsing the past week, and pinning one of its images (WALL-17).
+//! ADR 0032, ADR 0036): "Update now", which Resume and Unpin are too (WALL-11, WALL-14,
+//! WALL-17), browsing the past week, pinning one of its images (WALL-17), and setup's preview of
+//! today's image and its first check (ONB-01).
 //!
 //! Each of them blocks on the network or the wallpaper, so the holder, on the main thread,
 //! only queues it here and asks the platform to run the queue on the job's thread. The job's
@@ -22,6 +23,12 @@ pub enum ImageTask {
     Browse,
     /// Pins the past week's image with the feed's id (WALL-17).
     Pin(String),
+    /// Reads today's image and its preview for setup, without caching or setting anything
+    /// (ONB-01, WALL-02).
+    PreviewToday,
+    /// Runs the daily check at once, within its rules, once setup has turned the daily image on
+    /// (ONB-03, WALL-03, WALL-04).
+    Check,
 }
 
 /// The tasks waiting, and the one running. Clones of its `Arc` share it.

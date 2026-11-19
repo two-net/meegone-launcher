@@ -38,7 +38,8 @@ pub struct FeedImage {
     pub offered_as_wallpaper: bool,
     /// Every size on offer, in no particular order.
     pub versions: Vec<ImageVersion>,
-    /// A small size, only for browsing the past week (WALL-17, ADR 0032). It is never one of
+    /// A small size, only for browsing the past week (WALL-17, ADR 0032) and for setup's
+    /// lock-screen image step (ONB-01, ADR 0036). It is never one of
     /// [`versions`](Self::versions), so it never becomes the wallpaper.
     pub preview: ImageVersion,
 }

@@ -8,7 +8,7 @@ use meegone_launcher::{Launcher, ShellIntent};
 #[test]
 fn a_tap_in_a_view_reaches_the_platform_through_the_state_layer() {
     // UI → state → data (ARCH-02, ARCH-05).
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     fakes.apps.apps.lock().unwrap().push(app("mail", "Mail"));
     let mut launcher = Launcher::start(fakes.platform());
 
@@ -22,7 +22,7 @@ fn a_tap_in_a_view_reaches_the_platform_through_the_state_layer() {
 #[test]
 fn a_theme_chosen_in_settings_applies_to_the_whole_app() {
     // THEME-01, THEME-03
-    let fakes = Fakes::default();
+    let fakes = Fakes::after_setup();
     let mut launcher = Launcher::start(fakes.platform());
     launcher.dispatch(ShellIntent::OpenSettings);
 

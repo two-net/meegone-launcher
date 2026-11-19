@@ -234,7 +234,13 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private static final int ACCESS_INSTRUCTIONS = 147; // an AccessSettings item, or -1
     private static final int REGION = 148; // 0 Automatic, else its place in nativeRegions; or -1
     private static final int RESET_OFFERED = 149; // 1 while Reset launcher is offered
-    private static final int FRAME_SIZE = 150;
+    // First-run setup and the home-app banner (ONB-01, ONB-02, ONB-04, ADR 0036):
+    private static final int SETUP_STEP = 150; // a SetupScreens step; -1 while none shows
+    private static final int SETUP_PUT_OFF = 151; // SetupScreens.*_PUT_OFF bits
+    private static final int SETUP_IMAGE_SWITCH = 152; // SetupScreens.SWITCH_*; -1 Continue alone
+    private static final int SETUP_IMAGE_REVISION = 153; // changes when it changes; -1 none
+    private static final int HOME_BANNER = 154; // 1 while the banner shows
+    private static final int FRAME_SIZE = 155;
     /** The licences of the third-party code MeeGone includes, in About (LEGAL-06). */
     private static final int[] LICENCES = {
         R.raw.licence_mit, R.raw.licence_apache_2_0, R.raw.licence_unicode_3_0,
@@ -361,6 +367,10 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     /** Covers the home views while the image details screen is open (WALL-15). */
     private final ImageDetails imageDetails;
     private final PastImages pastImages;
+    /** Covers everything but the menu until first-run setup is finished (ONB-01). */
+    private final SetupScreens setup;
+    /** Offers to make MeeGone the default home app, at the bottom of the home views (ONB-04). */
+    private final HomeBannerView banner;
     /** The Events and Recent pages' and Settings' scrolling, which the theme colours. */
     private final List<ScrollView> scrolls = new ArrayList<>();
     /** The whole screen cross-fading to a new theme (ANIM-19). */
@@ -457,6 +467,10 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private long recentShown = -1;
     private int imageDetailsShown;
     private int pastImagesShown;
+    /** Setup's step as shown, or -1 for none; and its image screen's revision last read. */
+    private int setupShown = -1;
+    private int setupImageRead = -1;
+    private int bannerShown = -1;
     /** The revisions of the image details, the status line and the past week last read, or -1. */
     private int imageDetailsRead = -1;
     private int imageStatusRead = -1;
@@ -666,6 +680,26 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         status.setTextColor(Color.TRANSPARENT);
         status.setAccessibilityLiveRegion(ACCESSIBILITY_LIVE_REGION_POLITE);
         addView(status, new LayoutParams(1, 1, Gravity.TOP | Gravity.START));
+
+        // At the bottom of the home views, below every screen that covers them (ONB-04).
+        banner = new HomeBannerView(context, new HomeBannerView.Listener() {
+            @Override
+            public void makeDefault() {
+                String message = nativeHomeBannerMakeDefault();
+                apply();
+                toast(message);
+            }
+
+            @Override
+            public void dismiss() {
+                String message = nativeHomeBannerDismissed();
+                apply();
+                toast(message);
+            }
+        });
+        banner.setVisibility(GONE);
+        addView(banner, new LayoutParams(
+                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT, Gravity.BOTTOM));
 
         // Below Settings, which can open over it (ADR 0031).
         imageDetails = new ImageDetails(context, new ImageDetails.Listener() {
@@ -907,6 +941,58 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         addView(pastImages, new LayoutParams(
                 LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
 
+        // Above every other screen, until setup is finished (ONB-01, ADR 0036).
+        setup = new SetupScreens(context, new SetupScreens.Listener() {
+            @Override
+            public void next() {
+                answered(nativeSetupContinue());
+            }
+
+            @Override
+            public void allow(int item) {
+                // The same shortcuts as Settings → Access (SET-02).
+                switch (item) {
+                    case AccessSettings.DEFAULT_HOME:
+                        answered(nativeDefaultHome());
+                        break;
+                    case AccessSettings.NOTIFICATIONS:
+                        answered(nativeNotificationAccessSettings());
+                        break;
+                    default:
+                        answered(nativeUsageAccessSettings());
+                        break;
+                }
+            }
+
+            @Override
+            public void notNow(int item) {
+                answered(nativeSetupNotNow(item));
+            }
+
+            @Override
+            public void imageSwitched(boolean on) {
+                answered(nativeSetupImageSwitch(on));
+            }
+
+            @Override
+            public void region() {
+                chooseRegion();
+            }
+
+            @Override
+            public byte[] preview(int revision) {
+                return nativeSetupImagePreview(revision);
+            }
+
+            private void answered(String message) {
+                apply();
+                toast(message);
+            }
+        });
+        setup.setVisibility(GONE);
+        scrolls.add(setup);
+        addView(setup, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
+
         menu = new LinearLayout(context);
         menu.setOrientation(LinearLayout.VERTICAL);
         menu.setPadding(0, dp(8), 0, dp(8));
@@ -985,6 +1071,12 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         settings.setPadding(safe.left, safe.top, safe.right, safe.bottom);
         imageDetails.setPadding(safe.left, safe.top, safe.right, safe.bottom);
         pastImages.setPadding(safe.left, safe.top, safe.right, safe.bottom);
+        setup.setPadding(safe.left, safe.top, safe.right, safe.bottom);
+        LayoutParams bannerParams = (LayoutParams) banner.getLayoutParams();
+        int bannerGap = dp(16);
+        bannerParams.setMargins(safe.left + bannerGap, 0, safe.right + bannerGap,
+                safe.bottom + bannerGap);
+        banner.setLayoutParams(bannerParams);
         recentList.viewport(getHeight() - safe.top - safe.bottom);
         LayoutParams params = (LayoutParams) indicator.getLayoutParams();
         if (params.topMargin != safe.top + indicatorMargin) {
@@ -1264,7 +1356,8 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         switch (event.getActionMasked()) {
             case MotionEvent.ACTION_DOWN:
                 removeCallbacks(longPress);
-                if (!claimed && !menuOpen() && frame[SETTINGS] == 0) {
+                if (!claimed && !menuOpen() && frame[SETTINGS] == 0 && frame[SETUP_STEP] < 0
+                        && !onBanner(event.getX(), event.getY())) {
                     downX = event.getX();
                     downY = event.getY();
                     postDelayed(longPress, ViewConfiguration.getLongPressTimeout());
@@ -1497,6 +1590,8 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         applyImageDetails();
         applySettings();
         applyPastImages();
+        applySetup();
+        applyBanner();
         applyMenu();
         applyRename();
         int offered = (frame[SEARCH] & SEARCH_OFFERED) != 0 ? 1 : 0;
@@ -1855,6 +1950,76 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             pastImagesRead = revision;
             pastImages.fill(revision, nativePastImages());
         }
+    }
+
+    /**
+     * Shows first-run setup over everything but the menu while the Rust app says so, one screen
+     * at a time (ONB-01, ADR 0036). Each screen's content is read as the frame's slots 150 to
+     * 153 say; the accesses' status and instructions are Settings → Access's own (slots 145 to
+     * 147).
+     */
+    private void applySetup() {
+        int step = frame[SETUP_STEP];
+        if (setup.show(step)) {
+            // A dialog, such as Region's, belonged to the screen before.
+            closeSettingsDialog();
+            setupImageRead = -1;
+            if (step == SetupScreens.LOCK_SCREEN_IMAGE) {
+                // The device's language, and so Automatic's region, may have changed.
+                regions = nativeRegions();
+            }
+        }
+        if (step != setupShown) {
+            setupShown = step;
+            hidePagesFromScreenReaders();
+        }
+        if (step < 0) {
+            return;
+        }
+        setup.colour(background, foreground, dim, frame[ACCENT]);
+        switch (step) {
+            case SetupScreens.DEFAULT_HOME:
+                setup.showDefaultHome(frame[ACCESS_INSTRUCTIONS] == AccessSettings.DEFAULT_HOME
+                        ? instructions
+                        : null);
+                break;
+            case SetupScreens.LOCK_SCREEN_IMAGE:
+                int switchState = frame[SETUP_IMAGE_SWITCH];
+                String reason = switchState == SetupScreens.SWITCH_UNAVAILABLE
+                        ? nativeImageUnavailableReason()
+                        : null;
+                setup.showImage(switchState, reason, regionName(frame[REGION]));
+                int revision = frame[SETUP_IMAGE_REVISION];
+                if (revision >= 0 && revision != setupImageRead) {
+                    setupImageRead = revision;
+                    setup.fillImage(revision, nativeSetupImage());
+                }
+                break;
+            case SetupScreens.ACCESS:
+                setup.showAccess(frame[NOTIFICATION_ACCESS] > 0, frame[USAGE_ACCESS] > 0,
+                        frame[SETUP_PUT_OFF], frame[ACCESS_INSTRUCTIONS], instructions);
+                break;
+            default:
+                break;
+        }
+    }
+
+    /** The banner offering to make MeeGone the default home app, while it shows (ONB-04). */
+    private void applyBanner() {
+        if (frame[HOME_BANNER] != bannerShown) {
+            bannerShown = frame[HOME_BANNER];
+            banner.setVisibility(bannerShown != 0 ? VISIBLE : GONE);
+        }
+        if (bannerShown != 0) {
+            banner.colour(foreground, dim, surface, frame[ACCENT]);
+        }
+    }
+
+    /** Whether the banner shows at {@code (x, y)} in the home views. */
+    private boolean onBanner(float x, float y) {
+        return banner.getVisibility() == VISIBLE
+                && x >= banner.getLeft() && x < banner.getRight()
+                && y >= banner.getTop() && y < banner.getBottom();
     }
 
     /**
@@ -2566,6 +2731,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private void hidePagesFromScreenReaders() {
         int importance = menuShown != 0 || appMenuShown >= 0 || eventsMenuShown != 0
                 || settingsShown != 0 || imageDetailsShown != 0 || pastImagesShown != 0
+                || setupShown >= 0
                 ? IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
                 : IMPORTANT_FOR_ACCESSIBILITY_AUTO;
         for (FrameLayout page : pages) {
@@ -3055,6 +3221,39 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
      * or a short message to show when it couldn't start.
      */
     private native String nativePastImagesTryAgain();
+
+    /**
+     * Continue was tapped in setup, on Welcome or the image screen, whose switch it applies
+     * (ONB-01, WALL-02). Returns null, or a short message to show.
+     */
+    private native String nativeSetupContinue();
+
+    /**
+     * Not now was tapped in setup on {@code item}, numbered as {@link AccessSettings} does
+     * (ONB-02). Returns null, or a short message to show.
+     */
+    private native String nativeSetupNotNow(int item);
+
+    /**
+     * Setup's image switch was tapped. Nothing is saved before Continue (WALL-02). Returns null,
+     * or a short message to show.
+     */
+    private native String nativeSetupImageSwitch(boolean on);
+
+    /** Setup's image screen as of the last frame, in SetupScreens' fields (ONB-01). */
+    private native String[] nativeSetupImage();
+
+    /** Today's preview on setup's image screen as read at {@code revision}, or null (SEC-02). */
+    private native byte[] nativeSetupImagePreview(int revision);
+
+    /**
+     * The banner's Make default was tapped: the system's dialog opens (ONB-04). Returns null, or
+     * a short message to show, such as written instructions.
+     */
+    private native String nativeHomeBannerMakeDefault();
+
+    /** The banner was dismissed until tomorrow (ONB-04). Returns null, or a short message. */
+    private native String nativeHomeBannerDismissed();
 
     /** Fills {@code frame} with what to draw now, in the slots above. */
     private native void nativeRead(int[] frame);

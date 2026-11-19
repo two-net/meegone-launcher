@@ -63,7 +63,8 @@ impl Shared {
 
     /// Runs what the user asked of the daily image, one task after another until none waits:
     /// "Update now", Resume and Unpin (WALL-11, WALL-14, WALL-17, ADR 0030), browsing the past
-    /// week and pinning one of its images (WALL-17, ADR 0032). It blocks, as
+    /// week and pinning one of its images (WALL-17, ADR 0032), and setup's preview of today's
+    /// image and its first check (ONB-01, ONB-03, ADR 0036). It blocks, as
     /// [`check_image`](Self::check_image) does. The home then reads the image again whatever
     /// happened (`ShellIntent::ImageChecked`), and shows as on its way only what still waits.
     pub fn run_image_tasks(&self) {
@@ -75,6 +76,12 @@ impl Shared {
             ImageTask::Browse => self.updater.browse(past),
             ImageTask::Pin(id) => {
                 self.updater.pin(id, past);
+            }
+            ImageTask::PreviewToday => self.updater.preview_today(&self.image_memory.today),
+            // Within the daily check's rules: the job's thread runs one check at a time, so
+            // the job finds today's check done (WALL-03, WALL-04).
+            ImageTask::Check => {
+                self.updater.check();
             }
         });
     }

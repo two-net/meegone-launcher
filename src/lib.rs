@@ -22,8 +22,8 @@ pub use meegone_shell_ui::{
     EventsListFrame, EventsListMode, EventsMenuFrame, EventsRow, FolderFrame, FolderId,
     GridChangeFrame, GridLayout, HomeFrame, HoverFrame, LiftFrame, MenuFrame, MergeFrame,
     NotificationMenuItem, PastAction, PastContent, PastImageContent, Preview, RECENT_ROWS,
-    RecentFrame, RecentMode, RecentWindow, RenameFrame, RowTarget, SearchFrame, ShownCard, Surface,
-    SurfaceCellsFrame, UpdateStatus,
+    RecentFrame, RecentMode, RecentWindow, RenameFrame, RowTarget, SearchFrame, SetupFrame,
+    SetupImageContent, SetupStep, ShownCard, Surface, SurfaceCellsFrame, TodayEntry, UpdateStatus,
 };
 
 pub struct Launcher {

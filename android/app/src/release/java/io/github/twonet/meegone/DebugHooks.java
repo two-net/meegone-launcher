@@ -6,10 +6,6 @@ import android.content.Intent;
 final class DebugHooks {
     private DebugHooks() {}
 
-    static boolean requestsHomeRole(Intent intent) {
-        return false;
-    }
-
     static void readIconExtras(Intent intent) {}
 
     static boolean legacyIcons() {

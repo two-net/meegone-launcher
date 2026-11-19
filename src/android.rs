@@ -20,7 +20,8 @@
 //! revision and place when tapped or long-pressed (ADR 0020, ADR 0021). So are Recent's cards,
 //! with `nativeRecentCards`, named by revision and place when tapped (ADR 0023). Two fingers on
 //! the home views reach the shell through `nativePinch`, which may pinch Recent's cards (ADR
-//! 0024).
+//! 0024). First-run setup covers the home views as the frame's slot 150 says, and its
+//! lock-screen image step is read with `nativeSetupImage` (ADR 0036).
 //!
 //! A bug in MeeGone becomes a Java `RuntimeException` instead of an abort, so its message
 //! reaches logcat. Containing it keeps `panic = "unwind"`, as ARCH-09 already requires.
@@ -43,7 +44,7 @@ use crate::{
     Direction, EventsListMode, EventsRow, FOLDER_COLUMNS, FolderId, GridLayout, HomeFrame,
     HomeView, Launcher, Layout, MenuItem, NotificationMenuItem, PREVIEW_APPS, PastAction,
     PinchEvent, PinchKind, PointerEvent, PointerKind, RECENT_ROWS, RecentMode, RowTarget,
-    SavedHome, SettingsGroup, Shared, ShellIntent, ShownCard, Surface,
+    SavedHome, SettingsGroup, SetupStep, Shared, ShellIntent, ShownCard, Surface,
 };
 
 /// JNI's `jboolean`.
@@ -472,25 +473,6 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_AppAccents_nativeAcc
         Ok(())
     });
     rgb
-}
-
-/// `void nativeRequestDefaultHome()`: in debug builds, taps the banner's "make default" button,
-/// which isn't drawn yet, so the role request can be checked on a device (ADR 0005).
-///
-/// # Safety
-///
-/// Called only by the JVM, with the arguments of that native method.
-#[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeActivity_nativeRequestDefaultHome(
-    env: RawEnv,
-    _activity: JObject,
-) {
-    // SAFETY: the JVM passes this thread's environment.
-    let env = unsafe { Env::from_raw(env) };
-    with_launcher(env, |launcher| {
-        launcher.view().home_banner().make_default_tapped();
-        launcher.frame();
-    });
 }
 
 /// `void nativeLayout(int widthPx, float density, int touchSlopPx, boolean rtl)`: the home
@@ -1568,6 +1550,133 @@ fn access_item_code(item: AccessItem) -> i32 {
     }
 }
 
+/// The Access item with `code`, as [`access_item_code`] gives it.
+fn access_item_of(code: i32) -> Option<AccessItem> {
+    match code {
+        0 => Some(AccessItem::DefaultHome),
+        1 => Some(AccessItem::Notifications),
+        2 => Some(AccessItem::Usage),
+        _ => None,
+    }
+}
+
+/// A step of first-run setup as the frame's slot 150 gives it, mirrored in `SetupScreens.java`
+/// (ONB-01).
+fn setup_step_code(step: SetupStep) -> i32 {
+    match step {
+        SetupStep::Welcome => 0,
+        SetupStep::DefaultHome => 1,
+        SetupStep::LockScreenImage => 2,
+        SetupStep::Access => 3,
+    }
+}
+
+/// `String nativeSetupContinue()`: Continue was tapped in setup, on Welcome or the lock-screen
+/// image step, whose switch it applies (ONB-01, WALL-02). Returns `null`, or a short message to
+/// show: on the image step the lock-screen image's problem first, such as a job that couldn't
+/// be scheduled, otherwise Settings'. Does nothing while Settings isn't working (ARCH-09).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeSetupContinue(
+    env: RawEnv,
+    _views: JObject,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    let mut shown = std::ptr::null_mut();
+    guarded(env, || {
+        LAUNCHER.with_borrow_mut(|launcher| {
+            let launcher = launcher.as_mut().ok_or("MeeGone hasn't started")?;
+            let Some(setup) = launcher.frame().setup else {
+                return Ok(());
+            };
+            launcher.view().setup().continue_tapped();
+            launcher.frame();
+            let shell = launcher.shell();
+            let image_problem = (setup.step == SetupStep::LockScreenImage
+                && shell.lockimage_ready())
+            .then(|| shell.lockimage().state().problem.clone())
+            .flatten();
+            let problem = image_problem.or_else(|| shell.settings().state().problem.clone());
+            shown = message(env, problem.as_deref())?;
+            Ok(())
+        })
+    });
+    shown
+}
+
+/// `String nativeSetupNotNow(int item)`: "Not now" was tapped in setup on the item with that
+/// code, as [`access_item_code`] gives it: the default home app, notification access or usage
+/// access. Declining never blocks setup (ONB-02). Returns `null`, or a short message to show.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeSetupNotNow(
+    env: RawEnv,
+    _views: JObject,
+    item: i32,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_settings_message(env, |launcher| {
+        let Some(item) = access_item_of(item) else {
+            return false;
+        };
+        launcher.view().setup().not_now_tapped(item);
+        true
+    })
+}
+
+/// `String nativeHomeBannerMakeDefault()`: the banner's "Make default" was tapped: the system's
+/// dialog for the default home app opens, which also answers the banner for today (ONB-04,
+/// HOME-01). Returns as `nativeDefaultHome` does. Does nothing while the banner isn't shown.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeHomeBannerMakeDefault(
+    env: RawEnv,
+    _views: JObject,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_settings_message(env, |launcher| {
+        let shown = launcher.shell().banner_shown();
+        if shown {
+            launcher.view().home_banner().make_default_tapped();
+        }
+        shown
+    })
+}
+
+/// `String nativeHomeBannerDismissed()`: the banner was dismissed, so it stays away until
+/// tomorrow (ONB-04). Returns `null`, or a short message to show when that couldn't be saved.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeHomeBannerDismissed(
+    env: RawEnv,
+    _views: JObject,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_settings_message(env, |launcher| {
+        let shown = launcher.shell().banner_shown();
+        if shown {
+            launcher.view().home_banner().dismissed();
+        }
+        shown
+    })
+}
+
 /// `String nativeAccessInstructions()`: the written instructions shown below the Access item
 /// in the frame's slot 147, or `null` while there are none (SRS 8.1).
 ///
@@ -2392,6 +2501,111 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativePast
                         .past_images()
                         .preview(revision as u32, index)
                 })
+                .flatten();
+            if let Some(preview) = preview {
+                bytes = env
+                    .new_bytes(preview.bytes())
+                    .map_err(|error| format!("Couldn't pass the preview: {error}"))?
+                    .into_raw();
+            }
+            Ok(())
+        })
+    });
+    bytes
+}
+
+/// `String nativeSetupImageSwitch(boolean on)`: the switch of setup's lock-screen image step
+/// was tapped. Nothing is saved, and nothing reaches the lock screen, until Continue (WALL-02).
+/// Returns `null`, or a short message to show. Does nothing while the device can't set the
+/// wallpaper (WALL-13).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeSetupImageSwitch(
+    env: RawEnv,
+    _views: JObject,
+    on: JBoolean,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_image_message(env, |launcher| {
+        launcher.view().image_setup().switched(on != 0)
+    })
+}
+
+/// `String[] nativeSetupImage()`: what setup's lock-screen image step shows besides its switch
+/// and Region, as of the last frame (ONB-01), mirrored in `SetupScreens.java`:
+/// 1. today's title, or empty before it is read or while offline;
+/// 2. its attribution, as the source gives it (LEGAL-03);
+/// 3. "1" while it has a preview, read with `nativeSetupImagePreview`;
+/// 4. "1" while today's image is being read.
+///
+/// Empty unless the frame's slot 153 says the step shows.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeSetupImage(
+    env: RawEnv,
+    _views: JObject,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    let mut fields = std::ptr::null_mut();
+    guarded(env, || {
+        LAUNCHER.with_borrow(|launcher| {
+            let launcher = launcher.as_ref().ok_or("MeeGone hasn't started")?;
+            let content = launcher
+                .shell()
+                .lockimage_ready()
+                .then(|| launcher.view().image_setup().content())
+                .flatten();
+            let texts: Vec<&str> = content.as_ref().map_or_else(Vec::new, |content| {
+                let today = content.today.as_ref();
+                vec![
+                    today.map_or("", |today| today.title.as_str()),
+                    today.map_or("", |today| today.attribution.as_str()),
+                    flag(today.is_some_and(|today| today.preview.is_some())),
+                    flag(content.loading),
+                ]
+            });
+            let array = env
+                .new_string_array(texts.into_iter())
+                .map_err(|error| format!("Couldn't pass setup's image: {error}"))?;
+            fields = array.into_raw();
+            Ok(())
+        })
+    });
+    fields
+}
+
+/// `byte[] nativeSetupImagePreview(int revision)`: the preview of today's image on setup's
+/// lock-screen image step as read at `revision`, a JPEG checked to decode within bounds
+/// (SEC-02, ONB-01), or `null` if it has none or the step changed since.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeSetupImagePreview(
+    env: RawEnv,
+    _views: JObject,
+    revision: i32,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    let mut bytes = std::ptr::null_mut();
+    guarded(env, || {
+        LAUNCHER.with_borrow(|launcher| {
+            let launcher = launcher.as_ref().ok_or("MeeGone hasn't started")?;
+            // The revision travels as Java's `int`.
+            let preview = launcher
+                .shell()
+                .lockimage_ready()
+                .then(|| launcher.view().image_setup().preview(revision as u32))
                 .flatten();
             if let Some(preview) = preview {
                 bytes = env
@@ -3386,7 +3600,7 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRead
 }
 
 /// How many slots the frame has.
-const FRAME_SLOTS: usize = 150;
+const FRAME_SLOTS: usize = 155;
 /// The first of Recent's close-mode slots.
 const CLOSE_SLOTS: usize = 104;
 
@@ -3508,6 +3722,11 @@ const CLOSE_SLOTS: usize = 104;
 /// | 147 | The Access item showing written instructions, read with `nativeAccessInstructions`: 0 default home app, 1 notification access, 2 usage access, as [`access_item_code`] says, or -1 for none (SRS 8.1) |
 /// | 148 | Settings → Lock-screen image → Region: 0 Automatic, otherwise the region's place in `nativeRegions`, or -1 while the lock-screen image isn't working, so it isn't offered (WALL-05) |
 /// | 149 | 1 while Settings → About offers Reset launcher: every feature it resets works (SET-06, ARCH-09); otherwise 0 |
+/// | 150 | First-run setup's step while it covers the home views: 0 Welcome, 1 the default home app, 2 the lock-screen image, 3 access, as [`setup_step_code`] says, or -1 while setup doesn't show (ONB-01) |
+/// | 151 | The accesses setup's "Not now" put off, as bits: 1 notification access, 2 usage access. Whether each is granted is in slots 145 and 146, and the item showing instructions in slot 147 (ONB-02) |
+/// | 152 | The switch of setup's lock-screen image step: 1 on, 0 off, 2 unavailable, with its reason from `nativeImageUnavailableReason`, or -1 while the step doesn't show or the lock-screen image isn't working, so the step offers Continue alone (WALL-02, WALL-13, ARCH-09) |
+/// | 153 | The revision of what setup's lock-screen image step shows: when it changes, it is read again with `nativeSetupImage`; -1 under slot 152's -1 (ONB-01) |
+/// | 154 | 1 while the banner that offers to make MeeGone the default home app shows over the home views (ONB-04); otherwise 0 |
 fn frame_slots(frame: &HomeFrame) -> [i32; FRAME_SLOTS] {
     let [events, applications, recent] = frame.pages;
     let menu_items = frame.menu.map_or(0, |menu| {
@@ -3741,6 +3960,17 @@ fn frame_slots(frame: &HomeFrame) -> [i32; FRAME_SLOTS] {
         .region
         .map_or(-1, |choice| i32::try_from(choice).unwrap_or(-1));
     slots[window + 22] = i32::from(frame.reset_offered);
+    slots[window + 23] = frame.setup.map_or(-1, |setup| setup_step_code(setup.step));
+    slots[window + 24] = frame.setup.map_or(0, |setup| {
+        i32::from(setup.notifications_put_off) | i32::from(setup.usage_put_off) << 1
+    });
+    slots[window + 25] = frame.setup_image_switch.map_or(-1, |switch| match switch {
+        DailyImage::Off => 0,
+        DailyImage::On => 1,
+        DailyImage::Unavailable => 2,
+    });
+    slots[window + 26] = revision(frame.setup_image);
+    slots[window + 27] = i32::from(frame.home_banner);
     slots
 }
 

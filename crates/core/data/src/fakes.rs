@@ -20,7 +20,8 @@ use crate::model::{
     Access, App, AppId, DataError, ImageCrop, ImageJob, NetworkState, Notification, Profile,
     ProfileId, RecentUse, Rect, Screen, Shortcut, Size, TimeStyle, WallpaperMarker,
 };
-use crate::storage::{MAX_STORED_BYTES, StorageAdapter, StoredFile, check_budget};
+use crate::settings::Settings;
+use crate::storage::{MAX_STORED_BYTES, StorageAdapter, StoredFile, check_budget, encode};
 
 /// Every fake, and the [`Platform`] built from them.
 #[derive(Clone, Default)]
@@ -36,6 +37,24 @@ pub struct Fakes {
 }
 
 impl Fakes {
+    /// Fakes of a device where first-run setup was already finished, so the home shows at once
+    /// (ONB-01, ADR 0036). Its settings are the defaults otherwise. They are put in storage
+    /// directly, so no read or write is recorded.
+    pub fn after_setup() -> Self {
+        let fakes = Self::default();
+        let settings = Settings {
+            setup_install_ms: Some(0),
+            ..Settings::default()
+        };
+        fakes
+            .storage
+            .files
+            .lock()
+            .unwrap()
+            .insert(StoredFile::Settings, encode(&settings));
+        fakes
+    }
+
     pub fn platform(&self) -> Platform {
         Platform {
             apps: self.apps.clone(),
