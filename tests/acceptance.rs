@@ -2,9 +2,8 @@
 //! (MAINT-03). Each test carries its scenario's id; each feature adds its own here.
 //!
 //! Not automated yet, because the behaviour isn't built:
-//! - AC-01: first-run setup (#35)
-//! - AC-15 and AC-17: the daily image as the lock-screen wallpaper (#29). Its card in Events
-//!   (EVT-12, #21), AC-16 and the daily check's conditions (#28) are automated below.
+//! - AC-01: first-run setup (#35). Its lock-screen image step's promise, that nothing changes
+//!   before Continue (WALL-02), is automated below.
 //!
 //! AC-18 to AC-20 (animation scale, screen reader, timing) need a device; they belong to the
 //! device matrix (#43). Their core logic is tested without one: the carousel with animations
@@ -27,7 +26,7 @@ use meegone_core_data::{
 use meegone_core_state::{Access, Health, Theme};
 use meegone_core_ui::tokens;
 use meegone_launcher::{
-    Age, AppMenuItem, BADGE_ROWS, Bounds, CardContent, CellKey, CheckStatus, Direction,
+    Age, AppMenuItem, BADGE_ROWS, Bounds, CardContent, CellKey, CheckStatus, DailyImage, Direction,
     EventsListMode, EventsMenuFrame, FolderId, GridLayout, HomeView, Launcher, Layout, LiftFrame,
     MenuItem, NotificationMenuItem, PinchEvent, PinchKind, PointerEvent, PointerKind, RECENT_ROWS,
     RecentFrame, RecentMode, RecentWindow, SettingsGroup, Shared, ShellIntent, Surface,
@@ -3220,10 +3219,11 @@ fn wall04_given_mobile_data_only_and_use_mobile_data_off_no_automatic_download_h
     run_the_daily_job(&fakes, &shared, &mut launcher, NOV_19_MS + 25 * HOUR_MS);
     assert!(fakes.network.requests.lock().unwrap().is_empty());
 
-    // Without it, today's image downloads over mobile data.
+    // Without it, today's image downloads over mobile data, and the lock screen shows it.
     *fakes.network.saves_data.lock().unwrap() = false;
     run_the_daily_job(&fakes, &shared, &mut launcher, NOV_19_MS + 26 * HOUR_MS);
     assert_eq!(*fakes.network.requests.lock().unwrap(), [FEED_URL, UHD_URL]);
+    assert_eq!(lock_screen(&fakes), cached_image(&fakes));
     launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
     assert_eq!(
         image_card(&mut launcher).map(|card| card.title),
@@ -3254,6 +3254,8 @@ fn wall03_a_new_image_is_fetched_once_a_day_after_local_midnight() {
     );
     let requests = fakes.network.requests.lock().unwrap().clone();
     assert_eq!(requests[2..], [FEED_URL; 4]);
+    // Set as the lock-screen wallpaper once, the day it came (ADR 0030).
+    assert_eq!(*fakes.wallpaper.lock_screen_images_set.lock().unwrap(), 1);
     assert_eq!(
         fakes
             .scheduler
@@ -3263,6 +3265,241 @@ fn wall03_a_new_image_is_fetched_once_a_day_after_local_midnight() {
             .map(|job| job.not_before_ms),
         Some(bangkok_midnight + 24 * HOUR_MS)
     );
+}
+
+/// The lock screen's own wallpaper, or `None` while it shows the home wallpaper.
+fn lock_screen(fakes: &Fakes) -> Option<Vec<u8>> {
+    fakes.wallpaper.lock_screen.lock().unwrap().clone()
+}
+
+/// The image the updater cached first, in the cache's first file.
+fn cached_image(fakes: &Fakes) -> Option<Vec<u8>> {
+    fakes
+        .storage
+        .files
+        .lock()
+        .unwrap()
+        .get(&StoredFile::ImageA)
+        .cloned()
+}
+
+/// Runs "Update now" as the job's thread does, then tells the home (WALL-11, ADR 0030).
+fn run_update_now(shared: &Shared, launcher: &mut Launcher) {
+    shared.update_image_now();
+    launcher.dispatch(ShellIntent::ImageChecked);
+}
+
+#[test]
+fn ac15_given_the_daily_image_is_on_and_wifi_when_a_new_image_is_published_then_the_lock_screen_shows_it_and_the_details_its_title_and_attribution()
+ {
+    // AC-15, issue #29: WALL-01, WALL-03, WALL-15.
+    let fakes = Fakes::default();
+    serve_todays_image(&fakes);
+    let (shared, mut launcher) = with_the_daily_check(&fakes);
+    assert_eq!(lock_screen(&fakes), None);
+
+    run_the_daily_job(&fakes, &shared, &mut launcher, NOV_19_MS + 24 * HOUR_MS);
+
+    // The lock screen shows the image, cropped for it, and only the lock screen's wallpaper
+    // was set (WALL-01): the platform is asked for nothing else.
+    assert!(cached_image(&fakes).is_some());
+    assert_eq!(lock_screen(&fakes), cached_image(&fakes));
+    assert_eq!(*fakes.wallpaper.lock_screen_images_set.lock().unwrap(), 1);
+    let current = launcher
+        .shell()
+        .lockimage()
+        .state()
+        .current
+        .clone()
+        .unwrap();
+    assert_eq!(current.applied_at_ms, Some(NOV_19_MS));
+    // The details screen opens from the card, which shows its title and attribution
+    // (LEGAL-03); the screen draws them with #30.
+    launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
+    let card = image_card(&mut launcher).expect("the card shows");
+    assert_eq!(card.title, "Hunting from dusk till dawn");
+    assert_eq!(
+        card.attribution,
+        "Pair of barn owls (© Zahoor Salmi/Getty Images)"
+    );
+    let revision = launcher.frame().image_card.unwrap();
+    assert!(launcher.view().image_card().tapped(revision));
+    assert!(launcher.frame().image_details_open);
+    assert_eq!(current.title, card.title);
+    assert_eq!(current.attribution, card.attribution);
+}
+
+#[test]
+fn ac17_given_the_feature_is_on_when_it_is_turned_off_and_the_lock_screen_reset_then_no_more_downloads_happen_the_images_are_deleted_and_the_lock_screen_shows_the_home_wallpaper()
+ {
+    // AC-17, issue #29: WALL-12.
+    let fakes = Fakes::default();
+    serve_todays_image(&fakes);
+    let (shared, mut launcher) = with_the_daily_check(&fakes);
+    run_the_daily_job(&fakes, &shared, &mut launcher, NOV_19_MS + HOUR_MS);
+    assert!(lock_screen(&fakes).is_some());
+    launcher.dispatch(ShellIntent::OpenSettings);
+    assert!(!launcher.frame().image_off_actions);
+
+    launcher.view().image_settings().daily_image_toggled(false);
+    // The wallpaper stays until the user resets it; Settings offers the reset and the
+    // system's wallpaper settings.
+    let frame = launcher.frame();
+    assert_eq!(frame.daily_image, Some(DailyImage::Off));
+    assert!(frame.image_off_actions);
+    assert_eq!(frame.update_now, None);
+    assert!(lock_screen(&fakes).is_some());
+    launcher.view().image_settings().reset_lock_screen();
+    launcher.frame();
+
+    assert_eq!(lock_screen(&fakes), None);
+    assert_eq!(*fakes.wallpaper.resets.lock().unwrap(), 1);
+    // The cached images and their details are gone (WALL-12).
+    assert!(
+        fakes
+            .storage
+            .files
+            .lock()
+            .unwrap()
+            .keys()
+            .all(|file| !matches!(
+                file,
+                StoredFile::ImageDetails | StoredFile::ImageA | StoredFile::ImageB
+            ))
+    );
+    // No more downloads: no job waits, and a check or "Update now" does nothing.
+    assert_eq!(*fakes.scheduler.job.lock().unwrap(), None);
+    let requests = fakes.network.requests.lock().unwrap().len();
+    *fakes.system.now_ms.lock().unwrap() = NOV_19_MS + 48 * HOUR_MS;
+    assert!(!shared.check_image());
+    shared.update_image_now();
+    assert_eq!(fakes.network.requests.lock().unwrap().len(), requests);
+    assert_eq!(lock_screen(&fakes), None);
+
+    // The shortcut opens the system's wallpaper settings.
+    launcher.view().image_settings().open_wallpaper_settings();
+    launcher.frame();
+    assert_eq!(*fakes.wallpaper.settings_opened.lock().unwrap(), 1);
+}
+
+#[test]
+fn wall02_given_the_daily_image_was_never_confirmed_then_the_lock_screen_is_unchanged() {
+    // Issue #29: WALL-02. As when setup is left before Continue on the image screen: the
+    // daily image was never turned on, and MeeGone's start checks as usual.
+    let fakes = Fakes::default();
+    serve_todays_image(&fakes);
+    *fakes.system.now_ms.lock().unwrap() = NOV_19_MS;
+    let shared = Shared::new(fakes.platform());
+    let mut launcher = Launcher::start_shared(&shared);
+
+    assert!(!shared.check_image());
+    shared.update_image_now();
+    launcher.dispatch(ShellIntent::Resumed);
+
+    assert_eq!(launcher.frame().daily_image, Some(DailyImage::Off));
+    assert!(fakes.network.requests.lock().unwrap().is_empty());
+    assert_eq!(lock_screen(&fakes), None);
+    assert_eq!(*fakes.wallpaper.lock_screen_images_set.lock().unwrap(), 0);
+    assert_eq!(*fakes.scheduler.job.lock().unwrap(), None);
+}
+
+#[test]
+fn wall10_given_no_image_was_ever_downloaded_then_the_lock_screen_is_left_as_it_is() {
+    // Issue #29: WALL-10, WALL-08. On, but offline all day: no placeholder is applied.
+    let fakes = Fakes::default();
+    let (shared, mut launcher) = with_the_daily_check(&fakes);
+
+    run_the_daily_job(&fakes, &shared, &mut launcher, NOV_19_MS + 24 * HOUR_MS);
+    run_update_now(&shared, &mut launcher);
+
+    assert_eq!(fakes.network.requests.lock().unwrap().len(), 7);
+    assert_eq!(lock_screen(&fakes), None);
+    assert_eq!(*fakes.wallpaper.lock_screen_images_set.lock().unwrap(), 0);
+}
+
+#[test]
+fn wall11_update_now_fetches_the_image_at_once_over_mobile_data() {
+    // Issue #29: WALL-11. Only mobile data, "Use mobile data" off: the daily check waits, but
+    // "Update now" goes ahead.
+    let fakes = Fakes::default();
+    serve_todays_image(&fakes);
+    *fakes.network.state.lock().unwrap() = NetworkState::Metered;
+    let (shared, mut launcher) = with_the_daily_check(&fakes);
+    run_the_daily_job(&fakes, &shared, &mut launcher, NOV_19_MS + HOUR_MS);
+    assert!(fakes.network.requests.lock().unwrap().is_empty());
+    launcher.dispatch(ShellIntent::OpenSettings);
+    assert_eq!(launcher.frame().update_now, Some(false));
+
+    launcher.view().image_settings().update_now();
+    // It shows as on its way, and a second tap asks for nothing more.
+    assert_eq!(launcher.frame().update_now, Some(true));
+    launcher.view().image_settings().update_now();
+    launcher.frame();
+    assert_eq!(*fakes.scheduler.updates_now.lock().unwrap(), 1);
+    run_update_now(&shared, &mut launcher);
+
+    assert_eq!(launcher.frame().update_now, Some(false));
+    assert_eq!(*fakes.network.requests.lock().unwrap(), [FEED_URL, UHD_URL]);
+    assert_eq!(lock_screen(&fakes), cached_image(&fakes));
+    assert_eq!(launcher.view().image_settings().checks(), CheckStatus::Fine);
+}
+
+#[test]
+fn wall13_given_the_device_cant_set_wallpapers_then_the_feature_is_unavailable_with_the_reason() {
+    // Issue #29: WALL-13.
+    let fakes = Fakes::default();
+    *fakes.wallpaper.unsupported.lock().unwrap() =
+        Some("Your organisation doesn't allow changing the wallpaper".into());
+    let mut launcher = Launcher::start(fakes.platform());
+    launcher.dispatch(ShellIntent::OpenSettings);
+
+    launcher.view().image_settings().daily_image_toggled(true);
+    let frame = launcher.frame();
+
+    assert_eq!(frame.daily_image, Some(DailyImage::Unavailable));
+    assert_eq!(
+        launcher
+            .view()
+            .image_settings()
+            .unavailable_reason()
+            .as_deref(),
+        Some("Your organisation doesn't allow changing the wallpaper")
+    );
+    assert_eq!(frame.update_now, None);
+    assert!(!frame.image_off_actions);
+    assert_eq!(*fakes.scheduler.job.lock().unwrap(), None);
+}
+
+#[test]
+fn wall14_given_someone_else_changes_the_lock_screen_then_daily_updates_pause_until_resumed() {
+    // Issue #29: WALL-14.
+    let fakes = Fakes::default();
+    serve_todays_image(&fakes);
+    let (shared, mut launcher) = with_the_daily_check(&fakes);
+    run_the_daily_job(&fakes, &shared, &mut launcher, NOV_19_MS + HOUR_MS);
+    let ours = lock_screen(&fakes);
+    assert!(ours.is_some());
+
+    fakes.wallpaper.changed_by_someone_else();
+    launcher.dispatch(ShellIntent::Resumed);
+    launcher.dispatch(ShellIntent::OpenSettings);
+    assert!(launcher.frame().image_paused);
+
+    // The next day's check asks for nothing and changes nothing, and no job waits after it.
+    let requests = fakes.network.requests.lock().unwrap().len();
+    run_the_daily_job(&fakes, &shared, &mut launcher, NOV_19_MS + 48 * HOUR_MS);
+    assert_eq!(fakes.network.requests.lock().unwrap().len(), requests);
+    assert_eq!(lock_screen(&fakes).as_deref(), Some(&b"someone else's"[..]));
+    assert_eq!(*fakes.scheduler.job.lock().unwrap(), None);
+
+    // Resume puts the image back, and the daily checks go on.
+    launcher.view().image_settings().update_now();
+    launcher.frame();
+    run_update_now(&shared, &mut launcher);
+
+    assert!(!launcher.frame().image_paused);
+    assert_eq!(lock_screen(&fakes), ours);
+    assert!(fakes.scheduler.job.lock().unwrap().is_some());
 }
 
 /// A card's on-screen rect, which its app grows from (ANIM-08).

@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use crate::model::{
     Access, App, AppId, DataError, ImageCrop, ImageJob, NetworkState, Notification, Profile,
-    ProfileId, RecentUse, Rect, Shortcut, Size, TimeStyle,
+    ProfileId, RecentUse, Rect, Screen, Shortcut, TimeStyle, WallpaperMarker,
 };
 use crate::storage::StorageAdapter;
 
@@ -88,8 +88,12 @@ pub trait UsageAdapter: Send + Sync {
 pub trait WallpaperAdapter: Send + Sync {
     /// `Ok` if the lock-screen wallpaper can be set; otherwise the reason it can't (WALL-13).
     fn lock_screen_support(&self) -> Result<(), DataError>;
-    /// The size the lock-screen image is cropped to (WALL-06). Empty if the system can't say.
-    fn lock_screen_size(&self) -> Size;
+    /// The screen the lock screen shows on, which the lock-screen image is cropped for
+    /// (WALL-06, ADR 0028). Its size is empty if the system can't say.
+    fn screen(&self) -> Screen;
+    /// Whether the device folds, so the lock screen can show on screens of other shapes
+    /// (ADR 0030).
+    fn folds(&self) -> bool;
     /// Cuts `crop`'s region out of a JPEG image, scales it to `crop.size` and encodes it as a
     /// JPEG, without the original's metadata (WALL-06). Decoding is bounded: only the region is
     /// decoded, at 1/`crop.sample` of its size (SEC-02). It blocks: on Android, call it from a
@@ -98,8 +102,16 @@ pub trait WallpaperAdapter: Send + Sync {
     /// Fails with [`DataError::Invalid`] if the image doesn't decode, or not at
     /// `crop.image`'s size, so nothing undecodable is ever handed on (WALL-07).
     fn crop_image(&self, jpeg: &[u8], crop: &ImageCrop) -> Result<Vec<u8>, DataError>;
-    /// Sets the lock-screen wallpaper only; the home wallpaper is untouched (WALL-01).
-    fn set_lock_screen(&self, image: &[u8]) -> Result<(), DataError>;
+    /// Sets a JPEG image as the lock-screen wallpaper only; the home wallpaper and the system
+    /// lock screen itself are untouched (WALL-01, SEC-05). It blocks: on Android, call it from
+    /// a JVM thread other than the main one.
+    ///
+    /// Returns the marker the system gave the new wallpaper, or `None` if the platform can't
+    /// tell wallpapers apart (WALL-14, ADR 0030).
+    fn set_lock_screen(&self, image: &[u8]) -> Result<Option<WallpaperMarker>, DataError>;
+    /// The marker of the wallpaper the lock screen has now, whoever set it; `None` if the
+    /// platform can't tell (WALL-14, ADR 0030).
+    fn lock_screen_marker(&self) -> Option<WallpaperMarker>;
     /// Makes the lock screen show the home wallpaper again (WALL-12).
     fn reset_lock_screen(&self) -> Result<(), DataError>;
     /// Opens the system's wallpaper settings (WALL-12).
@@ -135,6 +147,10 @@ pub trait SchedulerAdapter: Send + Sync {
     /// the next MeeGone start (SRS 8.1).
     fn schedule_image_job(&self, job: ImageJob) -> Result<(), DataError>;
     fn cancel_image_job(&self) -> Result<(), DataError>;
+    /// Runs the image job's check at once, on the job's own thread, as an update the user
+    /// asked for: `ImageUpdater::update_now`, over any available connection (WALL-11,
+    /// ADR 0030). It doesn't wait for it; the check reports back as the job does.
+    fn update_image_now(&self) -> Result<(), DataError>;
 }
 
 /// Device configuration, the clock, and device-wide services: the home-app role, the next

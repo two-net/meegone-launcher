@@ -3,7 +3,8 @@
 //! [`Downloader::download`] takes one [`FeedImage`] through every step, and caches the result
 //! only when all of them succeed. On any failure the cache is untouched, so the current image,
 //! and the lock-screen wallpaper set from it, stay as they were (WALL-08):
-//! 1. Skip the download when storage is low, and say so (SRS 7.6).
+//! 1. Work out the size to crop to from the device's screen ([`lock_screen_target`]), and
+//!    skip the download when storage is low, and say so (SRS 7.6).
 //! 2. Pick the version that suits the lock screen ([`pick_version`], WALL-06).
 //! 3. Download it over HTTPS, at most [`MAX_DOWNLOAD_BYTES`] (WALL-06, WALL-07).
 //! 4. Check that it is a JPEG image of a usable size ([`check_image`], WALL-07, SEC-02).
@@ -11,14 +12,14 @@
 //!    than needed ([`plan_crop`], WALL-06, SEC-02), and check what comes back.
 //! 6. Cache the cropped image with its details, as the current one (WALL-09).
 //!
-//! Picking, checking and planning are pure, so they are tested without a device (MAINT-01).
-//! The updater, `ImageUpdater` in `meegone-lockimage-state`, decides when to download (ADR 0029),
-//! and the wallpaper is set from the cache (#29).
+//! Sizing, picking, checking and planning are pure, so they are tested without a device
+//! (MAINT-01). The updater, `ImageUpdater` in `meegone-lockimage-state`, decides when to
+//! download (ADR 0029), and sets the wallpaper from the cache (ADR 0030).
 
 use std::sync::Arc;
 
 use meegone_core_data::{
-    DataError, ImageCrop, NetworkAdapter, Size, SystemConfigAdapter, WallpaperAdapter,
+    DataError, ImageCrop, NetworkAdapter, Screen, Size, SystemConfigAdapter, WallpaperAdapter,
 };
 
 use crate::feed::{FORMAT_CHANGED, FeedImage, ImageVersion};
@@ -43,6 +44,39 @@ pub const IMAGE_TOO_LARGE: &str = "The image is too large";
 /// As [`DataError::Failed`]: storage is too low to download, so nothing was requested
 /// (SRS 7.6). A full disk, found while writing, says the same.
 pub const LOW_STORAGE: &str = "Not enough storage space";
+
+/// Screens at least this many dp across their smallest side turn freely, as MeeGone lets them
+/// (HOME-12): tablets, and foldables unfolded.
+pub const LARGE_SCREEN_DP: u32 = 600;
+
+/// The size to crop the lock-screen image to for `screen` (WALL-06, ADR 0030):
+/// - On a phone, whose lock screen stays upright, the screen's size in its natural
+///   orientation.
+/// - On a screen [`LARGE_SCREEN_DP`] or more across, or a device that `folds`, the lock screen
+///   may turn or change shape, so a square as wide as the screen's longest side. The system's
+///   own centre crop then fills the lock screen whichever way it is turned, and on a
+///   foldable's other screen.
+///
+/// Empty if the screen's size is unknown.
+pub fn lock_screen_target(screen: Screen, folds: bool) -> Size {
+    let Size { width, height } = screen.size;
+    if screen.size.is_empty() {
+        return Size::default();
+    }
+    // In dp, a length is its pixels × 160 / the density; an unknown density counts as a
+    // phone's.
+    let large = screen.density_dpi > 0
+        && u64::from(width.min(height)) * 160
+            >= u64::from(LARGE_SCREEN_DP) * u64::from(screen.density_dpi);
+    if !large && !folds {
+        return screen.size;
+    }
+    let side = width.max(height);
+    Size {
+        width: side,
+        height: side,
+    }
+}
 
 /// The version to download for a lock screen of `screen`'s size (WALL-06): the smallest
 /// portrait version at least as large as the screen, or else the largest version. Of two
@@ -176,7 +210,7 @@ impl Downloader {
     ///   usable;
     /// - the cache's error if it can't be saved.
     pub fn download(&self, image: &FeedImage, region: &str) -> Result<ImageRecord, DataError> {
-        let screen = self.wallpaper.lock_screen_size();
+        let screen = lock_screen_target(self.wallpaper.screen(), self.wallpaper.folds());
         if screen.is_empty() {
             return Err(DataError::Failed(
                 "The lock screen's size is unknown".into(),
@@ -217,6 +251,7 @@ impl Downloader {
             applied_at_ms: None,
             image: None,
             id: Some(image.id.clone()),
+            marker: None,
         };
         self.cache.put(record, &cropped)
     }
@@ -239,6 +274,79 @@ mod tests {
 
     const fn px(width: u32, height: u32) -> Size {
         Size { width, height }
+    }
+
+    const fn screen(size: Size, density_dpi: u32) -> Screen {
+        Screen { size, density_dpi }
+    }
+
+    #[test]
+    fn a_phone_crops_to_its_screen_upright() {
+        // WALL-06: a phone's lock screen stays upright (HOME-12).
+        for (phone, dpi) in [(S22, 425), (px(720, 1280), 320), (px(1440, 3200), 600)] {
+            assert_eq!(
+                lock_screen_target(screen(phone, dpi), false),
+                phone,
+                "{phone:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_screen_that_turns_crops_to_a_square_of_its_longest_side() {
+        // ADR 0030: a tablet, whatever its natural orientation.
+        assert_eq!(
+            lock_screen_target(screen(px(2560, 1600), 320), false),
+            px(2560, 2560)
+        );
+        assert_eq!(
+            lock_screen_target(screen(px(1200, 1920), 240), false),
+            px(1920, 1920)
+        );
+        // Exactly 600 dp across turns too; just under doesn't.
+        assert_eq!(
+            lock_screen_target(screen(px(1200, 1600), 320), false),
+            px(1600, 1600)
+        );
+        assert_eq!(
+            lock_screen_target(screen(px(1199, 1600), 320), false),
+            px(1199, 1600)
+        );
+    }
+
+    #[test]
+    fn a_foldable_crops_to_a_square_on_either_screen() {
+        // ADR 0030: folded, its cover screen is a phone's, but the lock screen may show on the
+        // inner one too, which turns.
+        let cover = screen(px(904, 2316), 420);
+        let inner = screen(px(1812, 2176), 420);
+
+        assert_eq!(lock_screen_target(cover, true), px(2316, 2316));
+        assert_eq!(lock_screen_target(inner, true), px(2176, 2176));
+        assert_eq!(lock_screen_target(inner, false), px(2176, 2176));
+    }
+
+    #[test]
+    fn an_unknown_screen_gives_no_size() {
+        assert!(lock_screen_target(Screen::default(), false).is_empty());
+        assert!(lock_screen_target(screen(Size::default(), 420), true).is_empty());
+        // A screen of unknown density is taken as a phone's.
+        assert_eq!(lock_screen_target(screen(S22, 0), false), S22);
+    }
+
+    #[test]
+    fn a_square_crop_keeps_the_middle_and_never_scales_up() {
+        // WALL-06 on a tablet: the feed's UHD image gives its full height, square.
+        let target = lock_screen_target(screen(px(2560, 1600), 320), false);
+        let versions = bing_versions();
+        let version = pick_version(&versions, target).unwrap();
+        assert_eq!((version.width, version.height), (3840, 2160));
+
+        let crop = plan_crop(px(3840, 2160), target);
+
+        assert_eq!((crop.left, crop.top), (840, 0));
+        assert_eq!((crop.width, crop.height), (2160, 2160));
+        assert_eq!(crop.size, px(2160, 2160));
     }
 
     fn version(width: u32, height: u32) -> ImageVersion {
@@ -498,7 +606,7 @@ mod tests {
     fn setup(download: Vec<u8>) -> Setup {
         let fakes = Fakes::default();
         *fakes.network.state.lock().unwrap() = NetworkState::Unmetered;
-        *fakes.wallpaper.lock_screen_size.lock().unwrap() = S22;
+        *fakes.wallpaper.screen.lock().unwrap() = screen(S22, 425);
         serve(&fakes, download);
         let cache = Arc::new(PersistentImageCache::new(fakes.storage.clone()));
         let downloader = Downloader::new(
@@ -563,6 +671,7 @@ mod tests {
                 applied_at_ms: None,
                 image: Some(ImageFile::A),
                 id: Some("OHR.Test20261119".into()),
+                marker: None,
             }
         );
         assert_eq!(cache.current(), Some(record.clone()));
@@ -573,7 +682,7 @@ mod tests {
         assert_eq!(*fakes.wallpaper.crops.lock().unwrap(), [crop]);
         // The crop is cached, never the download (PERF-08).
         assert_eq!(cache.image(&record), Ok(Some(fakes::jpeg(crop.size))));
-        // Nothing was set as the wallpaper yet: that is #29's.
+        // Nothing was set as the wallpaper: the updater does that (ADR 0030).
         assert_eq!(*fakes.wallpaper.lock_screen.lock().unwrap(), None);
     }
 
@@ -782,7 +891,7 @@ mod tests {
         let Setup {
             fakes, downloader, ..
         } = setup(uhd());
-        *fakes.wallpaper.lock_screen_size.lock().unwrap() = Size::default();
+        *fakes.wallpaper.screen.lock().unwrap() = Screen::default();
 
         let result = downloader.download(&feed_image("20261119"), "en-GB");
 

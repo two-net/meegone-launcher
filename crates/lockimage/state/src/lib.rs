@@ -1,10 +1,12 @@
 //! Lock-screen image state (SRS 4.5): whether the daily image is on or available, the current
-//! image's details, the feed region (WALL-05), "Use mobile data" (WALL-04), and how the daily
-//! checks are going (SRS 7.6).
+//! image's details, the feed region (WALL-05), "Use mobile data" (WALL-04), how the daily
+//! checks are going (SRS 7.6), "Update now" (WALL-11), whether daily updates are paused
+//! because someone else changed the lock screen (WALL-14), and resetting the lock screen once
+//! the image is off (WALL-12).
 //!
 //! Its options live in the settings store (ADR 0002); the image details and the check log live
-//! in this feature's image cache. [`ImageUpdater`] runs the daily check, off the main thread
-//! (ADR 0029); [`checks`] decides when.
+//! in this feature's image cache. [`ImageUpdater`] runs the daily check and sets the
+//! wallpaper, off the main thread (ADR 0029, ADR 0030); [`checks`] decides when.
 
 pub mod checks;
 mod updater;
@@ -18,7 +20,7 @@ use meegone_core_state::StateHolder;
 use meegone_lockimage_data::{ImageCache, ImageFeed, region};
 
 pub use checks::CheckStatus;
-pub use meegone_lockimage_data::{ImageFile, ImageRecord};
+pub use meegone_lockimage_data::{ImageFile, ImageRecord, Marker};
 pub use updater::{Checked, ImageUpdater, Wait};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -47,6 +49,14 @@ pub struct LockImageState {
     pub use_mobile_data: bool,
     /// How the daily checks are going (WALL-16, SRS 7.6).
     pub checks: CheckStatus,
+    /// Whether "Update now" is on its way (WALL-11).
+    pub updating: bool,
+    /// Whether someone else changed the lock screen's wallpaper after MeeGone set it, so daily
+    /// updates wait until the user resumes them (WALL-14).
+    pub paused: bool,
+    /// Whether the device didn't keep the image as the lock screen's wallpaper, so it may not
+    /// appear there (SRS C5, ADR 0030).
+    pub may_not_show: bool,
     pub problem: Option<String>,
 }
 
@@ -72,6 +82,18 @@ pub enum LockImageIntent {
     /// After days of failures, checks again as soon as the network and battery allow, within
     /// the day's budget (SRS 7.6, REL-04).
     TryAgain,
+    /// Fetches today's image at once, over any connection, and puts the current one back on
+    /// the lock screen, which resumes paused updates (WALL-11, WALL-14). Only while the daily
+    /// image is on; the update runs on the job's thread, and [`Self::Checked`] reports it.
+    UpdateNow,
+    /// A check, or "Update now", has run on the job's thread: reads the image and the checks
+    /// again (ADR 0029).
+    Checked,
+    /// Makes the lock screen show the home wallpaper again. Only while the daily image is off
+    /// (WALL-12).
+    ResetLockScreen,
+    /// Opens the system's wallpaper settings (WALL-12).
+    OpenWallpaperSettings,
     /// Opens the image details screen, from the card in Events (EVT-12, WALL-15). The screen
     /// covers the home views, so the shell opens it (ADR 0022); the holder ignores it.
     OpenDetails,
@@ -124,6 +146,15 @@ impl LockImageHolder {
             Ok(()) if options.enabled => ImageStatus::On,
             Ok(()) => ImageStatus::Off,
         };
+        let current = self
+            .state
+            .current
+            .as_ref()
+            .filter(|_| self.state.status == ImageStatus::On);
+        self.state.paused = current
+            .is_some_and(|current| updater::changed_by_someone_else(current, &*self.wallpaper));
+        self.state.may_not_show =
+            current.is_some_and(|current| current.marker == Some(Marker::NotKept));
     }
 
     fn set_enabled(&mut self, on: bool) {
@@ -185,6 +216,36 @@ impl LockImageHolder {
         self.refresh();
     }
 
+    /// The update runs on the job's thread, so this only asks for it; one at a time.
+    fn update_now(&mut self) {
+        if self.state.status != ImageStatus::On || self.state.updating {
+            return;
+        }
+        let result = self.scheduler.update_image_now();
+        self.state.updating = result.is_ok();
+        self.state.problem = result.err().map(|error| error.to_string());
+    }
+
+    fn checked(&mut self) {
+        self.state.updating = false;
+        self.refresh();
+    }
+
+    /// While the daily image is on, the next image would replace the home wallpaper on the lock
+    /// screen anyway, and the reset would look like someone else's change (WALL-14).
+    fn reset_lock_screen(&mut self) {
+        if self.state.status != ImageStatus::Off {
+            return;
+        }
+        let result = self.wallpaper.reset_lock_screen();
+        self.state.problem = result.err().map(|error| error.to_string());
+    }
+
+    fn open_wallpaper_settings(&mut self) {
+        let result = self.wallpaper.open_wallpaper_settings();
+        self.state.problem = result.err().map(|error| error.to_string());
+    }
+
     fn apply(&self, options: &ImageOptions) -> Result<(), DataError> {
         if options.enabled {
             self.arm(true, options.use_mobile_data)
@@ -223,6 +284,10 @@ impl StateHolder for LockImageHolder {
             LockImageIntent::SetRegion(choice) => self.set_region(choice),
             LockImageIntent::SetUseMobileData(on) => self.set_use_mobile_data(on),
             LockImageIntent::TryAgain => self.try_again(),
+            LockImageIntent::UpdateNow => self.update_now(),
+            LockImageIntent::Checked => self.checked(),
+            LockImageIntent::ResetLockScreen => self.reset_lock_screen(),
+            LockImageIntent::OpenWallpaperSettings => self.open_wallpaper_settings(),
             LockImageIntent::OpenDetails => {}
         }
     }
@@ -482,6 +547,7 @@ mod tests {
                     applied_at_ms: Some(1),
                     image: None,
                     id: None,
+                    marker: None,
                 },
                 b"image",
             )
@@ -666,5 +732,173 @@ mod tests {
         holder.handle(LockImageIntent::OpenDetails);
 
         assert_eq!(*holder.state(), before);
+    }
+
+    /// The daily image on, with an image the updater has set as the lock-screen wallpaper.
+    fn with_an_image_set(setup: &mut Setup) {
+        setup.holder.handle(LockImageIntent::SetEnabled(true));
+        *setup.fakes.network.state.lock().unwrap() = meegone_core_data::NetworkState::Unmetered;
+        let image = meegone_lockimage_data::fakes::feed_image("puffins", "20261119");
+        for version in &image.versions {
+            let size = meegone_core_data::Size {
+                width: version.width,
+                height: version.height,
+            };
+            setup
+                .fakes
+                .network
+                .responses
+                .lock()
+                .unwrap()
+                .insert(version.url.clone(), meegone_core_data::fakes::jpeg(size));
+        }
+        *setup.feed.image.lock().unwrap() = Some(image);
+        let updater = ImageUpdater::new(
+            setup.settings.clone(),
+            setup.cache.clone(),
+            setup.feed.clone(),
+            setup.fakes.network.clone(),
+            setup.fakes.wallpaper.clone(),
+            setup.fakes.scheduler.clone(),
+            setup.fakes.system.clone(),
+        );
+        assert!(matches!(updater.check(), Checked::New(_)));
+        setup.holder.handle(LockImageIntent::Checked);
+    }
+
+    #[test]
+    fn update_now_runs_on_the_jobs_thread_once_until_it_has_checked() {
+        // WALL-11
+        let mut setup = setup();
+        setup.holder.handle(LockImageIntent::SetEnabled(true));
+
+        setup.holder.handle(LockImageIntent::UpdateNow);
+        setup.holder.handle(LockImageIntent::UpdateNow);
+
+        assert!(setup.holder.state().updating);
+        assert_eq!(*setup.fakes.scheduler.updates_now.lock().unwrap(), 1);
+        // Other reads don't end it; only the check's report does.
+        setup.holder.handle(LockImageIntent::Refresh);
+        assert!(setup.holder.state().updating);
+
+        setup.holder.handle(LockImageIntent::Checked);
+
+        assert!(!setup.holder.state().updating);
+        setup.holder.handle(LockImageIntent::UpdateNow);
+        assert_eq!(*setup.fakes.scheduler.updates_now.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn update_now_does_nothing_while_the_image_is_off_or_unavailable() {
+        // WALL-02, WALL-13
+        let mut setup = setup();
+        setup.holder.handle(LockImageIntent::UpdateNow);
+
+        *setup.fakes.wallpaper.unsupported.lock().unwrap() = Some("Blocked".into());
+        setup.holder.handle(LockImageIntent::Refresh);
+        setup.holder.handle(LockImageIntent::UpdateNow);
+
+        assert!(!setup.holder.state().updating);
+        assert_eq!(*setup.fakes.scheduler.updates_now.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn an_image_on_the_lock_screen_is_neither_paused_nor_in_doubt() {
+        let mut setup = setup();
+        with_an_image_set(&mut setup);
+
+        let state = setup.holder.state();
+        assert!(state.current.as_ref().unwrap().applied());
+        assert!(!state.paused);
+        assert!(!state.may_not_show);
+    }
+
+    #[test]
+    fn someone_elses_wallpaper_pauses_the_daily_image_until_update_now() {
+        // WALL-14
+        let mut setup = setup();
+        with_an_image_set(&mut setup);
+
+        setup.fakes.wallpaper.changed_by_someone_else();
+        setup.holder.handle(LockImageIntent::Refresh);
+
+        assert!(setup.holder.state().paused);
+        assert_eq!(setup.holder.state().status, ImageStatus::On);
+
+        // Resuming is "Update now", which puts the image back.
+        setup.holder.handle(LockImageIntent::UpdateNow);
+        assert_eq!(*setup.fakes.scheduler.updates_now.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn turning_it_off_ends_the_pause() {
+        // WALL-12, WALL-14: nothing is cached, so nothing waits to resume.
+        let mut setup = setup();
+        with_an_image_set(&mut setup);
+        setup.fakes.wallpaper.changed_by_someone_else();
+        setup.holder.handle(LockImageIntent::Refresh);
+
+        setup.holder.handle(LockImageIntent::SetEnabled(false));
+
+        assert!(!setup.holder.state().paused);
+    }
+
+    #[test]
+    fn an_image_the_device_didnt_keep_may_not_show() {
+        // SRS C5
+        let mut setup = setup();
+        *setup.fakes.wallpaper.keeps.lock().unwrap() = false;
+
+        with_an_image_set(&mut setup);
+
+        assert!(setup.holder.state().may_not_show);
+        assert!(!setup.holder.state().paused);
+    }
+
+    #[test]
+    fn once_off_the_lock_screen_can_be_reset_to_the_home_wallpaper() {
+        // WALL-12, AC-17
+        let mut setup = setup();
+        with_an_image_set(&mut setup);
+        assert!(setup.fakes.wallpaper.lock_screen.lock().unwrap().is_some());
+
+        // Not while the daily image is on.
+        setup.holder.handle(LockImageIntent::ResetLockScreen);
+        assert_eq!(*setup.fakes.wallpaper.resets.lock().unwrap(), 0);
+
+        // Turning it off leaves the wallpaper as it is.
+        setup.holder.handle(LockImageIntent::SetEnabled(false));
+        assert!(setup.fakes.wallpaper.lock_screen.lock().unwrap().is_some());
+
+        setup.holder.handle(LockImageIntent::ResetLockScreen);
+
+        assert_eq!(*setup.fakes.wallpaper.resets.lock().unwrap(), 1);
+        assert_eq!(*setup.fakes.wallpaper.lock_screen.lock().unwrap(), None);
+        assert_eq!(setup.holder.state().problem, None);
+    }
+
+    #[test]
+    fn a_reset_or_wallpaper_settings_that_fail_say_why() {
+        // WALL-12, ARCH-09
+        let Setup {
+            fakes, mut holder, ..
+        } = setup();
+        *fakes.wallpaper.error.lock().unwrap() =
+            Some(DataError::Unsupported("No wallpaper settings".into()));
+
+        holder.handle(LockImageIntent::OpenWallpaperSettings);
+        assert_eq!(
+            holder.state().problem.as_deref(),
+            Some("No wallpaper settings")
+        );
+
+        *fakes.wallpaper.error.lock().unwrap() = None;
+        holder.handle(LockImageIntent::OpenWallpaperSettings);
+        assert_eq!(holder.state().problem, None);
+        assert_eq!(*fakes.wallpaper.settings_opened.lock().unwrap(), 1);
+
+        *fakes.wallpaper.error.lock().unwrap() = Some(DataError::Failed("Couldn't".into()));
+        holder.handle(LockImageIntent::ResetLockScreen);
+        assert_eq!(holder.state().problem.as_deref(), Some("Couldn't"));
     }
 }

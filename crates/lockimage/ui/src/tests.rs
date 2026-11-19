@@ -19,6 +19,7 @@ fn record(date: &str, image: Option<ImageFile>) -> ImageRecord {
         applied_at_ms: None,
         image,
         id: None,
+        marker: None,
     }
 }
 
@@ -293,4 +294,99 @@ fn settings_say_the_daily_image_is_unavailable_after_3_days_of_failures() {
         ..on()
     }));
     assert!(!section.daily_image_unavailable());
+}
+
+#[test]
+fn settings_switch_the_daily_image_and_say_why_it_cant_be_used() {
+    // WALL-02, WALL-13
+    let (latest, section, sent) = section(LockImageState::default());
+    assert_eq!(section.daily_image(), DailyImage::Off);
+    assert_eq!(section.unavailable_reason(), None);
+
+    section.daily_image_toggled(true);
+    assert!(matches!(
+        sent.borrow()[..],
+        [LockImageIntent::SetEnabled(true)]
+    ));
+
+    latest.set(Arc::new(on()));
+    assert_eq!(section.daily_image(), DailyImage::On);
+
+    latest.set(Arc::new(LockImageState {
+        status: ImageStatus::Unavailable("Blocked by device policy".into()),
+        ..LockImageState::default()
+    }));
+    assert_eq!(section.daily_image(), DailyImage::Unavailable);
+    assert_eq!(
+        section.unavailable_reason().as_deref(),
+        Some("Blocked by device policy")
+    );
+    assert!(!section.is_switch_enabled());
+}
+
+#[test]
+fn settings_offer_update_now_while_the_daily_image_is_on() {
+    // WALL-11
+    let (latest, section, sent) = section(on());
+    assert!(section.update_now_offered());
+    assert!(!section.updating());
+
+    section.update_now();
+    assert!(matches!(sent.borrow()[..], [LockImageIntent::UpdateNow]));
+
+    latest.set(Arc::new(LockImageState {
+        updating: true,
+        ..on()
+    }));
+    assert!(section.updating());
+
+    latest.set(Arc::new(LockImageState::default()));
+    assert!(!section.update_now_offered());
+}
+
+#[test]
+fn settings_say_when_updates_are_paused_or_the_image_may_not_show() {
+    // WALL-14, SRS C5
+    let (latest, section, _) = section(LockImageState {
+        paused: true,
+        may_not_show: true,
+        ..on()
+    });
+    assert!(section.paused());
+    assert!(section.may_not_show());
+
+    // Not once the daily image is off.
+    latest.set(Arc::new(LockImageState {
+        status: ImageStatus::Off,
+        paused: true,
+        may_not_show: true,
+        ..on()
+    }));
+    assert!(!section.paused());
+    assert!(!section.may_not_show());
+}
+
+#[test]
+fn once_off_settings_offer_the_reset_and_the_wallpaper_settings() {
+    // WALL-12
+    let (latest, section, sent) = section(LockImageState::default());
+    assert!(section.off_actions_offered());
+
+    section.reset_lock_screen();
+    section.open_wallpaper_settings();
+    assert!(matches!(
+        sent.borrow()[..],
+        [
+            LockImageIntent::ResetLockScreen,
+            LockImageIntent::OpenWallpaperSettings
+        ]
+    ));
+
+    latest.set(Arc::new(on()));
+    assert!(!section.off_actions_offered());
+    latest.set(Arc::new(LockImageState {
+        status: ImageStatus::Unavailable("No wallpapers".into()),
+        ..LockImageState::default()
+    }));
+    assert!(!section.off_actions_offered());
 }

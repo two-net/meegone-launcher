@@ -21,7 +21,8 @@ import java.util.concurrent.Executors;
  * and not while the battery is low. The job isn't persisted, so MeeGone needs no permission to
  * start at boot (SEC-03): as the home app it starts anyway, and {@link #checkAtStart} schedules
  * the job again. Each check runs on one thread of its own, never the main one, as its requests
- * block.
+ * block. "Update now" runs on the same thread, at once, without {@code JobScheduler} ({@link
+ * #updateNow}, WALL-11, ADR 0030).
  */
 public final class ImageJobService extends JobService {
     static {
@@ -83,6 +84,25 @@ public final class ImageJobService extends JobService {
             if (check(app)) {
                 MAIN.post(Bridge::imageChecked);
             }
+        });
+    }
+
+    /**
+     * "Update now" (WALL-11, ADR 0030): puts the current image back on the lock screen if it
+     * isn't there, then asks for today's image at once, over any connection. It runs on the
+     * checks' thread without {@code JobScheduler}, so it works where background scheduling
+     * doesn't, and the home always hears when it is done, which ends "Updating…". Called from
+     * Rust, through {@link Bridge}.
+     */
+    static void updateNow(Context context) {
+        Context app = context.getApplicationContext();
+        CHECKER.execute(() -> {
+            try {
+                nativeUpdateImageNow(Bridge.get(app), app.getFilesDir().getPath());
+            } catch (RuntimeException e) {
+                Log.w(TAG, "Updating the daily image failed: " + e.getMessage());
+            }
+            MAIN.post(Bridge::imageChecked);
         });
     }
 
@@ -170,4 +190,7 @@ public final class ImageJobService extends JobService {
      * Returns whether it reached the feed.
      */
     private static native boolean nativeCheckImage(Bridge bridge, String filesDir);
+
+    /** Runs "Update now", whatever the time, the battery or the network (WALL-11). */
+    private static native void nativeUpdateImageNow(Bridge bridge, String filesDir);
 }

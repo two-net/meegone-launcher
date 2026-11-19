@@ -223,6 +223,23 @@ impl Size {
     }
 }
 
+/// One of the device's screens, as the lock-screen image is cropped for it (WALL-06,
+/// ADR 0030).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Screen {
+    /// Its size in its natural orientation, so turning the device doesn't change it.
+    pub size: Size,
+    /// Its density in dots per inch: 160 is one pixel per dp.
+    pub density_dpi: u32,
+}
+
+/// The system's name for a wallpaper it holds, so MeeGone can tell whether the lock screen
+/// still has the one it set (WALL-14, ADR 0030). It means nothing else: markers are only
+/// compared. On Android it is `WallpaperManager`'s wallpaper id, negative when the lock screen
+/// has no wallpaper of its own and shows the home wallpaper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WallpaperMarker(pub i32);
+
 /// How to turn a downloaded image into the lock-screen image (WALL-06): keep the region at
 /// `left`, `top`, `width` × `height` of an `image`-sized picture, decode it at 1/`sample` of its
 /// size, and scale the result to `size`.

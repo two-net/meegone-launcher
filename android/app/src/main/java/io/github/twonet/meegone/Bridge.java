@@ -9,6 +9,7 @@ import android.app.Notification;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.SearchManager;
+import android.app.WallpaperManager;
 import android.app.role.RoleManager;
 import android.app.usage.UsageEvents;
 import android.app.usage.UsageStatsManager;
@@ -62,6 +63,7 @@ import android.view.Display;
 import android.view.HapticFeedbackConstants;
 import android.view.View;
 import android.view.WindowInsets;
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
@@ -86,13 +88,16 @@ import javax.net.ssl.SSLException;
  *
  * <p>Rust looks these methods up by name and signature on the main thread, so keep them in step
  * with {@code crates/core/data/src/android/system.rs}, {@code apps.rs}, {@code
- * notifications.rs}, {@code usage.rs}, {@code network.rs} and {@code wallpaper.rs}. Every method
+ * notifications.rs}, {@code usage.rs}, {@code network.rs}, {@code wallpaper.rs} and {@code
+ * scheduler.rs}. Every method
  * catches what Android may throw: an exception must never reach Rust. Logs hold only yes/no
  * answers and the kinds of errors, never user data such as which apps are installed or used, or
  * what a notification says (EVT-13, PRIV-03).
  */
 final class Bridge {
     private static final String TAG = "MeeGone";
+    /** The system Settings' wallpaper screen, which isn't among {@code Settings}' constants. */
+    private static final String WALLPAPER_SETTINGS = "android.settings.WALLPAPER_SETTINGS";
 
     // The app catalogue's records (ADR 0010), mirrored in crates/core/data/src/catalogue.rs.
     // An app: package, activity, label, profile serial number, flags, accent (ADR 0011),
@@ -1523,6 +1528,15 @@ final class Bridge {
     }
 
     /**
+     * "Update now": runs the daily image's update on its own thread at once, over any
+     * connection (WALL-11, ADR 0030). Returns null: it is on its way. Called from Rust.
+     */
+    String updateImageNow() {
+        ImageJobService.updateNow(context);
+        return null;
+    }
+
+    /**
      * The daily image's check reached the feed, on its own thread: the home reads the image and
      * how the checks are going again, on the main thread (ADR 0029). Does nothing before there
      * is a bridge.
@@ -1662,11 +1676,13 @@ final class Bridge {
     }
 
     /**
-     * The lock screen's width and height in pixels, which the daily image is cropped to
-     * (WALL-06, ADR 0028): the default display's, in its natural orientation, from its mode, so
-     * turning the device doesn't change it. Null if the system can't say. Called from Rust.
+     * The screen the lock screen shows on, which the daily image is cropped for (WALL-06, ADR
+     * 0028, ADR 0030): the default display's width and height in pixels, in its natural
+     * orientation, from its mode, so turning the device doesn't change them, and its density in
+     * dpi. Other displays, such as a monitor, never show the lock screen. Null if the system
+     * can't say. Called from Rust.
      */
-    int[] lockScreenSize() {
+    int[] screen() {
         try {
             Display display =
                     context.getSystemService(DisplayManager.class)
@@ -1677,11 +1693,127 @@ final class Bridge {
             Display.Mode mode = display.getMode();
             int width = mode.getPhysicalWidth();
             int height = mode.getPhysicalHeight();
-            return width > 0 && height > 0 ? new int[] {width, height} : null;
+            int density = context.getResources().getDisplayMetrics().densityDpi;
+            return width > 0 && height > 0 ? new int[] {width, height, density} : null;
         } catch (RuntimeException e) {
             Log.w(TAG, "Couldn't read the display's size: " + e.getClass().getSimpleName());
             return null;
         }
+    }
+
+    /**
+     * Whether the device folds, from its hinge-angle sensor, so the lock screen may show on a
+     * screen of another shape (ADR 0030). Called from Rust.
+     */
+    boolean folds() {
+        try {
+            return context.getPackageManager()
+                    .hasSystemFeature(PackageManager.FEATURE_SENSOR_HINGE_ANGLE);
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
+    /**
+     * Why the lock-screen wallpaper can't be set, or null if it can (WALL-13, ADR 0030): a
+     * device without wallpapers, or a policy that forbids changing them. Called from Rust.
+     */
+    String lockScreenUnsupported() {
+        try {
+            WallpaperManager wallpapers = WallpaperManager.getInstance(context);
+            if (!wallpapers.isWallpaperSupported()) {
+                return context.getString(R.string.wallpaper_not_supported);
+            }
+            if (!wallpapers.isSetWallpaperAllowed()) {
+                return context.getString(R.string.wallpaper_not_allowed);
+            }
+            return null;
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Couldn't ask about wallpapers: " + e.getClass().getSimpleName());
+            return context.getString(R.string.wallpaper_not_supported);
+        }
+    }
+
+    /**
+     * Sets a JPEG image as the lock screen's wallpaper only, without backup (WALL-01, ADR 0030):
+     * {@code FLAG_LOCK} leaves the home wallpaper as it is, and nothing here touches the system
+     * lock screen itself (SEC-05). Returns the new wallpaper's id, or -1 if it couldn't be set:
+     * {@code setStream} answers 0 when the system refused it and wrote nothing. It blocks while
+     * the system writes the image, so it answers -1 on the main thread without setting
+     * anything. Called from Rust, off the main thread.
+     */
+    int setLockScreen(byte[] jpeg) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            Log.w(TAG, "Refused to set a wallpaper on the main thread");
+            return -1;
+        }
+        try {
+            int id = WallpaperManager.getInstance(context)
+                    .setStream(new ByteArrayInputStream(jpeg), null, false,
+                            WallpaperManager.FLAG_LOCK);
+            if (id <= 0) {
+                Log.w(TAG, "The system didn't set the lock screen's wallpaper");
+                return -1;
+            }
+            return id;
+        } catch (IOException | RuntimeException e) {
+            Log.w(TAG, "Couldn't set the lock screen's wallpaper: "
+                    + e.getClass().getSimpleName());
+            return -1;
+        }
+    }
+
+    /**
+     * The id of the lock screen's wallpaper, whoever set it, negative while the lock screen has
+     * none of its own and shows the home wallpaper, or {@code Integer.MIN_VALUE} if the system
+     * can't say (WALL-14, ADR 0030). Called from Rust.
+     */
+    int lockScreenWallpaperId() {
+        try {
+            return WallpaperManager.getInstance(context).getWallpaperId(WallpaperManager.FLAG_LOCK);
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Couldn't read the lock screen's wallpaper: "
+                    + e.getClass().getSimpleName());
+            return Integer.MIN_VALUE;
+        }
+    }
+
+    /**
+     * Removes the lock screen's own wallpaper, so it shows the home wallpaper (WALL-12, ADR
+     * 0030). Returns null, or a short message if it couldn't. Called from Rust.
+     */
+    String resetLockScreen() {
+        try {
+            WallpaperManager.getInstance(context).clear(WallpaperManager.FLAG_LOCK);
+            return null;
+        } catch (IOException | RuntimeException e) {
+            Log.w(TAG, "Couldn't reset the lock screen: " + e.getClass().getSimpleName());
+            return context.getString(R.string.lock_screen_reset_failed);
+        }
+    }
+
+    /**
+     * Opens the system's wallpaper settings, where the user picks any wallpaper (WALL-12, ADR
+     * 0030): the system Settings' own wallpaper screen where it has one, as Samsung's and
+     * Google's do, or else the system's choice of wallpaper apps. Returns null, or written
+     * instructions if neither opens. Called from Rust.
+     */
+    String openWallpaperSettings() {
+        Activity current = activity;
+        Context from = current != null ? current : context;
+        Intent[] screens = {
+            new Intent(WALLPAPER_SETTINGS), new Intent(Intent.ACTION_SET_WALLPAPER),
+        };
+        for (Intent screen : screens) {
+            try {
+                from.startActivity(screen.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                return null;
+            } catch (ActivityNotFoundException | SecurityException e) {
+                // Try the next screen.
+            }
+        }
+        Log.w(TAG, "Couldn't open the wallpaper settings");
+        return context.getString(R.string.wallpaper_settings_unavailable);
     }
 
     /**

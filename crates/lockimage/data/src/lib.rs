@@ -10,6 +10,8 @@
 //!   WALL-09, ADR 0028).
 //! - [`Checks`]: what the daily image's checks have done, kept with the images so the updater
 //!   keeps to its budget across restarts (WALL-03, REL-04, ADR 0029).
+//! - [`Marker`]: how the lock screen took the image MeeGone set, so a change by someone else
+//!   can be told (WALL-14, ADR 0030).
 //!
 //! The updater that decides when to check (SRS 7.5) is in `meegone-lockimage-state`.
 
@@ -26,23 +28,24 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use meegone_core_data::storage::format::{Fields, Line};
 use meegone_core_data::storage::{Decode, Encode, Format, Migration, Reader, Writer, load, save};
-use meegone_core_data::{DataError, StorageAdapter, StoredFile};
+use meegone_core_data::{DataError, StorageAdapter, StoredFile, WallpaperMarker};
 
 pub use bing::BingFeed;
 pub use download::{
-    Downloader, IMAGE_TOO_LARGE, IMAGE_TOO_SMALL, LOW_STORAGE, MAX_DOWNLOAD_BYTES, MAX_SIDE,
-    MIN_SHORT_SIDE, NOT_AN_IMAGE, check_image, pick_version, plan_crop,
+    Downloader, IMAGE_TOO_LARGE, IMAGE_TOO_SMALL, LARGE_SCREEN_DP, LOW_STORAGE, MAX_DOWNLOAD_BYTES,
+    MAX_SIDE, MIN_SHORT_SIDE, NOT_AN_IMAGE, check_image, lock_screen_target, pick_version,
+    plan_crop,
 };
 pub use feed::{FORMAT_CHANGED, FeedImage, ImageFeed, ImageVersion};
 
 /// Version of the saved image-details format (MAINT-04). Changing the format means a new
 /// version, a migration in [`IMAGE_CACHE_MIGRATIONS`] and a fixture (ARCHITECTURE.md,
 /// "Persistence").
-pub const IMAGE_CACHE_VERSION: u32 = 3;
+pub const IMAGE_CACHE_VERSION: u32 = 4;
 
 /// Brings image details saved by older versions up to date, one version at a time.
 const IMAGE_CACHE_MIGRATIONS: [Migration; IMAGE_CACHE_VERSION as usize - 1] =
-    [add_image_file, add_ids_and_checks];
+    [add_image_file, add_ids_and_checks, add_markers];
 
 /// Version 2 names the file that holds each record's image (ADR 0022). Records saved before
 /// had no image.
@@ -73,6 +76,21 @@ fn add_ids_and_checks(body: &str) -> Option<String> {
         migrated.push('\n');
     }
     migrated.push_str("checks -\n");
+    Some(migrated)
+}
+
+/// Version 4 keeps the marker of the wallpaper each image was set as (ADR 0030). Images saved
+/// before were never set, so they have none.
+fn add_markers(body: &str) -> Option<String> {
+    let mut migrated = String::with_capacity(body.len() + 4);
+    for line in body.lines() {
+        let (key, value) = line.split_once(' ')?;
+        migrated.push_str(line);
+        if matches!(key, "current" | "previous") && value != "-" {
+            migrated.push_str(" -");
+        }
+        migrated.push('\n');
+    }
     Some(migrated)
 }
 
@@ -123,6 +141,28 @@ pub struct ImageRecord {
     /// The feed's id for the image, which tells it apart from the next day's (WALL-03). A
     /// record saved before ids were kept has none.
     pub id: Option<String>,
+    /// How the lock screen took the image when MeeGone set it (WALL-14). `None` until it is
+    /// set, and where the platform can't tell wallpapers apart.
+    pub marker: Option<Marker>,
+}
+
+impl ImageRecord {
+    /// Whether MeeGone has set it as the lock-screen wallpaper.
+    pub fn applied(&self) -> bool {
+        self.applied_at_ms.is_some()
+    }
+}
+
+/// How the lock screen took an image MeeGone set as its wallpaper (WALL-14, SRS C5,
+/// ADR 0030).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Marker {
+    /// The system's marker for it, read back as the lock screen's own. While the lock screen
+    /// has another, someone else changed it.
+    Set(WallpaperMarker),
+    /// Right after it was set, the lock screen had another wallpaper: the device didn't keep
+    /// it, so the image may not appear there.
+    NotKept,
 }
 
 /// What the daily image's checks have done (ADR 0029). The updater keeps it, so its budget
@@ -158,6 +198,15 @@ pub trait ImageCache: Send + Sync {
     fn put(&self, record: ImageRecord, image: &[u8]) -> Result<ImageRecord, DataError>;
     /// The bytes of `record`'s image, or `None` if it has none.
     fn image(&self, record: &ImageRecord) -> Result<Option<Vec<u8>>, DataError>;
+    /// Records that the current image, in `file`, was set as the lock-screen wallpaper at
+    /// `at_ms`, with its `marker` (SRS 7.5). Returns the record as saved, or `None` if the
+    /// current image is no longer the one in `file`, which then stays as it is.
+    fn applied(
+        &self,
+        file: ImageFile,
+        at_ms: u64,
+        marker: Option<Marker>,
+    ) -> Result<Option<ImageRecord>, DataError>;
     /// Deletes every cached image and its details, the check log included (WALL-12).
     fn clear(&self) -> Result<(), DataError>;
     /// What the daily image's checks have done (ADR 0029).
@@ -242,6 +291,28 @@ impl ImageCache for PersistentImageCache {
         }
     }
 
+    fn applied(
+        &self,
+        file: ImageFile,
+        at_ms: u64,
+        marker: Option<Marker>,
+    ) -> Result<Option<ImageRecord>, DataError> {
+        let _changing = self.changing();
+        let mut cached = self.cached();
+        let Some(current) = cached
+            .current
+            .as_mut()
+            .filter(|current| current.image == Some(file))
+        else {
+            return Ok(None);
+        };
+        current.applied_at_ms = Some(at_ms);
+        current.marker = marker;
+        let record = current.clone();
+        self.save(&cached)?;
+        Ok(Some(record))
+    }
+
     fn clear(&self) -> Result<(), DataError> {
         let _changing = self.changing();
         // The details go first, so nothing names an image while its file goes.
@@ -309,6 +380,7 @@ impl Encode for ImageRecord {
         self.applied_at_ms.encode(line);
         self.image.encode(line);
         self.id.encode(line);
+        self.marker.encode(line);
     }
 }
 
@@ -323,6 +395,7 @@ impl Decode for ImageRecord {
             applied_at_ms: Option::decode(fields)?,
             image: Option::decode(fields)?,
             id: Option::decode(fields)?,
+            marker: Option::decode(fields)?,
         })
     }
 }
@@ -354,6 +427,32 @@ impl Decode for Checks {
         })
     }
 }
+
+/// Saved as the system's number for it, or `not-kept`.
+impl Encode for Marker {
+    fn encode(&self, line: &mut Line<'_>) {
+        match self {
+            Self::Set(marker) => line.token(&marker.0.to_string()),
+            Self::NotKept => line.token(NOT_KEPT),
+        }
+    }
+}
+
+impl Decode for Marker {
+    fn decode(fields: &mut Fields<'_>) -> Option<Self> {
+        match fields.token()? {
+            NOT_KEPT => Some(Self::NotKept),
+            // Only as written: `+1` or `01` isn't a marker.
+            token => token
+                .parse()
+                .ok()
+                .filter(|number: &i32| number.to_string() == token)
+                .map(|number| Self::Set(WallpaperMarker(number))),
+        }
+    }
+}
+
+const NOT_KEPT: &str = "not-kept";
 
 /// Saved as `a` or `b`.
 impl Encode for ImageFile {
@@ -391,7 +490,8 @@ mod tests {
     const FIXTURES: [Fixture; IMAGE_CACHE_VERSION as usize] = [
         (include_str!("../fixtures/image-cache-v1.txt"), sample_v1),
         (include_str!("../fixtures/image-cache-v2.txt"), sample_v2),
-        (include_str!("../fixtures/image-cache-v3.txt"), sample),
+        (include_str!("../fixtures/image-cache-v3.txt"), sample_v3),
+        (include_str!("../fixtures/image-cache-v4.txt"), sample),
     ];
 
     fn record(date: &str) -> ImageRecord {
@@ -404,6 +504,7 @@ mod tests {
             applied_at_ms: None,
             image: None,
             id: None,
+            marker: None,
         }
     }
 
@@ -418,6 +519,7 @@ mod tests {
                 applied_at_ms: Some(1_763_272_800_000),
                 image: Some(ImageFile::B),
                 id: Some("OHR.Puffins_EN-GB0123456789".into()),
+                marker: Some(Marker::Set(WallpaperMarker(57))),
             }),
             previous: Some(ImageRecord {
                 image: Some(ImageFile::A),
@@ -436,9 +538,21 @@ mod tests {
         }
     }
 
+    /// Version 3 kept no markers.
+    fn sample_v3() -> Cached {
+        let mut cached = sample();
+        for record in [&mut cached.current, &mut cached.previous]
+            .into_iter()
+            .flatten()
+        {
+            record.marker = None;
+        }
+        cached
+    }
+
     /// Version 2 kept no ids and no checks.
     fn sample_v2() -> Cached {
-        let mut cached = sample();
+        let mut cached = sample_v3();
         for record in [&mut cached.current, &mut cached.previous]
             .into_iter()
             .flatten()
@@ -595,6 +709,81 @@ mod tests {
 
         *storage.error.lock().unwrap() = None;
         assert_eq!(cache.checks().attempts, 1);
+    }
+
+    #[test]
+    fn setting_the_current_image_records_its_time_and_marker() {
+        // SRS 7.5: "Record time and applied marker".
+        let (storage, cache) = cache();
+        let cached = cache.put(record("20261116"), b"one").unwrap();
+        assert!(!cached.applied());
+
+        let applied = cache
+            .applied(
+                cached.image.unwrap(),
+                1_000,
+                Some(Marker::Set(WallpaperMarker(7))),
+            )
+            .unwrap()
+            .unwrap();
+
+        assert!(applied.applied());
+        assert_eq!(applied.applied_at_ms, Some(1_000));
+        assert_eq!(applied.marker, Some(Marker::Set(WallpaperMarker(7))));
+        let restarted = PersistentImageCache::new(storage.clone());
+        assert_eq!(restarted.current(), Some(applied));
+        assert_eq!(restarted.image(&cached), Ok(Some(b"one".to_vec())));
+    }
+
+    #[test]
+    fn an_image_no_longer_current_isnt_recorded_as_set() {
+        // A newer image was cached meanwhile: the record is the newer one's.
+        let (_, cache) = cache();
+        let older = cache.put(record("20261115"), b"one").unwrap();
+        cache.put(record("20261116"), b"two").unwrap();
+
+        assert_eq!(
+            cache.applied(older.image.unwrap(), 1_000, Some(Marker::NotKept)),
+            Ok(None)
+        );
+
+        assert_eq!(cache.current().unwrap().applied_at_ms, None);
+        assert_eq!(cache.previous().unwrap().applied_at_ms, None);
+        assert_eq!(cache.applied(ImageFile::A, 1_000, None), Ok(None));
+    }
+
+    #[test]
+    fn every_kind_of_marker_is_saved_as_it_was() {
+        // ADR 0030: the system's number, negative included, and an image the device didn't
+        // keep.
+        let (storage, cache) = cache();
+        for marker in [
+            None,
+            Some(Marker::Set(WallpaperMarker(-1))),
+            Some(Marker::Set(WallpaperMarker(i32::MAX))),
+            Some(Marker::NotKept),
+        ] {
+            let cached = cache.put(record("20261116"), b"one").unwrap();
+            cache.applied(cached.image.unwrap(), 1, marker).unwrap();
+
+            let restarted = PersistentImageCache::new(storage.clone());
+            assert_eq!(restarted.current().unwrap().marker, marker);
+        }
+    }
+
+    #[test]
+    fn a_marker_written_any_other_way_doesnt_load() {
+        // MAINT-04
+        for marker in ["+1", "01", "x", "-0", "2147483648"] {
+            let body = format!("current 1 en-US T A - 1 a - {marker}\nprevious -\n");
+            let (storage, cache) = cache();
+            storage.files.lock().unwrap().insert(
+                StoredFile::ImageDetails,
+                seal("image-cache", IMAGE_CACHE_VERSION, &body),
+            );
+
+            assert_eq!(cache.current(), None, "{marker}");
+        }
     }
 
     #[test]

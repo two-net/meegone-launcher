@@ -22,6 +22,11 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
+    <!-- Setting the wallpaper (SRS 8.1), granted at install, for the daily image: MeeGone sets
+         only the lock screen's wallpaper, and never replaces or covers the lock screen itself
+         (WALL-01, SEC-05, ADR 0030). -->
+    <uses-permission android:name="android.permission.SET_WALLPAPER" />
+
     <!-- Applications lists every app with a launcher entry (APPS-01), and the first grid puts
          the default browser and camera first (APPS-05). From Android 11, other apps are hidden
          from MeeGone unless it declares them here. It is not a permission (SEC-03). -->

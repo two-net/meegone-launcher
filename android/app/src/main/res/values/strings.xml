@@ -212,6 +212,34 @@
     <string name="image_try_again">Try again</string>
     <!-- What Settings says when the system can't schedule the daily image's check (SRS 8.1). -->
     <string name="image_job_unavailable">Background work isn\'t available. The image is checked when MeeGone starts.</string>
+    <!-- Settings → Lock-screen image: the switch that puts Bing's image of the day on the lock
+         screen. Turning it on is the user's confirmation: nothing changes before (WALL-01,
+         WALL-02, SET-02). -->
+    <string name="daily_image">Daily lock-screen image</string>
+    <!-- Below that switch, disabled, when the device can't set wallpapers (WALL-13). -->
+    <string name="wallpaper_not_supported">This device doesn\'t support wallpapers.</string>
+    <string name="wallpaper_not_allowed">This device\'s policy doesn\'t allow changing the wallpaper.</string>
+    <!-- Settings → Lock-screen image: fetches today's image at once, over any connection, and
+         what it reads while it does (WALL-11). -->
+    <string name="image_update_now">Update now</string>
+    <string name="image_updating">Updating…</string>
+    <!-- Settings → Lock-screen image, when another app or the system's settings changed the
+         lock screen's wallpaper after MeeGone set it, with the button that puts the image back
+         and goes on (WALL-14). -->
+    <string name="image_paused">The lock screen\'s wallpaper was changed. Daily images are paused.</string>
+    <string name="image_resume">Resume</string>
+    <!-- Settings → Lock-screen image, when the device kept another wallpaper on its lock screen
+         right after MeeGone set the image (SRS C5). -->
+    <string name="image_may_not_show">This device may not show the image on its lock screen.</string>
+    <!-- Settings → Lock-screen image, once the daily image is off: the lock screen keeps the
+         last image until the user resets it, or picks another wallpaper (WALL-12). -->
+    <string name="reset_lock_screen">Reset lock screen to home wallpaper</string>
+    <string name="wallpaper_settings">Wallpaper settings</string>
+    <!-- Shown briefly once the lock screen shows the home wallpaper again (WALL-12). -->
+    <string name="lock_screen_reset">The lock screen shows the home wallpaper</string>
+    <string name="lock_screen_reset_failed">The lock screen couldn\'t be reset.</string>
+    <!-- Written instructions when the system has no wallpaper settings to open (SRS 8.1). -->
+    <string name="wallpaper_settings_unavailable">To change the wallpaper, open Settings, then Wallpaper.</string>
     <!-- Recent's card while MeeGone has no usage access: one plain sentence saying what is
          read and why (REC-02, ONB-02), and the button that opens the system's usage-access
          screen. -->

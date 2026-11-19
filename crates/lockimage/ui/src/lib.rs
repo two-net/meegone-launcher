@@ -119,6 +119,16 @@ impl Slot for ImageCard {
     }
 }
 
+/// The "Daily lock-screen image" switch (SET-02).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DailyImage {
+    Off,
+    On,
+    /// The device can't set the lock-screen wallpaper: the switch is disabled, with the reason
+    /// (WALL-13).
+    Unavailable,
+}
+
 /// The "Lock-screen image" section of Settings (SET-02).
 ///
 /// Clones share their state, so the shell can keep one for the host while Settings holds
@@ -139,9 +149,72 @@ impl ImageSettingsSection {
         !matches!(self.latest.get().status, ImageStatus::Unavailable(_))
     }
 
-    /// WALL-02, WALL-12
+    /// Whether the daily image is on, off or can't be used on this device (WALL-02, WALL-13).
+    pub fn daily_image(&self) -> DailyImage {
+        match self.latest.get().status {
+            ImageStatus::Off => DailyImage::Off,
+            ImageStatus::On => DailyImage::On,
+            ImageStatus::Unavailable(_) => DailyImage::Unavailable,
+        }
+    }
+
+    /// Why the device can't set the lock-screen wallpaper, while it can't (WALL-13).
+    pub fn unavailable_reason(&self) -> Option<String> {
+        match &self.latest.get().status {
+            ImageStatus::Unavailable(reason) => Some(reason.clone()),
+            _ => None,
+        }
+    }
+
+    /// The switch is the user's confirmation: nothing changes on the lock screen before it is
+    /// on (WALL-02, WALL-12).
     pub fn daily_image_toggled(&self, on: bool) {
         self.dispatch.send(LockImageIntent::SetEnabled(on));
+    }
+
+    /// "Update now" is offered while the daily image is on (WALL-11).
+    pub fn update_now_offered(&self) -> bool {
+        self.latest.get().status == ImageStatus::On
+    }
+
+    /// Whether "Update now" is on its way: it shows as "Updating…" and takes no tap (WALL-11).
+    pub fn updating(&self) -> bool {
+        self.latest.get().updating
+    }
+
+    /// "Update now", or Resume while paused, was tapped (WALL-11, WALL-14).
+    pub fn update_now(&self) {
+        self.dispatch.send(LockImageIntent::UpdateNow);
+    }
+
+    /// Whether the section says someone else changed the lock screen, so daily updates are
+    /// paused, with Resume (WALL-14).
+    pub fn paused(&self) -> bool {
+        let state = self.latest.get();
+        state.status == ImageStatus::On && state.paused
+    }
+
+    /// Whether the section says the image may not appear on this device's lock screen (SRS C5,
+    /// ADR 0030).
+    pub fn may_not_show(&self) -> bool {
+        let state = self.latest.get();
+        state.status == ImageStatus::On && state.may_not_show
+    }
+
+    /// "Reset lock screen to home wallpaper" and the shortcut to the system's wallpaper
+    /// settings are offered once the daily image is off (WALL-12).
+    pub fn off_actions_offered(&self) -> bool {
+        self.latest.get().status == ImageStatus::Off
+    }
+
+    /// "Reset lock screen to home wallpaper" was tapped (WALL-12).
+    pub fn reset_lock_screen(&self) {
+        self.dispatch.send(LockImageIntent::ResetLockScreen);
+    }
+
+    /// The shortcut to the system's wallpaper settings was tapped (WALL-12).
+    pub fn open_wallpaper_settings(&self) {
+        self.dispatch.send(LockImageIntent::OpenWallpaperSettings);
     }
 
     /// Whether "Show card in Events" is on (EVT-12).
@@ -205,8 +278,9 @@ impl ImageSettingsSection {
 
 impl Slot for ImageSettingsSection {
     fn render(&mut self, _tokens: &Tokens) {
-        // The host draws "Show card in Events", "Use mobile data" and "Daily image unavailable"
-        // until the Settings screen, #34, draws the rest, Region included (ADR 0006, ADR 0022,
-        // ADR 0027, ADR 0029).
+        // The host draws the daily image's switch, Update now, the pause, "Show card in
+        // Events", "Use mobile data", "Daily image unavailable" and, once the image is off, the
+        // reset and the wallpaper settings, until the Settings screen, #34, draws the rest,
+        // Region included (ADR 0006, ADR 0022, ADR 0027, ADR 0029, ADR 0030).
     }
 }

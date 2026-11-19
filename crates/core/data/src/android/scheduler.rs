@@ -5,6 +5,7 @@
 //! with the ones looked up here. `ImageJobService` schedules the job with `JobScheduler`: no
 //! earlier than asked, on the network asked for, and not while the battery is low. A job asked
 //! for while the job runs is scheduled when it finishes, so the running job isn't stopped.
+//! "Update now" runs the same check at once, on the job's thread (WALL-11, ADR 0030).
 
 use super::jni::{Env, GlobalRef, JValue, LocalRef, MethodId, Vm};
 use crate::adapters::SchedulerAdapter;
@@ -18,6 +19,8 @@ pub struct AndroidScheduler {
     schedule_image_job: MethodId,
     /// `String cancelImageJob()`: `null`, or a short message when the system can't schedule.
     cancel_image_job: MethodId,
+    /// `String updateImageNow()`: `null` once the update is on its way (WALL-11).
+    update_image_now: MethodId,
 }
 
 impl AndroidScheduler {
@@ -31,6 +34,7 @@ impl AndroidScheduler {
                 c"(JI)Ljava/lang/String;",
             )?,
             cancel_image_job: env.method_id(bridge, c"cancelImageJob", c"()Ljava/lang/String;")?,
+            update_image_now: env.method_id(bridge, c"updateImageNow", c"()Ljava/lang/String;")?,
             bridge: env.global_ref(bridge)?,
         })
     }
@@ -57,5 +61,11 @@ impl SchedulerAdapter for AndroidScheduler {
 
     fn cancel_image_job(&self) -> Result<(), DataError> {
         self.call(self.cancel_image_job, &[])
+    }
+
+    /// `ImageJobService` runs the update on the job's thread, without `JobScheduler`, so it
+    /// works where background scheduling doesn't (WALL-11, ADR 0030).
+    fn update_image_now(&self) -> Result<(), DataError> {
+        self.call(self.update_image_now, &[])
     }
 }

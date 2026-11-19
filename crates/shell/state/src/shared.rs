@@ -55,6 +55,14 @@ impl Shared {
     pub fn check_image(&self) -> bool {
         self.updater.check().attempted()
     }
+
+    /// "Update now" (WALL-11, ADR 0030): puts the current image back on the lock screen if it
+    /// isn't there, and asks the feed for today's image at once, over any connection. It
+    /// blocks, as [`check_image`](Self::check_image) does. The home then reads the image again
+    /// whatever happened, which ends "Updating…" (`ShellIntent::ImageChecked`).
+    pub fn update_image_now(&self) {
+        self.updater.update_now();
+    }
 }
 
 #[cfg(test)]

@@ -18,7 +18,7 @@ use crate::adapters::{
 };
 use crate::model::{
     Access, App, AppId, DataError, ImageCrop, ImageJob, NetworkState, Notification, Profile,
-    ProfileId, RecentUse, Rect, Shortcut, Size, TimeStyle,
+    ProfileId, RecentUse, Rect, Screen, Shortcut, Size, TimeStyle, WallpaperMarker,
 };
 use crate::storage::{MAX_STORED_BYTES, StorageAdapter, StoredFile, check_budget};
 
@@ -392,10 +392,26 @@ pub struct FakeWallpaper {
     /// When set, the lock-screen wallpaper can't be set, for this reason (WALL-13).
     pub unsupported: Mutex<Option<String>>,
     /// A typical phone screen, unless set.
-    pub lock_screen_size: Mutex<Size>,
+    pub screen: Mutex<Screen>,
+    /// Whether the device folds: false unless set.
+    pub folds: Mutex<bool>,
     /// The image last set as the lock-screen wallpaper; `None` after a reset.
     pub lock_screen: Mutex<Option<Vec<u8>>>,
     pub lock_screen_images_set: Mutex<u32>,
+    /// The marker of the lock screen's wallpaper now. It starts as the home wallpaper's, which
+    /// the lock screen shows until a wallpaper of its own is set (WALL-14).
+    pub lock_screen_marker: Mutex<WallpaperMarker>,
+    /// The marker the next wallpaper set gets; each one set takes the next.
+    pub next_marker: Mutex<i32>,
+    /// Whether the platform can tell wallpapers apart: true unless set (WALL-14).
+    pub tracks: Mutex<bool>,
+    /// Whether the system keeps the image as the lock screen's wallpaper: true unless set. When
+    /// false, the lock screen keeps the wallpaper it had, as a device that overrides it may
+    /// (SRS C5).
+    pub keeps: Mutex<bool>,
+    /// When set, setting a wallpaper fails with it, as when the system refuses the image.
+    pub refuses: Mutex<Option<DataError>>,
+    pub resets: Mutex<u32>,
     pub settings_opened: Mutex<u32>,
     /// Every crop asked for, in order.
     pub crops: Mutex<Vec<ImageCrop>>,
@@ -407,21 +423,52 @@ pub struct FakeWallpaper {
     pub error: Mutex<Option<DataError>>,
 }
 
+/// The marker of the home wallpaper, which the lock screen shows until it has its own.
+pub const HOME_WALLPAPER: WallpaperMarker = WallpaperMarker(-1);
+
+/// A phone screen 1080 × 2400 pixels at 420 dpi: about 411 × 914 dp.
+pub const PHONE_SCREEN: Screen = Screen {
+    size: Size {
+        width: 1080,
+        height: 2400,
+    },
+    density_dpi: 420,
+};
+
 impl Default for FakeWallpaper {
     fn default() -> Self {
         Self {
             unsupported: Mutex::default(),
-            lock_screen_size: Mutex::new(Size {
-                width: 1080,
-                height: 2400,
-            }),
+            screen: Mutex::new(PHONE_SCREEN),
+            folds: Mutex::default(),
             lock_screen: Mutex::default(),
             lock_screen_images_set: Mutex::default(),
+            lock_screen_marker: Mutex::new(HOME_WALLPAPER),
+            next_marker: Mutex::new(100),
+            tracks: Mutex::new(true),
+            keeps: Mutex::new(true),
+            refuses: Mutex::default(),
+            resets: Mutex::default(),
             settings_opened: Mutex::default(),
             crops: Mutex::default(),
             cropped: Mutex::default(),
             error: Mutex::default(),
         }
+    }
+}
+
+impl FakeWallpaper {
+    /// Someone other than MeeGone sets a lock-screen wallpaper of their own (WALL-14).
+    pub fn changed_by_someone_else(&self) {
+        let marker = self.take_marker();
+        *self.lock_screen.lock().unwrap() = Some(b"someone else's".to_vec());
+        *self.lock_screen_marker.lock().unwrap() = marker;
+    }
+
+    fn take_marker(&self) -> WallpaperMarker {
+        let mut next = self.next_marker.lock().unwrap();
+        *next += 1;
+        WallpaperMarker(*next - 1)
     }
 }
 
@@ -434,8 +481,12 @@ impl WallpaperAdapter for FakeWallpaper {
         }
     }
 
-    fn lock_screen_size(&self) -> Size {
-        *self.lock_screen_size.lock().unwrap()
+    fn screen(&self) -> Screen {
+        *self.screen.lock().unwrap()
+    }
+
+    fn folds(&self) -> bool {
+        *self.folds.lock().unwrap()
     }
 
     fn crop_image(&self, _jpeg: &[u8], crop: &ImageCrop) -> Result<Vec<u8>, DataError> {
@@ -449,16 +500,30 @@ impl WallpaperAdapter for FakeWallpaper {
             .unwrap_or_else(|| jpeg(crop.size)))
     }
 
-    fn set_lock_screen(&self, image: &[u8]) -> Result<(), DataError> {
+    fn set_lock_screen(&self, image: &[u8]) -> Result<Option<WallpaperMarker>, DataError> {
         self.lock_screen_support()?;
-        *self.lock_screen.lock().unwrap() = Some(image.to_vec());
+        check(&self.refuses)?;
         *self.lock_screen_images_set.lock().unwrap() += 1;
-        Ok(())
+        let marker = self.take_marker();
+        if *self.keeps.lock().unwrap() {
+            *self.lock_screen.lock().unwrap() = Some(image.to_vec());
+            *self.lock_screen_marker.lock().unwrap() = marker;
+        }
+        Ok(self.tracks.lock().unwrap().then_some(marker))
+    }
+
+    fn lock_screen_marker(&self) -> Option<WallpaperMarker> {
+        self.tracks
+            .lock()
+            .unwrap()
+            .then(|| *self.lock_screen_marker.lock().unwrap())
     }
 
     fn reset_lock_screen(&self) -> Result<(), DataError> {
         self.lock_screen_support()?;
         *self.lock_screen.lock().unwrap() = None;
+        *self.lock_screen_marker.lock().unwrap() = HOME_WALLPAPER;
+        *self.resets.lock().unwrap() += 1;
         Ok(())
     }
 
@@ -512,6 +577,9 @@ impl NetworkAdapter for FakeNetwork {
 pub struct FakeScheduler {
     /// The job waiting to run, if any (ARCH-07: there is only one).
     pub job: Mutex<Option<ImageJob>>,
+    /// How many times an update was asked to run at once (WALL-11). The test runs it, with
+    /// `Shared::update_image_now`, as the job's thread would.
+    pub updates_now: Mutex<u32>,
     pub error: Mutex<Option<DataError>>,
 }
 
@@ -525,6 +593,12 @@ impl SchedulerAdapter for FakeScheduler {
     fn cancel_image_job(&self) -> Result<(), DataError> {
         check(&self.error)?;
         *self.job.lock().unwrap() = None;
+        Ok(())
+    }
+
+    /// It runs on its own thread, without background scheduling, so `error` doesn't stop it.
+    fn update_image_now(&self) -> Result<(), DataError> {
+        *self.updates_now.lock().unwrap() += 1;
         Ok(())
     }
 }

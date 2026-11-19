@@ -37,7 +37,7 @@ pub use adapters::{
 };
 pub use model::{
     Access, App, AppId, DataError, ImageCrop, ImageJob, JobNetwork, NetworkState, Notification,
-    Profile, ProfileId, RecentUse, Rect, Rgb, Shortcut, Size, TimeStyle,
+    Profile, ProfileId, RecentUse, Rect, Rgb, Screen, Shortcut, Size, TimeStyle, WallpaperMarker,
 };
 pub use settings::{
     HomeTarget, ImageOptions, PersistentSettingsStore, RecentDensity, RecentWindow,

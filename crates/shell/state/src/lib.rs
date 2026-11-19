@@ -346,8 +346,9 @@ pub enum ShellIntent {
     /// The host decoded the image-of-the-day card's new thumbnail and is about to draw it over
     /// the one it showed, so the cross-fade starts (ANIM-22, ADR 0022).
     NewImageShown,
-    /// The daily image's check, off the main thread, reached the feed: it may have cached a
-    /// new image or changed how the checks are going (ADR 0029).
+    /// The daily image's check, off the main thread, reached the feed, or "Update now" ran: it
+    /// may have set a new image or changed how the checks are going, and "Updating…" ends
+    /// (ADR 0029, ADR 0030).
     ImageChecked,
     Apps(AppsIntent),
     Events(EventsIntent),
@@ -701,7 +702,7 @@ impl HomeShell {
             ShellIntent::NewImageShown => {
                 self.image_change.start(self.carousel.animation_scale());
             }
-            ShellIntent::ImageChecked => self.lockimage.dispatch(LockImageIntent::Refresh),
+            ShellIntent::ImageChecked => self.lockimage.dispatch(LockImageIntent::Checked),
             ShellIntent::Apps(AppsIntent::OpenSearch) => self.open_search(),
             ShellIntent::Apps(intent) => self.apps.dispatch(intent),
             ShellIntent::Events(intent) => self.events.dispatch(intent),
@@ -1638,7 +1639,8 @@ mod tests {
     };
     use meegone_core_data::{
         App, AppId, AppsAdapter, DataError, ImageCrop, Notification, NotificationsAdapter, Profile,
-        ProfileId, RecentUse, Rect, Shortcut, Size, UsageAdapter, WallpaperAdapter,
+        ProfileId, RecentUse, Rect, Screen, Shortcut, UsageAdapter, WallpaperAdapter,
+        WallpaperMarker,
     };
     use meegone_core_state::motion::{DRAG_LIFT_SCALE, ICON_PRESS_SCALE};
     use meegone_core_state::{Access, Health, Theme, ThemeChoice};
@@ -1991,6 +1993,7 @@ mod tests {
                     applied_at_ms: None,
                     image: None,
                     id: Some(format!("OHR.{date}")),
+                    marker: None,
                 },
                 date.as_bytes(),
             )
@@ -2062,15 +2065,23 @@ mod tests {
             panic!("wallpaper bug");
         }
 
-        fn lock_screen_size(&self) -> Size {
-            Size::default()
+        fn screen(&self) -> Screen {
+            Screen::default()
+        }
+
+        fn folds(&self) -> bool {
+            false
         }
 
         fn crop_image(&self, _jpeg: &[u8], _crop: &ImageCrop) -> Result<Vec<u8>, DataError> {
             panic!("wallpaper bug");
         }
 
-        fn set_lock_screen(&self, _image: &[u8]) -> Result<(), DataError> {
+        fn set_lock_screen(&self, _image: &[u8]) -> Result<Option<WallpaperMarker>, DataError> {
+            panic!("wallpaper bug");
+        }
+
+        fn lock_screen_marker(&self) -> Option<WallpaperMarker> {
             panic!("wallpaper bug");
         }
 
@@ -2147,6 +2158,34 @@ mod tests {
         shell.dispatch(ShellIntent::LockImage(LockImageIntent::SetEnabled(false)));
         assert!(!shared.check_image());
         assert_eq!(fakes.network.requests.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn update_now_runs_on_the_jobs_thread_and_the_home_hears_when_it_is_done() {
+        // WALL-11, ADR 0030
+        let fakes = Fakes::default();
+        let shared = Shared::new(fakes.platform());
+        let mut shell = HomeShell::compose_shared(&shared);
+        shell.dispatch(ShellIntent::LockImage(LockImageIntent::SetEnabled(true)));
+
+        shell.dispatch(ShellIntent::LockImage(LockImageIntent::UpdateNow));
+        assert!(shell.lockimage().state().updating);
+        assert_eq!(*fakes.scheduler.updates_now.lock().unwrap(), 1);
+
+        let update = {
+            let shared = shared.clone();
+            std::thread::spawn(move || shared.update_image_now())
+        };
+        update.join().unwrap();
+        // Offline: it asked at once, and failed.
+        assert_eq!(fakes.network.requests.lock().unwrap().len(), 1);
+
+        shell.dispatch(ShellIntent::ImageChecked);
+        assert!(!shell.lockimage().state().updating);
+        assert_eq!(
+            shell.lockimage().state().checks,
+            CheckStatus::Retrying("No connection".into())
+        );
     }
 
     #[test]

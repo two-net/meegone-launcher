@@ -37,9 +37,9 @@ use meegone_core_data::android::{self, Env, JObject, LocalRef, RawEnv};
 use meegone_core_data::{App, RecentDensity, RecentWindow, Rect, Rgb, accent};
 
 use crate::{
-    Age, AppMenuItem, BADGE_ROWS, Bounds, Cell, CellKey, Direction, EventsListMode, EventsRow,
-    FOLDER_COLUMNS, FolderId, GridLayout, HomeFrame, HomeView, Launcher, Layout, MenuItem,
-    NotificationMenuItem, PREVIEW_APPS, PinchEvent, PinchKind, PointerEvent, PointerKind,
+    Age, AppMenuItem, BADGE_ROWS, Bounds, Cell, CellKey, DailyImage, Direction, EventsListMode,
+    EventsRow, FOLDER_COLUMNS, FolderId, GridLayout, HomeFrame, HomeView, Launcher, Layout,
+    MenuItem, NotificationMenuItem, PREVIEW_APPS, PinchEvent, PinchKind, PointerEvent, PointerKind,
     RECENT_ROWS, RecentMode, RowTarget, SavedHome, SettingsGroup, Shared, ShellIntent, ShownCard,
     Surface,
 };
@@ -275,6 +275,36 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_ImageJobService_nati
         Ok(())
     });
     JBoolean::from(attempted)
+}
+
+/// `static void nativeUpdateImageNow(Bridge bridge, String filesDir)`: "Update now", on the
+/// job's thread (WALL-11, ADR 0030). It puts the current image back on the lock screen if it
+/// isn't there, then asks the feed for today's image at once, over any connection. The host
+/// then always tells the home (`nativeImageChecked`), so "Updating…" ends.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_ImageJobService_nativeUpdateImageNow(
+    env: RawEnv,
+    _class: JObject,
+    bridge: JObject,
+    files_dir: JObject,
+) {
+    // SAFETY: the JVM passes this thread's environment and live local references, which are
+    // used only during this call.
+    let (env, bridge, files_dir) = unsafe {
+        (
+            Env::from_raw(env),
+            LocalRef::from_raw(bridge),
+            LocalRef::from_raw(files_dir),
+        )
+    };
+    guarded(env, || {
+        shared(env, &bridge, &files_dir)?.update_image_now();
+        Ok(())
+    });
 }
 
 /// `static void nativeImageChecked()`: the daily image's check reached the feed, so the image
@@ -1586,6 +1616,132 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeImag
     })
 }
 
+/// `String nativeDailyImage(boolean on)`: Settings → Lock-screen image → "Daily lock-screen
+/// image" was switched: the user's confirmation, before which the lock screen never changes
+/// (WALL-02, WALL-12). Returns `null`, or a short message to show when it couldn't be done.
+/// Does nothing while the device can't set the wallpaper (WALL-13).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeDailyImage(
+    env: RawEnv,
+    _views: JObject,
+    on: JBoolean,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_image_message(env, |launcher| {
+        let section = launcher.view().image_settings();
+        let offered = section.daily_image() != DailyImage::Unavailable;
+        if offered {
+            section.daily_image_toggled(on != 0);
+        }
+        offered
+    })
+}
+
+/// `String nativeImageUpdateNow()`: "Update now", or Resume while daily updates are paused,
+/// was tapped (WALL-11, WALL-14). The update runs on the job's thread. Returns `null`, or a
+/// short message to show when it couldn't start. Does nothing unless it is offered and not on
+/// its way already.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeImageUpdateNow(
+    env: RawEnv,
+    _views: JObject,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_image_message(env, |launcher| {
+        let section = launcher.view().image_settings();
+        let offered = section.update_now_offered() && !section.updating();
+        if offered {
+            section.update_now();
+        }
+        offered
+    })
+}
+
+/// `String nativeResetLockScreen()`: "Reset lock screen to home wallpaper" was tapped
+/// (WALL-12). Returns `null` once the lock screen shows the home wallpaper, or a short message
+/// saying why it doesn't. Does nothing unless the daily image is off.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeResetLockScreen(
+    env: RawEnv,
+    _views: JObject,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_image_message(env, |launcher| {
+        let section = launcher.view().image_settings();
+        let offered = section.off_actions_offered();
+        if offered {
+            section.reset_lock_screen();
+        }
+        offered
+    })
+}
+
+/// `String nativeOpenWallpaperSettings()`: the shortcut to the system's wallpaper settings was
+/// tapped (WALL-12). Returns `null`, or a short message saying how to get there when the
+/// system has no such screen. Does nothing unless the daily image is off.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeOpenWallpaperSettings(
+    env: RawEnv,
+    _views: JObject,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_image_message(env, |launcher| {
+        let section = launcher.view().image_settings();
+        let offered = section.off_actions_offered();
+        if offered {
+            section.open_wallpaper_settings();
+        }
+        offered
+    })
+}
+
+/// `String nativeImageUnavailableReason()`: why the device can't set the lock-screen
+/// wallpaper, shown below the disabled switch, or `null` while it can (WALL-13).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeImageUnavailableReason(
+    env: RawEnv,
+    _views: JObject,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    let mut reason = std::ptr::null_mut();
+    guarded(env, || {
+        LAUNCHER.with_borrow(|launcher| {
+            let Some(launcher) = launcher.as_ref().filter(|l| l.shell().lockimage_ready()) else {
+                return Ok(());
+            };
+            let text = launcher.view().image_settings().unavailable_reason();
+            reason = message(env, text.as_deref())?;
+            Ok(())
+        })
+    });
+    reason
+}
+
 /// Asks something of the lock-screen image with `step`, applies it, and returns its `problem`
 /// as a message for the host to show, or `null`. Does nothing while it isn't working (ARCH-09).
 fn with_image_message(env: Env, step: impl FnOnce(&Launcher) -> bool) -> JObject {
@@ -2482,7 +2638,7 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRead
 }
 
 /// How many slots the frame has.
-const FRAME_SLOTS: usize = 130;
+const FRAME_SLOTS: usize = 135;
 /// The first of Recent's close-mode slots.
 const CLOSE_SLOTS: usize = 104;
 
@@ -2584,6 +2740,11 @@ const CLOSE_SLOTS: usize = 104;
 /// | 127 | Settings → Recent → Time window: 12, 24 or 72 hours, or -1 while Recent isn't working, so Settings doesn't offer it (REC-11) |
 /// | 128 | Settings → "Use mobile data": 1 on, 0 off, or -1 while the lock-screen image isn't working, so it isn't offered (WALL-04, ARCH-09) |
 /// | 129 | 1 while Settings shows "Daily image unavailable", with Try again (SRS 7.6); otherwise 0 |
+/// | 130 | Settings → "Daily lock-screen image": 1 on, 0 off, 2 unavailable, with its reason from `nativeImageUnavailableReason`, or -1 while the lock-screen image isn't working (WALL-02, WALL-13) |
+/// | 131 | Settings → "Update now": 0 offered, 1 on its way, or -1 not offered (WALL-11) |
+/// | 132 | 1 while Settings says someone else changed the lock screen, with Resume (WALL-14); otherwise 0 |
+/// | 133 | 1 while Settings says the image may not appear on this device's lock screen (SRS C5); otherwise 0 |
+/// | 134 | 1 while Settings offers "Reset lock screen to home wallpaper" and the wallpaper settings (WALL-12); otherwise 0 |
 fn frame_slots(frame: &HomeFrame) -> [i32; FRAME_SLOTS] {
     let [events, applications, recent] = frame.pages;
     let menu_items = frame.menu.map_or(0, |menu| {
@@ -2782,6 +2943,15 @@ fn frame_slots(frame: &HomeFrame) -> [i32; FRAME_SLOTS] {
         .map_or(-1, |window| window.hours() as i32);
     slots[window + 1] = frame.use_mobile_data.map_or(-1, i32::from);
     slots[window + 2] = i32::from(frame.image_unavailable);
+    slots[window + 3] = frame.daily_image.map_or(-1, |daily| match daily {
+        DailyImage::Off => 0,
+        DailyImage::On => 1,
+        DailyImage::Unavailable => 2,
+    });
+    slots[window + 4] = frame.update_now.map_or(-1, i32::from);
+    slots[window + 5] = i32::from(frame.image_paused);
+    slots[window + 6] = i32::from(frame.image_may_not_show);
+    slots[window + 7] = i32::from(frame.image_off_actions);
     slots
 }
 

@@ -13,9 +13,11 @@
 //!   them, and an app's notification settings (EVT-03 to EVT-08, ADR 0020, ADR 0021).
 //! - [`usage`]: usage access and the apps used recently (REC-02, REC-03, ADR 0023).
 //! - [`network`]: the network's state and HTTPS requests (SEC-01, SEC-02, ADR 0027).
-//! - [`wallpaper`]: the lock screen's size and cropping the daily image (WALL-06, ADR 0028).
-//!   Setting the wallpaper arrives with #29.
-//! - [`scheduler`]: the daily image's job (ARCH-07, WALL-03, ADR 0029).
+//! - [`wallpaper`]: the device's screens, cropping the daily image (WALL-06, ADR 0028), and
+//!   setting, reading and resetting the lock-screen wallpaper (WALL-01, WALL-12 to WALL-14,
+//!   ADR 0030).
+//! - [`scheduler`]: the daily image's job, and "Update now" (ARCH-07, WALL-03, WALL-11,
+//!   ADR 0029, ADR 0030).
 //!
 //! What isn't built yet answers with its "if unavailable" value (SRS 8.1), through
 //! [`not_yet`].

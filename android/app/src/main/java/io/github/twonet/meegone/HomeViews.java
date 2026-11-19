@@ -197,7 +197,13 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     // Settings → Lock-screen image's daily checks (WALL-04, SRS 7.6, ADR 0029):
     private static final int USE_MOBILE_DATA = 128; // 1 on, 0 off, -1 not offered
     private static final int IMAGE_UNAVAILABLE = 129; // 1 while "Daily image unavailable" shows
-    private static final int FRAME_SIZE = 130;
+    // Settings → Lock-screen image's wallpaper (WALL-02, WALL-11 to WALL-14, ADR 0030):
+    private static final int DAILY_IMAGE = 130; // ImageSettings.DAILY_IMAGE_*; -1 not offered
+    private static final int UPDATE_NOW = 131; // ImageSettings.UPDATE_NOW_*; -1 not offered
+    private static final int IMAGE_PAUSED = 132; // 1 while someone else changed the lock screen
+    private static final int IMAGE_MAY_NOT_SHOW = 133; // 1 while the device didn't keep it
+    private static final int IMAGE_OFF_ACTIONS = 134; // 1 while the reset is offered
+    private static final int FRAME_SIZE = 135;
     private static final int SEARCH_OPEN = 1; // the field has the keyboard
     private static final int SEARCH_RESULTS = 2; // the results show instead of the grid
     private static final int SEARCH_NOTHING = 4; // nothing matches
@@ -631,8 +637,33 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             toast(message);
         });
         recentSettings.setVisibility(GONE);
-        // Settings → Lock-screen image (EVT-12, ADR 0029), after Recent in SET-02's order.
+        // Settings → Lock-screen image (EVT-12, ADR 0029, ADR 0030), after Recent in SET-02's
+        // order.
         imageSettings = new ImageSettings(context, new ImageSettings.Listener() {
+            @Override
+            public void dailyImage(boolean on) {
+                answered(nativeDailyImage(on));
+            }
+
+            @Override
+            public void updateNow() {
+                answered(nativeImageUpdateNow());
+            }
+
+            @Override
+            public void resetLockScreen() {
+                String message = nativeResetLockScreen();
+                apply();
+                toast(message != null
+                        ? message
+                        : getContext().getString(R.string.lock_screen_reset));
+            }
+
+            @Override
+            public void openWallpaperSettings() {
+                answered(nativeOpenWallpaperSettings());
+            }
+
             @Override
             public void showCard(boolean on) {
                 answered(nativeShowImageCard(on));
@@ -1713,16 +1744,31 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     }
 
     /**
-     * Settings → Lock-screen image: "Show card in Events" (EVT-12), "Use mobile data" (WALL-04)
-     * and "Daily image unavailable" (SRS 7.6), offered only while the lock-screen image works
-     * (ARCH-09).
+     * Settings → Lock-screen image: the daily image's switch (WALL-02, WALL-13), the pause
+     * (WALL-14), "Daily image unavailable" (SRS 7.6), "Show card in Events" (EVT-12), "Use
+     * mobile data" (WALL-04), "Update now" (WALL-11) and, once it is off, the reset and the
+     * wallpaper settings (WALL-12), offered only while the lock-screen image works (ARCH-09).
      */
     private void applyImageSettings() {
-        int showCard = frame[SHOW_IMAGE_CARD];
-        imageSettings.setVisibility(showCard >= 0 ? VISIBLE : GONE);
+        int daily = frame[DAILY_IMAGE];
+        imageSettings.setVisibility(daily >= 0 ? VISIBLE : GONE);
+        if (daily < 0) {
+            return;
+        }
         imageSettings.colour(foreground, dim, frame[ACCENT]);
+        String reason = daily == ImageSettings.DAILY_IMAGE_UNAVAILABLE
+                ? nativeImageUnavailableReason()
+                : null;
         imageSettings.show(
-                showCard > 0, frame[USE_MOBILE_DATA] > 0, frame[IMAGE_UNAVAILABLE] != 0);
+                daily,
+                reason,
+                frame[UPDATE_NOW],
+                frame[IMAGE_PAUSED] != 0,
+                frame[IMAGE_MAY_NOT_SHOW] != 0,
+                frame[IMAGE_UNAVAILABLE] != 0,
+                frame[SHOW_IMAGE_CARD] > 0,
+                frame[USE_MOBILE_DATA] > 0,
+                frame[IMAGE_OFF_ACTIONS] != 0);
     }
 
     /**
@@ -2363,6 +2409,33 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
      * message to show when it couldn't be done.
      */
     private native String nativeImageTryAgain();
+
+    /**
+     * "Daily lock-screen image" was switched (WALL-02, WALL-12). Returns null, or a short
+     * message to show when it couldn't be done.
+     */
+    private native String nativeDailyImage(boolean on);
+
+    /**
+     * "Update now", or Resume, was tapped (WALL-11, WALL-14). Returns null, or a short message
+     * to show when it couldn't start.
+     */
+    private native String nativeImageUpdateNow();
+
+    /**
+     * "Reset lock screen to home wallpaper" was tapped (WALL-12). Returns null once the lock
+     * screen shows the home wallpaper, or a short message saying why it doesn't.
+     */
+    private native String nativeResetLockScreen();
+
+    /**
+     * "Wallpaper settings" was tapped (WALL-12). Returns null, or written instructions when the
+     * system has no such screen.
+     */
+    private native String nativeOpenWallpaperSettings();
+
+    /** Why the device can't set the lock-screen wallpaper, or null while it can (WALL-13). */
+    private native String nativeImageUnavailableReason();
 
     /** Fills {@code frame} with what to draw now, in the slots above. */
     private native void nativeRead(int[] frame);

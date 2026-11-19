@@ -26,7 +26,7 @@ use meegone_events_ui::EventsView;
 pub use meegone_events_ui::{
     EventsListMode, EventsMenuFrame, EventsRow, NotificationMenuItem, RowTarget,
 };
-pub use meegone_lockimage_ui::{CardContent, CheckStatus};
+pub use meegone_lockimage_ui::{CardContent, CheckStatus, DailyImage};
 use meegone_lockimage_ui::{ImageCard, ImageSettingsSection};
 pub use meegone_recent_ui::{Age, RecentMode, RecentWindow, ShownCard};
 use meegone_recent_ui::{RecentSettingsSection, RecentView};
@@ -326,6 +326,22 @@ pub struct HomeFrame {
     /// Settings → Lock-screen image shows "Daily image unavailable", with Try again: its checks
     /// have failed for 3 days (SRS 7.6, ADR 0029).
     pub image_unavailable: bool,
+    /// Settings → Lock-screen image → "Daily lock-screen image": on, off, or unavailable with
+    /// its reason (WALL-02, WALL-13); `None` while the lock-screen image isn't working
+    /// (ARCH-09).
+    pub daily_image: Option<DailyImage>,
+    /// Settings → Lock-screen image → "Update now" (WALL-11): offered while the daily image is
+    /// on, `Some(true)` while it is on its way.
+    pub update_now: Option<bool>,
+    /// Settings → Lock-screen image says someone else changed the lock screen, so daily
+    /// updates are paused, with Resume (WALL-14, ADR 0030).
+    pub image_paused: bool,
+    /// Settings → Lock-screen image says the image may not appear on this device's lock
+    /// screen (SRS C5, ADR 0030).
+    pub image_may_not_show: bool,
+    /// Settings → Lock-screen image offers "Reset lock screen to home wallpaper" and the
+    /// system's wallpaper settings: the daily image is off (WALL-12).
+    pub image_off_actions: bool,
     /// Settings → Recent → Time window (REC-11): the window chosen, or `None` while Recent isn't
     /// working, so Settings doesn't offer it (ARCH-09).
     pub recent_window: Option<RecentWindow>,
@@ -578,6 +594,14 @@ impl ShellView {
                 .then(|| self.image_settings.use_mobile_data()),
             image_unavailable: shell.lockimage_ready()
                 && self.image_settings.daily_image_unavailable(),
+            daily_image: shell
+                .lockimage_ready()
+                .then(|| self.image_settings.daily_image()),
+            update_now: (shell.lockimage_ready() && self.image_settings.update_now_offered())
+                .then(|| self.image_settings.updating()),
+            image_paused: shell.lockimage_ready() && self.image_settings.paused(),
+            image_may_not_show: shell.lockimage_ready() && self.image_settings.may_not_show(),
+            image_off_actions: shell.lockimage_ready() && self.image_settings.off_actions_offered(),
             recent_window: shell.recent_ready().then(|| self.recent_settings.window()),
             recent: shell.recent_ready().then(|| {
                 let revision = self.recent.show_cards(&shell.recent().state(), tokens);
