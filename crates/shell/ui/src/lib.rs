@@ -27,9 +27,10 @@ pub use meegone_events_ui::{
     EventsListMode, EventsMenuFrame, EventsRow, NotificationMenuItem, RowTarget,
 };
 pub use meegone_lockimage_ui::{
-    CardContent, CheckStatus, DailyImage, DetailsContent, UpdateStatus,
+    CardContent, CheckStatus, DailyImage, DetailsContent, PastAction, PastContent,
+    PastImageContent, Preview, UpdateStatus,
 };
-use meegone_lockimage_ui::{ImageCard, ImageDetailsScreen, ImageSettingsSection};
+use meegone_lockimage_ui::{ImageCard, ImageDetailsScreen, ImageSettingsSection, PastImagesScreen};
 pub use meegone_recent_ui::{Age, RecentMode, RecentWindow, ShownCard};
 use meegone_recent_ui::{RecentSettingsSection, RecentView};
 use meegone_settings_ui::{HomeBanner, SettingsView};
@@ -321,6 +322,12 @@ pub struct HomeFrame {
     /// What the image details screen shows: its revision, which changes whenever that does,
     /// or `None` while the screen isn't open (WALL-15, ADR 0031).
     pub image_details: Option<u32>,
+    /// The past week's images cover the home views, over the details screen or Settings
+    /// (WALL-17).
+    pub past_images_open: bool,
+    /// What the past week's screen shows: its revision, which changes whenever that does, or
+    /// `None` while the screen isn't open (WALL-17, ADR 0032).
+    pub past_images: Option<u32>,
     /// The daily image's status line, in Settings and on the details screen: its revision,
     /// which changes whenever it does, or `None` while the daily image is off or the
     /// lock-screen image isn't working (WALL-16, ARCH-09).
@@ -381,6 +388,7 @@ pub struct ShellView {
     hidden_apps: HiddenAppsSection,
     image_card: ImageCard,
     image_details: ImageDetailsScreen,
+    past_images: PastImagesScreen,
     image_settings: ImageSettingsSection,
     recent_settings: RecentSettingsSection,
     home_banner: HomeBanner,
@@ -391,17 +399,20 @@ impl ShellView {
         let outbox = Outbox::default();
 
         // The lock-screen image shows its card in Events, its section in Settings and its own
-        // details screen. All read the latest image state, which the shell keeps current.
+        // screens, the details and the past week. All read the latest image state, which the
+        // shell keeps current.
         let image = Latest::new(shell.lockimage().state());
         shell.subscribe_lockimage({
             let image = image.clone();
             move |state| image.set(Arc::clone(state))
         });
 
-        // The shell keeps a handle on each for the host (ADR 0022, ADR 0031).
+        // The shell keeps a handle on each for the host (ADR 0022, ADR 0031, ADR 0032).
         let image_card = ImageCard::new(image.clone(), dispatch(&outbox, ShellIntent::LockImage));
         let image_details =
             ImageDetailsScreen::new(image.clone(), dispatch(&outbox, ShellIntent::LockImage));
+        let past_images =
+            PastImagesScreen::new(image.clone(), dispatch(&outbox, ShellIntent::LockImage));
         let image_settings =
             ImageSettingsSection::new(image, dispatch(&outbox, ShellIntent::LockImage));
 
@@ -451,6 +462,7 @@ impl ShellView {
             hidden_apps,
             image_card,
             image_details,
+            past_images,
             image_settings,
             recent_settings,
             home_banner,
@@ -604,6 +616,9 @@ impl ShellView {
             image_details: state
                 .image_details_open
                 .then(|| self.image_details.revision()),
+            past_images_open: state.past_images_open,
+            // Open only while the lock-screen image works and its daily image is on.
+            past_images: state.past_images_open.then(|| self.past_images.revision()),
             image_status: (shell.lockimage_ready()
                 && self.image_settings.update_status().is_some())
             .then(|| self.image_settings.status_revision()),
@@ -661,6 +676,10 @@ impl ShellView {
     /// Draws what is on screen in the current theme (THEME-03).
     pub fn render(&mut self, shell: &HomeShell) {
         let tokens = tokens(shell.theme().state().theme);
+        if shell.state().past_images_open {
+            // The host draws the past week's images from `past_images` (ADR 0032).
+            return;
+        }
         if shell.state().settings_open {
             self.settings.render(&shell.settings().state(), tokens);
             return;
@@ -708,6 +727,11 @@ impl ShellView {
     /// The image details screen (WALL-15). Shown only while [`HomeFrame::image_details`] is.
     pub fn image_details(&self) -> &ImageDetailsScreen {
         &self.image_details
+    }
+
+    /// The past week's images (WALL-17). Shown only while [`HomeFrame::past_images`] is.
+    pub fn past_images(&self) -> &PastImagesScreen {
+        &self.past_images
     }
 
     /// Settings → Lock-screen image (SET-02). Offered only while

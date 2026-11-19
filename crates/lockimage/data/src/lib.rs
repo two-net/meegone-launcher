@@ -12,6 +12,9 @@
 //!   keeps to its budget across restarts (WALL-03, REL-04, ADR 0029).
 //! - [`Marker`]: how the lock screen took the image MeeGone set, so a change by someone else
 //!   can be told (WALL-14, ADR 0030).
+//! - [`ImageMemory`], kept in memory only: [`PastImages`], the past week's images and their
+//!   previews, for browsing and pinning one (WALL-17), and [`ImageTasks`], what the user asked
+//!   of the image job's thread: "Update now", browsing and pinning (ADR 0032).
 //!
 //! The updater that decides when to check (SRS 7.5) is in `meegone-lockimage-state`.
 
@@ -22,7 +25,9 @@ pub mod fakes;
 mod feed;
 mod jpeg;
 mod json;
+mod past;
 pub mod region;
+mod tasks;
 
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
@@ -36,16 +41,30 @@ pub use download::{
     MAX_SIDE, MIN_SHORT_SIDE, NOT_AN_IMAGE, check_image, lock_screen_target, pick_version,
     plan_crop,
 };
-pub use feed::{FORMAT_CHANGED, FeedImage, ImageFeed, ImageVersion};
+pub use feed::{FORMAT_CHANGED, FeedImage, ImageFeed, ImageVersion, PAST_WEEK_IMAGES};
+pub use past::{
+    MAX_PREVIEW_BYTES, MAX_PREVIEW_SIDE, PREVIEW_TOO_LARGE, PastImage, PastImages, Preview, Week,
+    check_preview,
+};
+pub use tasks::{ImageTask, ImageTasks};
+
+/// What the lock-screen image keeps in memory only, which the home and the image job's thread
+/// share (ADR 0032): the past week as last browsed, and what the user asked of the job's
+/// thread. Nothing of it is stored (PERF-08).
+#[derive(Debug, Default)]
+pub struct ImageMemory {
+    pub past: PastImages,
+    pub tasks: ImageTasks,
+}
 
 /// Version of the saved image-details format (MAINT-04). Changing the format means a new
 /// version, a migration in [`IMAGE_CACHE_MIGRATIONS`] and a fixture (ARCHITECTURE.md,
 /// "Persistence").
-pub const IMAGE_CACHE_VERSION: u32 = 4;
+pub const IMAGE_CACHE_VERSION: u32 = 5;
 
 /// Brings image details saved by older versions up to date, one version at a time.
 const IMAGE_CACHE_MIGRATIONS: [Migration; IMAGE_CACHE_VERSION as usize - 1] =
-    [add_image_file, add_ids_and_checks, add_markers];
+    [add_image_file, add_ids_and_checks, add_markers, add_pins];
 
 /// Version 2 names the file that holds each record's image (ADR 0022). Records saved before
 /// had no image.
@@ -88,6 +107,21 @@ fn add_markers(body: &str) -> Option<String> {
         migrated.push_str(line);
         if matches!(key, "current" | "previous") && value != "-" {
             migrated.push_str(" -");
+        }
+        migrated.push('\n');
+    }
+    Some(migrated)
+}
+
+/// Version 5 keeps whether the current image is pinned (WALL-17, ADR 0032). Nothing was pinned
+/// before.
+fn add_pins(body: &str) -> Option<String> {
+    let mut migrated = String::with_capacity(body.len() + 12);
+    for line in body.lines() {
+        let (key, value) = line.split_once(' ')?;
+        migrated.push_str(line);
+        if matches!(key, "current" | "previous") && value != "-" {
+            migrated.push_str(" false");
         }
         migrated.push('\n');
     }
@@ -144,6 +178,10 @@ pub struct ImageRecord {
     /// How the lock screen took the image when MeeGone set it (WALL-14). `None` until it is
     /// set, and where the platform can't tell wallpapers apart.
     pub marker: Option<Marker>,
+    /// Whether the user pinned it, so daily updates wait until it is unpinned (WALL-17). Only
+    /// the current image's counts; [`ImageCache::put`] and [`ImageCache::choose`] unpin the
+    /// image they make previous.
+    pub pinned: bool,
 }
 
 impl ImageRecord {
@@ -207,6 +245,13 @@ pub trait ImageCache: Send + Sync {
         at_ms: u64,
         marker: Option<Marker>,
     ) -> Result<Option<ImageRecord>, DataError>;
+    /// Makes the image in `file` current, pinned or not (WALL-17), without touching any image:
+    /// the current one stays, or the previous one and the current one change places. Returns
+    /// the record as saved, or `None` if no record's image is in `file`.
+    ///
+    /// The previous image comes back as not yet set on the lock screen, with no time or
+    /// marker: its old marker would look like someone else's wallpaper (WALL-14).
+    fn choose(&self, file: ImageFile, pinned: bool) -> Result<Option<ImageRecord>, DataError>;
     /// Deletes every cached image and its details, the check log included (WALL-12).
     fn clear(&self) -> Result<(), DataError>;
     /// What the daily image's checks have done (ADR 0029).
@@ -280,6 +325,9 @@ impl ImageCache for PersistentImageCache {
         self.storage.write(file.stored(), image)?;
         record.image = Some(file);
         cached.previous = cached.current.replace(record.clone());
+        if let Some(previous) = cached.previous.as_mut() {
+            previous.pinned = false;
+        }
         self.save(&cached)?;
         Ok(record)
     }
@@ -308,6 +356,36 @@ impl ImageCache for PersistentImageCache {
         };
         current.applied_at_ms = Some(at_ms);
         current.marker = marker;
+        let record = current.clone();
+        self.save(&cached)?;
+        Ok(Some(record))
+    }
+
+    fn choose(&self, file: ImageFile, pinned: bool) -> Result<Option<ImageRecord>, DataError> {
+        let _changing = self.changing();
+        let mut cached = self.cached();
+        let holds = |record: &Option<ImageRecord>| {
+            record
+                .as_ref()
+                .is_some_and(|record| record.image == Some(file))
+        };
+        if !holds(&cached.current) {
+            if !holds(&cached.previous) {
+                return Ok(None);
+            }
+            std::mem::swap(&mut cached.current, &mut cached.previous);
+            if let Some(current) = cached.current.as_mut() {
+                current.applied_at_ms = None;
+                current.marker = None;
+            }
+            if let Some(previous) = cached.previous.as_mut() {
+                previous.pinned = false;
+            }
+        }
+        let Some(current) = cached.current.as_mut() else {
+            return Ok(None);
+        };
+        current.pinned = pinned;
         let record = current.clone();
         self.save(&cached)?;
         Ok(Some(record))
@@ -381,6 +459,7 @@ impl Encode for ImageRecord {
         self.image.encode(line);
         self.id.encode(line);
         self.marker.encode(line);
+        self.pinned.encode(line);
     }
 }
 
@@ -396,6 +475,7 @@ impl Decode for ImageRecord {
             image: Option::decode(fields)?,
             id: Option::decode(fields)?,
             marker: Option::decode(fields)?,
+            pinned: bool::decode(fields)?,
         })
     }
 }
@@ -491,7 +571,8 @@ mod tests {
         (include_str!("../fixtures/image-cache-v1.txt"), sample_v1),
         (include_str!("../fixtures/image-cache-v2.txt"), sample_v2),
         (include_str!("../fixtures/image-cache-v3.txt"), sample_v3),
-        (include_str!("../fixtures/image-cache-v4.txt"), sample),
+        (include_str!("../fixtures/image-cache-v4.txt"), sample_v4),
+        (include_str!("../fixtures/image-cache-v5.txt"), sample),
     ];
 
     fn record(date: &str) -> ImageRecord {
@@ -505,6 +586,7 @@ mod tests {
             image: None,
             id: None,
             marker: None,
+            pinned: false,
         }
     }
 
@@ -520,6 +602,7 @@ mod tests {
                 image: Some(ImageFile::B),
                 id: Some("OHR.Puffins_EN-GB0123456789".into()),
                 marker: Some(Marker::Set(WallpaperMarker(57))),
+                pinned: true,
             }),
             previous: Some(ImageRecord {
                 image: Some(ImageFile::A),
@@ -538,9 +621,21 @@ mod tests {
         }
     }
 
+    /// Version 4 kept no pins.
+    fn sample_v4() -> Cached {
+        let mut cached = sample();
+        for record in [&mut cached.current, &mut cached.previous]
+            .into_iter()
+            .flatten()
+        {
+            record.pinned = false;
+        }
+        cached
+    }
+
     /// Version 3 kept no markers.
     fn sample_v3() -> Cached {
-        let mut cached = sample();
+        let mut cached = sample_v4();
         for record in [&mut cached.current, &mut cached.previous]
             .into_iter()
             .flatten()
@@ -774,15 +869,23 @@ mod tests {
     #[test]
     fn a_marker_written_any_other_way_doesnt_load() {
         // MAINT-04
-        for marker in ["+1", "01", "x", "-0", "2147483648"] {
-            let body = format!("current 1 en-US T A - 1 a - {marker}\nprevious -\n");
+        for (marker, loads) in [
+            ("1", true),
+            ("+1", false),
+            ("01", false),
+            ("x", false),
+            ("-0", false),
+            ("2147483648", false),
+        ] {
+            let body =
+                format!("current 1 en-US T A - 1 a - {marker} false\nprevious -\nchecks -\n");
             let (storage, cache) = cache();
             storage.files.lock().unwrap().insert(
                 StoredFile::ImageDetails,
                 seal("image-cache", IMAGE_CACHE_VERSION, &body),
             );
 
-            assert_eq!(cache.current(), None, "{marker}");
+            assert_eq!(cache.current().is_some(), loads, "{marker}");
         }
     }
 
@@ -864,6 +967,155 @@ mod tests {
             assert_eq!(cache.current(), None);
             assert_eq!(cache.previous(), None);
         }
+    }
+
+    #[test]
+    fn a_pin_stays_with_the_current_image_only() {
+        // WALL-17: the pin is written with the image, in one write.
+        let (storage, cache) = cache();
+        cache
+            .put(
+                ImageRecord {
+                    pinned: true,
+                    ..record("20261113")
+                },
+                b"pinned",
+            )
+            .unwrap();
+        let restarted = PersistentImageCache::new(storage.clone());
+        assert!(restarted.current().unwrap().pinned);
+
+        // A newer image makes it previous, and unpinned.
+        cache.put(record("20261119"), b"today").unwrap();
+        assert!(!cache.current().unwrap().pinned);
+        assert!(!cache.previous().unwrap().pinned);
+    }
+
+    #[test]
+    fn choosing_the_current_image_pins_or_unpins_it() {
+        // WALL-17
+        let (storage, cache) = cache();
+        let current = cache.put(record("20261119"), b"today").unwrap();
+        let file = current.image.unwrap();
+        let set = cache
+            .applied(file, 1_000, Some(Marker::Set(WallpaperMarker(7))))
+            .unwrap()
+            .unwrap();
+
+        let pinned = cache.choose(file, true).unwrap().unwrap();
+        assert_eq!(
+            pinned,
+            ImageRecord {
+                pinned: true,
+                ..set.clone()
+            }
+        );
+        assert_eq!(
+            PersistentImageCache::new(storage.clone()).current(),
+            Some(pinned)
+        );
+
+        // Still on the lock screen: its time and marker stay.
+        assert_eq!(cache.choose(file, false), Ok(Some(set)));
+        assert_eq!(cache.image(&current), Ok(Some(b"today".to_vec())));
+    }
+
+    #[test]
+    fn choosing_the_previous_image_brings_it_back_as_not_yet_set() {
+        // WALL-17, WALL-14: the previous image's old marker isn't the lock screen's any more.
+        let (storage, cache) = cache();
+        let older = cache.put(record("20261118"), b"yesterday").unwrap();
+        cache
+            .applied(
+                older.image.unwrap(),
+                1_000,
+                Some(Marker::Set(WallpaperMarker(7))),
+            )
+            .unwrap();
+        let newer = cache
+            .put(
+                ImageRecord {
+                    pinned: true,
+                    ..record("20261113")
+                },
+                b"pinned",
+            )
+            .unwrap();
+        let writes = storage.writes.lock().unwrap().len();
+
+        let chosen = cache.choose(older.image.unwrap(), false).unwrap().unwrap();
+
+        assert_eq!(chosen, older);
+        assert_eq!((chosen.applied_at_ms, chosen.marker), (None, None));
+        let restarted = PersistentImageCache::new(storage.clone());
+        assert_eq!(restarted.current(), Some(chosen.clone()));
+        assert_eq!(
+            restarted.previous(),
+            Some(ImageRecord {
+                pinned: false,
+                ..newer.clone()
+            })
+        );
+        // Only the details are written; both images stay where they were.
+        assert_eq!(storage.writes.lock().unwrap().len(), writes + 1);
+        assert_eq!(restarted.image(&chosen), Ok(Some(b"yesterday".to_vec())));
+        assert_eq!(restarted.image(&newer), Ok(Some(b"pinned".to_vec())));
+    }
+
+    #[test]
+    fn choosing_a_file_no_record_holds_changes_nothing() {
+        let (storage, cache) = cache();
+        assert_eq!(cache.choose(ImageFile::A, true), Ok(None));
+        cache.put(record("20261119"), b"today").unwrap();
+        let before = storage.files.lock().unwrap().clone();
+
+        assert_eq!(cache.choose(ImageFile::B, true), Ok(None));
+        assert_eq!(*storage.files.lock().unwrap(), before);
+    }
+
+    /// Storage that reads, but fails every write while `failing` is set.
+    struct WritesFail {
+        storage: FakeStorage,
+        failing: std::sync::atomic::AtomicBool,
+    }
+
+    impl StorageAdapter for WritesFail {
+        fn read(&self, file: StoredFile) -> Result<Option<Vec<u8>>, DataError> {
+            self.storage.read(file)
+        }
+
+        fn write(&self, file: StoredFile, bytes: &[u8]) -> Result<(), DataError> {
+            if self.failing.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(DataError::Failed("Disk error".into()));
+            }
+            self.storage.write(file, bytes)
+        }
+
+        fn remove(&self, file: StoredFile) -> Result<(), DataError> {
+            self.storage.remove(file)
+        }
+    }
+
+    #[test]
+    fn a_choice_that_cant_be_saved_changes_nothing() {
+        // REL-03
+        let storage = Arc::new(WritesFail {
+            storage: FakeStorage::default(),
+            failing: false.into(),
+        });
+        let cache = PersistentImageCache::new(storage.clone());
+        let older = cache.put(record("20261118"), b"yesterday").unwrap();
+        cache.put(record("20261119"), b"today").unwrap();
+        storage
+            .failing
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        assert!(cache.choose(older.image.unwrap(), true).is_err());
+
+        let current = cache.current().unwrap();
+        assert_eq!(current.date, "20261119");
+        assert!(!current.pinned);
+        assert_eq!(cache.previous().unwrap().date, "20261118");
     }
 
     #[test]

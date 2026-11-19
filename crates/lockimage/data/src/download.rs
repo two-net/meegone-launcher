@@ -193,9 +193,9 @@ impl Downloader {
         }
     }
 
-    /// Makes `image`, from the feed's `region`, the cached current image, and returns its
-    /// record as cached. The previous image stays, and the one before it is deleted (WALL-09).
-    /// Only then may it be set as the wallpaper (WALL-08).
+    /// Makes `image`, from the feed's `region`, the cached current image, pinned or not
+    /// (WALL-17), and returns its record as cached. The previous image stays, and the one
+    /// before it is deleted (WALL-09). Only then may it be set as the wallpaper (WALL-08).
     ///
     /// It makes at most one request and never retries; the updater keeps to the call budget
     /// (REL-04). It blocks: on Android, call it from a JVM thread other than the main one.
@@ -209,7 +209,12 @@ impl Downloader {
     /// - [`NOT_AN_IMAGE`], [`IMAGE_TOO_SMALL`] or [`IMAGE_TOO_LARGE`] for an image that isn't
     ///   usable;
     /// - the cache's error if it can't be saved.
-    pub fn download(&self, image: &FeedImage, region: &str) -> Result<ImageRecord, DataError> {
+    pub fn download(
+        &self,
+        image: &FeedImage,
+        region: &str,
+        pinned: bool,
+    ) -> Result<ImageRecord, DataError> {
         let screen = lock_screen_target(self.wallpaper.screen(), self.wallpaper.folds());
         if screen.is_empty() {
             return Err(DataError::Failed(
@@ -252,6 +257,7 @@ impl Downloader {
             image: None,
             id: Some(image.id.clone()),
             marker: None,
+            pinned,
         };
         self.cache.put(record, &cropped)
     }
@@ -591,6 +597,11 @@ mod tests {
             info_link: Some(format!("https://www.bing.com/search?q={date}")),
             offered_as_wallpaper: true,
             versions: bing_versions(),
+            preview: ImageVersion {
+                width: 800,
+                height: 480,
+                url: format!("https://www.bing.com/th?id=OHR.Test{date}_800x480.jpg"),
+            },
         }
     }
 
@@ -657,7 +668,7 @@ mod tests {
         } = setup(uhd());
 
         let record = downloader
-            .download(&feed_image("20261119"), "en-GB")
+            .download(&feed_image("20261119"), "en-GB", false)
             .unwrap();
 
         assert_eq!(
@@ -672,6 +683,7 @@ mod tests {
                 image: Some(ImageFile::A),
                 id: Some("OHR.Test20261119".into()),
                 marker: None,
+                pinned: false,
             }
         );
         assert_eq!(cache.current(), Some(record.clone()));
@@ -697,12 +709,12 @@ mod tests {
             downloader,
         } = setup(uhd());
         downloader
-            .download(&feed_image("20261118"), "en-GB")
+            .download(&feed_image("20261118"), "en-GB", false)
             .unwrap();
         let before = cached(&cache);
         serve(&fakes, huge);
 
-        let result = downloader.download(&feed_image("20261119"), "en-GB");
+        let result = downloader.download(&feed_image("20261119"), "en-GB", false);
 
         assert_eq!(result, Err(invalid("Too large")));
         assert_eq!(cached(&cache), before);
@@ -724,13 +736,13 @@ mod tests {
                 downloader,
             } = setup(uhd());
             downloader
-                .download(&feed_image("20261118"), "en-GB")
+                .download(&feed_image("20261118"), "en-GB", false)
                 .unwrap();
             *fakes.wallpaper.lock_screen.lock().unwrap() = Some(b"current".to_vec());
             let before = cached(&cache);
             serve(&fakes, download);
 
-            let result = downloader.download(&feed_image("20261119"), "en-GB");
+            let result = downloader.download(&feed_image("20261119"), "en-GB", false);
 
             assert_eq!(result, Err(invalid(problem)));
             assert_eq!(cached(&cache), before, "{problem}");
@@ -759,7 +771,9 @@ mod tests {
             ("20261119", px(1920, 1080)),
         ] {
             serve(&fakes, fakes::jpeg(size));
-            downloader.download(&feed_image(date), "en-GB").unwrap();
+            downloader
+                .download(&feed_image(date), "en-GB", false)
+                .unwrap();
             sizes.push(plan_crop(size, S22).size);
         }
 
@@ -795,7 +809,7 @@ mod tests {
         } = setup(uhd());
         *fakes.wallpaper.error.lock().unwrap() = Some(invalid("Couldn't decode"));
 
-        let result = downloader.download(&feed_image("20261119"), "en-GB");
+        let result = downloader.download(&feed_image("20261119"), "en-GB", false);
 
         assert_eq!(result, Err(invalid(NOT_AN_IMAGE)));
         assert_eq!(cache.current(), None);
@@ -817,7 +831,7 @@ mod tests {
             } = setup(uhd());
             *fakes.wallpaper.cropped.lock().unwrap() = Some(cropped);
 
-            let result = downloader.download(&feed_image("20261119"), "en-GB");
+            let result = downloader.download(&feed_image("20261119"), "en-GB", false);
 
             assert_eq!(result, Err(invalid(NOT_AN_IMAGE)));
             assert_eq!(cache.current(), None);
@@ -833,7 +847,7 @@ mod tests {
         } = setup(uhd());
         *fakes.wallpaper.error.lock().unwrap() = Some(DataError::Failed("Out of memory".into()));
 
-        let result = downloader.download(&feed_image("20261119"), "en-GB");
+        let result = downloader.download(&feed_image("20261119"), "en-GB", false);
 
         assert_eq!(result, Err(DataError::Failed("Out of memory".into())));
         assert_eq!(cache.current(), None);
@@ -852,7 +866,7 @@ mod tests {
             version.url = version.url.replace("https://", "http://");
         }
 
-        let result = downloader.download(&image, "en-GB");
+        let result = downloader.download(&image, "en-GB", false);
 
         assert_eq!(result, Err(invalid(FORMAT_CHANGED)));
         assert!(fakes.network.requests.lock().unwrap().is_empty());
@@ -869,7 +883,7 @@ mod tests {
         } = setup(uhd());
         *fakes.system.free_storage_bytes.lock().unwrap() = Some(19_999_999);
 
-        let result = downloader.download(&feed_image("20261119"), "en-GB");
+        let result = downloader.download(&feed_image("20261119"), "en-GB", false);
 
         assert_eq!(result, Err(DataError::Failed(LOW_STORAGE.into())));
         assert!(fakes.network.requests.lock().unwrap().is_empty());
@@ -880,7 +894,7 @@ mod tests {
             *fakes.system.free_storage_bytes.lock().unwrap() = free;
             assert!(
                 downloader
-                    .download(&feed_image("20261119"), "en-GB")
+                    .download(&feed_image("20261119"), "en-GB", false)
                     .is_ok()
             );
         }
@@ -893,7 +907,7 @@ mod tests {
         } = setup(uhd());
         *fakes.wallpaper.screen.lock().unwrap() = Screen::default();
 
-        let result = downloader.download(&feed_image("20261119"), "en-GB");
+        let result = downloader.download(&feed_image("20261119"), "en-GB", false);
 
         assert_eq!(
             result,
@@ -913,12 +927,12 @@ mod tests {
             downloader,
         } = setup(uhd());
         downloader
-            .download(&feed_image("20261118"), "en-GB")
+            .download(&feed_image("20261118"), "en-GB", false)
             .unwrap();
         let before = cached(&cache);
         *fakes.network.state.lock().unwrap() = NetworkState::Offline;
 
-        let result = downloader.download(&feed_image("20261119"), "en-GB");
+        let result = downloader.download(&feed_image("20261119"), "en-GB", false);
 
         assert_eq!(result, Err(DataError::Offline));
         assert_eq!(cached(&cache), before);
@@ -933,11 +947,11 @@ mod tests {
             downloader,
         } = setup(uhd());
         downloader
-            .download(&feed_image("20261118"), "en-GB")
+            .download(&feed_image("20261118"), "en-GB", false)
             .unwrap();
         *fakes.storage.error.lock().unwrap() = Some(DataError::Failed(LOW_STORAGE.into()));
 
-        let result = downloader.download(&feed_image("20261119"), "en-GB");
+        let result = downloader.download(&feed_image("20261119"), "en-GB", false);
 
         assert_eq!(result, Err(DataError::Failed(LOW_STORAGE.into())));
         *fakes.storage.error.lock().unwrap() = None;

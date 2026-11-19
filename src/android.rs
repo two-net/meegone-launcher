@@ -39,9 +39,9 @@ use meegone_core_data::{App, RecentDensity, RecentWindow, Rect, Rgb, accent};
 use crate::{
     Age, AppMenuItem, BADGE_ROWS, Bounds, Cell, CellKey, CheckStatus, DailyImage, Direction,
     EventsListMode, EventsRow, FOLDER_COLUMNS, FolderId, GridLayout, HomeFrame, HomeView, Launcher,
-    Layout, MenuItem, NotificationMenuItem, PREVIEW_APPS, PinchEvent, PinchKind, PointerEvent,
-    PointerKind, RECENT_ROWS, RecentMode, RowTarget, SavedHome, SettingsGroup, Shared, ShellIntent,
-    ShownCard, Surface,
+    Layout, MenuItem, NotificationMenuItem, PREVIEW_APPS, PastAction, PinchEvent, PinchKind,
+    PointerEvent, PointerKind, RECENT_ROWS, RecentMode, RowTarget, SavedHome, SettingsGroup,
+    Shared, ShellIntent, ShownCard, Surface,
 };
 
 /// JNI's `jboolean`.
@@ -277,16 +277,17 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_ImageJobService_nati
     JBoolean::from(attempted)
 }
 
-/// `static void nativeUpdateImageNow(Bridge bridge, String filesDir)`: "Update now", on the
-/// job's thread (WALL-11, ADR 0030). It puts the current image back on the lock screen if it
-/// isn't there, then asks the feed for today's image at once, over any connection. The host
-/// then always tells the home (`nativeImageChecked`), so "Updating…" ends.
+/// `static void nativeRunImageTasks(Bridge bridge, String filesDir)`: what the user asked of
+/// the daily image, on the job's thread, one task after another: "Update now", Resume and
+/// Unpin (WALL-11, WALL-14, WALL-17, ADR 0030), browsing the past week and pinning one of its
+/// images (WALL-17, ADR 0032). The host then always tells the home (`nativeImageChecked`), so
+/// what has run no longer shows as on its way.
 ///
 /// # Safety
 ///
 /// Called only by the JVM, with the arguments of that native method.
 #[unsafe(no_mangle)]
-pub unsafe extern "system" fn Java_io_github_twonet_meegone_ImageJobService_nativeUpdateImageNow(
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_ImageJobService_nativeRunImageTasks(
     env: RawEnv,
     _class: JObject,
     bridge: JObject,
@@ -302,7 +303,7 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_ImageJobService_nati
         )
     };
     guarded(env, || {
-        shared(env, &bridge, &files_dir)?.update_image_now();
+        shared(env, &bridge, &files_dir)?.run_image_tasks();
         Ok(())
     });
 }
@@ -1750,7 +1751,8 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeImag
 /// 4. the feed region it is from, a BCP 47 tag such as `en-GB`, which the host names;
 /// 5. the file that holds the image, relative to the folder `nativeStart` was given;
 /// 6. the image's key, which changes only when the image does;
-/// 7. "1" while More info is offered: the image has a link and a browser can open it.
+/// 7. "1" while More info is offered: the image has a link and a browser can open it;
+/// 8. "1" while the image is pinned, so the screen offers Unpin (WALL-17).
 ///
 /// Empty unless the frame's slot 135 says the screen shows.
 ///
@@ -1781,7 +1783,8 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeImag
                     content.region.as_str(),
                     content.image_path,
                     content.image_key.as_str(),
-                    if content.more_info { "1" } else { "" },
+                    flag(content.more_info),
+                    flag(content.pinned),
                 ]
             });
             let array = env
@@ -1800,7 +1803,9 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeImag
 ///    before the first;
 /// 2. the last problem, in plain words, or empty while nothing fails;
 /// 3. how the checks are going: "retrying", "unavailable" after 3 days of failures (SRS 7.6),
-///    or empty.
+///    or empty;
+/// 4. "1" while the image is pinned, so daily updates wait: the line says so in place of the
+///    checks, with Unpin (WALL-17).
 ///
 /// Empty unless the frame's slot 136 says the status shows.
 ///
@@ -1829,7 +1834,12 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeImag
                     CheckStatus::Retrying(problem) => (problem.as_str(), "retrying"),
                     CheckStatus::Unavailable(problem) => (problem.as_str(), "unavailable"),
                 };
-                vec![status.updated.as_deref().unwrap_or(""), problem, kind]
+                vec![
+                    status.updated.as_deref().unwrap_or(""),
+                    problem,
+                    kind,
+                    flag(status.pinned),
+                ]
             });
             let array = env
                 .new_string_array(texts.into_iter())
@@ -1881,6 +1891,208 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeImag
             launcher.frame();
         }
     });
+}
+
+/// `String[] nativePastImages()`: what the past week's screen shows, as of the last frame
+/// (WALL-17, ADR 0032), mirrored in `PastImages.java`. Two fields, then seven for each image,
+/// today's first:
+/// 1. "1" while the week is being read;
+/// 2. the last problem browsing or pinning had, in plain words, or empty;
+///
+/// and for each image:
+/// 1. the feed's id, by which the host keeps its decoded preview;
+/// 2. its title, as plain text (SEC-02);
+/// 3. its attribution, as the source provides it (LEGAL-03);
+/// 4. its date in the device's language, or empty to leave it out (L10N-03);
+/// 5. "1" while it is the image the lock screen has;
+/// 6. what it offers: "pin", "later" (Pin, not now), "pinning", "unpin", "unpinning" or
+///    "not-offered" (LEGAL-04);
+/// 7. "1" while it has a preview, which `nativePastImagePreview` gives.
+///
+/// Empty unless the frame's slot 138 says the screen shows.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativePastImages(
+    env: RawEnv,
+    _views: JObject,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    let mut fields = std::ptr::null_mut();
+    guarded(env, || {
+        LAUNCHER.with_borrow(|launcher| {
+            let launcher = launcher.as_ref().ok_or("MeeGone hasn't started")?;
+            let content = launcher
+                .shell()
+                .past_images_offered()
+                .then(|| launcher.view().past_images().content())
+                .flatten();
+            let texts: Vec<&str> = content.as_ref().map_or_else(Vec::new, |content| {
+                let mut texts = vec![
+                    flag(content.loading),
+                    content.problem.as_deref().unwrap_or(""),
+                ];
+                for image in &content.images {
+                    texts.extend([
+                        image.id.as_str(),
+                        image.title.as_str(),
+                        image.attribution.as_str(),
+                        image.date.as_str(),
+                        flag(image.current),
+                        match image.action {
+                            PastAction::Pin => "pin",
+                            PastAction::PinLater => "later",
+                            PastAction::Pinning => "pinning",
+                            PastAction::Unpin => "unpin",
+                            PastAction::Unpinning => "unpinning",
+                            PastAction::NotOffered => "not-offered",
+                        },
+                        flag(image.preview.is_some()),
+                    ]);
+                }
+                texts
+            });
+            let array = env
+                .new_string_array(texts.into_iter())
+                .map_err(|error| format!("Couldn't pass the past week: {error}"))?;
+            fields = array.into_raw();
+            Ok(())
+        })
+    });
+    fields
+}
+
+/// `byte[] nativePastImagePreview(int revision, int index)`: the preview of the image at
+/// `index` of the past week's screen as read at `revision`, a JPEG checked to decode within
+/// bounds (SEC-02, WALL-17), or `null` if it has none or the screen changed since.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativePastImagePreview(
+    env: RawEnv,
+    _views: JObject,
+    revision: i32,
+    index: i32,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    let mut bytes = std::ptr::null_mut();
+    guarded(env, || {
+        LAUNCHER.with_borrow(|launcher| {
+            let launcher = launcher.as_ref().ok_or("MeeGone hasn't started")?;
+            let Ok(index) = usize::try_from(index) else {
+                return Ok(());
+            };
+            // The revision travels as Java's `int`.
+            let preview = launcher
+                .shell()
+                .past_images_offered()
+                .then(|| {
+                    launcher
+                        .view()
+                        .past_images()
+                        .preview(revision as u32, index)
+                })
+                .flatten();
+            if let Some(preview) = preview {
+                bytes = env
+                    .new_bytes(preview.bytes())
+                    .map_err(|error| format!("Couldn't pass the preview: {error}"))?
+                    .into_raw();
+            }
+            Ok(())
+        })
+    });
+    bytes
+}
+
+/// `String nativePinImage(int revision, int index)`: Pin was tapped on the image at `index` of
+/// the past week's screen as read at `revision`, so it is pinned on the job's thread (WALL-17).
+/// Returns `null`, or a short message to show. Does nothing if the screen changed since, or
+/// the image may not be pinned now.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativePinImage(
+    env: RawEnv,
+    _views: JObject,
+    revision: i32,
+    index: i32,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_image_message(env, |launcher| {
+        let Ok(index) = usize::try_from(index) else {
+            return false;
+        };
+        launcher.shell().past_images_offered()
+            && launcher.view().past_images().pin(revision as u32, index)
+    })
+}
+
+/// `String nativeUnpinImage()`: Unpin was tapped, on the past week's screen, the details
+/// screen or in Settings: today's image comes back and daily updates resume. It is "Update
+/// now" (WALL-11, WALL-17). Returns `null`, or a short message to show.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeUnpinImage(
+    env: RawEnv,
+    _views: JObject,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_image_message(env, |launcher| launcher.view().past_images().unpin())
+}
+
+/// `String nativePastImagesTryAgain()`: Try again was tapped on the past week's screen, after a
+/// problem, so the week is read again (WALL-17). Returns `null`, or a short message to show.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativePastImagesTryAgain(
+    env: RawEnv,
+    _views: JObject,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_image_message(env, |launcher| launcher.view().past_images().try_again())
+}
+
+/// `void nativeOpenPastImages()`: "Past week" on the details screen, or "Choose from the past
+/// week" in Settings, was tapped, so the past week's images open over it (WALL-17).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeOpenPastImages(
+    env: RawEnv,
+    _views: JObject,
+) {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_launcher(env, |launcher| {
+        if launcher.shell().lockimage_ready() && launcher.view().image_settings().past_images() {
+            launcher.frame();
+        }
+    });
+}
+
+/// "1" for a flag that is set, or empty, as the host reads flags among text fields.
+fn flag(on: bool) -> &'static str {
+    if on { "1" } else { "" }
 }
 
 /// Asks something of the lock-screen image with `step`, applies it, and returns its `problem`
@@ -2779,7 +2991,7 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRead
 }
 
 /// How many slots the frame has.
-const FRAME_SLOTS: usize = 137;
+const FRAME_SLOTS: usize = 139;
 /// The first of Recent's close-mode slots.
 const CLOSE_SLOTS: usize = 104;
 
@@ -2888,6 +3100,8 @@ const CLOSE_SLOTS: usize = 104;
 /// | 134 | 1 while Settings offers "Reset lock screen to home wallpaper" and the wallpaper settings (WALL-12); otherwise 0 |
 /// | 135 | The image details screen's revision while it is open: when it changes, the screen is read again with `nativeImageDetails`; -1 while it is closed (WALL-15) |
 /// | 136 | The daily image's status line's revision, in Settings and on the details screen: when it changes, it is read again with `nativeImageStatus`; -1 while the daily image is off or the lock-screen image isn't working (WALL-16, ARCH-09) |
+/// | 137 | 1 while the past week's images cover the home views, over the details screen or Settings (WALL-17); otherwise 0 |
+/// | 138 | The past week's screen's revision while it is open: when it changes, the screen is read again with `nativePastImages`; -1 while it is closed (WALL-17) |
 fn frame_slots(frame: &HomeFrame) -> [i32; FRAME_SLOTS] {
     let [events, applications, recent] = frame.pages;
     let menu_items = frame.menu.map_or(0, |menu| {
@@ -3099,6 +3313,8 @@ fn frame_slots(frame: &HomeFrame) -> [i32; FRAME_SLOTS] {
     let revision = |revision: Option<u32>| revision.map_or(-1, |r| (r & 0x7FFF_FFFF) as i32);
     slots[window + 8] = revision(frame.image_details);
     slots[window + 9] = revision(frame.image_status);
+    slots[window + 10] = i32::from(frame.past_images_open);
+    slots[window + 11] = revision(frame.past_images);
     slots
 }
 

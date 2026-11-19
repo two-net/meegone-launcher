@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use meegone_core_ui::{Dispatch, Latest};
 use meegone_lockimage_state::{
-    CheckStatus, ImageFile, ImageRecord, ImageStatus, LockImageIntent, LockImageState,
+    CheckStatus, ImageFile, ImageRecord, ImageStatus, LockImageIntent, LockImageState, PastEntry,
 };
 
 use super::*;
@@ -20,6 +20,7 @@ fn record(date: &str, image: Option<ImageFile>) -> ImageRecord {
         image,
         id: None,
         marker: None,
+        pinned: false,
     }
 }
 
@@ -432,6 +433,7 @@ fn the_details_show_the_image_its_title_attribution_date_and_region() {
             image_path: "images/a",
             image_key: "20261116 en-GB images/a".into(),
             more_info: true,
+            pinned: false,
         })
     );
 }
@@ -547,6 +549,7 @@ fn the_status_line_says_when_the_image_last_updated_and_the_last_problem() {
         Some(UpdateStatus {
             updated: Some("19 November, 07:00".into()),
             checks: retrying,
+            pinned: false,
         })
     );
 
@@ -557,6 +560,7 @@ fn the_status_line_says_when_the_image_last_updated_and_the_last_problem() {
         Some(UpdateStatus {
             updated: None,
             checks: CheckStatus::Fine,
+            pinned: false,
         })
     );
     latest.set(Arc::new(LockImageState {
@@ -583,4 +587,222 @@ fn the_status_line_revision_changes_only_when_it_does() {
         ..on()
     }));
     assert_ne!(section.status_revision(), first);
+}
+
+/// The past week as browsed: today's image, current; barn owls; a sculpture not offered as a
+/// wallpaper.
+fn browsed() -> LockImageState {
+    let entry = |id: &str, date: &str, offered, current| PastEntry {
+        id: id.into(),
+        date: date.into(),
+        title: format!("Image {id}"),
+        attribution: "© Someone".into(),
+        offered,
+        current,
+        preview: None,
+    };
+    LockImageState {
+        past: vec![
+            entry("puffins", "19 November", true, true),
+            entry("owls", "18 November", true, false),
+            entry("sculpture", "17 November", false, false),
+        ],
+        ..on()
+    }
+}
+
+fn past(state: LockImageState) -> (Latest<LockImageState>, PastImagesScreen, Sent) {
+    let latest = Latest::new(Arc::new(state));
+    let sent: Sent = Rc::default();
+    let into = sent.clone();
+    let screen = PastImagesScreen::new(
+        latest.clone(),
+        Dispatch::new(move |intent| into.borrow_mut().push(intent)),
+    );
+    (latest, screen, sent)
+}
+
+fn actions(screen: &PastImagesScreen) -> Vec<PastAction> {
+    screen.revision();
+    screen
+        .content()
+        .unwrap()
+        .images
+        .iter()
+        .map(|image| image.action)
+        .collect()
+}
+
+#[test]
+fn the_past_week_shows_each_image_with_what_it_offers() {
+    // WALL-17, LEGAL-03, LEGAL-04
+    let (_, screen, _) = past(browsed());
+
+    assert!(screen.is_offered());
+    screen.revision();
+    let content = screen.content().unwrap();
+    assert!(!content.loading);
+    assert_eq!(content.problem, None);
+    assert_eq!(content.images[1].title, "Image owls");
+    assert_eq!(content.images[1].attribution, "© Someone");
+    assert_eq!(content.images[1].date, "18 November");
+    assert!(content.images[0].current);
+    assert_eq!(
+        actions(&screen),
+        [PastAction::Pin, PastAction::Pin, PastAction::NotOffered]
+    );
+}
+
+#[test]
+fn a_pinned_image_offers_unpin_and_one_on_its_way_says_so() {
+    // WALL-17
+    let (latest, screen, _) = past(LockImageState {
+        pinned: true,
+        ..browsed()
+    });
+    assert_eq!(
+        actions(&screen),
+        [PastAction::Unpin, PastAction::Pin, PastAction::NotOffered]
+    );
+
+    latest.set(Arc::new(LockImageState {
+        pinning: Some("owls".into()),
+        ..browsed()
+    }));
+    assert_eq!(
+        actions(&screen),
+        [
+            PastAction::PinLater,
+            PastAction::Pinning,
+            PastAction::NotOffered
+        ]
+    );
+
+    latest.set(Arc::new(LockImageState {
+        pinned: true,
+        updating: true,
+        ..browsed()
+    }));
+    assert_eq!(
+        actions(&screen),
+        [
+            PastAction::Unpinning,
+            PastAction::PinLater,
+            PastAction::NotOffered
+        ]
+    );
+}
+
+#[test]
+fn pin_asks_only_for_the_image_shown_while_it_may_be_pinned() {
+    // WALL-17, LEGAL-04
+    let (latest, screen, sent) = past(browsed());
+    let revision = screen.revision();
+
+    assert!(!screen.pin(revision, 2));
+    assert!(!screen.pin(revision, 9));
+    assert!(!screen.pin(revision.wrapping_add(1), 1));
+    assert!(screen.pin(revision, 1));
+    assert!(matches!(&sent.borrow()[..], [LockImageIntent::Pin(id)] if id == "owls"));
+
+    // Once the week changed, the old revision pins nothing.
+    latest.set(Arc::new(LockImageState {
+        past: browsed().past[1..].to_vec(),
+        ..browsed()
+    }));
+    let newer = screen.revision();
+    assert_ne!(newer, revision);
+    assert!(!screen.pin(revision, 1));
+    assert_eq!(sent.borrow().len(), 1);
+}
+
+#[test]
+fn unpin_is_update_now_and_try_again_browses() {
+    // WALL-11, WALL-17
+    let (latest, screen, sent) = past(browsed());
+    assert!(!screen.unpin());
+
+    latest.set(Arc::new(LockImageState {
+        pinned: true,
+        ..browsed()
+    }));
+    assert!(screen.unpin());
+    assert!(screen.try_again());
+    assert!(matches!(
+        sent.borrow()[..],
+        [LockImageIntent::UpdateNow, LockImageIntent::Browse]
+    ));
+
+    latest.set(Arc::new(LockImageState {
+        browsing: true,
+        ..browsed()
+    }));
+    assert!(!screen.try_again());
+    screen.revision();
+    assert!(screen.content().unwrap().loading);
+}
+
+#[test]
+fn the_past_week_is_offered_only_while_the_daily_image_is_on() {
+    // WALL-17: before the first image too.
+    let (latest, screen, _) = past(LockImageState {
+        current: None,
+        ..browsed()
+    });
+    assert!(screen.is_offered());
+
+    latest.set(Arc::new(LockImageState {
+        status: ImageStatus::Off,
+        ..browsed()
+    }));
+    assert!(!screen.is_offered());
+    assert!(!screen.try_again());
+}
+
+#[test]
+fn the_details_screen_and_settings_open_the_past_week_and_say_what_is_pinned() {
+    // WALL-17
+    let pinned = LockImageState {
+        pinned: true,
+        checks: CheckStatus::Unavailable("No connection".into()),
+        ..browsed()
+    };
+    let (_, details, sent) = details(pinned.clone());
+    details.revision();
+    assert!(details.content().unwrap().pinned);
+    assert!(details.past_images());
+    assert!(matches!(
+        sent.borrow()[..],
+        [LockImageIntent::OpenPastImages]
+    ));
+
+    let (_, section, sent) = settings(pinned);
+    assert!(section.pinned());
+    assert!(section.past_images_offered());
+    assert!(section.past_images());
+    assert!(matches!(
+        sent.borrow()[..],
+        [LockImageIntent::OpenPastImages]
+    ));
+    assert!(section.update_status().unwrap().pinned);
+    // While pinned, the checks wait, so they aren't "unavailable".
+    assert!(!section.daily_image_unavailable());
+
+    let (_, section, sent) = settings(LockImageState {
+        status: ImageStatus::Off,
+        ..browsed()
+    });
+    assert!(!section.past_images());
+    assert!(sent.borrow().is_empty());
+}
+
+fn settings(state: LockImageState) -> (Latest<LockImageState>, ImageSettingsSection, Sent) {
+    let latest = Latest::new(Arc::new(state));
+    let sent: Sent = Rc::default();
+    let into = sent.clone();
+    let section = ImageSettingsSection::new(
+        latest.clone(),
+        Dispatch::new(move |intent| into.borrow_mut().push(intent)),
+    );
+    (latest, section, sent)
 }

@@ -147,10 +147,11 @@ pub trait SchedulerAdapter: Send + Sync {
     /// the next MeeGone start (SRS 8.1).
     fn schedule_image_job(&self, job: ImageJob) -> Result<(), DataError>;
     fn cancel_image_job(&self) -> Result<(), DataError>;
-    /// Runs the image job's check at once, on the job's own thread, as an update the user
-    /// asked for: `ImageUpdater::update_now`, over any available connection (WALL-11,
-    /// ADR 0030). It doesn't wait for it; the check reports back as the job does.
-    fn update_image_now(&self) -> Result<(), DataError>;
+    /// Runs the work the user asked of the daily image at once, on the job's own thread: the
+    /// lock-screen image's queue of tasks, such as "Update now" (`ImageUpdater::update_now`,
+    /// WALL-11, ADR 0030), browsing the past week and pinning one of its images (WALL-17,
+    /// ADR 0032). It doesn't wait for them; the home hears afterwards, as after a check.
+    fn run_image_tasks(&self) -> Result<(), DataError>;
 }
 
 /// Device configuration, the clock, and device-wide services: the home-app role, the next

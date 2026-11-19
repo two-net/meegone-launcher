@@ -3,12 +3,13 @@
 //! The system may start the job with or without the home, and on another thread. Both use one
 //! settings store and one image cache, so each sees the other's writes at once: a choice made
 //! in Settings counts for the next check, and turning the daily image off while it downloads
-//! leaves nothing cached (WALL-12).
+//! leaves nothing cached (WALL-12). They also share what the user asked of the job's thread,
+//! and the past week it read (ADR 0032).
 
 use std::sync::Arc;
 
 use meegone_core_data::{PersistentSettingsStore, Platform};
-use meegone_lockimage_data::{BingFeed, PersistentImageCache};
+use meegone_lockimage_data::{BingFeed, ImageMemory, ImageTask, PersistentImageCache};
 use meegone_lockimage_state::ImageUpdater;
 
 /// The platform adapters, the stores both the home and the job write, and the daily image's
@@ -20,6 +21,9 @@ pub struct Shared {
     pub(crate) image_cache: Arc<PersistentImageCache>,
     /// The feed's only implementation, which alone knows its format (ADR 0027).
     pub(crate) feed: Arc<BingFeed>,
+    /// The past week, and what the user asked of the job's thread, in memory (WALL-17,
+    /// ADR 0032).
+    pub(crate) image_memory: Arc<ImageMemory>,
     updater: Arc<ImageUpdater>,
 }
 
@@ -43,6 +47,7 @@ impl Shared {
             settings,
             image_cache,
             feed,
+            image_memory: Arc::default(),
             updater,
         }
     }
@@ -56,12 +61,22 @@ impl Shared {
         self.updater.check().attempted()
     }
 
-    /// "Update now" (WALL-11, ADR 0030): puts the current image back on the lock screen if it
-    /// isn't there, and asks the feed for today's image at once, over any connection. It
-    /// blocks, as [`check_image`](Self::check_image) does. The home then reads the image again
-    /// whatever happened, which ends "Updating…" (`ShellIntent::ImageChecked`).
-    pub fn update_image_now(&self) {
-        self.updater.update_now();
+    /// Runs what the user asked of the daily image, one task after another until none waits:
+    /// "Update now", Resume and Unpin (WALL-11, WALL-14, WALL-17, ADR 0030), browsing the past
+    /// week and pinning one of its images (WALL-17, ADR 0032). It blocks, as
+    /// [`check_image`](Self::check_image) does. The home then reads the image again whatever
+    /// happened (`ShellIntent::ImageChecked`), and shows as on its way only what still waits.
+    pub fn run_image_tasks(&self) {
+        let past = &self.image_memory.past;
+        self.image_memory.tasks.run_each(&mut |task| match task {
+            ImageTask::UpdateNow => {
+                self.updater.update_now();
+            }
+            ImageTask::Browse => self.updater.browse(past),
+            ImageTask::Pin(id) => {
+                self.updater.pin(id, past);
+            }
+        });
     }
 }
 

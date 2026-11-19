@@ -1587,11 +1587,12 @@ final class Bridge {
     }
 
     /**
-     * "Update now": runs the daily image's update on its own thread at once, over any
-     * connection (WALL-11, ADR 0030). Returns null: it is on its way. Called from Rust.
+     * Runs what the user asked of the daily image on its own thread at once, over any
+     * connection: "Update now" (WALL-11, ADR 0030), browsing the past week and pinning one of its
+     * images (WALL-17, ADR 0032). Returns null: they are on their way. Called from Rust.
      */
-    String updateImageNow() {
-        ImageJobService.updateNow(context);
+    String runImageTasks() {
+        ImageJobService.runTasks(context);
         return null;
     }
 

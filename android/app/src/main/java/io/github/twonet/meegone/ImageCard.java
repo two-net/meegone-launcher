@@ -274,25 +274,44 @@ final class ImageCard extends LinearLayout {
     @SuppressWarnings("deprecation") // newInstance(String) arrived in Android 12.
     static Bitmap decode(File file, int width, int height) {
         try {
-            BitmapRegionDecoder decoder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+            return decode(Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
                     ? BitmapRegionDecoder.newInstance(file.getPath())
-                    : BitmapRegionDecoder.newInstance(file.getPath(), false);
-            if (decoder == null) {
-                return null;
-            }
-            try {
-                Rect band = centreCrop(decoder.getWidth(), decoder.getHeight(), width, height);
-                if (band.isEmpty()) {
-                    return null;
-                }
-                BitmapFactory.Options options = new BitmapFactory.Options();
-                options.inSampleSize = sampleSize(band.width(), width);
-                return decoder.decodeRegion(band, options);
-            } finally {
-                decoder.recycle();
-            }
+                    : BitmapRegionDecoder.newInstance(file.getPath(), false), width, height);
         } catch (IOException | RuntimeException e) {
             return null;
+        }
+    }
+
+    /**
+     * As {@link #decode(File, int, int)}, from a JPEG in memory, such as a past image's preview
+     * (WALL-17). The Rust app checked its header, so decoding it stays bounded (SEC-02).
+     */
+    @SuppressWarnings("deprecation") // newInstance(byte[], int, int) arrived in Android 12.
+    static Bitmap decode(byte[] jpeg, int width, int height) {
+        try {
+            return decode(Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+                    ? BitmapRegionDecoder.newInstance(jpeg, 0, jpeg.length)
+                    : BitmapRegionDecoder.newInstance(jpeg, 0, jpeg.length, false), width, height);
+        } catch (IOException | RuntimeException e) {
+            return null;
+        }
+    }
+
+    /** The middle of what {@code decoder} reads, in a box's proportions, then lets it go. */
+    private static Bitmap decode(BitmapRegionDecoder decoder, int width, int height) {
+        if (decoder == null) {
+            return null;
+        }
+        try {
+            Rect band = centreCrop(decoder.getWidth(), decoder.getHeight(), width, height);
+            if (band.isEmpty()) {
+                return null;
+            }
+            BitmapFactory.Options options = new BitmapFactory.Options();
+            options.inSampleSize = sampleSize(band.width(), width);
+            return decoder.decodeRegion(band, options);
+        } finally {
+            decoder.recycle();
         }
     }
 

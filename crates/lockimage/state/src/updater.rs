@@ -26,16 +26,24 @@
 //! nothing to set (WALL-10).
 //!
 //! [`ImageUpdater::update_now`] is "Update now": the same run at once, whenever the user asks,
-//! over any connection (WALL-11). It puts the current image back on the lock screen first,
-//! which resumes paused updates (WALL-14).
+//! over any connection (WALL-11). It lets go of a pinned image, and puts the current image back
+//! on the lock screen first, which resumes paused updates (WALL-14, WALL-17).
+//!
+//! [`ImageUpdater::browse`] reads the past week's images and their previews into memory, and
+//! [`ImageUpdater::pin`] makes one of them the lock-screen wallpaper until it is unpinned
+//! (WALL-17, ADR 0032). While an image is pinned, the daily check asks nothing and no job
+//! waits.
 
 use std::sync::{Arc, Mutex, PoisonError};
 
 use meegone_core_data::{
-    DataError, ImageJob, ImageOptions, NetworkAdapter, NetworkState, SchedulerAdapter,
+    DataError, ImageJob, ImageOptions, JobNetwork, NetworkAdapter, NetworkState, SchedulerAdapter,
     SettingsStore, SystemConfigAdapter, WallpaperAdapter,
 };
-use meegone_lockimage_data::{Downloader, ImageCache, ImageFeed, ImageRecord, Marker, region};
+use meegone_lockimage_data::{
+    Downloader, FeedImage, ImageCache, ImageFeed, ImageRecord, MAX_PREVIEW_BYTES, Marker,
+    PastImage, PastImages, Preview, Week, region,
+};
 
 use crate::checks::{self, WAIT_MS};
 
@@ -48,6 +56,9 @@ pub enum Checked {
     /// Someone else changed the lock screen's wallpaper after MeeGone set it: daily updates
     /// are paused, and no job waits, until the user resumes them (WALL-14).
     Paused,
+    /// The user pinned the current image: it stays on the lock screen, daily updates wait, and
+    /// no job waits, until it is unpinned (WALL-17).
+    Pinned,
     /// No check is due yet; the job waits until one is.
     NotDue,
     /// A check is due, but waits for the battery or the network (WALL-04, PWR-04).
@@ -83,6 +94,11 @@ pub enum Wait {
     UnmeteredNetwork,
 }
 
+/// What pinning an image the past week no longer lists fails with (WALL-17).
+pub const NOT_LISTED: &str = "The image is no longer available";
+/// What pinning an image not offered as a wallpaper fails with (LEGAL-04).
+pub const NOT_OFFERED: &str = "The image isn't offered as a wallpaper";
+
 /// The feed's answer.
 enum Answer {
     Same,
@@ -100,7 +116,8 @@ pub struct ImageUpdater {
     wallpaper: Arc<dyn WallpaperAdapter>,
     scheduler: Arc<dyn SchedulerAdapter>,
     system: Arc<dyn SystemConfigAdapter>,
-    /// One check at a time: the job, the check at start and "Update now" never overlap.
+    /// One check at a time: the job, the check at start, "Update now" and pinning never
+    /// overlap.
     checking: Mutex<()>,
 }
 
@@ -149,20 +166,27 @@ impl ImageUpdater {
     /// Checks for today's image if a check is due, and schedules the job for the next one. It
     /// blocks: on Android, call it from a JVM thread other than the main one.
     pub fn check(&self) -> Checked {
+        let _checking = self.checking();
         self.run(false)
     }
 
-    /// "Update now" (WALL-11): puts the current image back on the lock screen if it isn't
-    /// there, which resumes paused updates (WALL-14), then asks the feed for today's image at
-    /// once, over any available connection. Neither the time of day, the battery, the network
-    /// nor the day's budget of automatic attempts holds it back, though its attempt counts
-    /// towards that budget (REL-04). It blocks, as [`check`](Self::check) does.
+    /// "Update now" (WALL-11): lets go of a pinned image, which is how Unpin works (WALL-17),
+    /// and puts the current image back on the lock screen if it isn't there, which resumes
+    /// paused updates (WALL-14). Then it asks the feed for today's image at once, over any
+    /// available connection. Neither the time of day, the battery, the network nor the day's
+    /// budget of automatic attempts holds it back, though its attempt counts towards that
+    /// budget (REL-04). It blocks, as [`check`](Self::check) does.
     pub fn update_now(&self) -> Checked {
+        let _checking = self.checking();
         self.run(true)
     }
 
+    fn checking(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.checking.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// One check; the caller holds `checking`.
     fn run(&self, now_asked: bool) -> Checked {
-        let _checking = self.checking.lock().unwrap_or_else(PoisonError::into_inner);
         let options = self.settings.get().image;
         if !options.enabled {
             // A job left from before the feature was turned off has nothing to do.
@@ -174,13 +198,26 @@ impl ImageUpdater {
         }
         let now = self.system.now_ms();
         let offset = |at| self.system.utc_offset_ms(at);
-        let current = self.cache.current();
+        let mut current = self.cache.current();
         if now_asked {
+            // Unpin (WALL-17): the user wants today's image again.
+            if let Some(file) = current
+                .as_ref()
+                .filter(|current| current.pinned)
+                .and_then(|current| current.image)
+            {
+                match self.cache.choose(file, false) {
+                    Ok(unpinned) => current = unpinned,
+                    Err(error) => return Checked::Failed(error),
+                }
+            }
             // Without the network, so it works offline too. If it fails, the feed's answer
             // tries again below.
             if let Some(current) = current.filter(|current| !self.shows(current)) {
                 let _ = self.apply(&current, now);
             }
+        } else if let Some(pinned) = current.as_ref().filter(|current| current.pinned) {
+            return self.keep_pinned(pinned, now);
         } else if current.is_some_and(|current| changed_by_someone_else(&current, &*self.wallpaper))
         {
             let _ = self.scheduler.cancel_image_job();
@@ -248,6 +285,187 @@ impl ImageUpdater {
         }
     }
 
+    /// While an image is pinned, the daily check asks nothing and no job waits (WALL-17). A
+    /// pinned image that isn't on the lock screen yet, because setting it failed or MeeGone
+    /// stopped first, is set now, and tried again after a wait if that fails. One someone else
+    /// replaced stays replaced (WALL-14): pinning it again puts it back.
+    fn keep_pinned(&self, pinned: &ImageRecord, now: u64) -> Checked {
+        if !pinned.applied() {
+            if let Err(error) = self.apply(pinned, now) {
+                self.schedule(ImageJob {
+                    not_before_ms: now.saturating_add(WAIT_MS),
+                    // Setting the wallpaper needs no network.
+                    network: JobNetwork::Any,
+                });
+                return Checked::Failed(error);
+            }
+        }
+        let _ = self.scheduler.cancel_image_job();
+        Checked::Pinned
+    }
+
+    /// Reads the past week's images for the region in use, and the preview of each one
+    /// offered as a wallpaper, into `past`, in memory (WALL-17, LEGAL-04). It runs because the user asked,
+    /// over any connection, and keeps what it read for the rest of the local day, unless a
+    /// newer image of the day has come in meanwhile: browsing again costs nothing (PWR-03).
+    ///
+    /// It never touches the cache or the check log. A preview that fails is left out, and the
+    /// image is still listed. If the feed fails, the problem is kept for the screen. Nothing is
+    /// kept if the daily image is turned off meanwhile (WALL-12). It blocks, as
+    /// [`check`](Self::check) does.
+    pub fn browse(&self, past: &PastImages) {
+        let options = self.settings.get().image;
+        if !options.enabled || self.wallpaper.lock_screen_support().is_err() {
+            return;
+        }
+        let region = self.region(&options);
+        let now = self.system.now_ms();
+        let day = checks::local_day(now, &|at| self.system.utc_offset_ms(at));
+        let current = self.cache.current();
+        let fresh = |week: &Week| {
+            week.region == region
+                && week.day == day
+                && week.images.first().is_some_and(|newest| {
+                    current
+                        .as_ref()
+                        .is_none_or(|current| current.date <= newest.image.date)
+                })
+        };
+        if past.week().is_some_and(|week| fresh(&week)) {
+            past.set_problem(None);
+            return;
+        }
+        let week = self.feed.past_week(&region).map(|images| Week {
+            images: images
+                .into_iter()
+                .map(|image| PastImage {
+                    preview: self.preview(&image),
+                    image,
+                })
+                .collect(),
+            region,
+            day,
+        });
+        if !self.settings.get().image.enabled {
+            past.clear();
+            return;
+        }
+        match week {
+            Ok(week) => past.set_week(week),
+            Err(error) => past.set_problem(Some(error.to_string())),
+        }
+    }
+
+    /// `image`'s preview, if it is offered as a wallpaper and its preview downloads and checks
+    /// out (SEC-02, LEGAL-04).
+    fn preview(&self, image: &FeedImage) -> Option<Preview> {
+        if !image.offered_as_wallpaper {
+            return None;
+        }
+        let bytes = self
+            .network
+            .get(&image.preview.url, MAX_PREVIEW_BYTES)
+            .ok()?;
+        Preview::new(&bytes).ok()
+    }
+
+    /// Pins the image with the feed's `id` from the past week in `past` (WALL-17): makes it the
+    /// current image,
+    /// sets it as the lock-screen wallpaper, and stops the job until it is unpinned.
+    ///
+    /// An image already cached, the current one or the previous one, isn't downloaded again.
+    /// Any other is downloaded and checked as the daily image is, within 20 MB, at least 720 px
+    /// on its short side, and cropped (WALL-06, WALL-07); any failure leaves the cache and the
+    /// lock screen as they were (WALL-08). An image not offered as a wallpaper is refused
+    /// (LEGAL-04). Its download isn't one of the day's checks.
+    ///
+    /// A failure is kept in `past` for the screen, in plain words. It blocks, as
+    /// [`check`](Self::check) does.
+    pub fn pin(&self, id: &str, past: &PastImages) -> Checked {
+        let _checking = self.checking();
+        let pinned = self.pin_locked(id, past);
+        past.set_problem(match &pinned {
+            Checked::Failed(error) => Some(error.to_string()),
+            _ => None,
+        });
+        pinned
+    }
+
+    fn pin_locked(&self, id: &str, past: &PastImages) -> Checked {
+        let options = self.settings.get().image;
+        if !options.enabled || self.wallpaper.lock_screen_support().is_err() {
+            return Checked::Off;
+        }
+        let Some((image, region)) = past.week().and_then(|week| {
+            let image = week.image(id)?.clone();
+            Some((image, week.region))
+        }) else {
+            return Checked::Failed(DataError::Invalid(NOT_LISTED.into()));
+        };
+        if !image.offered_as_wallpaper {
+            return Checked::Failed(DataError::Invalid(NOT_OFFERED.into()));
+        }
+        // Any failure here leaves the cache and the lock screen as they were (WALL-08).
+        let record = match self.cache_pinned(&image, &region) {
+            Ok(record) => record,
+            Err(error) => return Checked::Failed(error),
+        };
+        let now = self.system.now_ms();
+        let set = if self.shows(&record) {
+            Ok(None)
+        } else {
+            self.apply(&record, now)
+        };
+        // The feature may have been turned off meanwhile: nothing stays (WALL-12).
+        if !self.settings.get().image.enabled {
+            let _ = self.cache.clear();
+            let _ = self.scheduler.cancel_image_job();
+            return Checked::Off;
+        }
+        match set {
+            Ok(_) => {
+                let _ = self.scheduler.cancel_image_job();
+                Checked::Pinned
+            }
+            // Pinned and cached, but not on the lock screen: the job sets it after a wait.
+            Err(error) => {
+                self.schedule(ImageJob {
+                    not_before_ms: now.saturating_add(WAIT_MS),
+                    network: JobNetwork::Any,
+                });
+                Checked::Failed(error)
+            }
+        }
+    }
+
+    /// `image` as the cached current image, pinned: chosen from the cache if it is there,
+    /// otherwise downloaded.
+    fn cache_pinned(&self, image: &FeedImage, region: &str) -> Result<ImageRecord, DataError> {
+        let cached = |record: Option<ImageRecord>| {
+            record
+                .filter(|record| {
+                    record.id.as_deref() == Some(image.id.as_str()) && record.region == region
+                })
+                .and_then(|record| record.image)
+        };
+        match cached(self.cache.current()).or_else(|| cached(self.cache.previous())) {
+            Some(file) => self
+                .cache
+                .choose(file, true)?
+                .ok_or_else(|| DataError::Failed("The image isn't cached".into())),
+            None => self.downloader.download(image, region, true),
+        }
+    }
+
+    /// The region the feed is asked for (WALL-05).
+    fn region(&self, options: &ImageOptions) -> String {
+        region::in_use(
+            options.region.as_deref(),
+            &self.system.locale(),
+            &self.feed.regions(),
+        )
+    }
+
     /// What a due check waits for, if anything (WALL-04, PWR-04). Offline isn't one: the
     /// attempt fails as "No connection", and counts (AC-16).
     fn wait(&self, options: &ImageOptions) -> Option<Wait> {
@@ -265,18 +483,14 @@ impl ImageUpdater {
     /// Asks the feed for today's image, and downloads it if it is new and may be used. Today's
     /// image is in only once it is on the lock screen.
     fn ask(&self, options: &ImageOptions, now: u64) -> Result<Answer, DataError> {
-        let region = region::in_use(
-            options.region.as_deref(),
-            &self.system.locale(),
-            &self.feed.regions(),
-        );
+        let region = self.region(options);
         let image = self.feed.today(&region)?;
-        let same = self.cache.current().filter(|current| {
-            current.id.as_deref() == Some(image.id.as_str())
-                && current.region == region
-                && current.image.is_some()
-        });
-        if let Some(current) = same {
+        let today = |record: &ImageRecord| {
+            record.id.as_deref() == Some(image.id.as_str())
+                && record.region == region
+                && record.image.is_some()
+        };
+        if let Some(current) = self.cache.current().filter(today) {
             if self.shows(&current) {
                 return Ok(Answer::Same);
             }
@@ -284,10 +498,20 @@ impl ImageUpdater {
             let applied = self.apply(&current, now)?;
             return Ok(Answer::New(applied.unwrap_or(current)));
         }
+        // Today's image is the previous one, as after unpinning (WALL-17): it comes back from
+        // the cache.
+        let previous = match self.cache.previous().filter(today).and_then(|p| p.image) {
+            Some(file) => self.cache.choose(file, false)?,
+            None => None,
+        };
+        if let Some(previous) = previous {
+            let applied = self.apply(&previous, now)?;
+            return Ok(Answer::New(applied.unwrap_or(previous)));
+        }
         if !image.offered_as_wallpaper {
             return Ok(Answer::NotOffered);
         }
-        let record = self.downloader.download(&image, &region)?;
+        let record = self.downloader.download(&image, &region, false)?;
         let applied = self.apply(&record, now)?;
         Ok(Answer::New(applied.unwrap_or(record)))
     }
@@ -347,6 +571,7 @@ mod tests {
         feed: Arc<FakeFeed>,
         settings: Arc<PersistentSettingsStore>,
         cache: Arc<PersistentImageCache>,
+        past: Arc<PastImages>,
         updater: ImageUpdater,
     }
 
@@ -364,6 +589,7 @@ mod tests {
         let settings = Arc::new(PersistentSettingsStore::new(fakes.storage.clone()));
         settings.update(&mut |s| s.image.enabled = true).unwrap();
         let cache = Arc::new(PersistentImageCache::new(fakes.storage.clone()));
+        let past = Arc::new(PastImages::default());
         let updater = ImageUpdater::new(
             settings.clone(),
             cache.clone(),
@@ -378,6 +604,7 @@ mod tests {
             feed,
             settings,
             cache,
+            past,
             updater,
         }
     }
@@ -656,6 +883,11 @@ mod tests {
         fn today(&self, region: &str) -> Result<FeedImage, DataError> {
             (self.during)();
             self.inner.today(region)
+        }
+
+        fn past_week(&self, region: &str) -> Result<Vec<FeedImage>, DataError> {
+            (self.during)();
+            self.inner.past_week(region)
         }
     }
 
@@ -1103,5 +1335,445 @@ mod tests {
         at(&fakes, NOV_20 + HOUR_MS);
 
         assert_eq!(updater.check(), Checked::Same);
+    }
+    /// The feed offers `images` as the past week, and serves each one's sizes and preview.
+    fn offer_week(fakes: &Fakes, feed: &FakeFeed, images: Vec<FeedImage>) {
+        let mut responses = fakes.network.responses.lock().unwrap();
+        for image in &images {
+            for version in image.versions.iter().chain([&image.preview]) {
+                let size = Size {
+                    width: version.width,
+                    height: version.height,
+                };
+                responses.insert(version.url.clone(), fakes::jpeg(size));
+            }
+        }
+        *feed.week.lock().unwrap() = images;
+    }
+
+    /// Today's puffins, not offered as a wallpaper, then barn owls and cedars.
+    fn a_week() -> Vec<FeedImage> {
+        vec![
+            FeedImage {
+                offered_as_wallpaper: false,
+                ..feed_image("sculpture", "20261119")
+            },
+            feed_image("owls", "20261118"),
+            feed_image("cedars", "20261117"),
+        ]
+    }
+
+    fn downloads(fakes: &Fakes) -> Vec<String> {
+        fakes.network.requests.lock().unwrap().clone()
+    }
+
+    #[test]
+    fn browsing_reads_the_week_and_the_previews_of_images_offered_once_a_day() {
+        // WALL-17, PWR-03, LEGAL-04
+        let Setup {
+            fakes,
+            feed,
+            cache,
+            past,
+            updater,
+            ..
+        } = setup("puffins");
+        offer_week(&fakes, &feed, a_week());
+
+        updater.browse(&past);
+
+        let week = past.week().unwrap();
+        assert_eq!((week.region.as_str(), week.images.len()), ("en-US", 3));
+        // Only images offered as a wallpaper have a preview, and only theirs are fetched.
+        assert_eq!(
+            week.images
+                .iter()
+                .map(|past| past.preview.is_some())
+                .collect::<Vec<_>>(),
+            [false, true, true]
+        );
+        assert_eq!(
+            downloads(&fakes),
+            [
+                "https://example.com/owls_800x480.jpg",
+                "https://example.com/cedars_800x480.jpg"
+            ]
+        );
+        // Nothing is cached, nothing is checked, and no job changes.
+        assert_eq!(cache.current(), None);
+        assert_eq!(cache.checks(), Default::default());
+        assert_eq!(feed_requests(&feed), 0);
+
+        // Browsing again that day costs nothing.
+        at(&fakes, NOV_19 + 20 * HOUR_MS);
+        updater.browse(&past);
+        assert_eq!(feed.week_requests.lock().unwrap().len(), 1);
+        assert_eq!(downloads(&fakes).len(), 2);
+
+        // The next day, it reads the week again.
+        at(&fakes, NOV_20 + HOUR_MS);
+        updater.browse(&past);
+        assert_eq!(feed.week_requests.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_newer_image_of_the_day_makes_the_week_read_again() {
+        // WALL-17: the feed's day can turn after the browse, before local midnight.
+        let Setup {
+            fakes,
+            feed,
+            past,
+            updater,
+            ..
+        } = setup("puffins");
+        offer_week(&fakes, &feed, a_week()[1..].to_vec());
+        updater.browse(&past);
+        updater.check();
+
+        updater.browse(&past);
+
+        assert_eq!(feed.week_requests.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_failed_browse_keeps_its_problem_and_a_failed_preview_only_leaves_it_out() {
+        // WALL-16, WALL-17
+        let Setup {
+            fakes,
+            feed,
+            past,
+            updater,
+            ..
+        } = setup("puffins");
+        *feed.error.lock().unwrap() = Some(DataError::Offline);
+        updater.browse(&past);
+        assert_eq!(past.week(), None);
+        assert_eq!(past.problem().as_deref(), Some("No connection"));
+
+        *feed.error.lock().unwrap() = None;
+        offer_week(&fakes, &feed, a_week());
+        fakes.network.responses.lock().unwrap().insert(
+            "https://example.com/owls_800x480.jpg".into(),
+            b"<html>".to_vec(),
+        );
+        updater.browse(&past);
+
+        let week = past.week().unwrap();
+        assert_eq!(past.problem(), None);
+        assert_eq!(week.images[1].image.id, "owls");
+        assert_eq!(week.images[1].preview, None);
+        assert!(week.images[2].preview.is_some());
+    }
+
+    #[test]
+    fn nothing_is_browsed_while_the_daily_image_is_off() {
+        // WALL-02
+        let Setup {
+            fakes,
+            feed,
+            settings,
+            past,
+            updater,
+            ..
+        } = setup("puffins");
+        offer_week(&fakes, &feed, a_week());
+        settings.update(&mut |s| s.image.enabled = false).unwrap();
+
+        updater.browse(&past);
+
+        assert!(feed.week_requests.lock().unwrap().is_empty());
+        assert_eq!(past.week(), None);
+    }
+
+    #[test]
+    fn turning_it_off_during_a_browse_keeps_nothing() {
+        // WALL-12
+        let settings_for_feed = Arc::new(Mutex::new(None::<Arc<PersistentSettingsStore>>));
+        let off = settings_for_feed.clone();
+        let Setup {
+            fakes,
+            feed,
+            settings,
+            past,
+            updater,
+            ..
+        } = setup_with("puffins", move |inner| {
+            Arc::new(During {
+                inner,
+                during: move || {
+                    if let Some(settings) = &*off.lock().unwrap() {
+                        settings.update(&mut |s| s.image.enabled = false).unwrap();
+                    }
+                },
+            })
+        });
+        *settings_for_feed.lock().unwrap() = Some(settings.clone());
+        offer_week(&fakes, &feed, a_week());
+
+        updater.browse(&past);
+
+        assert_eq!(feed.week_requests.lock().unwrap().len(), 1);
+        assert_eq!((past.week(), past.problem()), (None, None));
+    }
+
+    /// Today's puffins set by the daily check, then the past week browsed.
+    fn browsed() -> Setup {
+        let setup = setup("puffins");
+        assert!(matches!(setup.updater.check(), Checked::New(_)));
+        let mut week = a_week();
+        week[0] = feed_image("puffins", "20261119");
+        offer_week(&setup.fakes, &setup.feed, week);
+        setup.updater.browse(&setup.past);
+        setup
+    }
+
+    #[test]
+    fn pinning_downloads_the_image_sets_it_and_stops_the_job() {
+        // WALL-17, WALL-06 to WALL-08: the pinned image is downloaded and checked as the daily
+        // image is.
+        let Setup {
+            fakes,
+            cache,
+            past,
+            updater,
+            ..
+        } = browsed();
+        let before = downloads(&fakes).len();
+
+        assert_eq!(updater.pin("owls", &past), Checked::Pinned);
+
+        let current = cache.current().unwrap();
+        assert_eq!(current.id.as_deref(), Some("owls"));
+        assert!(current.pinned && current.applied());
+        assert_eq!(lock_screen(&fakes), cache.image(&current).unwrap());
+        assert_eq!(
+            downloads(&fakes)[before..],
+            ["https://example.com/owls_1080x1920.jpg"]
+        );
+        assert_eq!(job(&fakes), None);
+        // Today's image stays cached, unpinned, and the day's checks are as they were.
+        let previous = cache.previous().unwrap();
+        assert_eq!(
+            (previous.id.as_deref(), previous.pinned),
+            (Some("puffins"), false)
+        );
+        assert_eq!(cache.checks().attempts, 1);
+    }
+
+    #[test]
+    fn while_pinned_the_daily_check_asks_nothing_and_the_lock_screen_stays() {
+        // Issue #31: given a pinned image, when the next day's check runs, the lock-screen
+        // wallpaper doesn't change.
+        let Setup {
+            fakes,
+            feed,
+            cache,
+            past,
+            updater,
+            ..
+        } = browsed();
+        updater.pin("owls", &past);
+        let pinned = lock_screen(&fakes);
+        let asked = feed_requests(&feed);
+        offer(&fakes, &feed, feed_image("lighthouse", "20261120"));
+
+        at(&fakes, NOV_20 + HOUR_MS);
+        assert_eq!(updater.check(), Checked::Pinned);
+
+        assert_eq!(feed_requests(&feed), asked);
+        assert_eq!(lock_screen(&fakes), pinned);
+        assert_eq!(*fakes.wallpaper.lock_screen_images_set.lock().unwrap(), 2);
+        assert_eq!(job(&fakes), None);
+        assert_eq!(cache.current().unwrap().id.as_deref(), Some("owls"));
+        assert!(!Checked::Pinned.attempted());
+    }
+
+    #[test]
+    fn unpinning_brings_todays_image_back_from_the_cache() {
+        // Issue #31: after unpinning, daily updates resume. Unpin is "Update now".
+        let Setup {
+            fakes,
+            cache,
+            past,
+            updater,
+            ..
+        } = browsed();
+        updater.pin("owls", &past);
+        let before = downloads(&fakes).len();
+
+        let Checked::New(today) = updater.update_now() else {
+            panic!("expected today's image back");
+        };
+
+        assert_eq!(today.id.as_deref(), Some("puffins"));
+        assert!(!today.pinned);
+        assert_eq!(lock_screen(&fakes), cache.image(&today).unwrap());
+        assert_eq!(downloads(&fakes).len(), before);
+        assert_eq!(cache.previous().unwrap().id.as_deref(), Some("owls"));
+        assert!(!cache.previous().unwrap().pinned);
+        // Today's image is in, so the next check is tomorrow's.
+        assert_eq!(job(&fakes).unwrap().not_before_ms, NOV_20);
+        at(&fakes, NOV_20 + HOUR_MS);
+        assert_ne!(updater.check(), Checked::Pinned);
+    }
+
+    #[test]
+    fn unpinning_on_a_later_day_downloads_that_days_image() {
+        // WALL-11, WALL-17
+        let Setup {
+            fakes,
+            feed,
+            cache,
+            past,
+            updater,
+            ..
+        } = browsed();
+        updater.pin("owls", &past);
+        offer(&fakes, &feed, feed_image("lighthouse", "20261120"));
+        at(&fakes, NOV_20 + 30 * HOUR_MS);
+
+        let Checked::New(today) = updater.update_now() else {
+            panic!("expected a new image");
+        };
+
+        assert_eq!(today.id.as_deref(), Some("lighthouse"));
+        assert_eq!(lock_screen(&fakes), cache.image(&today).unwrap());
+        assert!(job(&fakes).is_some());
+    }
+
+    #[test]
+    fn pinning_a_cached_image_downloads_nothing() {
+        // WALL-17, PWR-03: the current image, then the previous one.
+        let Setup {
+            fakes,
+            cache,
+            past,
+            updater,
+            ..
+        } = browsed();
+        let before = downloads(&fakes).len();
+
+        assert_eq!(updater.pin("puffins", &past), Checked::Pinned);
+        assert!(cache.current().unwrap().pinned);
+        // Already on the lock screen: not set again.
+        assert_eq!(*fakes.wallpaper.lock_screen_images_set.lock().unwrap(), 1);
+        assert_eq!(downloads(&fakes).len(), before);
+
+        updater.pin("owls", &past);
+        assert_eq!(downloads(&fakes).len(), before + 1);
+        assert_eq!(updater.pin("puffins", &past), Checked::Pinned);
+
+        let current = cache.current().unwrap();
+        assert_eq!(
+            (current.id.as_deref(), current.pinned),
+            (Some("puffins"), true)
+        );
+        assert_eq!(lock_screen(&fakes), cache.image(&current).unwrap());
+        assert_eq!(downloads(&fakes).len(), before + 1);
+    }
+
+    #[test]
+    fn an_image_not_offered_or_no_longer_listed_isnt_pinned() {
+        // LEGAL-04, WALL-17
+        let Setup {
+            fakes,
+            feed,
+            cache,
+            past,
+            updater,
+            ..
+        } = setup("puffins");
+        updater.check();
+        // Nothing browsed yet.
+        assert_eq!(
+            updater.pin("owls", &past),
+            Checked::Failed(DataError::Invalid(NOT_LISTED.into()))
+        );
+        assert_eq!(past.problem().as_deref(), Some(NOT_LISTED));
+
+        offer_week(&fakes, &feed, a_week());
+        updater.browse(&past);
+        let before = downloads(&fakes).len();
+        assert_eq!(
+            updater.pin("sculpture", &past),
+            Checked::Failed(DataError::Invalid(NOT_OFFERED.into()))
+        );
+        assert_eq!(past.problem().as_deref(), Some(NOT_OFFERED));
+        assert_eq!(
+            updater.pin("lighthouse", &past),
+            Checked::Failed(DataError::Invalid(NOT_LISTED.into()))
+        );
+
+        assert_eq!(downloads(&fakes).len(), before);
+        let current = cache.current().unwrap();
+        assert_eq!(
+            (current.id.as_deref(), current.pinned),
+            (Some("puffins"), false)
+        );
+        // A pin that works forgets the problem.
+        assert_eq!(updater.pin("owls", &past), Checked::Pinned);
+        assert_eq!(past.problem(), None);
+    }
+
+    #[test]
+    fn a_pinned_image_the_system_refuses_is_set_at_the_next_check() {
+        // WALL-08, WALL-17
+        let Setup {
+            fakes,
+            cache,
+            past,
+            updater,
+            ..
+        } = browsed();
+        *fakes.wallpaper.refuses.lock().unwrap() = Some(DataError::Failed("Refused".into()));
+
+        assert_eq!(
+            updater.pin("owls", &past),
+            Checked::Failed(DataError::Failed("Refused".into()))
+        );
+        let current = cache.current().unwrap();
+        assert!(current.pinned && !current.applied());
+        // Setting it needs no network.
+        assert_eq!(
+            job(&fakes),
+            Some(ImageJob {
+                not_before_ms: NOV_19 + 8 * HOUR_MS + WAIT_MS,
+                network: JobNetwork::Any,
+            })
+        );
+        // Still refused at the retry: tried again after another wait.
+        at(&fakes, NOV_19 + 8 * HOUR_MS + WAIT_MS);
+        assert!(matches!(updater.check(), Checked::Failed(_)));
+        assert_eq!(
+            job(&fakes).unwrap().not_before_ms,
+            NOV_19 + 8 * HOUR_MS + 2 * WAIT_MS
+        );
+
+        *fakes.wallpaper.refuses.lock().unwrap() = None;
+        at(&fakes, NOV_19 + 8 * HOUR_MS + 2 * WAIT_MS);
+        assert_eq!(updater.check(), Checked::Pinned);
+        assert_eq!(lock_screen(&fakes), cache.image(&current).unwrap());
+        assert_eq!(job(&fakes), None);
+    }
+
+    #[test]
+    fn a_pin_someone_else_replaced_stays_replaced_until_pinned_again() {
+        // WALL-14, WALL-17
+        let Setup {
+            fakes,
+            cache,
+            past,
+            updater,
+            ..
+        } = browsed();
+        updater.pin("owls", &past);
+        fakes.wallpaper.changed_by_someone_else();
+
+        assert_eq!(updater.check(), Checked::Pinned);
+        assert_eq!(lock_screen(&fakes).as_deref(), Some(&b"someone else's"[..]));
+
+        assert_eq!(updater.pin("owls", &past), Checked::Pinned);
+        let current = cache.current().unwrap();
+        assert_eq!(lock_screen(&fakes), cache.image(&current).unwrap());
     }
 }

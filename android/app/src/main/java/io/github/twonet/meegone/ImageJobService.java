@@ -21,8 +21,9 @@ import java.util.concurrent.Executors;
  * and not while the battery is low. The job isn't persisted, so MeeGone needs no permission to
  * start at boot (SEC-03): as the home app it starts anyway, and {@link #checkAtStart} schedules
  * the job again. Each check runs on one thread of its own, never the main one, as its requests
- * block. "Update now" runs on the same thread, at once, without {@code JobScheduler} ({@link
- * #updateNow}, WALL-11, ADR 0030).
+ * block. What the user asks for, such as "Update now", browsing the past week or pinning one
+ * of its images, runs on the same thread, at once, without {@code JobScheduler} ({@link
+ * #runTasks}, WALL-11, WALL-17, ADR 0030, ADR 0032).
  */
 public final class ImageJobService extends JobService {
     static {
@@ -88,19 +89,20 @@ public final class ImageJobService extends JobService {
     }
 
     /**
-     * "Update now" (WALL-11, ADR 0030): puts the current image back on the lock screen if it
-     * isn't there, then asks for today's image at once, over any connection. It runs on the
-     * checks' thread without {@code JobScheduler}, so it works where background scheduling
-     * doesn't, and the home always hears when it is done, which ends "Updating…". Called from
-     * Rust, through {@link Bridge}.
+     * Runs what the user asked of the daily image, which the Rust app queued: "Update now",
+     * Resume and Unpin (WALL-11, WALL-14, WALL-17, ADR 0030), browsing the past week and
+     * pinning one of its images (WALL-17, ADR 0032). They run on the checks' thread without
+     * {@code JobScheduler}, so they work where background scheduling doesn't, and the home
+     * always hears when they are done, which ends "Updating…" or "Pinning…". Called from Rust,
+     * through {@link Bridge}.
      */
-    static void updateNow(Context context) {
+    static void runTasks(Context context) {
         Context app = context.getApplicationContext();
         CHECKER.execute(() -> {
             try {
-                nativeUpdateImageNow(Bridge.get(app), app.getFilesDir().getPath());
+                nativeRunImageTasks(Bridge.get(app), app.getFilesDir().getPath());
             } catch (RuntimeException e) {
-                Log.w(TAG, "Updating the daily image failed: " + e.getMessage());
+                Log.w(TAG, "The daily image's tasks failed: " + e.getMessage());
             }
             MAIN.post(Bridge::imageChecked);
         });
@@ -191,6 +193,9 @@ public final class ImageJobService extends JobService {
      */
     private static native boolean nativeCheckImage(Bridge bridge, String filesDir);
 
-    /** Runs "Update now", whatever the time, the battery or the network (WALL-11). */
-    private static native void nativeUpdateImageNow(Bridge bridge, String filesDir);
+    /**
+     * Runs the tasks the user asked for, one after another, whatever the time, the battery or
+     * the network (WALL-11, WALL-17).
+     */
+    private static native void nativeRunImageTasks(Bridge bridge, String filesDir);
 }

@@ -2,9 +2,9 @@
 //!
 //! This feature shows its content inside other features' views: the card in Events (EVT-12)
 //! and a section in Settings (SET-02). Both are [`Slot`]s that the shell puts in place, so
-//! neither Events nor Settings depends on this feature (ARCH-03, ADR 0002). Its own screen, the
-//! image details (WALL-15), covers the home views, so the shell opens it and keeps a handle on
-//! it for the host (ADR 0031).
+//! neither Events nor Settings depends on this feature (ARCH-03, ADR 0002). Its own screens,
+//! the image details (WALL-15) and the past week's images (WALL-17), cover the home views, so
+//! the shell opens them and keeps a handle on them for the host (ADR 0031, ADR 0032).
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -12,7 +12,7 @@ use std::rc::Rc;
 use meegone_core_ui::{Dispatch, Latest, Slot, Tokens};
 use meegone_lockimage_state::{ImageStatus, LockImageIntent, LockImageState};
 
-pub use meegone_lockimage_state::CheckStatus;
+pub use meegone_lockimage_state::{CheckStatus, Preview};
 
 #[cfg(test)]
 mod tests;
@@ -156,6 +156,8 @@ pub struct DetailsContent {
     /// Whether More info is offered: the image has a link and a browser can open it (WALL-15,
     /// SRS 8.1).
     pub more_info: bool,
+    /// Whether the image is pinned, so daily updates wait until it is unpinned (WALL-17).
+    pub pinned: bool,
 }
 
 /// The image details screen (WALL-15; ADR 0031): the current image, its title, attribution,
@@ -220,6 +222,16 @@ impl ImageDetailsScreen {
         offered
     }
 
+    /// "Past week" was tapped: the past week's images open over this screen (WALL-17).
+    /// Returns whether that was asked.
+    pub fn past_images(&self) -> bool {
+        let offered = self.is_offered();
+        if offered {
+            self.dispatch.send(LockImageIntent::OpenPastImages);
+        }
+        offered
+    }
+
     fn shown(state: &LockImageState) -> Option<DetailsContent> {
         if !state.has_details() {
             return None;
@@ -238,6 +250,183 @@ impl ImageDetailsScreen {
                     .info_link
                     .as_deref()
                     .is_some_and(|link| link.starts_with("https://")),
+            pinned: state.pinned,
+        })
+    }
+}
+
+/// What one of the past week's images offers (WALL-17).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PastAction {
+    /// Pin, which makes it the lock-screen wallpaper until unpinned.
+    Pin,
+    /// Pin, but not now: another image is being pinned, or the current one unpinned.
+    PinLater,
+    /// "Pinning…": on its way.
+    Pinning,
+    /// It is pinned: Unpin, which brings today's image back (WALL-11).
+    Unpin,
+    /// "Unpinning…": on its way.
+    Unpinning,
+    /// The source doesn't offer it as a wallpaper, so it can't be pinned (LEGAL-04).
+    NotOffered,
+}
+
+/// One of the past week's images, as the screen shows it (WALL-17).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PastImageContent {
+    /// The feed's id. The host keeps a decoded preview by it while the screen shows.
+    pub id: String,
+    /// Plain text, as the source gives it (SEC-02).
+    pub title: String,
+    /// Shown as the source provides it, as plain text (LEGAL-03, SEC-02).
+    pub attribution: String,
+    /// Its date in the device's language, or empty to leave it out (L10N-03).
+    pub date: String,
+    /// Whether it is the image the lock screen has now.
+    pub current: bool,
+    pub action: PastAction,
+    /// Its preview, a checked JPEG the host decodes, when it has one (SEC-02).
+    pub preview: Option<Preview>,
+}
+
+/// What the past week's screen shows (WALL-17).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PastContent {
+    /// Today's first.
+    pub images: Vec<PastImageContent>,
+    /// Whether the week is being read.
+    pub loading: bool,
+    /// The last problem browsing or pinning had, in plain words, with Try again.
+    pub problem: Option<String>,
+}
+
+/// The past week's images (WALL-17; ADR 0032): today's and the six before, each with its
+/// preview, title, attribution and date, and Pin, or Unpin for the pinned one.
+///
+/// It covers the home views, so the shell opens and closes it; it is offered while the daily
+/// image is on. The host draws it from [`PastImagesScreen::revision`] and
+/// [`PastImagesScreen::content`], as it draws the details screen.
+///
+/// Clones share what the host was last told.
+#[derive(Clone)]
+pub struct PastImagesScreen {
+    latest: Latest<LockImageState>,
+    dispatch: Dispatch<LockImageIntent>,
+    told: Rc<RefCell<Told<PastContent>>>,
+}
+
+impl PastImagesScreen {
+    pub fn new(latest: Latest<LockImageState>, dispatch: Dispatch<LockImageIntent>) -> Self {
+        Self {
+            latest,
+            dispatch,
+            told: Rc::default(),
+        }
+    }
+
+    /// Whether the past week can be browsed: the daily image is on (WALL-17).
+    pub fn is_offered(&self) -> bool {
+        self.latest.get().past_offered()
+    }
+
+    /// The screen's revision, which changes whenever what it shows does, so the host reads
+    /// [`PastImagesScreen::content`] again.
+    pub fn revision(&self) -> u32 {
+        self.told.borrow_mut().take(Self::shown(&self.latest.get()))
+    }
+
+    /// What the screen shows, as of the last [`PastImagesScreen::revision`].
+    pub fn content(&self) -> Option<PastContent> {
+        self.told.borrow().content.clone()
+    }
+
+    /// The image at `index` of what the screen showed at `revision`, if that is still current.
+    fn told_image(&self, revision: u32, index: usize) -> Option<PastImageContent> {
+        let told = self.told.borrow();
+        if told.revision != revision {
+            return None;
+        }
+        told.content.as_ref()?.images.get(index).cloned()
+    }
+
+    /// The preview of the image at `index`, as shown at `revision` (WALL-17).
+    pub fn preview(&self, revision: u32, index: usize) -> Option<Preview> {
+        self.told_image(revision, index)?.preview
+    }
+
+    /// Pin was tapped on the image at `index`, as shown at `revision` (WALL-17). Returns whether
+    /// that was asked; nothing is while the screen changed meanwhile, or the image may not be
+    /// pinned now.
+    pub fn pin(&self, revision: u32, index: usize) -> bool {
+        let Some(image) = self.told_image(revision, index) else {
+            return false;
+        };
+        let offered = self.latest.get().may_pin(&image.id);
+        if offered {
+            self.dispatch.send(LockImageIntent::Pin(image.id));
+        }
+        offered
+    }
+
+    /// Unpin was tapped: today's image comes back, and daily updates resume. It is "Update
+    /// now" (WALL-11, WALL-17). Returns whether that was asked.
+    pub fn unpin(&self) -> bool {
+        let state = self.latest.get();
+        let offered = state.past_offered() && state.pinned && !state.updating;
+        if offered {
+            self.dispatch.send(LockImageIntent::UpdateNow);
+        }
+        offered
+    }
+
+    /// Try again was tapped, after a problem: the week is read again. Returns whether that
+    /// was asked.
+    pub fn try_again(&self) -> bool {
+        let state = self.latest.get();
+        let offered = state.past_offered() && !state.browsing;
+        if offered {
+            self.dispatch.send(LockImageIntent::Browse);
+        }
+        offered
+    }
+
+    fn shown(state: &LockImageState) -> Option<PastContent> {
+        if !state.past_offered() {
+            return None;
+        }
+        let action = |entry: &meegone_lockimage_state::PastEntry| {
+            let pinned = entry.current && state.pinned;
+            if !entry.offered {
+                PastAction::NotOffered
+            } else if state.pinning.as_deref() == Some(entry.id.as_str()) {
+                PastAction::Pinning
+            } else if pinned && state.updating {
+                PastAction::Unpinning
+            } else if pinned {
+                PastAction::Unpin
+            } else if state.may_pin(&entry.id) && !state.updating {
+                PastAction::Pin
+            } else {
+                PastAction::PinLater
+            }
+        };
+        Some(PastContent {
+            images: state
+                .past
+                .iter()
+                .map(|entry| PastImageContent {
+                    id: entry.id.clone(),
+                    title: entry.title.clone(),
+                    attribution: entry.attribution.clone(),
+                    date: entry.date.clone(),
+                    current: entry.current,
+                    action: action(entry),
+                    preview: entry.preview.clone(),
+                })
+                .collect(),
+            loading: state.browsing,
+            problem: state.past_problem.clone(),
         })
     }
 }
@@ -251,6 +440,9 @@ pub struct UpdateStatus {
     pub updated: Option<String>,
     /// The last problem, in plain words, while the checks retry or after 3 days of failures.
     pub checks: CheckStatus,
+    /// Whether the image is pinned, so daily updates wait: the line says so in place of the
+    /// checks (WALL-17).
+    pub pinned: bool,
 }
 
 /// The "Daily lock-screen image" switch (SET-02).
@@ -321,9 +513,33 @@ impl ImageSettingsSection {
         self.latest.get().updating
     }
 
-    /// "Update now", or Resume while paused, was tapped (WALL-11, WALL-14).
+    /// "Update now", or Resume while paused, or Unpin while pinned, was tapped (WALL-11,
+    /// WALL-14, WALL-17).
     pub fn update_now(&self) {
         self.dispatch.send(LockImageIntent::UpdateNow);
+    }
+
+    /// Whether the section says the image is pinned, so daily updates wait, with Unpin
+    /// (WALL-17).
+    pub fn pinned(&self) -> bool {
+        let state = self.latest.get();
+        state.status == ImageStatus::On && state.pinned
+    }
+
+    /// "Choose from the past week" is offered while the daily image is on, with an image yet
+    /// or not (WALL-17).
+    pub fn past_images_offered(&self) -> bool {
+        self.latest.get().past_offered()
+    }
+
+    /// "Choose from the past week" was tapped: the past week's images open over Settings
+    /// (WALL-17). Returns whether that was asked.
+    pub fn past_images(&self) -> bool {
+        let offered = self.past_images_offered();
+        if offered {
+            self.dispatch.send(LockImageIntent::OpenPastImages);
+        }
+        offered
     }
 
     /// Whether the section says someone else changed the lock screen, so daily updates are
@@ -409,6 +625,7 @@ impl ImageSettingsSection {
         (state.status == ImageStatus::On).then(|| UpdateStatus {
             updated: state.updated.clone(),
             checks: state.checks.clone(),
+            pinned: state.pinned,
         })
     }
 
@@ -419,10 +636,13 @@ impl ImageSettingsSection {
     }
 
     /// Whether the section says "Daily image unavailable", with Try again: the daily image is
-    /// on, and its checks have failed for 3 days (SRS 7.6).
+    /// on, its checks have failed for 3 days, and nothing is pinned, which would make them wait
+    /// anyway (SRS 7.6, WALL-17).
     pub fn daily_image_unavailable(&self) -> bool {
         let state = self.latest.get();
-        state.status == ImageStatus::On && matches!(state.checks, CheckStatus::Unavailable(_))
+        state.status == ImageStatus::On
+            && !state.pinned
+            && matches!(state.checks, CheckStatus::Unavailable(_))
     }
 
     /// Try again was tapped (SRS 7.6).
@@ -431,12 +651,18 @@ impl ImageSettingsSection {
     }
 }
 
+impl Slot for PastImagesScreen {
+    fn render(&mut self, _tokens: &Tokens) {
+        // The host draws the screen from `revision` and `content` (ADR 0006, ADR 0032).
+    }
+}
+
 impl Slot for ImageSettingsSection {
     fn render(&mut self, _tokens: &Tokens) {
-        // The host draws the daily image's switch, Update now, the status line, the pause,
-        // "Show card in Events", "Use mobile data", "Daily image unavailable" and, once the
-        // image is off, the reset and the wallpaper settings, until the Settings screen, #34,
-        // draws the rest, Region included (ADR 0006, ADR 0022, ADR 0027, ADR 0029 to
-        // ADR 0031).
+        // The host draws the daily image's switch, Update now, the status line, the pause, the
+        // pin, "Choose from the past week", "Show card in Events", "Use mobile data", "Daily
+        // image unavailable" and, once the image is off, the reset and the wallpaper settings,
+        // until the Settings screen, #34, draws the rest, Region included (ADR 0006, ADR 0022,
+        // ADR 0027, ADR 0029 to ADR 0032).
     }
 }

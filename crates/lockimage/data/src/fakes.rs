@@ -29,16 +29,26 @@ pub fn feed_image(id: &str, date: &str) -> FeedImage {
                 url: format!("https://example.com/{id}_1920x1080.jpg"),
             },
         ],
+        preview: ImageVersion {
+            width: 800,
+            height: 480,
+            url: format!("https://example.com/{id}_800x480.jpg"),
+        },
     }
 }
 
 /// Offers `image` for every region until it is cleared; without one, `today` fails as if the
-/// feed changed its format.
+/// feed changed its format. Offers `week` as the past week; while it is empty, `past_week`
+/// fails the same way.
 pub struct FakeFeed {
     pub regions: Mutex<Vec<String>>,
     pub image: Mutex<Option<FeedImage>>,
-    /// The region of every request, including failed ones, to check call budgets (REL-04).
+    pub week: Mutex<Vec<FeedImage>>,
+    /// The region of every request for today's image, including failed ones, to check call
+    /// budgets (REL-04).
     pub requests: Mutex<Vec<String>>,
+    /// The region of every request for the past week, including failed ones (WALL-17).
+    pub week_requests: Mutex<Vec<String>>,
     /// When set, every request fails with this error.
     pub error: Mutex<Option<DataError>>,
 }
@@ -48,7 +58,9 @@ impl Default for FakeFeed {
         Self {
             regions: Mutex::new(vec!["en-US".into(), "en-GB".into(), "fi-FI".into()]),
             image: Mutex::default(),
+            week: Mutex::default(),
             requests: Mutex::default(),
+            week_requests: Mutex::default(),
             error: Mutex::default(),
         }
     }
@@ -69,6 +81,18 @@ impl ImageFeed for FakeFeed {
             .unwrap()
             .clone()
             .ok_or_else(|| DataError::Invalid(FORMAT_CHANGED.into()))
+    }
+
+    fn past_week(&self, region: &str) -> Result<Vec<FeedImage>, DataError> {
+        self.week_requests.lock().unwrap().push(region.to_owned());
+        if let Some(error) = self.error.lock().unwrap().clone() {
+            return Err(error);
+        }
+        let week = self.week.lock().unwrap().clone();
+        if week.is_empty() {
+            return Err(DataError::Invalid(FORMAT_CHANGED.into()));
+        }
+        Ok(week)
     }
 }
 
@@ -97,5 +121,21 @@ mod tests {
 
         assert_eq!(*feed.requests.lock().unwrap(), ["fi-FI", "fi-FI"]);
         assert!(feed.regions().contains(&"en-US".to_owned()));
+    }
+
+    #[test]
+    fn the_past_week_is_offered_once_set() {
+        // WALL-17
+        let feed = FakeFeed::default();
+        assert!(matches!(
+            feed.past_week("en-US"),
+            Err(DataError::Invalid(_))
+        ));
+
+        *feed.week.lock().unwrap() =
+            vec![feed_image("b2", "20261116"), feed_image("a1", "20261115")];
+        assert_eq!(feed.past_week("en-US").unwrap().len(), 2);
+        assert_eq!(*feed.week_requests.lock().unwrap(), ["en-US", "en-US"]);
+        assert!(feed.requests.lock().unwrap().is_empty());
     }
 }

@@ -19,8 +19,8 @@ pub struct AndroidScheduler {
     schedule_image_job: MethodId,
     /// `String cancelImageJob()`: `null`, or a short message when the system can't schedule.
     cancel_image_job: MethodId,
-    /// `String updateImageNow()`: `null` once the update is on its way (WALL-11).
-    update_image_now: MethodId,
+    /// `String runImageTasks()`: `null` once the tasks are on their way (WALL-11, WALL-17).
+    run_image_tasks: MethodId,
 }
 
 impl AndroidScheduler {
@@ -34,7 +34,7 @@ impl AndroidScheduler {
                 c"(JI)Ljava/lang/String;",
             )?,
             cancel_image_job: env.method_id(bridge, c"cancelImageJob", c"()Ljava/lang/String;")?,
-            update_image_now: env.method_id(bridge, c"updateImageNow", c"()Ljava/lang/String;")?,
+            run_image_tasks: env.method_id(bridge, c"runImageTasks", c"()Ljava/lang/String;")?,
             bridge: env.global_ref(bridge)?,
         })
     }
@@ -63,9 +63,9 @@ impl SchedulerAdapter for AndroidScheduler {
         self.call(self.cancel_image_job, &[])
     }
 
-    /// `ImageJobService` runs the update on the job's thread, without `JobScheduler`, so it
-    /// works where background scheduling doesn't (WALL-11, ADR 0030).
-    fn update_image_now(&self) -> Result<(), DataError> {
-        self.call(self.update_image_now, &[])
+    /// `ImageJobService` runs the tasks on the job's thread, without `JobScheduler`, so they
+    /// work where background scheduling doesn't (WALL-11, ADR 0030, ADR 0032).
+    fn run_image_tasks(&self) -> Result<(), DataError> {
+        self.call(self.run_image_tasks, &[])
     }
 }

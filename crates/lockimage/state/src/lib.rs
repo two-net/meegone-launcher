@@ -2,11 +2,14 @@
 //! image's details, the feed region (WALL-05), "Use mobile data" (WALL-04), how the daily
 //! checks are going (SRS 7.6), "Update now" (WALL-11), whether daily updates are paused
 //! because someone else changed the lock screen (WALL-14), resetting the lock screen once the
-//! image is off (WALL-12), and what the image details screen shows and opens (WALL-15, WALL-16).
+//! image is off (WALL-12), what the image details screen shows and opens (WALL-15, WALL-16),
+//! and the past week's images, one of which can be pinned (WALL-17).
 //!
-//! Its options live in the settings store (ADR 0002); the image details and the check log live
-//! in this feature's image cache. [`ImageUpdater`] runs the daily check and sets the
-//! wallpaper, off the main thread (ADR 0029, ADR 0030); [`checks`] decides when.
+//! Its options live in the settings store (ADR 0002); the image details, the pin and the check
+//! log live in this feature's image cache, and the past week in memory. [`ImageUpdater`] runs
+//! the daily check, browses, pins and sets the wallpaper, off the main thread (ADR 0029,
+//! ADR 0030, ADR 0032); [`checks`] decides when. What the user asks of it waits in
+//! [`ImageMemory`]'s tasks until the job's thread runs it.
 
 pub mod checks;
 mod updater;
@@ -21,8 +24,11 @@ use meegone_core_state::StateHolder;
 use meegone_lockimage_data::{ImageCache, ImageFeed, region};
 
 pub use checks::CheckStatus;
-pub use meegone_lockimage_data::{ImageFile, ImageRecord, Marker};
-pub use updater::{Checked, ImageUpdater, Wait};
+pub use meegone_lockimage_data::{
+    ImageFile, ImageMemory, ImageRecord, ImageTask, ImageTasks, Marker, PAST_WEEK_IMAGES,
+    PastImages, Preview,
+};
+pub use updater::{Checked, ImageUpdater, NOT_LISTED, NOT_OFFERED, Wait};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ImageStatus {
@@ -50,7 +56,7 @@ pub struct LockImageState {
     pub use_mobile_data: bool,
     /// How the daily checks are going (WALL-16, SRS 7.6).
     pub checks: CheckStatus,
-    /// Whether "Update now" is on its way (WALL-11).
+    /// Whether "Update now", Resume or Unpin is on its way (WALL-11, WALL-14, WALL-17).
     pub updating: bool,
     /// Whether someone else changed the lock screen's wallpaper after MeeGone set it, so daily
     /// updates wait until the user resumes them (WALL-14).
@@ -66,7 +72,36 @@ pub struct LockImageState {
     pub updated: Option<String>,
     /// Whether a web browser is installed, without which More info is hidden (SRS 8.1).
     pub has_browser: bool,
+    /// Whether the current image is pinned, so daily updates wait until it is unpinned
+    /// (WALL-17). Only while the daily image is on.
+    pub pinned: bool,
+    /// The past week's images, today's first, once browsed (WALL-17).
+    pub past: Vec<PastEntry>,
+    /// Whether the past week is being read.
+    pub browsing: bool,
+    /// The past week's image being pinned, by the feed's id.
+    pub pinning: Option<String>,
+    /// The last problem browsing or pinning had, in plain words.
+    pub past_problem: Option<String>,
     pub problem: Option<String>,
+}
+
+/// One of the past week's images, as browsing shows it (WALL-17).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PastEntry {
+    /// The feed's id, which names it to pin.
+    pub id: String,
+    /// Its date, written in the device's language, such as "15 November" (L10N-03).
+    pub date: String,
+    pub title: String,
+    /// As the source provides it (LEGAL-03).
+    pub attribution: String,
+    /// Whether it may be pinned: the source offers it as a wallpaper (LEGAL-04).
+    pub offered: bool,
+    /// Whether it is the current image.
+    pub current: bool,
+    /// Its preview, when it has one.
+    pub preview: Option<Preview>,
 }
 
 impl LockImageState {
@@ -83,6 +118,24 @@ impl LockImageState {
                 .current
                 .as_ref()
                 .is_some_and(|current| current.image.is_some())
+    }
+
+    /// Whether the past week can be browsed: the daily image is on, with an image yet or not
+    /// (WALL-17).
+    pub fn past_offered(&self) -> bool {
+        self.status == ImageStatus::On
+    }
+
+    /// Whether the past week's entry `id` may be pinned now: it is listed, offered as a
+    /// wallpaper, and not pinned already, and nothing else is being pinned (WALL-17,
+    /// LEGAL-04).
+    pub fn may_pin(&self, id: &str) -> bool {
+        self.past_offered()
+            && self.pinning.is_none()
+            && self
+                .past
+                .iter()
+                .any(|entry| entry.id == id && entry.offered && !(entry.current && self.pinned))
     }
 }
 
@@ -101,13 +154,25 @@ pub enum LockImageIntent {
     /// After days of failures, checks again as soon as the network and battery allow, within
     /// the day's budget (SRS 7.6, REL-04).
     TryAgain,
-    /// Fetches today's image at once, over any connection, and puts the current one back on
-    /// the lock screen, which resumes paused updates (WALL-11, WALL-14). Only while the daily
-    /// image is on; the update runs on the job's thread, and [`Self::Checked`] reports it.
+    /// Fetches today's image at once, over any connection, after letting go of a pin and
+    /// putting the current image back on the lock screen, which resumes paused updates
+    /// (WALL-11, WALL-14). Resume and Unpin are this too (WALL-17). Only while the daily image
+    /// is on; the update runs on the job's thread, and [`Self::Checked`] reports it.
     UpdateNow,
-    /// A check, or "Update now", has run on the job's thread: reads the image and the checks
-    /// again (ADR 0029).
+    /// A check, or a task the user asked for, has run on the job's thread: reads the image,
+    /// the checks, the past week and the tasks again (ADR 0029, ADR 0032).
     Checked,
+    /// Opens the past week's images, from the image details screen or Settings (WALL-17). The
+    /// screen covers the home views, so the shell opens it, and asks for [`Self::Browse`]; the
+    /// holder ignores it.
+    OpenPastImages,
+    /// Reads the past week's images and their previews, on the job's thread, unless they are
+    /// read already today. Only while the daily image is on (WALL-17).
+    Browse,
+    /// Pins the past week's image with the feed's id, on the job's thread: it becomes the
+    /// lock-screen wallpaper, and daily updates wait until it is unpinned. Only an image
+    /// [`LockImageState::may_pin`] allows (WALL-17).
+    Pin(String),
     /// Makes the lock screen show the home wallpaper again. Only while the daily image is off
     /// (WALL-12).
     ResetLockScreen,
@@ -133,6 +198,9 @@ pub struct LockImageHolder {
     scheduler: Arc<dyn SchedulerAdapter>,
     /// The device's locale, from which Automatic is derived (WALL-05).
     system: Arc<dyn SystemConfigAdapter>,
+    /// The past week the job's thread read (WALL-17), and what waits for that thread or runs
+    /// on it.
+    memory: Arc<ImageMemory>,
     state: LockImageState,
 }
 
@@ -144,6 +212,7 @@ impl LockImageHolder {
         wallpaper: Arc<dyn WallpaperAdapter>,
         scheduler: Arc<dyn SchedulerAdapter>,
         system: Arc<dyn SystemConfigAdapter>,
+        memory: Arc<ImageMemory>,
     ) -> Self {
         Self {
             settings,
@@ -152,6 +221,7 @@ impl LockImageHolder {
             wallpaper,
             scheduler,
             system,
+            memory,
             state: LockImageState::default(),
         }
     }
@@ -177,25 +247,75 @@ impl LockImageHolder {
             .current
             .as_ref()
             .filter(|_| self.state.status == ImageStatus::On);
-        self.state.paused = current
-            .is_some_and(|current| updater::changed_by_someone_else(current, &*self.wallpaper));
+        self.state.pinned = current.is_some_and(|current| current.pinned);
+        // While pinned, the daily updates wait anyway (WALL-17).
+        self.state.paused = !self.state.pinned
+            && current
+                .is_some_and(|current| updater::changed_by_someone_else(current, &*self.wallpaper));
         self.state.may_not_show =
             current.is_some_and(|current| current.marker == Some(Marker::NotKept));
         self.write_times();
         self.state.has_browser = self.system.has_browser();
+        self.read_past();
+        self.read_tasks();
+    }
+
+    /// The past week as last browsed, while the daily image is on (WALL-17).
+    fn read_past(&mut self) {
+        let on = self.state.status == ImageStatus::On;
+        let week = self.memory.past.week().filter(|_| on);
+        let current = self.state.current.as_ref();
+        self.state.past = week
+            .map(|week| {
+                week.images
+                    .iter()
+                    .map(|past| PastEntry {
+                        id: past.image.id.clone(),
+                        date: self.written_date(&past.image.date),
+                        title: past.image.title.clone(),
+                        attribution: past.image.attribution.clone(),
+                        offered: past.image.offered_as_wallpaper,
+                        current: current.is_some_and(|current| {
+                            current.id.as_deref() == Some(past.image.id.as_str())
+                                && current.region == week.region
+                        }),
+                        preview: past.preview.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.state.past_problem = self.memory.past.problem().filter(|_| on);
+    }
+
+    /// What waits for the job's thread or runs on it, whatever has reported back meanwhile.
+    fn read_tasks(&mut self) {
+        let pending = self.memory.tasks.pending();
+        self.state.updating = pending.contains(&ImageTask::UpdateNow);
+        self.state.browsing = pending.contains(&ImageTask::Browse);
+        self.state.pinning = pending.into_iter().find_map(|task| match task {
+            ImageTask::Pin(id) => Some(id),
+            _ => None,
+        });
+    }
+
+    /// The feed's `yyyymmdd` written in the device's language, at noon so a time zone far from
+    /// UTC doesn't move it; empty if it isn't a date (WALL-15, L10N-03).
+    fn written_date(&self, date: &str) -> String {
+        let offset = |at| self.system.utc_offset_ms(at);
+        checks::day_of(date)
+            .map(|day| {
+                let noon = checks::local_noon_ms(day, &offset);
+                self.system.format_time(noon, TimeStyle::DayMonth)
+            })
+            .unwrap_or_default()
     }
 
     /// Writes the current image's date and when it was set, in the device's language. The date
     /// is written at noon, so a time zone far from UTC doesn't move it (WALL-15, WALL-16).
     fn write_times(&mut self) {
-        let offset = |at| self.system.utc_offset_ms(at);
         let current = self.state.current.as_ref();
         self.state.date = current
-            .and_then(|current| checks::day_of(&current.date))
-            .map(|day| {
-                let noon = checks::local_noon_ms(day, &offset);
-                self.system.format_time(noon, TimeStyle::DayMonth)
-            })
+            .map(|current| self.written_date(&current.date))
             .unwrap_or_default();
         self.state.updated = current
             .and_then(|current| current.applied_at_ms)
@@ -263,16 +383,41 @@ impl LockImageHolder {
 
     /// The update runs on the job's thread, so this only asks for it; one at a time.
     fn update_now(&mut self) {
-        if self.state.status != ImageStatus::On || self.state.updating {
-            return;
+        if self.state.status == ImageStatus::On {
+            self.ask(ImageTask::UpdateNow);
         }
-        let result = self.scheduler.update_image_now();
-        self.state.updating = result.is_ok();
-        self.state.problem = result.err().map(|error| error.to_string());
+    }
+
+    /// Reading the past week runs on the job's thread; one at a time (WALL-17).
+    fn browse(&mut self) {
+        if self.state.past_offered() {
+            self.ask(ImageTask::Browse);
+        }
+    }
+
+    /// Pinning runs on the job's thread; one at a time, and only an image that may be pinned
+    /// (WALL-17, LEGAL-04).
+    fn pin(&mut self, id: String) {
+        if self.state.may_pin(&id) {
+            self.ask(ImageTask::Pin(id));
+        }
+    }
+
+    /// Queues `task` for the job's thread, unless it is already on its way, and asks for the
+    /// queue to run. If the platform can't run it, the task is taken back and the reason is the
+    /// problem.
+    fn ask(&mut self, task: ImageTask) {
+        if self.memory.tasks.push(task.clone()) {
+            let result = self.scheduler.run_image_tasks();
+            if result.is_err() {
+                self.memory.tasks.withdraw(&task);
+            }
+            self.state.problem = result.err().map(|error| error.to_string());
+        }
+        self.read_tasks();
     }
 
     fn checked(&mut self) {
-        self.state.updating = false;
         self.refresh();
     }
 
@@ -314,15 +459,21 @@ impl LockImageHolder {
         if options.enabled {
             self.arm(true, options.use_mobile_data)
         } else {
-            // The current lock-screen wallpaper stays as it is (WALL-12).
+            // The current lock-screen wallpaper stays as it is (WALL-12). Nothing browsed stays
+            // either.
+            self.memory.past.clear();
             self.scheduler.cancel_image_job()?;
             self.cache.clear()
         }
     }
 
-    /// Schedules the job for the next check, while the daily image is on (WALL-03, WALL-04).
+    /// Schedules the job for the next check, while the daily image is on and nothing is
+    /// pinned (WALL-03, WALL-04, WALL-17).
     fn arm(&self, enabled: bool, use_mobile_data: bool) -> Result<(), DataError> {
-        if !enabled || matches!(self.state.status, ImageStatus::Unavailable(_)) {
+        if !enabled
+            || matches!(self.state.status, ImageStatus::Unavailable(_))
+            || self.cache.current().is_some_and(|current| current.pinned)
+        {
             return Ok(());
         }
         let now = self.system.now_ms();
@@ -353,7 +504,11 @@ impl StateHolder for LockImageHolder {
             LockImageIntent::ResetLockScreen => self.reset_lock_screen(),
             LockImageIntent::OpenWallpaperSettings => self.open_wallpaper_settings(),
             LockImageIntent::OpenInfoLink => self.open_info_link(),
-            LockImageIntent::OpenDetails | LockImageIntent::OpenSettings => {}
+            LockImageIntent::Browse => self.browse(),
+            LockImageIntent::Pin(id) => self.pin(id),
+            LockImageIntent::OpenDetails
+            | LockImageIntent::OpenSettings
+            | LockImageIntent::OpenPastImages => {}
         }
     }
 }
@@ -372,6 +527,7 @@ mod tests {
         feed: Arc<FakeFeed>,
         settings: Arc<PersistentSettingsStore>,
         cache: Arc<PersistentImageCache>,
+        memory: Arc<ImageMemory>,
         holder: LockImageHolder,
     }
 
@@ -380,17 +536,28 @@ mod tests {
         let feed = Arc::new(FakeFeed::default());
         let settings = Arc::new(PersistentSettingsStore::new(fakes.storage.clone()));
         let cache = Arc::new(PersistentImageCache::new(fakes.storage.clone()));
-        let mut holder = holder(&fakes, &feed, &settings, &cache);
+        let memory = Arc::new(ImageMemory::default());
+        let mut holder = LockImageHolder::new(
+            settings.clone(),
+            cache.clone(),
+            feed.clone(),
+            fakes.wallpaper.clone(),
+            fakes.scheduler.clone(),
+            fakes.system.clone(),
+            memory.clone(),
+        );
         holder.handle(LockImageIntent::Refresh);
         Setup {
             fakes,
             feed,
             settings,
             cache,
+            memory,
             holder,
         }
     }
 
+    /// A holder of its own, with nothing browsed or queued.
     fn holder(
         fakes: &Fakes,
         feed: &Arc<FakeFeed>,
@@ -404,7 +571,38 @@ mod tests {
             fakes.wallpaper.clone(),
             fakes.scheduler.clone(),
             fakes.system.clone(),
+            Arc::default(),
         )
+    }
+
+    /// The updater the job's thread runs, on the same stores.
+    fn updater(setup: &Setup) -> ImageUpdater {
+        ImageUpdater::new(
+            setup.settings.clone(),
+            setup.cache.clone(),
+            setup.feed.clone(),
+            setup.fakes.network.clone(),
+            setup.fakes.wallpaper.clone(),
+            setup.fakes.scheduler.clone(),
+            setup.fakes.system.clone(),
+        )
+    }
+
+    /// Runs the queued tasks as the job's thread would, then tells the holder.
+    fn run_tasks(setup: &mut Setup) {
+        let updater = updater(setup);
+        let past = &setup.memory.past;
+        setup.memory.tasks.run_each(&mut |task| {
+            match task {
+                ImageTask::UpdateNow => updater.update_now(),
+                ImageTask::Browse => {
+                    updater.browse(past);
+                    Checked::NotDue
+                }
+                ImageTask::Pin(id) => updater.pin(id, past),
+            };
+        });
+        setup.holder.handle(LockImageIntent::Checked);
     }
 
     #[test]
@@ -613,6 +811,7 @@ mod tests {
                     image: None,
                     id: None,
                     marker: None,
+                    pinned: false,
                 },
                 b"image",
             )
@@ -706,6 +905,7 @@ mod tests {
             settings,
             cache,
             mut holder,
+            ..
         } = setup();
 
         holder.handle(LockImageIntent::SetRegion(Some("en-GB".into())));
@@ -826,6 +1026,7 @@ mod tests {
                     image: None,
                     id: None,
                     marker: None,
+                    pinned: false,
                 },
                 b"image",
             )
@@ -956,16 +1157,7 @@ mod tests {
                 .insert(version.url.clone(), meegone_core_data::fakes::jpeg(size));
         }
         *setup.feed.image.lock().unwrap() = Some(image);
-        let updater = ImageUpdater::new(
-            setup.settings.clone(),
-            setup.cache.clone(),
-            setup.feed.clone(),
-            setup.fakes.network.clone(),
-            setup.fakes.wallpaper.clone(),
-            setup.fakes.scheduler.clone(),
-            setup.fakes.system.clone(),
-        );
-        assert!(matches!(updater.check(), Checked::New(_)));
+        assert!(matches!(updater(setup).check(), Checked::New(_)));
         setup.holder.handle(LockImageIntent::Checked);
     }
 
@@ -979,16 +1171,19 @@ mod tests {
         setup.holder.handle(LockImageIntent::UpdateNow);
 
         assert!(setup.holder.state().updating);
-        assert_eq!(*setup.fakes.scheduler.updates_now.lock().unwrap(), 1);
-        // Other reads don't end it; only the check's report does.
+        assert_eq!(*setup.fakes.scheduler.task_runs.lock().unwrap(), 1);
+        assert_eq!(setup.memory.tasks.pending(), [ImageTask::UpdateNow]);
+        // Other reads don't end it, nor does an automatic check's report: only its own run
+        // does (ADR 0032).
         setup.holder.handle(LockImageIntent::Refresh);
+        setup.holder.handle(LockImageIntent::Checked);
         assert!(setup.holder.state().updating);
 
-        setup.holder.handle(LockImageIntent::Checked);
+        run_tasks(&mut setup);
 
         assert!(!setup.holder.state().updating);
         setup.holder.handle(LockImageIntent::UpdateNow);
-        assert_eq!(*setup.fakes.scheduler.updates_now.lock().unwrap(), 2);
+        assert_eq!(*setup.fakes.scheduler.task_runs.lock().unwrap(), 2);
     }
 
     #[test]
@@ -1002,7 +1197,7 @@ mod tests {
         setup.holder.handle(LockImageIntent::UpdateNow);
 
         assert!(!setup.holder.state().updating);
-        assert_eq!(*setup.fakes.scheduler.updates_now.lock().unwrap(), 0);
+        assert_eq!(*setup.fakes.scheduler.task_runs.lock().unwrap(), 0);
     }
 
     #[test]
@@ -1030,7 +1225,7 @@ mod tests {
 
         // Resuming is "Update now", which puts the image back.
         setup.holder.handle(LockImageIntent::UpdateNow);
-        assert_eq!(*setup.fakes.scheduler.updates_now.lock().unwrap(), 1);
+        assert_eq!(*setup.fakes.scheduler.task_runs.lock().unwrap(), 1);
     }
 
     #[test]
@@ -1103,5 +1298,178 @@ mod tests {
         *fakes.wallpaper.error.lock().unwrap() = Some(DataError::Failed("Couldn't".into()));
         holder.handle(LockImageIntent::ResetLockScreen);
         assert_eq!(holder.state().problem.as_deref(), Some("Couldn't"));
+    }
+    /// The feed offers `images` as the past week, and serves each one's sizes and preview.
+    fn offer_week(setup: &Setup, images: Vec<meegone_lockimage_data::FeedImage>) {
+        let mut responses = setup.fakes.network.responses.lock().unwrap();
+        for image in &images {
+            for version in image.versions.iter().chain([&image.preview]) {
+                let size = meegone_core_data::Size {
+                    width: version.width,
+                    height: version.height,
+                };
+                responses.insert(version.url.clone(), meegone_core_data::fakes::jpeg(size));
+            }
+        }
+        *setup.feed.week.lock().unwrap() = images;
+    }
+
+    /// Today's puffins, set by the daily check, barn owls, and a sculpture not offered as a
+    /// wallpaper.
+    fn with_a_week(setup: &mut Setup) {
+        with_an_image_set(setup);
+        let image = meegone_lockimage_data::fakes::feed_image;
+        offer_week(
+            setup,
+            vec![
+                image("puffins", "20261119"),
+                image("owls", "20261118"),
+                meegone_lockimage_data::FeedImage {
+                    offered_as_wallpaper: false,
+                    ..image("sculpture", "20261117")
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn browsing_runs_on_the_jobs_thread_and_lists_the_week() {
+        // WALL-17
+        let mut setup = setup();
+        with_a_week(&mut setup);
+
+        setup.holder.handle(LockImageIntent::Browse);
+        setup.holder.handle(LockImageIntent::Browse);
+        assert!(setup.holder.state().browsing);
+        assert_eq!(*setup.fakes.scheduler.task_runs.lock().unwrap(), 1);
+
+        run_tasks(&mut setup);
+
+        let state = setup.holder.state();
+        assert!(!state.browsing);
+        assert_eq!(
+            state
+                .past
+                .iter()
+                .map(|entry| (entry.id.as_str(), entry.offered, entry.current))
+                .collect::<Vec<_>>(),
+            [
+                ("puffins", true, true),
+                ("owls", true, false),
+                ("sculpture", false, false)
+            ]
+        );
+        assert_eq!(state.past[1].date, setup.holder.written_date("20261118"));
+        assert!(!state.past[1].date.is_empty());
+        assert_eq!(state.past[1].title, "Image owls");
+        assert!(state.past[1].preview.is_some());
+        // No preview for an image not offered as a wallpaper (LEGAL-04).
+        assert_eq!(state.past[2].preview, None);
+        assert!(state.may_pin("owls") && state.may_pin("puffins"));
+        assert!(!state.may_pin("sculpture") && !state.may_pin("lighthouse"));
+    }
+
+    #[test]
+    fn pinning_and_unpinning_run_on_the_jobs_thread() {
+        // WALL-17, issue #31
+        let mut setup = setup();
+        with_a_week(&mut setup);
+        setup.holder.handle(LockImageIntent::Browse);
+        run_tasks(&mut setup);
+
+        // Only an image that may be pinned, and one at a time.
+        setup
+            .holder
+            .handle(LockImageIntent::Pin("sculpture".into()));
+        setup.holder.handle(LockImageIntent::Pin("owls".into()));
+        setup.holder.handle(LockImageIntent::Pin("puffins".into()));
+        assert_eq!(setup.holder.state().pinning.as_deref(), Some("owls"));
+        assert_eq!(
+            setup.memory.tasks.pending(),
+            [ImageTask::Pin("owls".into())]
+        );
+
+        run_tasks(&mut setup);
+
+        let state = setup.holder.state();
+        assert_eq!(state.pinning, None);
+        assert!(state.pinned);
+        assert_eq!(state.current.as_ref().unwrap().id.as_deref(), Some("owls"));
+        assert!(state.past[1].current && !state.past[0].current);
+        assert!(!state.may_pin("owls"));
+        assert_eq!(*setup.fakes.scheduler.job.lock().unwrap(), None);
+
+        // Unpin is "Update now".
+        setup.holder.handle(LockImageIntent::UpdateNow);
+        run_tasks(&mut setup);
+
+        let state = setup.holder.state();
+        assert!(!state.pinned);
+        assert_eq!(
+            state.current.as_ref().unwrap().id.as_deref(),
+            Some("puffins")
+        );
+        assert!(setup.fakes.scheduler.job.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn a_pin_that_fails_says_why() {
+        // WALL-16, WALL-17
+        let mut setup = setup();
+        with_a_week(&mut setup);
+        setup.holder.handle(LockImageIntent::Browse);
+        run_tasks(&mut setup);
+        *setup.fakes.network.state.lock().unwrap() = meegone_core_data::NetworkState::Offline;
+
+        setup.holder.handle(LockImageIntent::Pin("owls".into()));
+        run_tasks(&mut setup);
+
+        let state = setup.holder.state();
+        assert_eq!(state.past_problem.as_deref(), Some("No connection"));
+        assert!(!state.pinned);
+        assert_eq!(
+            state.current.as_ref().unwrap().id.as_deref(),
+            Some("puffins")
+        );
+    }
+
+    #[test]
+    fn while_pinned_nothing_pauses_and_nothing_schedules_the_job() {
+        // WALL-14, WALL-17: daily updates wait until unpinned.
+        let mut setup = setup();
+        with_a_week(&mut setup);
+        setup.holder.handle(LockImageIntent::Browse);
+        run_tasks(&mut setup);
+        setup.holder.handle(LockImageIntent::Pin("owls".into()));
+        run_tasks(&mut setup);
+
+        setup.fakes.wallpaper.changed_by_someone_else();
+        setup.holder.handle(LockImageIntent::Refresh);
+        assert!(!setup.holder.state().paused);
+
+        setup.holder.handle(LockImageIntent::SetUseMobileData(true));
+        setup.holder.handle(LockImageIntent::TryAgain);
+        assert_eq!(*setup.fakes.scheduler.job.lock().unwrap(), None);
+    }
+
+    #[test]
+    fn nothing_is_browsed_or_pinned_while_the_image_is_off_and_turning_it_off_forgets_the_week() {
+        // WALL-02, WALL-12
+        let mut setup = setup();
+        setup.holder.handle(LockImageIntent::Browse);
+        setup.holder.handle(LockImageIntent::Pin("owls".into()));
+        assert!(setup.memory.tasks.pending().is_empty());
+        assert!(!setup.holder.state().past_offered());
+
+        with_a_week(&mut setup);
+        assert!(setup.holder.state().past_offered());
+        setup.holder.handle(LockImageIntent::Browse);
+        run_tasks(&mut setup);
+        assert_eq!(setup.holder.state().past.len(), 3);
+
+        setup.holder.handle(LockImageIntent::SetEnabled(false));
+
+        assert!(setup.holder.state().past.is_empty());
+        assert_eq!(setup.memory.past.week(), None);
     }
 }

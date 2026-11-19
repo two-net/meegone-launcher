@@ -53,7 +53,9 @@ import java.util.List;
  * of a {@link SearchPanel}, whose results are a third {@link AppsGrid} (SRCH-01, ADR 0016).
  * Below the notifications, Events shows the image of the day in an {@link ImageCard}, whose tap,
  * like the home menu's Lock-screen image, opens the {@link ImageDetails} screen over the home
- * views (EVT-12, WALL-15, ADR 0022, ADR 0031).
+ * views (EVT-12, WALL-15, ADR 0022, ADR 0031). From there, or from Settings, the {@link
+ * PastImages} screen opens over them, to pin one of the past week's images (WALL-17,
+ * ADR 0032).
  *
  * <p>The Rust app owns the gesture, the motion, the view indicator and the menus. This view
  * passes it every touch, frame time and layout change, says when a finger has been held on
@@ -207,7 +209,10 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     // The image details screen and the daily image's status line (WALL-15, WALL-16, ADR 0031):
     private static final int IMAGE_DETAILS_REVISION = 135; // changes when it changes; -1 closed
     private static final int IMAGE_STATUS_REVISION = 136; // changes when it changes; -1 none
-    private static final int FRAME_SIZE = 137;
+    // The past week's images (WALL-17, ADR 0032):
+    private static final int PAST_IMAGES = 137; // 1 while the screen shows
+    private static final int PAST_IMAGES_REVISION = 138; // changes when it changes; -1 closed
+    private static final int FRAME_SIZE = 139;
     private static final int SEARCH_OPEN = 1; // the field has the keyboard
     private static final int SEARCH_RESULTS = 2; // the results show instead of the grid
     private static final int SEARCH_NOTHING = 4; // nothing matches
@@ -309,6 +314,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private final ImageSettings imageSettings;
     /** Covers the home views while the image details screen is open (WALL-15). */
     private final ImageDetails imageDetails;
+    private final PastImages pastImages;
     /**
      * The home menu (HOME-10), a card at the finger, or an app's menu (APPS-11), a card at its
      * icon: over the home views. Its items are made for the menu that opens.
@@ -388,9 +394,11 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     /** Recent's revision as shown, as an unsigned int, or -1 before it is first read. */
     private long recentShown = -1;
     private int imageDetailsShown;
-    /** The revisions of the image details and the status line last read, or -1. */
+    private int pastImagesShown;
+    /** The revisions of the image details, the status line and the past week last read, or -1. */
     private int imageDetailsRead = -1;
     private int imageStatusRead = -1;
+    private int pastImagesRead = -1;
     private int menuOffered = -1;
     /** The density action screen readers were last offered: its rows, or 0 for none. */
     private int densityOffered = -1;
@@ -608,6 +616,19 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             }
 
             @Override
+            public void unpin() {
+                String message = nativeUnpinImage();
+                apply();
+                toast(message);
+            }
+
+            @Override
+            public void pastImages() {
+                nativeOpenPastImages();
+                apply();
+            }
+
+            @Override
             public void settings() {
                 nativeImageDetailsSettings();
                 apply();
@@ -663,6 +684,17 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             }
 
             @Override
+            public void unpin() {
+                answered(nativeUnpinImage());
+            }
+
+            @Override
+            public void pastImages() {
+                nativeOpenPastImages();
+                apply();
+            }
+
+            @Override
             public void resetLockScreen() {
                 String message = nativeResetLockScreen();
                 apply();
@@ -715,6 +747,38 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         scrollParams.setMarginEnd(dp(16));
         settings.addView(hiddenAppsScroll, scrollParams);
         addView(settings, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
+
+        // Above Settings and the details screen, which open it (ADR 0032).
+        pastImages = new PastImages(context, new PastImages.Listener() {
+            @Override
+            public byte[] preview(int revision, int index) {
+                return nativePastImagePreview(revision, index);
+            }
+
+            @Override
+            public void pin(int revision, int index) {
+                String message = nativePinImage(revision, index);
+                apply();
+                toast(message);
+            }
+
+            @Override
+            public void unpin() {
+                String message = nativeUnpinImage();
+                apply();
+                toast(message);
+            }
+
+            @Override
+            public void tryAgain() {
+                String message = nativePastImagesTryAgain();
+                apply();
+                toast(message);
+            }
+        });
+        pastImages.setVisibility(GONE);
+        addView(pastImages, new LayoutParams(
+                LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
 
         menu = new LinearLayout(context);
         menu.setOrientation(LinearLayout.VERTICAL);
@@ -793,6 +857,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         }
         settings.setPadding(safe.left, safe.top, safe.right, safe.bottom);
         imageDetails.setPadding(safe.left, safe.top, safe.right, safe.bottom);
+        pastImages.setPadding(safe.left, safe.top, safe.right, safe.bottom);
         recentList.viewport(getHeight() - safe.top - safe.bottom);
         LayoutParams params = (LayoutParams) indicator.getLayoutParams();
         if (params.topMargin != safe.top + indicatorMargin) {
@@ -1294,6 +1359,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         applyRecent();
         applyImageDetails();
         applySettings();
+        applyPastImages();
         applyMenu();
         applyRename();
         int offered = (frame[SEARCH] & SEARCH_OFFERED) != 0 ? 1 : 0;
@@ -1595,6 +1661,33 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             imageDetails.fill(nativeImageDetails());
         }
         imageDetails.showUpdateNow(frame[UPDATE_NOW]);
+    }
+
+    /**
+     * Shows the past week's images over Settings or the details screen while they are open
+     * (WALL-17), read again whenever their revision changes. Their previews go once it hides.
+     */
+    private void applyPastImages() {
+        if (frame[PAST_IMAGES] != pastImagesShown) {
+            pastImagesShown = frame[PAST_IMAGES];
+            pastImages.setVisibility(pastImagesShown != 0 ? VISIBLE : GONE);
+            if (pastImagesShown != 0) {
+                pastImages.opened();
+            } else {
+                pastImages.closed();
+                pastImagesRead = -1;
+            }
+            hidePagesFromScreenReaders();
+        }
+        if (pastImagesShown == 0) {
+            return;
+        }
+        pastImages.colour(foreground, dim, surface, frame[ACCENT]);
+        int revision = frame[PAST_IMAGES_REVISION];
+        if (revision >= 0 && revision != pastImagesRead) {
+            pastImagesRead = revision;
+            pastImages.fill(revision, nativePastImages());
+        }
     }
 
     /**
@@ -2096,7 +2189,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     /** While a menu or Settings covers the home views, screen readers skip them. */
     private void hidePagesFromScreenReaders() {
         int importance = menuShown != 0 || appMenuShown >= 0 || eventsMenuShown != 0
-                || settingsShown != 0 || imageDetailsShown != 0
+                || settingsShown != 0 || imageDetailsShown != 0 || pastImagesShown != 0
                 ? IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
                 : IMPORTANT_FOR_ACCESSIBILITY_AUTO;
         for (FrameLayout page : pages) {
@@ -2499,6 +2592,42 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
 
     /** Settings on the image details screen was tapped: Settings opens over it. */
     private native void nativeImageDetailsSettings();
+
+    /**
+     * "Past week" on the details screen, or "Choose from the past week" in Settings, was tapped
+     * (WALL-17): the past week's images open over it.
+     */
+    private native void nativeOpenPastImages();
+
+    /**
+     * What the past week's screen shows as of the last frame (WALL-17): two fields, then seven
+     * for each image, as {@link PastImages} reads them. Empty while it doesn't show.
+     */
+    private native String[] nativePastImages();
+
+    /**
+     * The preview of the image at {@code index} as read at {@code revision}, a JPEG the Rust app
+     * checked, or null (WALL-17, SEC-02).
+     */
+    private native byte[] nativePastImagePreview(int revision, int index);
+
+    /**
+     * Pin was tapped on the image at {@code index} as read at {@code revision} (WALL-17).
+     * Returns null, or a short message to show when it couldn't start.
+     */
+    private native String nativePinImage(int revision, int index);
+
+    /**
+     * Unpin was tapped (WALL-17): today's image comes back, as "Update now" fetches it. Returns
+     * null, or a short message to show when it couldn't start.
+     */
+    private native String nativeUnpinImage();
+
+    /**
+     * Try again was tapped on the past week's screen, after a problem (WALL-17). Returns null,
+     * or a short message to show when it couldn't start.
+     */
+    private native String nativePastImagesTryAgain();
 
     /** Fills {@code frame} with what to draw now, in the slots above. */
     private native void nativeRead(int[] frame);

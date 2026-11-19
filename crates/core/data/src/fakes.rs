@@ -577,9 +577,9 @@ impl NetworkAdapter for FakeNetwork {
 pub struct FakeScheduler {
     /// The job waiting to run, if any (ARCH-07: there is only one).
     pub job: Mutex<Option<ImageJob>>,
-    /// How many times an update was asked to run at once (WALL-11). The test runs it, with
-    /// `Shared::update_image_now`, as the job's thread would.
-    pub updates_now: Mutex<u32>,
+    /// How many times the lock-screen image's tasks were asked to run at once (WALL-11,
+    /// WALL-17). The test runs them, with `Shared::run_image_tasks`, as the job's thread would.
+    pub task_runs: Mutex<u32>,
     pub error: Mutex<Option<DataError>>,
 }
 
@@ -597,8 +597,8 @@ impl SchedulerAdapter for FakeScheduler {
     }
 
     /// It runs on its own thread, without background scheduling, so `error` doesn't stop it.
-    fn update_image_now(&self) -> Result<(), DataError> {
-        *self.updates_now.lock().unwrap() += 1;
+    fn run_image_tasks(&self) -> Result<(), DataError> {
+        *self.task_runs.lock().unwrap() += 1;
         Ok(())
     }
 }

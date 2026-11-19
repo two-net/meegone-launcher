@@ -143,6 +143,9 @@ pub struct ShellState {
     /// The image details screen covers the home views (WALL-15). The image-of-the-day card in
     /// Events and the home menu's Lock-screen image open it (EVT-12, ADR 0022, ADR 0031).
     pub image_details_open: bool,
+    /// The past week's images cover the home views, over the image details screen or Settings,
+    /// which open them (WALL-17, ADR 0032).
+    pub past_images_open: bool,
     /// The home menu, open over the current view (HOME-10). It covers the home views: they get
     /// no touches while it is open.
     pub menu: Option<HomeMenu>,
@@ -222,6 +225,7 @@ impl ShellState {
     pub fn menu_offered(&self) -> bool {
         !self.settings_open
             && !self.image_details_open
+            && !self.past_images_open
             && self.menu.is_none()
             && !self.app_menu_open
             && !self.events_menu_open
@@ -237,6 +241,7 @@ impl ShellState {
         self.current == HomeView::Applications
             && !self.settings_open
             && !self.image_details_open
+            && !self.past_images_open
             && self.menu.is_none()
             && !self.app_menu_open
             && !self.folder_open
@@ -479,6 +484,7 @@ impl HomeShell {
                 platform.wallpaper.clone(),
                 platform.scheduler.clone(),
                 platform.system.clone(),
+                shared.image_memory.clone(),
             )),
             settings: Store::new(SettingsHolder::new(
                 settings_store.clone(),
@@ -714,10 +720,12 @@ impl HomeShell {
             ShellIntent::Recent(intent) => self.recent.dispatch(intent),
             ShellIntent::LockImage(LockImageIntent::OpenDetails) => self.open_image_details(),
             ShellIntent::LockImage(LockImageIntent::OpenSettings) => {
-                if self.state.image_details_open {
+                // Only from the details screen, while it is the one on top.
+                if self.state.image_details_open && !self.state.past_images_open {
                     self.open_settings(Some(SettingsGroup::LockScreenImage));
                 }
             }
+            ShellIntent::LockImage(LockImageIntent::OpenPastImages) => self.open_past_images(),
             ShellIntent::LockImage(intent) => self.lockimage.dispatch(intent),
             ShellIntent::Settings(intent) => {
                 self.settings.dispatch(intent);
@@ -734,6 +742,7 @@ impl HomeShell {
         self.keep_cells_in_step();
         self.keep_events_in_step();
         self.keep_image_details_in_step();
+        self.keep_past_images_in_step();
         self.keep_recent_in_step();
         self.keep_close_in_step();
         self.lift.sync(&self.drag_surfaces());
@@ -762,11 +771,12 @@ impl HomeShell {
         self.state.recent_change = self.recent_change.state();
     }
 
-    /// Whether Settings, the image details or a menu covers the home views, so they get no new
-    /// touches.
+    /// Whether Settings, the image details, the past week's images or a menu covers the home
+    /// views, so they get no new touches.
     fn covered(&self) -> bool {
         self.state.settings_open
             || self.state.image_details_open
+            || self.state.past_images_open
             || self.state.menu.is_some()
             || self.app_menu_shown()
             || self.events_menu_shown()
@@ -991,6 +1001,14 @@ impl HomeShell {
     fn keep_image_details_in_step(&mut self) {
         if self.state.image_details_open && !self.image_details_offered() {
             self.close_image_details();
+        }
+    }
+
+    /// The past week's images close once they can't be browsed: the daily image is turned
+    /// off, or the lock-screen image stops working (WALL-17, ARCH-09).
+    fn keep_past_images_in_step(&mut self) {
+        if self.state.past_images_open && !self.past_images_offered() {
+            self.close_past_images();
         }
     }
 
@@ -1474,8 +1492,15 @@ impl HomeShell {
 
     /// Opens Settings over the home views, at `group` or at its top.
     fn open_settings(&mut self, group: Option<SettingsGroup>) {
-        // Settings covers the home views, so a drag on them ends, the menus close and a pressed
-        // or lifted icon lets go.
+        self.cover_views();
+        self.settings.dispatch(SettingsIntent::Refresh);
+        self.state.settings_open = true;
+        self.state.settings_group = group;
+    }
+
+    /// A screen is about to cover the home views, as Settings does: a drag on them ends, the
+    /// menus close, and a pressed or lifted icon lets go.
+    fn cover_views(&mut self) {
         let release = self.carousel.end_gesture(self.state.current);
         self.settle(release);
         self.press.finish();
@@ -1486,9 +1511,6 @@ impl HomeShell {
         self.close_events_menu();
         self.close_folder();
         self.close_search();
-        self.settings.dispatch(SettingsIntent::Refresh);
-        self.state.settings_open = true;
-        self.state.settings_group = group;
     }
 
     /// Closes Settings. Returns whether it was open.
@@ -1514,16 +1536,7 @@ impl HomeShell {
             return;
         }
         // It covers the home views as Settings does.
-        let release = self.carousel.end_gesture(self.state.current);
-        self.settle(release);
-        self.press.finish();
-        self.lift.cancel();
-        self.search.end_gesture();
-        self.state.menu = None;
-        self.close_app_menu();
-        self.close_events_menu();
-        self.close_folder();
-        self.close_search();
+        self.cover_views();
         self.state.image_details_open = true;
     }
 
@@ -1532,10 +1545,33 @@ impl HomeShell {
         std::mem::take(&mut self.state.image_details_open)
     }
 
-    /// Closes Settings, or else the image details screen: whichever covers the home views.
-    /// Returns whether either was open.
+    /// Whether the past week's images can open: the lock-screen image works (ARCH-09), and its
+    /// daily image is on (WALL-17).
+    pub fn past_images_offered(&self) -> bool {
+        self.lockimage_ready() && self.lockimage.state().past_offered()
+    }
+
+    /// Opens the past week's images over the image details screen or Settings, which offer
+    /// them, and asks for the week, which is read unless it was already today (WALL-17).
+    fn open_past_images(&mut self) {
+        if !self.past_images_offered() {
+            return;
+        }
+        self.cover_views();
+        self.lockimage.dispatch(LockImageIntent::Browse);
+        self.state.past_images_open = true;
+    }
+
+    /// Closes the past week's images. Returns whether they were open.
+    fn close_past_images(&mut self) -> bool {
+        std::mem::take(&mut self.state.past_images_open)
+    }
+
+    /// Closes the topmost screen covering the home views: the past week's images, which open
+    /// over the others, then Settings, then the image details screen. Returns whether one was
+    /// open.
     fn close_screen(&mut self) -> bool {
-        self.close_settings() || self.close_image_details()
+        self.close_past_images() || self.close_settings() || self.close_image_details()
     }
 
     /// HOME-07: close what is open; otherwise go to Applications, or, on Applications, scroll
@@ -1559,8 +1595,8 @@ impl HomeShell {
         }
     }
 
-    /// HOME-08: close the topmost open element (Settings, then the image details, then the home
-    /// menu, then the view's own); otherwise do nothing.
+    /// HOME-08: close the topmost open element (the past week's images, then Settings, then the
+    /// image details, then the home menu, then the view's own); otherwise do nothing.
     fn back(&mut self) {
         if !self.close_screen() && self.state.menu.take().is_none() {
             self.close_topmost(self.state.current);
@@ -1573,6 +1609,7 @@ impl HomeShell {
     /// animates the return (ANIM-09).
     fn returned(&mut self, home: bool) {
         if home && self.settings_store.get().home_target == HomeTarget::Applications {
+            self.close_past_images();
             self.close_settings();
             self.close_image_details();
             self.state.menu = None;
@@ -2026,6 +2063,7 @@ mod tests {
                     image: None,
                     id: Some(format!("OHR.{date}")),
                     marker: None,
+                    pinned: false,
                 },
                 date.as_bytes(),
             )
@@ -2064,6 +2102,77 @@ mod tests {
         shell.dispatch(ShellIntent::Home);
         assert!(!shell.state().image_details_open);
         assert_eq!(shell.state().current, HomeView::Events);
+    }
+
+    #[test]
+    fn the_past_week_opens_over_the_details_or_settings_and_back_returns_to_them() {
+        // WALL-17, HOME-08
+        let fakes = Fakes::default();
+        let mut shell = with_an_image(&fakes);
+        go(&mut shell, Direction::Previous);
+
+        shell.dispatch(ShellIntent::LockImage(LockImageIntent::OpenDetails));
+        shell.dispatch(ShellIntent::LockImage(LockImageIntent::OpenPastImages));
+        assert!(shell.state().past_images_open && shell.state().image_details_open);
+        assert!(!shell.state().menu_offered());
+        // Opening it asks for the week, on the job's thread.
+        assert!(shell.lockimage().state().browsing);
+        assert_eq!(*fakes.scheduler.task_runs.lock().unwrap(), 1);
+        // The details' Settings isn't on top, so it opens nothing.
+        shell.dispatch(ShellIntent::LockImage(LockImageIntent::OpenSettings));
+        assert!(!shell.state().settings_open);
+
+        shell.dispatch(ShellIntent::Back);
+        assert!(!shell.state().past_images_open);
+        assert!(shell.state().image_details_open);
+
+        // Over Settings, opened over the details.
+        shell.dispatch(ShellIntent::LockImage(LockImageIntent::OpenSettings));
+        shell.dispatch(ShellIntent::LockImage(LockImageIntent::OpenPastImages));
+        shell.dispatch(ShellIntent::Back);
+        assert!(shell.state().settings_open && !shell.state().past_images_open);
+        shell.dispatch(ShellIntent::Back);
+        shell.dispatch(ShellIntent::Back);
+        assert!(!shell.state().image_details_open);
+        assert_eq!(shell.state().current, HomeView::Events);
+
+        // Home closes it first, as the topmost screen.
+        shell.dispatch(ShellIntent::LockImage(LockImageIntent::OpenPastImages));
+        assert!(shell.state().past_images_open);
+        shell.dispatch(ShellIntent::Home);
+        assert!(!shell.state().past_images_open);
+        assert_eq!(shell.state().current, HomeView::Events);
+    }
+
+    #[test]
+    fn the_past_week_is_offered_while_the_daily_image_is_on_even_before_the_first_image() {
+        // WALL-17, WALL-02
+        let mut shell = laid_out(&Fakes::default());
+        shell.dispatch(ShellIntent::LockImage(LockImageIntent::OpenPastImages));
+        assert!(!shell.state().past_images_open);
+
+        shell.dispatch(ShellIntent::LockImage(LockImageIntent::SetEnabled(true)));
+        assert!(shell.past_images_offered() && !shell.image_details_offered());
+        shell.dispatch(ShellIntent::LockImage(LockImageIntent::OpenPastImages));
+        assert!(shell.state().past_images_open);
+
+        // Turned off in Settings beneath it, it closes.
+        shell.dispatch(ShellIntent::LockImage(LockImageIntent::SetEnabled(false)));
+        assert!(!shell.state().past_images_open);
+    }
+
+    #[test]
+    fn coming_back_home_to_applications_closes_the_past_week() {
+        // HOME-06
+        let fakes = Fakes::default();
+        let mut shell = with_an_image(&fakes);
+        always_applications(&mut shell);
+        shell.dispatch(ShellIntent::LockImage(LockImageIntent::OpenPastImages));
+        assert!(shell.state().past_images_open);
+
+        shell.dispatch(ShellIntent::Returned { home: true });
+
+        assert!(!shell.state().past_images_open);
     }
 
     #[test]
@@ -2294,11 +2403,11 @@ mod tests {
 
         shell.dispatch(ShellIntent::LockImage(LockImageIntent::UpdateNow));
         assert!(shell.lockimage().state().updating);
-        assert_eq!(*fakes.scheduler.updates_now.lock().unwrap(), 1);
+        assert_eq!(*fakes.scheduler.task_runs.lock().unwrap(), 1);
 
         let update = {
             let shared = shared.clone();
-            std::thread::spawn(move || shared.update_image_now())
+            std::thread::spawn(move || shared.run_image_tasks())
         };
         update.join().unwrap();
         // Offline: it asked at once, and failed.

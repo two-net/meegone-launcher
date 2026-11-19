@@ -6,9 +6,10 @@
 
 use meegone_core_data::DataError;
 
-/// What [`ImageFeed::today`] fails with, as [`DataError::Invalid`], when a response can't be
-/// read: the feed's format has changed, or the response is malformed, truncated or too large. A
-/// failure of its own for the status line, never a crash (SRS 8.2, WALL-16).
+/// What [`ImageFeed::today`] and [`ImageFeed::past_week`] fail with, as [`DataError::Invalid`],
+/// when a response can't be read: the feed's format has changed, or the response is malformed,
+/// truncated or too large. A failure of its own for the status line, never a crash (SRS 8.2,
+/// WALL-16).
 pub const FORMAT_CHANGED: &str = "The feed's format has changed";
 
 /// One size of an image that the feed offers (WALL-06).
@@ -37,7 +38,14 @@ pub struct FeedImage {
     pub offered_as_wallpaper: bool,
     /// Every size on offer, in no particular order.
     pub versions: Vec<ImageVersion>,
+    /// A small size, only for browsing the past week (WALL-17, ADR 0032). It is never one of
+    /// [`versions`](Self::versions), so it never becomes the wallpaper.
+    pub preview: ImageVersion,
 }
+
+/// How many images [`ImageFeed::past_week`] gives at most: today's and the six before it
+/// (WALL-17).
+pub const PAST_WEEK_IMAGES: usize = 7;
 
 /// The image-of-the-day feed.
 pub trait ImageFeed: Send + Sync {
@@ -51,4 +59,8 @@ pub trait ImageFeed: Send + Sync {
     /// [`DataError::Invalid`] for a region the feed doesn't list, without a request, or with
     /// [`FORMAT_CHANGED`] if the response can't be read.
     fn today(&self, region: &str) -> Result<FeedImage, DataError>;
+    /// The images of the past seven days for `region`, today's first, at most
+    /// [`PAST_WEEK_IMAGES`], in exactly one request (WALL-17, ADR 0032). It fails as
+    /// [`today`](Self::today) does.
+    fn past_week(&self, region: &str) -> Result<Vec<FeedImage>, DataError>;
 }

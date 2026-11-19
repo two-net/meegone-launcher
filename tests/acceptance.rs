@@ -28,9 +28,9 @@ use meegone_core_ui::tokens;
 use meegone_launcher::{
     Age, AppMenuItem, BADGE_ROWS, Bounds, CardContent, CellKey, CheckStatus, DailyImage,
     DetailsContent, Direction, EventsListMode, EventsMenuFrame, FolderId, GridLayout, HomeView,
-    Launcher, Layout, LiftFrame, MenuItem, NotificationMenuItem, PinchEvent, PinchKind,
-    PointerEvent, PointerKind, RECENT_ROWS, RecentFrame, RecentMode, RecentWindow, SettingsGroup,
-    Shared, ShellIntent, Surface, UpdateStatus,
+    Launcher, Layout, LiftFrame, MenuItem, NotificationMenuItem, PastAction, PastContent,
+    PinchEvent, PinchKind, PointerEvent, PointerKind, RECENT_ROWS, RecentFrame, RecentMode,
+    RecentWindow, SettingsGroup, Shared, ShellIntent, Surface, UpdateStatus,
 };
 
 /// A phone 1080 × 2400 px at 2.75 px per dp.
@@ -3311,9 +3311,10 @@ fn cached_image(fakes: &Fakes) -> Option<Vec<u8>> {
         .cloned()
 }
 
-/// Runs "Update now" as the job's thread does, then tells the home (WALL-11, ADR 0030).
+/// Runs what the user asked of the job's thread, such as "Update now", as that thread does,
+/// then tells the home (WALL-11, ADR 0030, ADR 0032).
 fn run_update_now(shared: &Shared, launcher: &mut Launcher) {
-    shared.update_image_now();
+    shared.run_image_tasks();
     launcher.dispatch(ShellIntent::ImageChecked);
 }
 
@@ -3366,6 +3367,7 @@ fn ac15_given_the_daily_image_is_on_and_wifi_when_a_new_image_is_published_then_
         Some(UpdateStatus {
             updated: Some("19 November, 12:00 AM".into()),
             checks: CheckStatus::Fine,
+            pinned: false,
         })
     );
 }
@@ -3429,6 +3431,7 @@ fn wall16_given_the_last_attempt_failed_for_lack_of_connection_then_settings_say
     let status = UpdateStatus {
         updated: Some("16 November, 6:00 AM".into()),
         checks: CheckStatus::Retrying("No connection".into()),
+        pinned: false,
     };
     assert_eq!(
         launcher.view().image_settings().update_status(),
@@ -3471,6 +3474,7 @@ fn wall15_given_an_image_then_the_home_menus_lock_screen_image_opens_its_details
             image_path: "images/a",
             image_key: "20261116 en-GB images/a".into(),
             more_info: false,
+            pinned: false,
         })
     );
 
@@ -3540,7 +3544,9 @@ fn ac17_given_the_feature_is_on_when_it_is_turned_off_and_the_lock_screen_reset_
     let requests = fakes.network.requests.lock().unwrap().len();
     *fakes.system.now_ms.lock().unwrap() = NOV_19_MS + 48 * HOUR_MS;
     assert!(!shared.check_image());
-    shared.update_image_now();
+    launcher.view().image_settings().update_now();
+    launcher.frame();
+    shared.run_image_tasks();
     assert_eq!(fakes.network.requests.lock().unwrap().len(), requests);
     assert_eq!(lock_screen(&fakes), None);
 
@@ -3561,7 +3567,9 @@ fn wall02_given_the_daily_image_was_never_confirmed_then_the_lock_screen_is_unch
     let mut launcher = Launcher::start_shared(&shared);
 
     assert!(!shared.check_image());
-    shared.update_image_now();
+    launcher.view().image_settings().update_now();
+    launcher.frame();
+    shared.run_image_tasks();
     launcher.dispatch(ShellIntent::Resumed);
 
     assert_eq!(launcher.frame().daily_image, Some(DailyImage::Off));
@@ -3578,6 +3586,8 @@ fn wall10_given_no_image_was_ever_downloaded_then_the_lock_screen_is_left_as_it_
     let (shared, mut launcher) = with_the_daily_check(&fakes);
 
     run_the_daily_job(&fakes, &shared, &mut launcher, NOV_19_MS + 24 * HOUR_MS);
+    launcher.view().image_settings().update_now();
+    launcher.frame();
     run_update_now(&shared, &mut launcher);
 
     assert_eq!(fakes.network.requests.lock().unwrap().len(), 7);
@@ -3603,7 +3613,7 @@ fn wall11_update_now_fetches_the_image_at_once_over_mobile_data() {
     assert_eq!(launcher.frame().update_now, Some(true));
     launcher.view().image_settings().update_now();
     launcher.frame();
-    assert_eq!(*fakes.scheduler.updates_now.lock().unwrap(), 1);
+    assert_eq!(*fakes.scheduler.task_runs.lock().unwrap(), 1);
     run_update_now(&shared, &mut launcher);
 
     assert_eq!(launcher.frame().update_now, Some(false));
@@ -4280,4 +4290,296 @@ fn a11y05_a_screen_reader_clears_recent_without_gestures() {
         !recent_frame(&mut launcher).close_offered,
         "nothing to remove"
     );
+}
+
+/// Where Bing's feed gives the past week's images in the device's region (WALL-17).
+const WEEK_URL: &str = "https://www.bing.com/HPImageArchive.aspx?format=js&idx=0&n=7&mkt=en-US";
+/// The images of the week recorded on 19 November 2026, newest first. The first, the
+/// sculpture, isn't offered as a wallpaper; the second is today's image in `FEED_URL`.
+const WEEK: [&str; 7] = [
+    "OHR.KnowledgeSculpture_EN-US9746703110",
+    "OHR.BarnOwlsUnite_EN-US9661992435",
+    "OHR.TrailCedars_EN-US2240500417",
+    "OHR.GilaCliff_EN-US2139490645",
+    "OHR.FirstFrost_EN-US8881008245",
+    "OHR.BlueHK_EN-US7870996687",
+    "OHR.AbrahamCanada_EN-US3455540217",
+];
+/// The cedars' largest version, which pinning them downloads on this phone.
+const CEDARS_UHD_URL: &str = "https://www.bing.com/th?id=OHR.TrailCedars_EN-US2240500417_UHD.jpg";
+
+fn preview_url(id: &str) -> String {
+    format!("https://www.bing.com/th?id={id}_800x480.jpg")
+}
+
+/// A JPEG of `size` that is `bytes` long, padded with comments, as a real one of that size
+/// would download.
+fn jpeg_of(size: Size, bytes: usize) -> Vec<u8> {
+    let header = fakes::jpeg(size);
+    let mut jpeg = header[..2].to_vec();
+    while jpeg.len() + header.len() - 2 < bytes {
+        let room = bytes - (jpeg.len() + header.len() - 2);
+        let length = room.clamp(4, 0xFFFF);
+        jpeg.extend([0xFF, 0xFE]);
+        jpeg.extend(u16::try_from(length - 2).unwrap().to_be_bytes());
+        jpeg.resize(jpeg.len() + length - 4, b' ');
+    }
+    jpeg.extend(&header[2..]);
+    jpeg
+}
+
+/// The network serves the past week, a preview of `preview_bytes` for each image, and the
+/// cedars' largest version at `uhd_bytes` (WALL-17).
+fn serve_the_past_week(fakes: &Fakes, preview_bytes: usize, uhd_bytes: usize) {
+    let mut responses = fakes.network.responses.lock().unwrap();
+    responses.insert(
+        WEEK_URL.into(),
+        include_bytes!("../crates/lockimage/data/fixtures/bing-en-US-week.json").to_vec(),
+    );
+    for id in WEEK {
+        let preview = Size {
+            width: 800,
+            height: 480,
+        };
+        responses.insert(preview_url(id), jpeg_of(preview, preview_bytes));
+    }
+    let uhd = Size {
+        width: 3840,
+        height: 2160,
+    };
+    responses.insert(CEDARS_UHD_URL.into(), jpeg_of(uhd, uhd_bytes));
+}
+
+/// What the past week's screen shows after a frame, or `None` while it doesn't (WALL-17).
+fn past_images(launcher: &mut Launcher) -> Option<(u32, PastContent)> {
+    let revision = launcher.frame().past_images?;
+    Some((revision, launcher.view().past_images().content()?))
+}
+
+#[test]
+fn wall17_given_a_pinned_image_the_next_days_check_leaves_the_lock_screen_and_unpinning_resumes_daily_updates()
+ {
+    // Issue #31: WALL-17, LEGAL-03, LEGAL-04. Today's barn owls are on the lock screen; the user
+    // browses the past week from the details screen and pins the cedars.
+    let fakes = Fakes::default();
+    serve_todays_image(&fakes);
+    serve_the_past_week(&fakes, 1_000, 1_000);
+    let (shared, mut launcher) = with_the_daily_check(&fakes);
+    run_the_daily_job(&fakes, &shared, &mut launcher, NOV_19_MS + HOUR_MS);
+    assert_eq!(current_image(&fakes), Some((WEEK[1].to_owned(), false)));
+    let owls = lock_screen(&fakes);
+    assert!(owls.is_some());
+
+    launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
+    tap_the_image_card(&mut launcher);
+    launcher.frame();
+    assert!(launcher.view().image_details().past_images());
+    assert!(launcher.frame().past_images_open);
+    // The week is read on the job's thread.
+    assert!(past_images(&mut launcher).unwrap().1.loading);
+    run_update_now(&shared, &mut launcher);
+
+    let (revision, week) = past_images(&mut launcher).unwrap();
+    assert!(!week.loading);
+    assert_eq!(
+        week.images
+            .iter()
+            .map(|image| image.id.as_str())
+            .collect::<Vec<_>>(),
+        WEEK
+    );
+    assert_eq!(week.images[2].title, "Step into the great outdoors");
+    assert_eq!(
+        week.images[2].attribution,
+        "Trail of the Cedars, Glacier National Park, Montana (© DBushue Photography/Getty Images)"
+    );
+    assert_eq!(week.images[2].date, "17 November");
+    assert!(week.images[1].current);
+    // The sculpture can't be pinned, and has no preview (LEGAL-04); every other has one.
+    assert_eq!(week.images[0].action, PastAction::NotOffered);
+    assert!(week.images[0].preview.is_none());
+    assert!(
+        week.images[1..]
+            .iter()
+            .all(|image| image.action == PastAction::Pin && image.preview.is_some())
+    );
+
+    assert!(launcher.view().past_images().pin(revision, 2));
+    assert_eq!(
+        past_images(&mut launcher).unwrap().1.images[2].action,
+        PastAction::Pinning
+    );
+    run_update_now(&shared, &mut launcher);
+
+    // The cedars are the lock screen's wallpaper, pinned.
+    assert_eq!(current_image(&fakes), Some((WEEK[2].to_owned(), true)));
+    assert_eq!(*fakes.wallpaper.lock_screen_images_set.lock().unwrap(), 2);
+    assert_eq!(lock_screen(&fakes), current_image_bytes(&fakes));
+    let week = past_images(&mut launcher).unwrap().1;
+    assert!(week.images[2].current);
+    assert_eq!(week.images[2].action, PastAction::Unpin);
+    assert!(
+        launcher
+            .view()
+            .image_settings()
+            .update_status()
+            .unwrap()
+            .pinned
+    );
+    // One request for the week, one preview for each image offered, and the cedars.
+    let requests = fakes.network.requests.lock().unwrap().clone();
+    assert_eq!(requests[..2], [FEED_URL, UHD_URL]);
+    assert_eq!(requests[2], WEEK_URL);
+    assert_eq!(
+        requests[3..9],
+        WEEK[1..]
+            .iter()
+            .map(|id| preview_url(id))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(requests[9..], [CEDARS_UHD_URL]);
+    // Daily updates wait: no job.
+    assert_eq!(*fakes.scheduler.job.lock().unwrap(), None);
+
+    // The next day: neither the system's job nor MeeGone's start asks for anything, and the lock
+    // screen keeps the cedars.
+    let asked = requests.len();
+    assert_eq!(
+        run_the_daily_job(&fakes, &shared, &mut launcher, NOV_19_MS + 48 * HOUR_MS),
+        0
+    );
+    *fakes.system.now_ms.lock().unwrap() = NOV_19_MS + 25 * HOUR_MS;
+    assert!(!shared.check_image());
+    launcher.dispatch(ShellIntent::Resumed);
+    assert_eq!(fakes.network.requests.lock().unwrap().len(), asked);
+    assert_eq!(current_image(&fakes), Some((WEEK[2].to_owned(), true)));
+    assert_eq!(*fakes.wallpaper.lock_screen_images_set.lock().unwrap(), 2);
+
+    // Unpinned: today's image comes back from the cache, and the daily checks resume.
+    assert!(launcher.view().past_images().unpin());
+    launcher.frame();
+    run_update_now(&shared, &mut launcher);
+
+    assert_eq!(current_image(&fakes), Some((WEEK[1].to_owned(), false)));
+    assert_eq!(*fakes.wallpaper.lock_screen_images_set.lock().unwrap(), 3);
+    assert_eq!(lock_screen(&fakes), owls);
+    assert!(
+        !launcher
+            .view()
+            .image_settings()
+            .update_status()
+            .unwrap()
+            .pinned
+    );
+    assert_eq!(fakes.network.requests.lock().unwrap()[asked..], [FEED_URL]);
+    let job = fakes.scheduler.job.lock().unwrap().expect("the daily job");
+    assert_eq!(job.not_before_ms, NOV_19_MS + 48 * HOUR_MS);
+    run_the_daily_job(&fakes, &shared, &mut launcher, NOV_19_MS + 49 * HOUR_MS);
+    assert_eq!(
+        fakes.network.requests.lock().unwrap()[asked + 1..],
+        [FEED_URL]
+    );
+}
+
+/// The fields of the current image's saved record: `current`, then its date, region, title,
+/// attribution, link, time set, file, id, marker and pin.
+fn current_record(fakes: &Fakes) -> Option<Vec<String>> {
+    let files = fakes.storage.files.lock().unwrap();
+    let details = String::from_utf8_lossy(files.get(&StoredFile::ImageDetails)?).into_owned();
+    let current = details.lines().find(|line| line.starts_with("current "))?;
+    Some(current.split(' ').map(str::to_owned).collect())
+}
+
+/// The current image's feed id, and whether it is pinned, as saved.
+fn current_image(fakes: &Fakes) -> Option<(String, bool)> {
+    let record = current_record(fakes)?;
+    Some((record.get(8)?.clone(), record.get(10)? == "true"))
+}
+
+/// The current image's bytes, which the lock screen shows once it is set.
+fn current_image_bytes(fakes: &Fakes) -> Option<Vec<u8>> {
+    let file = match current_record(fakes)?.get(7)?.as_str() {
+        "b" => StoredFile::ImageB,
+        _ => StoredFile::ImageA,
+    };
+    fakes.storage.files.lock().unwrap().get(&file).cloned()
+}
+
+#[test]
+fn wall17_the_past_week_opens_from_settings_before_any_image_is_cached() {
+    // Issue #31: WALL-17, WALL-10. Today's image isn't offered as a wallpaper, so nothing is
+    // cached yet; the user picks a recent one instead.
+    let fakes = Fakes::default();
+    serve_the_past_week(&fakes, 1_000, 1_000);
+    *fakes.network.state.lock().unwrap() = NetworkState::Unmetered;
+    let (shared, mut launcher) = with_the_daily_check(&fakes);
+    launcher.dispatch(ShellIntent::OpenSettings);
+    assert!(launcher.frame().image_details.is_none());
+
+    assert!(launcher.view().image_settings().past_images());
+    launcher.frame();
+    run_update_now(&shared, &mut launcher);
+    let (revision, week) = past_images(&mut launcher).unwrap();
+    assert_eq!(week.images.len(), 7);
+    assert!(week.images.iter().all(|image| !image.current));
+    assert!(launcher.view().past_images().pin(revision, 2));
+    launcher.frame();
+    run_update_now(&shared, &mut launcher);
+
+    assert!(lock_screen(&fakes).is_some());
+    assert_eq!(current_image(&fakes), Some((WEEK[2].to_owned(), true)));
+    assert!(launcher.view().image_settings().pinned());
+    // Back goes to Settings, then home.
+    launcher.dispatch(ShellIntent::Back);
+    let frame = launcher.frame();
+    assert!(!frame.past_images_open && frame.settings_open);
+}
+
+#[test]
+fn pwr03_browsing_and_pinning_keep_a_day_within_10_mb() {
+    // Issue #31: PWR-03, WALL-17. The feed's real sizes: today's image about 3.7 MB, the
+    // week's previews about 35 KB each. A day with a check, two browses, a pin and an unpin.
+    let fakes = Fakes::default();
+    serve_todays_image(&fakes);
+    let uhd = Size {
+        width: 3840,
+        height: 2160,
+    };
+    fakes
+        .network
+        .responses
+        .lock()
+        .unwrap()
+        .insert(UHD_URL.into(), jpeg_of(uhd, 3_700_000));
+    serve_the_past_week(&fakes, 35_000, 3_700_000);
+    let (shared, mut launcher) = with_the_daily_check(&fakes);
+    run_the_daily_job(&fakes, &shared, &mut launcher, NOV_19_MS + HOUR_MS);
+
+    launcher.dispatch(ShellIntent::OpenSettings);
+    for _ in 0..2 {
+        assert!(launcher.view().image_settings().past_images());
+        launcher.frame();
+        run_update_now(&shared, &mut launcher);
+        launcher.dispatch(ShellIntent::Back);
+    }
+    launcher.view().image_settings().past_images();
+    let (revision, _) = past_images(&mut launcher).unwrap();
+    assert!(launcher.view().past_images().pin(revision, 2));
+    launcher.frame();
+    run_update_now(&shared, &mut launcher);
+    assert_eq!(current_image(&fakes), Some((WEEK[2].to_owned(), true)));
+    assert!(launcher.view().past_images().unpin());
+    launcher.frame();
+    run_update_now(&shared, &mut launcher);
+    assert_eq!(current_image(&fakes), Some((WEEK[1].to_owned(), false)));
+    run_the_daily_job(&fakes, &shared, &mut launcher, NOV_19_MS + 24 * HOUR_MS);
+
+    let responses = fakes.network.responses.lock().unwrap();
+    let requests = fakes.network.requests.lock().unwrap();
+    let bytes: usize = requests.iter().map(|url| responses[url].len()).sum();
+    // The week is read once that day, and the unpin downloads nothing.
+    assert_eq!(requests.iter().filter(|url| *url == WEEK_URL).count(), 1);
+    assert_eq!(requests.iter().filter(|url| *url == UHD_URL).count(), 1);
+    assert!(bytes < 10_000_000, "{bytes} bytes");
+    assert!(bytes > 7_400_000, "{bytes} bytes");
 }

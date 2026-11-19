@@ -14,8 +14,8 @@ import android.widget.Switch;
 import android.widget.TextView;
 
 /**
- * Settings → Lock-screen image (SET-02, ADR 0022, ADR 0029 to ADR 0031), as far as #21 and #28
- * to #30 draw it:
+ * Settings → Lock-screen image (SET-02, ADR 0022, ADR 0029 to ADR 0032), as far as #21, #28 to
+ * #31 draw it:
  *
  * <ul>
  *   <li>"Daily lock-screen image", the switch that confirms the feature, before which the lock
@@ -25,11 +25,14 @@ import android.widget.TextView;
  *       as "No connection. Will try again later." (WALL-16);
  *   <li>while someone else has changed the lock screen, that daily updates are paused, with
  *       Resume (WALL-14);
+ *   <li>while an image is pinned, that daily updates are paused, with Unpin (WALL-17);
  *   <li>where the device didn't keep the image, that it may not appear on the lock screen (SRS
  *       C5);
  *   <li>after three days of failed checks, "Daily image unavailable" with Try again (SRS 7.6);
  *   <li>"Show card in Events", which hides or shows the image-of-the-day card (EVT-12);
  *   <li>"Use mobile data", which lets the daily image download over mobile data (WALL-04);
+ *   <li>while it is on, "Choose from the past week", which opens the past week's images
+ *       (WALL-17);
  *   <li>"Update now", which reads "Updating…" while it runs (WALL-11);
  *   <li>once the daily image is off, "Reset lock screen to home wallpaper" and "Wallpaper
  *       settings" (WALL-12).
@@ -46,6 +49,12 @@ final class ImageSettings extends LinearLayout {
 
         /** "Update now", or Resume while daily updates are paused, was tapped. */
         void updateNow();
+
+        /** Unpin was tapped: today's image comes back (WALL-17). */
+        void unpin();
+
+        /** "Choose from the past week" was tapped (WALL-17). */
+        void pastImages();
 
         /** "Show card in Events" was switched. */
         void showCard(boolean on);
@@ -71,11 +80,12 @@ final class ImageSettings extends LinearLayout {
     static final int UPDATE_NOW_OFFERED = 0;
     static final int UPDATE_NOW_RUNNING = 1;
     // The fields of nativeImageStatus, mirrored in src/android.rs: when the image last updated,
-    // the last problem, and how the checks are going.
-    static final int STATUS_FIELDS = 3;
+    // the last problem, how the checks are going, and "1" while the image is pinned.
+    static final int STATUS_FIELDS = 4;
     private static final int STATUS_UPDATED = 0;
     private static final int STATUS_PROBLEM = 1;
     private static final int STATUS_KIND = 2;
+    private static final int STATUS_PINNED = 3;
     private static final String RETRYING = "retrying";
     private static final String UNAVAILABLE = "unavailable";
 
@@ -98,12 +108,16 @@ final class ImageSettings extends LinearLayout {
     private final LinearLayout paused;
     private final TextView pausedText;
     private final TextView resume;
+    private final LinearLayout pinned;
+    private final TextView pinnedText;
+    private final TextView unpin;
     private final TextView mayNotShow;
     private final LinearLayout unavailable;
     private final TextView unavailableText;
     private final TextView tryAgain;
     private final Switch showCard;
     private final Switch useMobileData;
+    private final TextView pastImages;
     private final TextView updateNow;
     private final TextView resetLockScreen;
     private final TextView wallpaperSettings;
@@ -137,6 +151,11 @@ final class ImageSettings extends LinearLayout {
         resume = new TextView(context);
         paused = withAction(context, pausedText, resume, R.string.image_resume, density);
         resume.setOnClickListener(view -> listener.updateNow());
+        pinnedText = new TextView(context);
+        pinnedText.setText(R.string.image_pinned);
+        unpin = new TextView(context);
+        pinned = withAction(context, pinnedText, unpin, R.string.image_unpin, density);
+        unpin.setOnClickListener(view -> listener.unpin());
         mayNotShow = note(context);
         mayNotShow.setText(R.string.image_may_not_show);
         unavailableText = new TextView(context);
@@ -154,6 +173,8 @@ final class ImageSettings extends LinearLayout {
         useMobileData.setOnClickListener(
                 view -> listener.useMobileData(useMobileData.isChecked()));
 
+        pastImages = action(context, R.string.image_choose_past_week, density);
+        pastImages.setOnClickListener(view -> listener.pastImages());
         updateNow = action(context, R.string.image_update_now, density);
         updateNow.setOnClickListener(view -> listener.updateNow());
         resetLockScreen = action(context, R.string.reset_lock_screen, density);
@@ -251,10 +272,12 @@ final class ImageSettings extends LinearLayout {
         if (useMobileData.isChecked() != useMobileDataOn) {
             useMobileData.setChecked(useMobileDataOn);
         }
+        pastImages.setVisibility(on ? VISIBLE : GONE);
         updateNow.setVisibility(update >= 0 ? VISIBLE : GONE);
         boolean running = update == UPDATE_NOW_RUNNING;
         updateNow.setText(running ? R.string.image_updating : R.string.image_update_now);
-        for (TextView button : new TextView[] {updateNow, resume}) {
+        // Resume and Unpin are Update now too (WALL-14, WALL-17).
+        for (TextView button : new TextView[] {updateNow, resume, unpin}) {
             button.setEnabled(!running);
             button.setTextColor(running ? dim : accent);
         }
@@ -271,9 +294,17 @@ final class ImageSettings extends LinearLayout {
         Resources res = getResources();
         updated.setText(shown ? updatedLine(res, status) : null);
         updated.setVisibility(shown ? VISIBLE : GONE);
-        String line = shown ? problemLine(res, status) : null;
+        boolean pinnedOn = shown && pinned(status);
+        pinned.setVisibility(pinnedOn ? VISIBLE : GONE);
+        // While pinned, the checks wait, so their last problem isn't news (WALL-17).
+        String line = shown && !pinnedOn ? problemLine(res, status) : null;
         problem.setText(line);
         problem.setVisibility(line != null ? VISIBLE : GONE);
+    }
+
+    /** Whether the status says the image is pinned, so daily updates wait (WALL-17). */
+    static boolean pinned(String[] status) {
+        return "1".equals(status[STATUS_PINNED]);
     }
 
     /** When the image last updated, in words: "Last updated 19 November, 07:00" (WALL-16). */
@@ -318,11 +349,11 @@ final class ImageSettings extends LinearLayout {
         problem.setTextColor(foreground);
         mayNotShow.setTextColor(dim);
         ColorStateList pressed = ColorStateList.valueOf((foreground & 0x00FFFFFF) | 0x1F000000);
-        for (TextView text : new TextView[] {pausedText, unavailableText}) {
+        for (TextView text : new TextView[] {pausedText, pinnedText, unavailableText}) {
             text.setTextColor(foreground);
         }
         for (TextView button : new TextView[] {
-            resume, tryAgain, updateNow, resetLockScreen, wallpaperSettings
+            resume, unpin, tryAgain, pastImages, updateNow, resetLockScreen, wallpaperSettings
         }) {
             button.setTextColor(button.isEnabled() ? accent : dim);
             button.setBackground(

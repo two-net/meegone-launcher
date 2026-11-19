@@ -23,8 +23,8 @@ import java.util.Locale;
  * The image details screen (WALL-15, ADR 0031). It covers the home views in the surface colour:
  * today's lock-screen image across the top, centre-cropped, then its title, its attribution as
  * the source provides it (LEGAL-03), its date and region, the update status that Settings shows
- * too (WALL-16), and the rows More info, Update now and Settings. It scrolls, so nothing
- * overlaps at large text sizes (A11Y-04).
+ * too (WALL-16), and the rows More info, Unpin while the image is pinned, Update now, Past week
+ * and Settings (WALL-17). It scrolls, so nothing overlaps at large text sizes (A11Y-04).
  *
  * <p>The Rust app decides what it shows; this view reads it again only when the frame's revision
  * changes. Every text is set as plain text: never as HTML, and with no links made clickable
@@ -33,8 +33,8 @@ import java.util.Locale;
 final class ImageDetails extends ScrollView {
     // The fields of nativeImageDetails, mirrored in src/android.rs: the title, the attribution,
     // the date, the region's tag, the image's file relative to the app's files folder, the
-    // image's key, and "1" while More info is offered.
-    static final int FIELDS = 7;
+    // image's key, "1" while More info is offered, and "1" while the image is pinned.
+    static final int FIELDS = 8;
     private static final int TITLE = 0;
     private static final int ATTRIBUTION = 1;
     private static final int DATE = 2;
@@ -42,6 +42,7 @@ final class ImageDetails extends ScrollView {
     private static final int PATH = 4;
     private static final int KEY = 5;
     private static final int MORE_INFO = 6;
+    private static final int PINNED = 7;
     private static final String OFFERED = "1";
 
     private static final float TITLE_SP = 24f;
@@ -64,6 +65,12 @@ final class ImageDetails extends ScrollView {
         /** Update now was tapped (WALL-11). */
         void updateNow();
 
+        /** Unpin was tapped: today's image comes back (WALL-17). */
+        void unpin();
+
+        /** Past week was tapped (WALL-17). */
+        void pastImages();
+
         /** Settings was tapped. */
         void settings();
     }
@@ -80,7 +87,9 @@ final class ImageDetails extends ScrollView {
     private final TextView updated;
     private final TextView problem;
     private final TextView moreInfo;
+    private final TextView unpin;
     private final TextView updateNow;
+    private final TextView pastImages;
     private final TextView settings;
     /** The image as of the last fill: its file and its key. */
     private String path = "";
@@ -126,8 +135,13 @@ final class ImageDetails extends ScrollView {
         moreInfo = action(context, actions, R.string.image_more_info);
         moreInfo.setOnClickListener(view -> listener.moreInfo());
         moreInfo.setVisibility(GONE);
+        unpin = action(context, actions, R.string.image_unpin);
+        unpin.setOnClickListener(view -> listener.unpin());
+        unpin.setVisibility(GONE);
         updateNow = action(context, actions, R.string.image_update_now);
         updateNow.setOnClickListener(view -> listener.updateNow());
+        pastImages = action(context, actions, R.string.image_past_week);
+        pastImages.setOnClickListener(view -> listener.pastImages());
         settings = action(context, actions, R.string.image_open_settings);
         settings.setOnClickListener(view -> listener.settings());
         content.addView(actions, matchWidth());
@@ -177,6 +191,7 @@ final class ImageDetails extends ScrollView {
         dateRegion.setText(line);
         dateRegion.setVisibility(line.isEmpty() ? GONE : VISIBLE);
         moreInfo.setVisibility(OFFERED.equals(fields[MORE_INFO]) ? VISIBLE : GONE);
+        unpin.setVisibility(OFFERED.equals(fields[PINNED]) ? VISIBLE : GONE);
         if (!fields[KEY].equals(key)) {
             path = fields[PATH];
             key = fields[KEY];
@@ -193,7 +208,12 @@ final class ImageDetails extends ScrollView {
         Resources res = getResources();
         updated.setText(shown ? ImageSettings.updatedLine(res, status) : null);
         updated.setVisibility(shown ? VISIBLE : GONE);
-        String line = shown ? ImageSettings.problemLine(res, status) : null;
+        // While pinned, that is what the line says, in place of the checks (WALL-17).
+        String line = !shown
+                ? null
+                : ImageSettings.pinned(status)
+                        ? res.getString(R.string.image_pinned)
+                        : ImageSettings.problemLine(res, status);
         problem.setText(line);
         problem.setVisibility(line != null ? VISIBLE : GONE);
     }
@@ -206,9 +226,12 @@ final class ImageDetails extends ScrollView {
         updateNow.setVisibility(update >= 0 ? VISIBLE : GONE);
         boolean running = update == ImageSettings.UPDATE_NOW_RUNNING;
         updateNow.setText(running ? R.string.image_updating : R.string.image_update_now);
-        if (updateNow.isEnabled() == running) {
-            updateNow.setEnabled(!running);
-            updateNow.setTextColor(running ? dim : accent);
+        // Unpin is Update now too (WALL-17).
+        for (TextView row : new TextView[] {updateNow, unpin}) {
+            if (row.isEnabled() == running) {
+                row.setEnabled(!running);
+                row.setTextColor(running ? dim : accent);
+            }
         }
     }
 
@@ -229,7 +252,7 @@ final class ImageDetails extends ScrollView {
         updated.setTextColor(dim);
         problem.setTextColor(foreground);
         ColorStateList pressed = ColorStateList.valueOf((foreground & 0x00FFFFFF) | 0x1F000000);
-        for (TextView row : new TextView[] {moreInfo, updateNow, settings}) {
+        for (TextView row : new TextView[] {moreInfo, unpin, updateNow, pastImages, settings}) {
             row.setTextColor(row.isEnabled() ? accent : dim);
             row.setBackground(new RippleDrawable(pressed, null, new ColorDrawable(Color.WHITE)));
         }

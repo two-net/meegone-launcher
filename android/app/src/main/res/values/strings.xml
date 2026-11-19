@@ -263,6 +263,33 @@
     <string name="image_open_settings">Settings</string>
     <!-- Shown briefly when no browser could open a link (SEC-02, SRS 8.1). -->
     <string name="browser_unavailable">No browser can open this link</string>
+    <!-- The image details screen's row that opens the past week's images, and that screen's
+         name and title (WALL-17). -->
+    <string name="image_past_week">Past week</string>
+    <!-- Settings → Lock-screen image: the same, while the daily image is on (WALL-17). -->
+    <string name="image_choose_past_week">Choose from the past week</string>
+    <!-- The past week's images while they are read, with nothing yet to show (WALL-17). -->
+    <string name="image_past_loading">Loading…</string>
+    <!-- Below a past image: pins it, so it stays on the lock screen and daily updates wait
+         until it is unpinned; and what it reads while that happens (WALL-17). -->
+    <string name="image_pin">Pin</string>
+    <string name="image_pinning">Pinning…</string>
+    <!-- What screen readers say for Pin and Unpin on a past image (A11Y-01). %1$s is the
+         image's title, such as "Step into the great outdoors". -->
+    <string name="image_pin_named">Pin %1$s</string>
+    <string name="image_unpin_named">Unpin %1$s</string>
+    <!-- Unpins the pinned image, which puts today's image back on the lock screen and resumes
+         daily updates; and what it reads while that happens (WALL-17). -->
+    <string name="image_unpin">Unpin</string>
+    <string name="image_unpinning">Unpinning…</string>
+    <!-- Below a past image the source doesn't offer as a wallpaper, in place of Pin
+         (LEGAL-04). -->
+    <string name="image_not_offered">Not offered as a wallpaper</string>
+    <!-- After a past image's date, when it is the one on the lock screen now (WALL-17). -->
+    <string name="image_on_lock_screen">On the lock screen</string>
+    <!-- Settings → Lock-screen image and the image details screen, while an image is pinned
+         (WALL-17). -->
+    <string name="image_pinned">Pinned. Daily updates are paused.</string>
     <!-- Recent's card while MeeGone has no usage access: one plain sentence saying what is
          read and why (REC-02, ONB-02), and the button that opens the system's usage-access
          screen. -->
