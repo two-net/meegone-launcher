@@ -597,6 +597,17 @@ impl ImageSettingsSection {
         self.latest.get().automatic_region.clone()
     }
 
+    /// The region chosen as a place in the list Settings offers: 0 for Automatic, otherwise 1 +
+    /// its place in [`Self::regions`] (WALL-05).
+    pub fn region_choice(&self) -> usize {
+        let state = self.latest.get();
+        state
+            .region
+            .as_ref()
+            .and_then(|chosen| state.regions.iter().position(|region| region == chosen))
+            .map_or(0, |place| place + 1)
+    }
+
     /// A region was chosen, or Automatic with `None` (WALL-05, SET-03).
     pub fn region_chosen(&self, region: Option<String>) {
         self.dispatch.send(LockImageIntent::SetRegion(region));
@@ -659,10 +670,10 @@ impl Slot for PastImagesScreen {
 
 impl Slot for ImageSettingsSection {
     fn render(&mut self, _tokens: &Tokens) {
-        // The host draws the daily image's switch, Update now, the status line, the pause, the
-        // pin, "Choose from the past week", "Show card in Events", "Use mobile data", "Daily
-        // image unavailable" and, once the image is off, the reset and the wallpaper settings,
-        // until the Settings screen, #34, draws the rest, Region included (ADR 0006, ADR 0022,
-        // ADR 0027, ADR 0029 to ADR 0032).
+        // The host draws the daily image's switch, the status line, the pause, the pin, "Daily
+        // image unavailable", Region, "Use mobile data", "Show card in Events", "Choose from the
+        // past week", Update now and, once the image is off, the reset and the wallpaper
+        // settings, in Settings' Lock-screen image group (ADR 0006, ADR 0022, ADR 0027, ADR 0029
+        // to ADR 0032, ADR 0035).
     }
 }

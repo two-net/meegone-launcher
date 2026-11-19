@@ -1,21 +1,14 @@
 package io.github.twonet.meegone;
 
 import android.content.Context;
-import android.content.res.ColorStateList;
 import android.content.res.Resources;
-import android.graphics.Color;
-import android.graphics.Typeface;
-import android.graphics.drawable.ColorDrawable;
-import android.graphics.drawable.RippleDrawable;
-import android.util.TypedValue;
-import android.view.Gravity;
 import android.widget.LinearLayout;
 import android.widget.Switch;
 import android.widget.TextView;
 
 /**
- * Settings → Lock-screen image (SET-02, ADR 0022, ADR 0029 to ADR 0032), as far as #21, #28 to
- * #31 draw it:
+ * Settings → Lock-screen image (SET-02, ADR 0022, ADR 0029 to ADR 0032, ADR 0035), in SET-02's
+ * order:
  *
  * <ul>
  *   <li>"Daily lock-screen image", the switch that confirms the feature, before which the lock
@@ -29,8 +22,9 @@ import android.widget.TextView;
  *   <li>where the device didn't keep the image, that it may not appear on the lock screen (SRS
  *       C5);
  *   <li>after three days of failed checks, "Daily image unavailable" with Try again (SRS 7.6);
- *   <li>"Show card in Events", which hides or shows the image-of-the-day card (EVT-12);
+ *   <li>Region, Automatic or one the feed offers, chosen in a dialog (WALL-05);
  *   <li>"Use mobile data", which lets the daily image download over mobile data (WALL-04);
+ *   <li>"Show card in Events", which hides or shows the image-of-the-day card (EVT-12);
  *   <li>while it is on, "Choose from the past week", which opens the past week's images
  *       (WALL-17);
  *   <li>"Update now", which reads "Updating…" while it runs (WALL-11);
@@ -38,14 +32,16 @@ import android.widget.TextView;
  *       settings" (WALL-12).
  * </ul>
  *
- * Changes take effect at once (SET-03). Until #34 draws the rest of Settings, it sits below
- * Hidden apps.
+ * Changes take effect at once (SET-03).
  */
 final class ImageSettings extends LinearLayout {
     /** What the user did here. */
     interface Listener {
         /** "Daily lock-screen image" was switched. */
         void dailyImage(boolean on);
+
+        /** Region was tapped: the choice of regions opens (WALL-05). */
+        void region();
 
         /** "Update now", or Resume while daily updates are paused, was tapped. */
         void updateNow();
@@ -89,17 +85,6 @@ final class ImageSettings extends LinearLayout {
     private static final String RETRYING = "retrying";
     private static final String UNAVAILABLE = "unavailable";
 
-    private static final float GROUP_SP = 14f;
-    private static final float TEXT_SP = 16f;
-    private static final float NOTE_SP = 14f;
-    private static final float ROW_DP = 56f;
-    private static final float GAP_DP = 16f;
-    /** The smallest a touch target gets (A11Y-02). */
-    private static final float TARGET_DP = 48f;
-    private static final int MEDIUM = 500;
-    /** How faint a control that takes no input is drawn. */
-    private static final float DISABLED_ALPHA = 0.38f;
-
     private final TextView group;
     private final Switch dailyImage;
     private final TextView unavailableReason;
@@ -115,8 +100,11 @@ final class ImageSettings extends LinearLayout {
     private final LinearLayout unavailable;
     private final TextView unavailableText;
     private final TextView tryAgain;
-    private final Switch showCard;
+    private final LinearLayout region;
+    private final TextView regionTitle;
+    private final TextView regionValue;
     private final Switch useMobileData;
+    private final Switch showCard;
     private final TextView pastImages;
     private final TextView updateNow;
     private final TextView resetLockScreen;
@@ -127,115 +115,61 @@ final class ImageSettings extends LinearLayout {
 
     ImageSettings(Context context, Listener listener) {
         super(context);
-        float density = getResources().getDisplayMetrics().density;
-        setOrientation(VERTICAL);
-        setPadding(0, Math.round(GAP_DP * density), 0, 0);
+        SettingsRows.startGroup(this);
+        group = SettingsRows.heading(this, R.string.menu_lock_screen_image);
 
-        group = new TextView(context);
-        group.setText(R.string.menu_lock_screen_image);
-        group.setTextSize(TypedValue.COMPLEX_UNIT_SP, GROUP_SP);
-        group.setAccessibilityHeading(true);
-        addView(group, new LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT));
-
-        // Each its own label, so screen readers hear "Daily lock-screen image, switch, off"
-        // (A11Y-01). A click, unlike a change of state, comes only from the user.
-        dailyImage = row(context, R.string.daily_image, density);
+        // A click, unlike a change of state, comes only from the user.
+        dailyImage = SettingsRows.switchRow(this, R.string.daily_image);
         dailyImage.setOnClickListener(view -> listener.dailyImage(dailyImage.isChecked()));
-        unavailableReason = note(context);
+        unavailableReason = SettingsRows.note(this);
         // WALL-16: when the image last updated, right below the switch.
-        updated = note(context);
+        updated = SettingsRows.note(this);
 
         // What needs the user's answer comes next, where it is seen, and only while it applies.
         pausedText = new TextView(context);
         pausedText.setText(R.string.image_paused);
         resume = new TextView(context);
-        paused = withAction(context, pausedText, resume, R.string.image_resume, density);
+        paused = SettingsRows.withAction(this, pausedText, resume, R.string.image_resume);
         resume.setOnClickListener(view -> listener.updateNow());
         pinnedText = new TextView(context);
         pinnedText.setText(R.string.image_pinned);
         unpin = new TextView(context);
-        pinned = withAction(context, pinnedText, unpin, R.string.image_unpin, density);
+        pinned = SettingsRows.withAction(this, pinnedText, unpin, R.string.image_unpin);
         unpin.setOnClickListener(view -> listener.unpin());
-        mayNotShow = note(context);
+        mayNotShow = SettingsRows.note(this);
         mayNotShow.setText(R.string.image_may_not_show);
         unavailableText = new TextView(context);
         unavailableText.setText(R.string.image_unavailable);
         tryAgain = new TextView(context);
-        unavailable = withAction(context, unavailableText, tryAgain, R.string.image_try_again,
-                density);
+        unavailable = SettingsRows.withAction(
+                this, unavailableText, tryAgain, R.string.image_try_again);
         tryAgain.setOnClickListener(view -> listener.tryAgain());
         // The last problem, below "Daily image unavailable" when that shows (WALL-16).
-        problem = note(context);
+        problem = SettingsRows.note(this);
 
-        showCard = row(context, R.string.show_image_card, density);
-        showCard.setOnClickListener(view -> listener.showCard(showCard.isChecked()));
-        useMobileData = row(context, R.string.use_mobile_data, density);
+        regionTitle = new TextView(context);
+        regionValue = new TextView(context);
+        region = SettingsRows.titled(
+                this, regionTitle, regionValue, R.string.image_region, listener::region);
+        useMobileData = SettingsRows.switchRow(this, R.string.use_mobile_data);
         useMobileData.setOnClickListener(
                 view -> listener.useMobileData(useMobileData.isChecked()));
+        showCard = SettingsRows.switchRow(this, R.string.show_image_card);
+        showCard.setOnClickListener(view -> listener.showCard(showCard.isChecked()));
 
-        pastImages = action(context, R.string.image_choose_past_week, density);
+        pastImages = SettingsRows.action(this, R.string.image_choose_past_week);
         pastImages.setOnClickListener(view -> listener.pastImages());
-        updateNow = action(context, R.string.image_update_now, density);
+        updateNow = SettingsRows.action(this, R.string.image_update_now);
         updateNow.setOnClickListener(view -> listener.updateNow());
-        resetLockScreen = action(context, R.string.reset_lock_screen, density);
+        resetLockScreen = SettingsRows.action(this, R.string.reset_lock_screen);
         resetLockScreen.setOnClickListener(view -> listener.resetLockScreen());
-        wallpaperSettings = action(context, R.string.wallpaper_settings, density);
+        wallpaperSettings = SettingsRows.action(this, R.string.wallpaper_settings);
         wallpaperSettings.setOnClickListener(view -> listener.openWallpaperSettings());
     }
 
-    private Switch row(Context context, int label, float density) {
-        Switch row = new Switch(context);
-        row.setText(label);
-        row.setTextSize(TypedValue.COMPLEX_UNIT_SP, TEXT_SP);
-        row.setMinHeight(Math.round(ROW_DP * density));
-        addView(row, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
-        return row;
-    }
-
-    /** A line of smaller text below the row it explains, hidden until it applies. */
-    private TextView note(Context context) {
-        TextView note = new TextView(context);
-        note.setTextSize(TypedValue.COMPLEX_UNIT_SP, NOTE_SP);
-        note.setVisibility(GONE);
-        addView(note, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
-        return note;
-    }
-
-    /** A whole row that does something when tapped, such as "Update now". */
-    private TextView action(Context context, int label, float density) {
-        TextView action = new TextView(context);
-        action.setText(label);
-        action.setTextSize(TypedValue.COMPLEX_UNIT_SP, TEXT_SP);
-        action.setGravity(Gravity.CENTER_VERTICAL);
-        action.setMinHeight(Math.round(ROW_DP * density));
-        action.setVisibility(GONE);
-        addView(action, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
-        return action;
-    }
-
-    /** A message with a button at its end, such as Try again, hidden until it applies. */
-    private LinearLayout withAction(
-            Context context, TextView text, TextView button, int label, float density) {
-        LinearLayout row = new LinearLayout(context);
-        row.setOrientation(HORIZONTAL);
-        row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setMinimumHeight(Math.round(ROW_DP * density));
-        row.setVisibility(GONE);
-        text.setTextSize(TypedValue.COMPLEX_UNIT_SP, TEXT_SP);
-        row.addView(text, new LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f));
-        button.setText(label);
-        button.setTextSize(TypedValue.COMPLEX_UNIT_SP, TEXT_SP);
-        button.setTypeface(Typeface.create(Typeface.DEFAULT, MEDIUM, false));
-        button.setGravity(Gravity.CENTER);
-        int target = Math.round(TARGET_DP * density);
-        button.setMinHeight(target);
-        button.setMinWidth(target);
-        int gap = Math.round(GAP_DP * density);
-        button.setPadding(gap, 0, gap, 0);
-        row.addView(button, new LayoutParams(
-                LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT));
-        addView(row, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
-        return row;
+    /** The group's heading, which Settings scrolls to when it opens at this group. */
+    TextView heading() {
+        return group;
     }
 
     /**
@@ -259,7 +193,7 @@ final class ImageSettings extends LinearLayout {
         }
         boolean available = daily != DAILY_IMAGE_UNAVAILABLE;
         dailyImage.setEnabled(available);
-        dailyImage.setAlpha(available ? 1f : DISABLED_ALPHA);
+        dailyImage.setAlpha(available ? 1f : SettingsRows.DISABLED_ALPHA);
         boolean withReason = daily == DAILY_IMAGE_UNAVAILABLE && reason != null;
         unavailableReason.setText(withReason ? reason : null);
         unavailableReason.setVisibility(withReason ? VISIBLE : GONE);
@@ -283,6 +217,13 @@ final class ImageSettings extends LinearLayout {
         }
         resetLockScreen.setVisibility(offActions ? VISIBLE : GONE);
         wallpaperSettings.setVisibility(offActions ? VISIBLE : GONE);
+    }
+
+    /** Shows the region chosen, in words, such as "Automatic (English (United States))". */
+    void showRegion(String name) {
+        if (!name.contentEquals(regionValue.getText())) {
+            regionValue.setText(name);
+        }
     }
 
     /**
@@ -348,23 +289,19 @@ final class ImageSettings extends LinearLayout {
         updated.setTextColor(dim);
         problem.setTextColor(foreground);
         mayNotShow.setTextColor(dim);
-        ColorStateList pressed = ColorStateList.valueOf((foreground & 0x00FFFFFF) | 0x1F000000);
         for (TextView text : new TextView[] {pausedText, pinnedText, unavailableText}) {
             text.setTextColor(foreground);
         }
+        regionTitle.setTextColor(foreground);
+        regionValue.setTextColor(dim);
+        region.setBackground(SettingsRows.ripple(foreground));
         for (TextView button : new TextView[] {
             resume, unpin, tryAgain, pastImages, updateNow, resetLockScreen, wallpaperSettings
         }) {
-            button.setTextColor(button.isEnabled() ? accent : dim);
-            button.setBackground(
-                    new RippleDrawable(pressed, null, new ColorDrawable(Color.WHITE)));
+            SettingsRows.colourButton(button, foreground, dim, accent);
         }
-        int[][] states = {{android.R.attr.state_checked}, {}};
-        for (Switch row : new Switch[] {dailyImage, showCard, useMobileData}) {
-            row.setTextColor(foreground);
-            row.setBackground(new RippleDrawable(pressed, null, new ColorDrawable(Color.WHITE)));
-            row.setThumbTintList(new ColorStateList(states, new int[] {accent, foreground}));
-            row.setTrackTintList(new ColorStateList(states, new int[] {accent, dim}));
+        for (Switch row : new Switch[] {dailyImage, useMobileData, showCard}) {
+            SettingsRows.colourSwitch(row, foreground, dim, accent);
         }
     }
 }

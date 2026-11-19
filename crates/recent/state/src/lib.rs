@@ -178,6 +178,10 @@ pub enum RecentIntent {
     /// How far back the cards go, chosen in Settings → Recent → Time window (REC-11). The choice
     /// is saved and the cards follow it at once (SET-03).
     SetWindow(RecentWindow),
+    /// Settings → Reset launcher (SET-06): the cards' size and the time window go back to
+    /// their defaults, apps removed from Recent may show again, and close mode ends, in one
+    /// save. A failed save changes nothing and says why.
+    Reset,
 }
 
 /// The cards for `uses`, newest first (REC-03). Pure, so Recent's filtering is tested without a
@@ -340,6 +344,24 @@ impl RecentHolder {
         }
     }
 
+    /// Settings → Reset launcher (SET-06): Recent's fields of the settings store go back to
+    /// their defaults in one write, and the cards are read again.
+    fn reset(&mut self) {
+        let defaults = Settings::default();
+        let saved = self.settings.update(&mut |settings| {
+            settings.recent_density = defaults.recent_density;
+            settings.recent_window = defaults.recent_window;
+            settings.removed_from_recent.clear();
+        });
+        match saved {
+            Ok(_) => {
+                self.state.close_mode = false;
+                self.refresh();
+            }
+            Err(error) => self.state.problem = Some(error.to_string()),
+        }
+    }
+
     /// Saves `apps` as removed from Recent now, in one write, forgetting removals that can no
     /// longer hide anything (PRIV-03). Their cards go, and close mode ends with the last one.
     /// A failed save keeps the cards and says why (ARCH-09).
@@ -411,6 +433,7 @@ impl StateHolder for RecentHolder {
             }
             RecentIntent::SetDensity(density) => self.set_density(density),
             RecentIntent::SetWindow(window) => self.set_window(window),
+            RecentIntent::Reset => self.reset(),
         }
     }
 
@@ -906,6 +929,46 @@ mod tests {
         assert_eq!(holder.state().problem.as_deref(), Some("Storage full"));
         assert_eq!(settings.get().recent_window, RecentWindow::TwentyFourHours);
         assert_eq!(packages(&holder), ["mail"]);
+    }
+
+    #[test]
+    fn reset_restores_the_defaults_and_brings_removed_apps_back() {
+        // SET-06: in one save, and close mode ends.
+        let (fakes, settings, mut holder) =
+            setup(vec![used("mail", 1), used("maps", 2), used("music", 30)]);
+        holder.handle(RecentIntent::Refresh);
+        holder.handle(RecentIntent::SetWindow(RecentWindow::ThreeDays));
+        holder.handle(RecentIntent::SetDensity(RecentDensity::TwoColumns));
+        holder.handle(RecentIntent::Remove(app_id("maps")));
+        holder.handle(RecentIntent::EnterCloseMode);
+        assert_eq!(packages(&holder), ["mail", "music"]);
+        let writes = fakes.storage.writes.lock().unwrap().len();
+
+        holder.handle(RecentIntent::Reset);
+
+        assert_eq!(fakes.storage.writes.lock().unwrap().len(), writes + 1);
+        let defaults = Settings::default();
+        assert_eq!(holder.state().window, defaults.recent_window);
+        assert_eq!(holder.state().density, defaults.recent_density);
+        assert!(!holder.state().close_mode);
+        assert_eq!(packages(&holder), ["mail", "maps"]);
+        assert!(settings.get().removed_from_recent.is_empty());
+    }
+
+    #[test]
+    fn a_reset_that_cant_be_saved_keeps_everything_and_says_why() {
+        // SET-06, ARCH-09
+        let (fakes, settings, mut holder) = setup(vec![used("mail", 1), used("maps", 30)]);
+        holder.handle(RecentIntent::Refresh);
+        holder.handle(RecentIntent::SetWindow(RecentWindow::ThreeDays));
+        *fakes.storage.error.lock().unwrap() = Some(DataError::Failed("Storage full".into()));
+
+        holder.handle(RecentIntent::Reset);
+
+        assert_eq!(holder.state().window, RecentWindow::ThreeDays);
+        assert_eq!(holder.state().problem.as_deref(), Some("Storage full"));
+        assert_eq!(settings.get().recent_window, RecentWindow::ThreeDays);
+        assert_eq!(packages(&holder), ["mail", "maps"]);
     }
 
     #[test]

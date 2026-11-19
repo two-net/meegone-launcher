@@ -18,6 +18,8 @@ import android.window.OnBackInvokedDispatcher;
  *
  * <p>It tells the Rust app about Home, Back and coming back to the home (ADR 0007). Whether the
  * home was out of sight is tracked here, per instance; what each case does is decided in Rust.
+ * The system's settings entry for MeeGone, such as the gear beside it in Default apps → Home
+ * app, opens it too, with Settings showing (SET-01, ADR 0035).
  *
  * <p>It draws edge to edge on every Android version, stays in portrait on phones and turns with
  * the device on large screens (HOME-11, HOME-12, ADR 0009). Size and orientation changes are
@@ -91,6 +93,9 @@ public final class HomeActivity extends Activity {
         setContentView(views);
         listenForBack();
         readDebugExtras(getIntent());
+        if (opensSettings(getIntent())) {
+            nativeOpenSettings();
+        }
     }
 
     @Override
@@ -104,6 +109,11 @@ public final class HomeActivity extends Activity {
                 nativeHome();
                 views.refresh();
             }
+        }
+        if (opensSettings(intent)) {
+            // Settings shows as the home comes back; Back closes it to the home views.
+            nativeOpenSettings();
+            views.refresh();
         }
         readDebugExtras(intent);
     }
@@ -318,6 +328,11 @@ public final class HomeActivity extends Activity {
                 && intent.hasCategory(Intent.CATEGORY_HOME);
     }
 
+    /** The system's settings entry for MeeGone opened it (SET-01). */
+    private static boolean opensSettings(Intent intent) {
+        return Intent.ACTION_APPLICATION_PREFERENCES.equals(intent.getAction());
+    }
+
     private void readDebugExtras(Intent intent) {
         if (DebugHooks.requestsHomeRole(intent)) {
             debugRequestHome = true;
@@ -343,6 +358,9 @@ public final class HomeActivity extends Activity {
 
     /** The system Back action. */
     private native void nativeBack();
+
+    /** The system's settings entry for MeeGone opened it: Settings shows, at its top (SET-01). */
+    private native void nativeOpenSettings();
 
     /** Fills {@code saved} with the current view and how far Applications is scrolled. */
     private native void nativeSave(int[] saved);

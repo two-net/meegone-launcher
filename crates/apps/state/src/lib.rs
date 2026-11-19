@@ -588,6 +588,11 @@ pub enum AppsIntent {
     /// Settings → Applications → Hidden apps: the app shows again, in its old place, in its
     /// folder too (APPS-19). Ignored unless it is hidden. A failed save changes nothing.
     Unhide(AppId),
+    /// Settings → Reset launcher (SET-06): the grid goes back to a first start's, the default
+    /// apps first and nothing marked new, folders gone, and every hidden app shows again. Edit
+    /// mode ends; the menu, the open folder, search and a rename close; the grid is at its top.
+    /// If the hidden apps can't be saved, nothing changes.
+    Reset,
 }
 
 pub struct AppsHolder {
@@ -615,6 +620,9 @@ pub struct AppsHolder {
     draft: Option<Layout>,
     /// The query, folded by the platform as the labels are (SRCH-02, L10N-04).
     query_key: String,
+    /// Reset launcher asked for a first start's layout, which the next refresh that can list
+    /// the apps builds and saves, whatever the store holds (SET-06).
+    resetting: bool,
     state: AppsState,
 }
 
@@ -637,6 +645,7 @@ impl AppsHolder {
             shown: Vec::new(),
             draft: None,
             query_key: String::new(),
+            resetting: false,
             state: AppsState::default(),
         }
     }
@@ -674,15 +683,19 @@ impl AppsHolder {
             let still = follow_hidden(&hidden, saved, &layout, &installed, &profiles);
             (layout, changed, still)
         };
+        // A first start's layout: the default apps first, then the rest alphabetically, with
+        // nothing marked new (APPS-04, APPS-05). Always saved.
+        let first = || {
+            let defaults = self.apps.default_apps();
+            let (layout, _, still) = reconciled(&Layout::default(), &Start::First { defaults });
+            (layout, true, still)
+        };
+        let resetting = std::mem::take(&mut self.resetting);
         let (layout, changed, still) = match self.layout.take() {
+            None if resetting => first(),
             Some(kept) => reconciled(&kept, &Start::Saved),
             None => match self.store.load() {
-                Ok(SavedLayout::Missing) => {
-                    let defaults = self.apps.default_apps();
-                    let (layout, _, still) =
-                        reconciled(&Layout::default(), &Start::First { defaults });
-                    (layout, true, still)
-                }
+                Ok(SavedLayout::Missing) => first(),
                 // Saved at once with this copy's install time, which differs from the backup's,
                 // so it is restored only once (APPS-21).
                 Ok(SavedLayout::Read(saved)) if is_restored(&saved, installed_ms) => {
@@ -793,6 +806,28 @@ impl AppsHolder {
             })
             .err()
             .map(|error| error.to_string());
+    }
+
+    /// Settings → Reset launcher (SET-06). Hidden apps are cleared first, so a failed save
+    /// changes nothing; then the layout is built again as at a first start, and saved.
+    fn reset(&mut self) {
+        if let Err(error) = self
+            .settings
+            .update(&mut |settings| settings.hidden_apps.clear())
+        {
+            self.state.problem = Some(error.to_string());
+            return;
+        }
+        self.state.menu = None;
+        self.state.renaming = None;
+        self.exit_edit_mode();
+        self.close_folder();
+        self.close_search();
+        self.state.scroll_px = 0.0;
+        self.layout = None;
+        // If the apps can't be listed now, the next refresh that can builds it.
+        self.resetting = true;
+        self.refresh();
     }
 
     fn catalogue(&self) -> Result<(Vec<App>, Vec<Profile>), DataError> {
@@ -1308,6 +1343,7 @@ impl StateHolder for AppsHolder {
                 }
             }
             AppsIntent::Unhide(app) => self.unhide(&app),
+            AppsIntent::Reset => self.reset(),
         }
     }
 
@@ -2408,6 +2444,97 @@ mod tests {
         let holder = holder(&fakes, &layout);
 
         assert_eq!(labels(holder.state()), ["Atlas", "Phone"]);
+    }
+
+    #[test]
+    fn reset_brings_back_a_first_starts_grid_with_every_app_shown() {
+        // SET-06: the default apps first, no folders, nothing hidden or marked new, and so
+        // after a restart too.
+        let fakes = Fakes::default();
+        install(
+            &fakes,
+            &[
+                ("atlas", "Atlas"),
+                ("chess", "Chess"),
+                ("dialer", "Phone"),
+                ("go", "Go"),
+            ],
+        );
+        *fakes.apps.default_apps.lock().unwrap() = vec!["dialer".into()];
+        let layout = layout_store();
+        layout
+            .save(&Layout {
+                entries: vec![
+                    LayoutEntry::Folder {
+                        id: FolderId(1),
+                        name: "Games".into(),
+                        apps: vec![app_id("chess"), app_id("go")],
+                    },
+                    LayoutEntry::App(app_id("atlas")),
+                    LayoutEntry::App(app_id("dialer")),
+                ],
+                new: [app_id("atlas")].into(),
+                ..Layout::default()
+            })
+            .unwrap();
+        let mut holder = holder(&fakes, &layout);
+        hide(&mut holder, app_id("atlas"));
+        holder.handle(AppsIntent::EnterEditMode);
+        holder.handle(AppsIntent::OpenFolder(FolderId(1)));
+        holder.handle(AppsIntent::Scrolled(300.0));
+        assert_eq!(labels(holder.state()), ["[Games]", "Phone"]);
+
+        holder.handle(AppsIntent::Reset);
+
+        let expected = ["Phone", "Atlas", "Chess", "Go"];
+        assert_eq!(labels(holder.state()), expected);
+        assert!(hidden_labels(&holder).is_empty());
+        assert!(saved_hidden(&fakes).is_empty());
+        assert!(saved(&layout).new.is_empty());
+        assert!(!holder.state().edit_mode);
+        assert_eq!(holder.state().open_folder, None);
+        assert_eq!(holder.state().scroll_px, 0.0);
+        assert_eq!(holder.state().problem, None);
+        assert_eq!(labels(self::holder(&fakes, &layout).state()), expected);
+    }
+
+    #[test]
+    fn a_reset_that_cant_be_saved_changes_nothing_and_is_the_problem() {
+        // SET-06, REL-03
+        let fakes = Fakes::default();
+        install(&fakes, &[("mail", "Mail"), ("maps", "Maps")]);
+        let mut holder = holder(&fakes, &layout_store());
+        hide(&mut holder, app_id("maps"));
+        *fakes.storage.error.lock().unwrap() = Some(DataError::Failed("disk full".into()));
+
+        holder.handle(AppsIntent::Reset);
+
+        assert_eq!(holder.state().problem.as_deref(), Some("disk full"));
+        assert_eq!(labels(holder.state()), ["Mail"]);
+        assert_eq!(hidden_labels(&holder), ["Maps"]);
+    }
+
+    #[test]
+    fn a_reset_while_the_apps_cant_be_listed_happens_at_the_next_refresh() {
+        // SET-06, REL-02: the saved grid isn't read back in the meantime.
+        let fakes = Fakes::default();
+        install(&fakes, &[("atlas", "Atlas"), ("dialer", "Phone")]);
+        let layout = layout_store();
+        let mut holder = holder(&fakes, &layout);
+        assert_eq!(labels(holder.state()), ["Atlas", "Phone"]);
+        *fakes.apps.default_apps.lock().unwrap() = vec!["dialer".into()];
+        *fakes.apps.error.lock().unwrap() = Some(DataError::Failed("busy".into()));
+
+        holder.handle(AppsIntent::Reset);
+        assert_eq!(holder.state().problem.as_deref(), Some("busy"));
+
+        *fakes.apps.error.lock().unwrap() = None;
+        holder.handle(AppsIntent::Refresh);
+        assert_eq!(labels(holder.state()), ["Phone", "Atlas"]);
+        assert_eq!(
+            labels(self::holder(&fakes, &layout).state()),
+            ["Phone", "Atlas"]
+        );
     }
 
     #[test]

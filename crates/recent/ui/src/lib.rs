@@ -290,8 +290,8 @@ impl RecentSettingsSection {
 
 impl Slot for RecentSettingsSection {
     fn render(&mut self, _tokens: &Tokens) {
-        // The host draws the time window until the Settings screen, #34, draws the rest
-        // (ADR 0006, ADR 0026).
+        // The host draws the time window in Settings' Recent group (ADR 0006, ADR 0026,
+        // ADR 0035).
     }
 }
 

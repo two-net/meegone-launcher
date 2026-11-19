@@ -6,11 +6,11 @@
 //! where the carousel's views are, how the view indicator looks, how the content comes back
 //! from an app, the home menu, the Applications grid, the pressed icon, the grid's cells as
 //! apps come, go and move, a cell's long-press menu, the dragged icon, edit mode, the open
-//! folder, search, Settings' Hidden apps list and "Show card in Events" switch, the Events
-//! header, list and a notification's long-press menu, the image-of-the-day card, the image
-//! details screen and the image's update status, Recent's cards, the theme chosen and the
-//! cross-fade to a new theme (ADR 0006 to ADR 0008, ADR 0010, ADR 0012 to ADR 0017, ADR 0019
-//! to ADR 0023, ADR 0031, ADR 0033).
+//! folder, search, the Events header, list and a notification's long-press menu, the
+//! image-of-the-day card, the image details screen and the image's update status, Recent's
+//! cards, the theme chosen and the cross-fade to a new theme, and Settings' groups (ADR 0006 to
+//! ADR 0008, ADR 0010, ADR 0012 to ADR 0017, ADR 0019 to ADR 0023, ADR 0031, ADR 0033,
+//! ADR 0035).
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -34,7 +34,7 @@ pub use meegone_lockimage_ui::{
 use meegone_lockimage_ui::{ImageCard, ImageDetailsScreen, ImageSettingsSection, PastImagesScreen};
 pub use meegone_recent_ui::{Age, RecentMode, RecentWindow, ShownCard};
 use meegone_recent_ui::{RecentSettingsSection, RecentView};
-pub use meegone_settings_ui::ThemeChoice;
+pub use meegone_settings_ui::{AccessItem, AccessStatus, HomeTarget, ThemeChoice};
 use meegone_settings_ui::{HomeBanner, SettingsView};
 pub use meegone_shell_state::{BADGE_ROWS, RECENT_ROWS};
 use meegone_shell_state::{HomeShell, HomeView, MenuItem, SettingsGroup, ShellIntent};
@@ -375,6 +375,19 @@ pub struct HomeFrame {
     pub recent_window: Option<RecentWindow>,
     /// What Recent shows, or `None` while Recent isn't working, so nothing does (ARCH-09).
     pub recent: Option<RecentFrame>,
+    /// Settings → Home → "Home button opens" (HOME-06): the last view or Applications, or
+    /// `None` while Settings isn't working, so it isn't offered (ARCH-09).
+    pub home_target: Option<HomeTarget>,
+    /// Settings → Home → Wrap-around (HOME-04), or `None` while Settings isn't working.
+    pub wrap_around: Option<bool>,
+    /// Settings → Access: each item's status, or `None` while Settings isn't working (SET-02).
+    pub access: Option<AccessStatus>,
+    /// Settings → Lock-screen image → Region: 0 for Automatic, otherwise 1 + the region's place
+    /// in [`ImageSettingsSection::regions`], or `None` while the lock-screen image isn't
+    /// working (WALL-05, ARCH-09).
+    pub region: Option<usize>,
+    /// Settings → About offers Reset launcher: every feature it resets works (SET-06).
+    pub reset_offered: bool,
     /// The home views' solid background (HOME-11, THEME-04).
     pub background: Rgb,
     /// Menus and Settings (THEME-03).
@@ -681,6 +694,19 @@ impl ShellView {
                     leave_scale: scale(state.recent_change.leave_scale),
                 }
             }),
+            home_target: shell
+                .settings_ready()
+                .then(|| shell.settings().state().home_target),
+            wrap_around: shell
+                .settings_ready()
+                .then(|| shell.settings().state().wrap_around),
+            access: shell
+                .settings_ready()
+                .then(|| AccessStatus::of(&shell.settings().state())),
+            region: shell
+                .lockimage_ready()
+                .then(|| self.image_settings.region_choice()),
+            reset_offered: shell.reset_offered(),
             background: tokens.background,
             surface: tokens.surface,
             foreground: tokens.text_primary,

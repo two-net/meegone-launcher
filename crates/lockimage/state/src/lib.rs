@@ -188,6 +188,11 @@ pub enum LockImageIntent {
     /// Opens Settings at its Lock-screen image group, from the details screen (WALL-15).
     /// Settings covers the home views, so the shell opens it (ADR 0031); the holder ignores it.
     OpenSettings,
+    /// Settings → Reset launcher (SET-06): the options go back to their defaults in one save.
+    /// The daily image is off, as switching it off leaves it, with nothing cached or scheduled;
+    /// the region is Automatic, mobile data isn't used and the card shows. The lock screen keeps
+    /// its picture (WALL-12).
+    Reset,
 }
 
 pub struct LockImageHolder {
@@ -329,6 +334,18 @@ impl LockImageHolder {
         let result = self
             .settings
             .update(&mut |settings| settings.image.enabled = on)
+            .and_then(|settings| self.apply(&settings.image));
+        self.state.problem = result.err().map(|error| error.to_string());
+        self.refresh();
+    }
+
+    /// The lock-screen image is the one writer of its options (ARCH-06), so it restores them
+    /// for Reset launcher (SET-06). Off is applied as switching it off is, even where the
+    /// device can't set the lock screen, so nothing is left cached or scheduled.
+    fn reset(&mut self) {
+        let result = self
+            .settings
+            .update(&mut |settings| settings.image = ImageOptions::default())
             .and_then(|settings| self.apply(&settings.image));
         self.state.problem = result.err().map(|error| error.to_string());
         self.refresh();
@@ -506,6 +523,7 @@ impl StateHolder for LockImageHolder {
             LockImageIntent::OpenInfoLink => self.open_info_link(),
             LockImageIntent::Browse => self.browse(),
             LockImageIntent::Pin(id) => self.pin(id),
+            LockImageIntent::Reset => self.reset(),
             LockImageIntent::OpenDetails
             | LockImageIntent::OpenSettings
             | LockImageIntent::OpenPastImages => {}
@@ -822,6 +840,44 @@ mod tests {
         assert_eq!(holder.state().status, ImageStatus::Off);
         assert_eq!(*fakes.scheduler.job.lock().unwrap(), None);
         assert_eq!(cache.current(), None);
+    }
+
+    #[test]
+    fn reset_restores_the_options_and_turns_the_daily_image_off_leaving_the_lock_screen() {
+        // SET-06, WALL-12
+        let mut setup = setup();
+        with_an_image_set(&mut setup);
+        setup
+            .holder
+            .handle(LockImageIntent::SetRegion(Some("en-GB".into())));
+        setup.holder.handle(LockImageIntent::SetUseMobileData(true));
+        setup.holder.handle(LockImageIntent::SetShowCard(false));
+        assert!(setup.fakes.scheduler.job.lock().unwrap().is_some());
+
+        setup.holder.handle(LockImageIntent::Reset);
+
+        assert_eq!(setup.settings.get().image, ImageOptions::default());
+        assert_eq!(setup.holder.state().status, ImageStatus::Off);
+        assert_eq!(setup.holder.state().region, None);
+        assert!(!setup.holder.state().use_mobile_data);
+        assert!(setup.holder.state().show_card);
+        assert_eq!(*setup.fakes.scheduler.job.lock().unwrap(), None);
+        assert_eq!(setup.cache.current(), None);
+        assert!(setup.fakes.wallpaper.lock_screen.lock().unwrap().is_some());
+        assert_eq!(setup.holder.state().problem, None);
+    }
+
+    #[test]
+    fn a_reset_that_cant_be_saved_says_why() {
+        // SET-06, ARCH-09
+        let mut setup = setup();
+        setup.holder.handle(LockImageIntent::SetShowCard(false));
+        *setup.fakes.storage.error.lock().unwrap() = Some(DataError::Failed("disk full".into()));
+
+        setup.holder.handle(LockImageIntent::Reset);
+
+        assert_eq!(setup.holder.state().problem.as_deref(), Some("disk full"));
+        assert!(!setup.holder.state().show_card);
     }
 
     #[test]

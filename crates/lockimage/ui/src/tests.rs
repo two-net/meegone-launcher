@@ -226,6 +226,7 @@ fn settings_show_and_choose_the_region() {
     assert_eq!(section.regions(), ["en-US", "de-DE", "ja-JP"]);
     assert_eq!(section.region().as_deref(), Some("ja-JP"));
     assert_eq!(section.automatic_region(), "de-DE");
+    assert_eq!(section.region_choice(), 3);
     section.region_chosen(None);
     section.region_chosen(Some("en-US".into()));
 
@@ -236,6 +237,21 @@ fn settings_show_and_choose_the_region() {
             LockImageIntent::SetRegion(Some(region)),
         ] if region == "en-US"
     ));
+}
+
+#[test]
+fn automatic_is_the_first_region_choice() {
+    // WALL-05: and so is a region the feed no longer offers.
+    for region in [None, Some("fi-FI".to_owned())] {
+        let latest = Latest::new(Arc::new(LockImageState {
+            regions: vec!["en-US".into()],
+            region,
+            ..on()
+        }));
+        let section = ImageSettingsSection::new(latest, Dispatch::new(|_| {}));
+
+        assert_eq!(section.region_choice(), 0);
+    }
 }
 
 fn section(state: LockImageState) -> (Latest<LockImageState>, ImageSettingsSection, Sent) {

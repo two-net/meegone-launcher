@@ -17,8 +17,7 @@ import android.widget.TextView;
 
 /**
  * Settings → Applications → Hidden apps (APPS-19, SET-02, ADR 0017): the apps the user hid, each
- * with its icon, its label and Unhide, or "No hidden apps". Until #34 draws the rest of Settings,
- * it is the only part of Settings drawn below its name.
+ * with its icon, its label and Unhide, or "No hidden apps".
  *
  * <p>It reads its apps from the Rust app only when the frame's revision changes, and names an app
  * by that revision and its place, so a tap on a list that changed meanwhile does nothing. Icons

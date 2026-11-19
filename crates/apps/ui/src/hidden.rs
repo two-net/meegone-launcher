@@ -78,7 +78,7 @@ impl HiddenAppsSection {
 
 impl Slot for HiddenAppsSection {
     fn render(&mut self, _tokens: &Tokens) {
-        // The host draws the list from `revision` and `apps` until the Settings screen, #34,
-        // draws the rest (ADR 0006, ADR 0017).
+        // The host draws the list from `revision` and `apps` in Settings' Applications group
+        // (ADR 0006, ADR 0017, ADR 0035).
     }
 }

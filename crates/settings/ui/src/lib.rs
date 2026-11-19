@@ -1,14 +1,40 @@
-//! Settings screens (SRS 4.8). They render [`SettingsState`], turn input into
-//! [`SettingsIntent`]s and show the sections other features provide, which the shell adds
-//! (ADR 0002).
+//! The Settings screen (SRS 4.8, ADR 0035). It renders [`SettingsState`], turns input into
+//! [`SettingsIntent`]s and shows the sections other features provide, which the shell adds
+//! (ADR 0002). Android's views draw it, groups in SET-02's order (ADR 0006).
 //!
 //! This feature also provides [`HomeBanner`], which the shell shows on the home views while
 //! MeeGone isn't the default home app (ONB-04).
 
-use meegone_core_state::HomeTarget;
-pub use meegone_core_state::ThemeChoice;
+use meegone_core_state::Access;
+pub use meegone_core_state::{HomeTarget, ThemeChoice};
 use meegone_core_ui::{Dispatch, Latest, Slot, Tokens, View};
+pub use meegone_settings_state::AccessItem;
 use meegone_settings_state::{SettingsIntent, SettingsState};
+
+/// Settings → Access as the host draws it: each item's status, and the one whose written
+/// instructions show below it (SET-02, SRS 8.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccessStatus {
+    /// MeeGone is the default home app (HOME-01).
+    pub default_home: bool,
+    /// Notification access is granted (EVT-03).
+    pub notifications: bool,
+    /// Usage access is granted (REC-02).
+    pub usage: bool,
+    /// The item whose shortcut found no system screen, so its instructions show instead.
+    pub instructions: Option<AccessItem>,
+}
+
+impl AccessStatus {
+    pub fn of(state: &SettingsState) -> Self {
+        Self {
+            default_home: state.default_home,
+            notifications: state.notification_access == Access::Granted,
+            usage: state.usage_access == Access::Granted,
+            instructions: state.instructions.as_ref().map(|(item, _)| *item),
+        }
+    }
+}
 
 pub struct SettingsView {
     dispatch: Dispatch<SettingsIntent>,
@@ -47,13 +73,29 @@ impl SettingsView {
     pub fn default_home_tapped(&self) {
         self.dispatch.send(SettingsIntent::RequestDefaultHome);
     }
+
+    /// The notification-access item of the Access group: its system screen opens (SET-02,
+    /// EVT-03).
+    pub fn notification_access_tapped(&self) {
+        self.dispatch.send(SettingsIntent::OpenNotificationAccess);
+    }
+
+    /// The usage-access item of the Access group: its system screen opens (SET-02, REC-02).
+    pub fn usage_access_tapped(&self) {
+        self.dispatch.send(SettingsIntent::OpenUsageAccess);
+    }
+
+    /// "Reset launcher", after the user confirmed it (SET-06).
+    pub fn reset_launcher_confirmed(&self) {
+        self.dispatch.send(SettingsIntent::ResetLauncher);
+    }
 }
 
 impl View for SettingsView {
     type State = SettingsState;
 
     fn render(&mut self, _state: &SettingsState, tokens: &Tokens) {
-        // Drawing Settings' own groups arrives with #34, in Android's views (ADR 0006).
+        // The host draws Settings' own groups from the frame (ADR 0035).
         for section in &mut self.sections {
             section.render(tokens);
         }

@@ -201,9 +201,6 @@ final class Bridge {
      * again", or if MeeGone isn't a valid home app.
      */
     private static final long NEVER_SHOWN_MS = 500;
-    private static final String INSTRUCTIONS =
-            "To make MeeGone your home screen, open Settings, then Apps, Default apps, Home app,"
-                    + " and choose MeeGone.";
 
     private static Bridge instance;
 
@@ -288,7 +285,7 @@ final class Bridge {
     String requestDefaultHome() {
         Activity current = activity;
         if (current == null) {
-            return INSTRUCTIONS;
+            return homeInstructions();
         }
         try {
             RoleManager roles = current.getSystemService(RoleManager.class);
@@ -300,11 +297,19 @@ final class Bridge {
                 Log.i(TAG, "Asked for the home role");
                 return null;
             }
-            return openHomeSettings(current) ? null : INSTRUCTIONS;
+            return openHomeSettings(current) ? null : homeInstructions();
         } catch (RuntimeException e) {
             Log.w(TAG, "Couldn't ask for the home role", e);
-            return INSTRUCTIONS;
+            return homeInstructions();
         }
+    }
+
+    /**
+     * How to make MeeGone the home app without a system screen to open, in the device's language
+     * (SRS 8.1, L10N-01).
+     */
+    private String homeInstructions() {
+        return context.getString(R.string.default_home_instructions);
     }
 
     /**

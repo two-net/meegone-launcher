@@ -21,16 +21,17 @@ use meegone_core_data::fakes::{
 use meegone_core_data::storage::format::seal;
 use meegone_core_data::{
     App, DataError, HomeTarget, JobNetwork, NetworkState, Notification, NotificationsAdapter,
-    Profile, ProfileId, RecentDensity, Rect, Rgb, Shortcut, Size, StoredFile, ThemeChoice, accent,
+    PersistentSettingsStore, Profile, ProfileId, RecentDensity, Rect, Rgb, SettingsStore, Shortcut,
+    Size, StoredFile, ThemeChoice, accent,
 };
 use meegone_core_state::{Access, Health, Theme};
 use meegone_core_ui::tokens;
 use meegone_launcher::{
-    Age, AppMenuItem, BADGE_ROWS, Bounds, CardContent, CellKey, CheckStatus, DailyImage,
-    DetailsContent, Direction, EventsListMode, EventsMenuFrame, FolderId, GridLayout, HomeView,
-    Launcher, Layout, LiftFrame, MenuItem, NotificationMenuItem, PastAction, PastContent,
-    PinchEvent, PinchKind, PointerEvent, PointerKind, RECENT_ROWS, RecentFrame, RecentMode,
-    RecentWindow, SettingsGroup, Shared, ShellIntent, Surface, UpdateStatus,
+    AccessItem, AccessStatus, Age, AppMenuItem, BADGE_ROWS, Bounds, CardContent, CellKey,
+    CheckStatus, DailyImage, DetailsContent, Direction, EventsListMode, EventsMenuFrame, FolderId,
+    GridLayout, HomeView, Launcher, Layout, LiftFrame, MenuItem, NotificationMenuItem, PastAction,
+    PastContent, PinchEvent, PinchKind, PointerEvent, PointerKind, RECENT_ROWS, RecentFrame,
+    RecentMode, RecentWindow, SettingsGroup, Shared, ShellIntent, Surface, UpdateStatus,
 };
 
 /// A phone 1080 × 2400 px at 2.75 px per dp.
@@ -4976,4 +4977,201 @@ fn pwr03_browsing_and_pinning_keep_a_day_within_10_mb() {
     assert_eq!(requests.iter().filter(|url| *url == UHD_URL).count(), 1);
     assert!(bytes < 10_000_000, "{bytes} bytes");
     assert!(bytes > 7_400_000, "{bytes} bytes");
+}
+
+#[test]
+fn set01_settings_opens_from_the_home_menu_and_from_the_systems_settings_entry() {
+    // Issue #34: SET-01, AC-19. The menu opens without a gesture, as a screen reader opens it.
+    let (mut launcher, _) = on_a_phone(&Fakes::default());
+    launcher.dispatch(ShellIntent::OpenMenu);
+    launcher.dispatch(ShellIntent::ChooseMenuItem(MenuItem::LauncherSettings));
+    let frame = launcher.frame();
+    assert!(frame.settings_open);
+    assert_eq!(frame.settings_group, None);
+    launcher.dispatch(ShellIntent::Back);
+    assert!(!launcher.frame().settings_open);
+
+    // The system's entry, such as the gear beside MeeGone in Default apps → Home app, reaches
+    // the host, which opens Settings at its top, over whatever was open.
+    launcher.dispatch(ShellIntent::OpenMenu);
+    launcher.dispatch(ShellIntent::ChooseMenuItem(MenuItem::EditApplications));
+    launcher.dispatch(ShellIntent::OpenSettings);
+    let frame = launcher.frame();
+    assert!(frame.settings_open);
+    assert_eq!(frame.settings_group, None);
+    assert_eq!(frame.menu, None);
+}
+
+#[test]
+fn set02_settings_offers_every_group_with_the_status_of_each_access() {
+    // Issue #34: SET-02. Appearance, Home, Applications, Recent, the lock-screen image, Access
+    // and About, with Reset launcher (SET-06).
+    let fakes = Fakes::default();
+    *fakes.notifications.access.lock().unwrap() = Access::Granted;
+    *fakes.system.default_home.lock().unwrap() = true;
+    let (mut launcher, _) = on_a_phone(&fakes);
+
+    launcher.dispatch(ShellIntent::OpenSettings);
+    let frame = launcher.frame();
+
+    assert_eq!(frame.theme_choice, Some(ThemeChoice::System));
+    assert_eq!(frame.home_target, Some(HomeTarget::LastView));
+    assert_eq!(frame.wrap_around, Some(true));
+    assert!(frame.hidden_apps.is_some());
+    assert_eq!(frame.recent_window, Some(RecentWindow::TwentyFourHours));
+    assert_eq!(frame.daily_image, Some(DailyImage::Off));
+    assert_eq!(frame.region, Some(0), "Automatic");
+    assert_eq!(frame.use_mobile_data, Some(false));
+    assert_eq!(frame.show_image_card, Some(true));
+    assert_eq!(
+        frame.access,
+        Some(AccessStatus {
+            default_home: true,
+            notifications: true,
+            usage: false,
+            instructions: None,
+        })
+    );
+    assert!(frame.reset_offered);
+}
+
+#[test]
+fn set02_an_access_shortcut_opens_its_system_screen_or_shows_written_instructions() {
+    // Issue #34: SET-02, SRS 8.1. Usage access has no screen on this device.
+    let fakes = Fakes::default();
+    let instructions = "Open Settings, then Apps, Special app access, Usage access";
+    *fakes.usage.error.lock().unwrap() = Some(DataError::Unsupported(instructions.into()));
+    let (mut launcher, _) = on_a_phone(&fakes);
+    launcher.dispatch(ShellIntent::OpenSettings);
+
+    launcher.view().settings().notification_access_tapped();
+    launcher.view().settings().default_home_tapped();
+    launcher.view().settings().usage_access_tapped();
+    let frame = launcher.frame();
+
+    assert_eq!(*fakes.notifications.access_screen_opened.lock().unwrap(), 1);
+    assert_eq!(*fakes.system.default_home_requested.lock().unwrap(), 1);
+    let access = frame.access.expect("Settings works");
+    assert_eq!(access.instructions, Some(AccessItem::Usage));
+    let state = launcher.shell().settings().state();
+    assert_eq!(state.instructions.as_ref().unwrap().1, instructions);
+    assert_eq!(state.problem, None);
+
+    // Back from the system's screens, the status is read again and the instructions go.
+    *fakes.usage.access.lock().unwrap() = Access::Granted;
+    launcher.dispatch(ShellIntent::Resumed);
+    let access = launcher.frame().access.expect("Settings works");
+    assert!(access.usage);
+    assert_eq!(access.instructions, None);
+}
+
+#[test]
+fn set02_the_region_is_automatic_or_one_the_feed_offers() {
+    // Issue #34: SET-02, WALL-05. Settings lists Automatic first, then the feed's regions.
+    let fakes = Fakes::default();
+    let (mut launcher, _) = on_a_phone(&fakes);
+    launcher.dispatch(ShellIntent::OpenSettings);
+    let section = launcher.view().image_settings();
+    let regions = section.regions();
+    let place = regions.iter().position(|region| region == "de-DE");
+    let place = place.expect("the feed offers de-DE");
+
+    section.region_chosen(Some("de-DE".into()));
+    assert_eq!(launcher.frame().region, Some(place + 1));
+
+    launcher.view().image_settings().region_chosen(None);
+    assert_eq!(launcher.frame().region, Some(0));
+}
+
+#[test]
+fn set03_a_change_in_settings_shows_on_returning_home_without_a_restart() {
+    // Issue #34: SET-03. No Save button: each change is saved and applied as it is made.
+    let fakes = Fakes::default();
+    let (mut launcher, _) = on_a_phone(&fakes);
+    launcher.dispatch(ShellIntent::OpenSettings);
+    let settings = launcher.view().settings();
+    settings.theme_chosen(ThemeChoice::Dark);
+    settings.wrap_around_toggled(false);
+    settings.home_target_chosen(HomeTarget::Applications);
+    let frame = launcher.frame();
+    assert_eq!(frame.wrap_around, Some(false));
+    assert_eq!(frame.home_target, Some(HomeTarget::Applications));
+
+    launcher.dispatch(ShellIntent::Back);
+    let frame = launcher.frame();
+    assert!(!frame.settings_open);
+    assert_eq!(frame.background, tokens::DARK.background);
+    // Recent is the last view: without wrap-around, it stays put.
+    for _ in 0..2 {
+        launcher.dispatch(ShellIntent::Swipe(Direction::Next));
+    }
+    assert_eq!(launcher.frame().current, HomeView::Recent);
+    // From an app, Home now shows Applications.
+    launcher.dispatch(ShellIntent::Resumed);
+    launcher.dispatch(ShellIntent::Returned { home: true });
+    assert_eq!(launcher.frame().current, HomeView::Applications);
+
+    let saved = PersistentSettingsStore::new(fakes.storage.clone()).get();
+    assert_eq!(
+        (saved.theme, saved.wrap_around, saved.home_target),
+        (ThemeChoice::Dark, false, HomeTarget::Applications)
+    );
+}
+
+#[test]
+fn set06_reset_launcher_restores_the_default_layout_and_settings() {
+    // Issue #34: SET-06, after the host's confirmation. Access, granted in system settings,
+    // stays as it is.
+    let fakes = Fakes::default();
+    let (mut launcher, _) = ready_to_hide(&fakes);
+    *fakes.system.default_home.lock().unwrap() = true;
+    fakes.apps.apps.lock().unwrap().push(app("atlas", "Atlas"));
+    launcher.dispatch(ShellIntent::AppsChanged);
+    hide(&mut launcher, "maps");
+    launcher.dispatch(ShellIntent::OpenSettings);
+    launcher.view().settings().theme_chosen(ThemeChoice::Dark);
+    launcher.view().settings().wrap_around_toggled(false);
+    launcher
+        .view()
+        .recent_settings()
+        .window_chosen(RecentWindow::ThreeDays);
+    let image = launcher.view().image_settings();
+    image.daily_image_toggled(true);
+    image.use_mobile_data_toggled(true);
+    image.show_card_toggled(false);
+    launcher.frame();
+    assert_eq!(grid(&launcher), ["Café", "Gmail", "Mail", "Atlas"]);
+    assert_eq!(dots(&mut launcher), [false, false, false, true]);
+
+    assert!(launcher.frame().reset_offered);
+    launcher.view().settings().reset_launcher_confirmed();
+    let frame = launcher.frame();
+
+    // Settings closes on Applications, at its top, fading to the default theme.
+    assert!(!frame.settings_open);
+    assert_eq!(frame.current, HomeView::Applications);
+    assert!(frame.theme_change < 10_000);
+    assert_eq!(frame.background, tokens::LIGHT.background);
+    // A first start's grid: alphabetical, nothing new, nothing hidden.
+    let first_grid = ["Atlas", "Café", "Gmail", "Mail", "Maps"];
+    assert_eq!(grid(&launcher), first_grid);
+    assert_eq!(dots(&mut launcher), [false; 5]);
+    assert!(hidden_apps(&launcher).is_empty());
+    assert_eq!(launcher.shell().apps().state().scroll_px, 0.0);
+    // Every option at its default; the daily image is off, with nothing scheduled.
+    let frame = launcher.frame();
+    assert_eq!(frame.wrap_around, Some(true));
+    assert_eq!(frame.recent_window, Some(RecentWindow::TwentyFourHours));
+    assert_eq!(frame.daily_image, Some(DailyImage::Off));
+    assert_eq!(frame.use_mobile_data, Some(false));
+    assert_eq!(frame.show_image_card, Some(true));
+    assert_eq!(*fakes.scheduler.job.lock().unwrap(), None);
+    assert!(frame.access.is_some_and(|access| access.default_home));
+
+    // And so after a restart.
+    drop(launcher);
+    let mut launcher = Launcher::start(fakes.platform());
+    launcher.dispatch(ShellIntent::Layout(phone()));
+    assert_eq!(grid(&launcher), first_grid);
+    assert_eq!(launcher.frame().theme_choice, Some(ThemeChoice::System));
 }

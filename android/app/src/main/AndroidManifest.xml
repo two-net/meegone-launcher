@@ -92,6 +92,13 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+
+            <!-- The system's settings entry for MeeGone, such as the gear beside it in Default
+                 apps → Home app: it opens MeeGone's Settings (SET-01, SEC-04, ADR 0035). -->
+            <intent-filter>
+                <action android:name="android.intent.action.APPLICATION_PREFERENCES" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
         </activity>
 
         <!-- Events' notifications (EVT-04, ADR 0020). The system binds the listener only while

@@ -327,7 +327,8 @@ pub enum ShellIntent {
     CloseMenu,
     /// An item of the home menu was chosen (HOME-10).
     ChooseMenuItem(MenuItem),
-    /// Opens Settings at its top (SET-01).
+    /// Opens Settings at its top, over whatever is open, as the system's settings entry for
+    /// MeeGone does (SET-01, ADR 0035).
     OpenSettings,
     /// MeeGone came to the foreground: at start, after the system's role dialog, or back from
     /// another app or a settings screen. The default home app, the day or the language may have
@@ -588,6 +589,12 @@ impl HomeShell {
         *self.settings.health() == Health::Ready
     }
 
+    /// Whether Settings offers Reset launcher: only while every feature it resets works, so a
+    /// reset is never partial (SET-06, ARCH-09).
+    pub fn reset_offered(&self) -> bool {
+        self.settings_ready() && self.apps_ready() && self.recent_ready() && self.lockimage_ready()
+    }
+
     pub fn events(&self) -> &Store<EventsHolder> {
         &self.events
     }
@@ -767,6 +774,7 @@ impl HomeShell {
             }
             ShellIntent::LockImage(LockImageIntent::OpenPastImages) => self.open_past_images(),
             ShellIntent::LockImage(intent) => self.lockimage.dispatch(intent),
+            ShellIntent::Settings(SettingsIntent::ResetLauncher) => self.reset_launcher(),
             ShellIntent::Settings(intent) => {
                 self.settings.dispatch(intent);
                 // The theme choice and wrap-around live in the settings store; take them on
@@ -1609,6 +1617,31 @@ impl HomeShell {
         self.close_search();
     }
 
+    /// Settings → Reset launcher, once confirmed (SET-06). Each feature restores what it owns
+    /// (ADR 0002): Applications its layout and hidden apps, Recent its cards' size, time window
+    /// and removals, the lock-screen image its options, and Settings its own. Everything open
+    /// closes, Settings too, and Applications shows at its top, cross-fading to the default
+    /// theme (THEME-06).
+    fn reset_launcher(&mut self) {
+        if !self.reset_offered() {
+            return;
+        }
+        self.cover_views();
+        self.close_past_images();
+        self.close_settings();
+        self.close_image_details();
+        for view in HomeView::ALL {
+            self.close_everything_in(view);
+        }
+        self.apps.dispatch(AppsIntent::Reset);
+        self.recent.dispatch(RecentIntent::Reset);
+        self.lockimage.dispatch(LockImageIntent::Reset);
+        self.settings.dispatch(SettingsIntent::ResetLauncher);
+        self.theme.dispatch(ThemeIntent::Refresh);
+        self.configure_carousel();
+        self.jump_to(HomeView::Applications);
+    }
+
     /// Closes Settings. Returns whether it was open.
     fn close_settings(&mut self) -> bool {
         self.state.settings_group = None;
@@ -1803,9 +1836,9 @@ mod tests {
         FakeApps, FakeNotifications, Fakes, app, app_id, notification, used,
     };
     use meegone_core_data::{
-        App, AppId, AppsAdapter, DataError, ImageCrop, Notification, NotificationsAdapter, Profile,
-        ProfileId, RecentUse, Rect, Screen, Shortcut, UsageAdapter, WallpaperAdapter,
-        WallpaperMarker,
+        App, AppId, AppsAdapter, DataError, ImageCrop, Notification, NotificationsAdapter,
+        PersistentSettingsStore, Profile, ProfileId, RecentUse, RecentWindow, Rect, Screen,
+        Settings, Shortcut, UsageAdapter, WallpaperAdapter, WallpaperMarker,
     };
     use meegone_core_state::motion::{DRAG_LIFT_SCALE, ICON_PRESS_SCALE};
     use meegone_core_state::{Access, Health, Theme, ThemeChoice};
@@ -3736,6 +3769,79 @@ mod tests {
         assert_eq!(shell.state().current, HomeView::Events);
         shell.dispatch(ShellIntent::Home);
         assert_eq!(shell.state().current, HomeView::Applications);
+    }
+
+    #[test]
+    fn the_systems_settings_entry_opens_settings_at_its_top_over_whatever_is_open() {
+        // SET-01: from the system's home-app settings, through the host.
+        let mut shell = laid_out(&Fakes::default());
+        shell.dispatch(ShellIntent::OpenMenu);
+        shell.dispatch(ShellIntent::ChooseMenuItem(MenuItem::EditApplications));
+
+        shell.dispatch(ShellIntent::OpenSettings);
+
+        assert!(shell.state().settings_open);
+        assert_eq!(shell.state().settings_group, None);
+        shell.dispatch(ShellIntent::Back);
+        assert!(!shell.state().settings_open);
+    }
+
+    #[test]
+    fn reset_launcher_restores_every_features_defaults_and_shows_applications_at_its_top() {
+        // SET-06, ADR 0002: each feature restores its own fields.
+        let fakes = Fakes::default();
+        *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail"), app("maps", "Maps")];
+        let mut shell = laid_out(&fakes);
+        hide_maps(&mut shell);
+        for intent in [
+            SettingsIntent::SetTheme(ThemeChoice::Dark),
+            SettingsIntent::SetHomeTarget(HomeTarget::Applications),
+            SettingsIntent::SetWrapAround(false),
+        ] {
+            shell.dispatch(ShellIntent::Settings(intent));
+        }
+        shell.dispatch(ShellIntent::Recent(RecentIntent::SetWindow(
+            RecentWindow::ThreeDays,
+        )));
+        shell.dispatch(ShellIntent::LockImage(LockImageIntent::SetShowCard(false)));
+        shell.dispatch(ShellIntent::Swipe(Direction::Previous));
+        shell.dispatch(ShellIntent::OpenSettings);
+        assert_eq!(shell.theme().state().theme, Theme::Dark);
+
+        shell.dispatch(ShellIntent::Settings(SettingsIntent::ResetLauncher));
+
+        let saved = PersistentSettingsStore::new(fakes.storage.clone()).get();
+        let defaults = Settings {
+            home_banner_dismissed_ms: saved.home_banner_dismissed_ms,
+            ..Settings::default()
+        };
+        assert_eq!(saved, defaults);
+        assert!(!shell.state().settings_open);
+        assert_eq!(shell.state().current, HomeView::Applications);
+        assert_eq!(shell.theme().state().theme, Theme::Light);
+        assert!(shell.apps().state().hidden_apps.is_empty());
+        assert_eq!(shell.apps().state().scroll_px, 0.0);
+        assert!(shell.state().theme_change.animating);
+    }
+
+    #[test]
+    fn reset_launcher_is_offered_only_while_every_feature_it_resets_works() {
+        // SET-06, ARCH-09: a failed Recent can't restore its own fields, so nothing is reset.
+        let fakes = Fakes::default();
+        let mut platform = fakes.platform();
+        platform.usage = Arc::new(BrokenUsage);
+        let mut shell = HomeShell::compose(platform);
+        shell.dispatch(ShellIntent::Settings(SettingsIntent::SetTheme(
+            ThemeChoice::Dark,
+        )));
+        shell.dispatch(ShellIntent::OpenSettings);
+
+        assert!(!shell.reset_offered());
+        shell.dispatch(ShellIntent::Settings(SettingsIntent::ResetLauncher));
+
+        assert!(shell.state().settings_open);
+        assert_eq!(shell.theme().state().theme, Theme::Dark);
+        assert!(HomeShell::compose(fakes.platform()).reset_offered());
     }
 
     #[test]

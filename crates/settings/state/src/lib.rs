@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use meegone_core_data::{
-    NotificationsAdapter, Settings, SettingsStore, SystemConfigAdapter, UsageAdapter,
+    DataError, NotificationsAdapter, Settings, SettingsStore, SystemConfigAdapter, UsageAdapter,
 };
 use meegone_core_state::{Access, HomeTarget, StateHolder, ThemeChoice};
 
@@ -24,15 +24,31 @@ pub struct SettingsState {
     /// MeeGone isn't the default home app and the user hasn't dismissed or answered the banner
     /// today, so the home views show it (ONB-04).
     pub home_banner: bool,
+    /// Written instructions for an Access item whose shortcut found no system screen to open,
+    /// shown below that item until Settings is opened again or MeeGone comes back to the
+    /// foreground (SRS 8.1).
+    pub instructions: Option<(AccessItem, String)>,
     pub problem: Option<String>,
 }
 
 /// A group of Settings (SET-02) that Settings can open at, rather than at its top. Only the
-/// groups something opens directly are listed; the others arrive with the Settings screen (#34).
+/// groups something opens directly are listed: the others are reached by scrolling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsGroup {
     /// The lock-screen image's options, opened from the home menu (HOME-10).
     LockScreenImage,
+}
+
+/// An item of Settings → Access, each with its status and a shortcut to its system screen
+/// (SET-02).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessItem {
+    /// MeeGone is the default home app (HOME-01).
+    DefaultHome,
+    /// Notification access, for Events (EVT-03).
+    Notifications,
+    /// Usage access, for Recent (REC-02).
+    Usage,
 }
 
 #[derive(Debug)]
@@ -51,6 +67,9 @@ pub enum SettingsIntent {
     RequestDefaultHome,
     /// Hides the banner until tomorrow (ONB-04).
     DismissHomeBanner,
+    /// "Reset launcher", once confirmed (SET-06). Settings restores its own options to their
+    /// defaults; the shell has every other feature restore its own (ADR 0002, ADR 0035).
+    ResetLauncher,
 }
 
 /// One day in milliseconds.
@@ -122,10 +141,39 @@ impl SettingsHolder {
     /// A request the system accepted counts as today's answer to the banner, so a user who
     /// declines in the dialog isn't reminded again the same day (ONB-04).
     fn request_default_home(&mut self) {
-        match self.system.request_default_home() {
-            Ok(()) => self.dismiss_banner(),
+        let result = self.system.request_default_home();
+        let asked = result.is_ok();
+        self.opened(AccessItem::DefaultHome, result);
+        // After, so a dismissal that can't be saved stays the problem.
+        if asked {
+            self.dismiss_banner();
+        }
+    }
+
+    /// After a shortcut to `item`'s system screen: where the system has no such screen, its
+    /// written instructions show below the item instead (SRS 8.1); any other failure is a
+    /// problem to report.
+    fn opened(&mut self, item: AccessItem, result: Result<(), DataError>) {
+        self.state.instructions = None;
+        self.state.problem = None;
+        match result {
+            Ok(()) => {}
+            Err(DataError::Unsupported(instructions)) => {
+                self.state.instructions = Some((item, instructions));
+            }
             Err(error) => self.state.problem = Some(error.to_string()),
         }
+    }
+
+    /// Settings' own options go back to their defaults (SET-06). Everything else in the store
+    /// belongs to another feature, which restores its own (ADR 0002).
+    fn reset(&mut self) {
+        let defaults = Settings::default();
+        self.change(|s| {
+            s.theme = defaults.theme;
+            s.home_target = defaults.home_target;
+            s.wrap_around = defaults.wrap_around;
+        });
     }
 
     /// Changes take effect at once; there is no Save button (SET-03).
@@ -149,26 +197,24 @@ impl StateHolder for SettingsHolder {
 
     fn handle(&mut self, intent: SettingsIntent) {
         match intent {
-            SettingsIntent::Refresh => self.refresh(),
+            SettingsIntent::Refresh => {
+                self.state.instructions = None;
+                self.refresh();
+            }
             SettingsIntent::SetTheme(theme) => self.change(|s| s.theme = theme),
             SettingsIntent::SetHomeTarget(target) => self.change(|s| s.home_target = target),
             SettingsIntent::SetWrapAround(on) => self.change(|s| s.wrap_around = on),
             SettingsIntent::OpenNotificationAccess => {
-                self.state.problem = self
-                    .notifications
-                    .open_access_settings()
-                    .err()
-                    .map(|error| error.to_string());
+                let result = self.notifications.open_access_settings();
+                self.opened(AccessItem::Notifications, result);
             }
             SettingsIntent::OpenUsageAccess => {
-                self.state.problem = self
-                    .usage
-                    .open_access_settings()
-                    .err()
-                    .map(|error| error.to_string());
+                let result = self.usage.open_access_settings();
+                self.opened(AccessItem::Usage, result);
             }
             SettingsIntent::RequestDefaultHome => self.request_default_home(),
             SettingsIntent::DismissHomeBanner => self.dismiss_banner(),
+            SettingsIntent::ResetLauncher => self.reset(),
         }
     }
 }
@@ -329,15 +375,94 @@ mod tests {
     }
 
     #[test]
+    fn a_request_whose_answer_cant_be_saved_says_why() {
+        // ONB-04, REL-03: the dialog opened, but the day's answer wasn't saved.
+        let (fakes, _, mut holder) = setup();
+        let failure = DataError::Failed("Not enough storage space".into());
+        *fakes.storage.error.lock().unwrap() = Some(failure.clone());
+
+        holder.handle(SettingsIntent::RequestDefaultHome);
+
+        assert_eq!(*fakes.system.default_home_requested.lock().unwrap(), 1);
+        assert_eq!(holder.state().problem, Some(failure.to_string()));
+        assert!(!holder.state().home_banner);
+    }
+
+    #[test]
     fn a_request_the_system_cant_show_keeps_the_banner_and_says_why() {
         // SRS 8.1: without a system screen, show written instructions instead.
         let (fakes, _, mut holder) = setup();
-        let instructions = DataError::Unsupported("Choose MeeGone in Settings".into());
-        *fakes.system.error.lock().unwrap() = Some(instructions.clone());
+        let instructions = "Choose MeeGone in Settings";
+        *fakes.system.error.lock().unwrap() = Some(DataError::Unsupported(instructions.into()));
 
         holder.handle(SettingsIntent::RequestDefaultHome);
 
         assert!(holder.state().home_banner);
-        assert_eq!(holder.state().problem, Some(instructions.to_string()));
+        assert_eq!(
+            holder.state().instructions,
+            Some((AccessItem::DefaultHome, instructions.to_owned()))
+        );
+        assert_eq!(holder.state().problem, None);
+    }
+
+    #[test]
+    fn an_access_shortcut_without_a_system_screen_shows_written_instructions_below_its_item() {
+        // SET-02, SRS 8.1: until Settings is opened again or MeeGone comes back.
+        let (fakes, _, mut holder) = setup();
+        let instructions = "Open Settings, then Notification access";
+        *fakes.notifications.error.lock().unwrap() =
+            Some(DataError::Unsupported(instructions.into()));
+
+        holder.handle(SettingsIntent::OpenNotificationAccess);
+        assert_eq!(
+            holder.state().instructions,
+            Some((AccessItem::Notifications, instructions.to_owned()))
+        );
+        assert_eq!(holder.state().problem, None);
+
+        holder.handle(SettingsIntent::SetWrapAround(false));
+        assert!(holder.state().instructions.is_some());
+        holder.handle(SettingsIntent::Refresh);
+        assert_eq!(holder.state().instructions, None);
+    }
+
+    #[test]
+    fn a_shortcut_that_fails_otherwise_reports_a_problem_and_the_next_one_clears_it() {
+        let (fakes, _, mut holder) = setup();
+        let failure = DataError::Failed("Something went wrong".into());
+        *fakes.usage.error.lock().unwrap() = Some(failure.clone());
+
+        holder.handle(SettingsIntent::OpenUsageAccess);
+        assert_eq!(holder.state().problem, Some(failure.to_string()));
+        assert_eq!(holder.state().instructions, None);
+
+        *fakes.usage.error.lock().unwrap() = None;
+        holder.handle(SettingsIntent::OpenUsageAccess);
+        assert_eq!(holder.state().problem, None);
+    }
+
+    #[test]
+    fn reset_launcher_restores_settings_own_options_and_nothing_else() {
+        // SET-06, ADR 0002: each feature restores the fields it writes.
+        let (_, store, mut holder) = setup();
+        holder.handle(SettingsIntent::SetTheme(ThemeChoice::Dark));
+        holder.handle(SettingsIntent::SetHomeTarget(HomeTarget::Applications));
+        holder.handle(SettingsIntent::SetWrapAround(false));
+        holder.handle(SettingsIntent::DismissHomeBanner);
+        store
+            .update(&mut |s| s.image.use_mobile_data = true)
+            .unwrap();
+
+        holder.handle(SettingsIntent::ResetLauncher);
+
+        let defaults = Settings::default();
+        let settings = store.get();
+        assert_eq!(settings.theme, defaults.theme);
+        assert_eq!(settings.home_target, defaults.home_target);
+        assert_eq!(settings.wrap_around, defaults.wrap_around);
+        assert!(settings.image.use_mobile_data);
+        assert!(settings.home_banner_dismissed_ms.is_some());
+        assert_eq!(holder.state().theme, defaults.theme);
+        assert!(holder.state().wrap_around);
     }
 }

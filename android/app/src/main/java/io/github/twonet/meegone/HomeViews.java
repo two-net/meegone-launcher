@@ -4,6 +4,7 @@ import android.annotation.TargetApi;
 import android.app.AlertDialog;
 import android.content.Context;
 import android.content.res.ColorStateList;
+import android.content.res.Resources;
 import android.graphics.Color;
 import android.graphics.Insets;
 import android.graphics.Matrix;
@@ -24,6 +25,7 @@ import android.view.RoundedCorner;
 import android.view.View;
 import android.view.ViewConfiguration;
 import android.view.ViewGroup;
+import android.view.ViewTreeObserver;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 import android.view.WindowManager;
@@ -31,14 +33,20 @@ import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityManager;
 import android.view.accessibility.AccessibilityNodeInfo;
 import android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction;
+import android.widget.Button;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 
 /**
  * The three home views, Events, Applications and Recent, in a wrap-around carousel (HOME-02 to
@@ -216,7 +224,21 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private static final int THEME_CHANGE = 139; // how far the new theme has faded in, to 10 000
     private static final int THEME = 140; // a value of THEMES; -1 not offered
     private static final int RECENT_LEAVE_SCALE = 141; // a leaving card's end, ten-thousandths
-    private static final int FRAME_SIZE = 142;
+    // Settings → Home (HOME-04, HOME-06), Access (SET-02), Region (WALL-05) and Reset launcher
+    // (SET-06, ADR 0035):
+    private static final int HOME_TARGET = 142; // 0 the last view, 1 Applications; -1 not offered
+    private static final int WRAP_AROUND = 143; // 1 on, 0 off, -1 not offered
+    private static final int DEFAULT_HOME = 144; // 1 MeeGone is, 0 it isn't; -1 not offered
+    private static final int NOTIFICATION_ACCESS = 145; // 1 granted, 0 not
+    private static final int USAGE_ACCESS = 146; // 1 granted, 0 not
+    private static final int ACCESS_INSTRUCTIONS = 147; // an AccessSettings item, or -1
+    private static final int REGION = 148; // 0 Automatic, else its place in nativeRegions; or -1
+    private static final int RESET_OFFERED = 149; // 1 while Reset launcher is offered
+    private static final int FRAME_SIZE = 150;
+    /** The licences of the third-party code MeeGone includes, in About (LEGAL-06). */
+    private static final int[] LICENCES = {
+        R.raw.licence_mit, R.raw.licence_apache_2_0, R.raw.licence_unicode_3_0,
+    };
     /** Settings → Appearance → Theme: System, Light and Dark, as the Rust app numbers them. */
     private static final int[] THEMES = {0, 1, 2};
     private static final int[] THEME_LABELS = {
@@ -316,19 +338,26 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
      */
     private final TextView status;
     /**
-     * Covers the home views while Settings is open. Until #34 draws it, it shows its name and
-     * Applications' Hidden apps (APPS-19).
+     * Covers the home views while Settings is open: its name, then its groups in SET-02's order,
+     * in one scrolling column (ADR 0035).
      */
     private final LinearLayout settings;
     private final TextView settingsTitle;
-    private final TextView settingsGroup;
-    private final HiddenAppsList hiddenApps;
+    private final ScrollView settingsScroll;
     /** Settings → Appearance → Theme (THEME-01). */
     private final ChoiceSettings themeSettings;
+    /** Settings → Home: "Home button opens" and Wrap-around (HOME-04, HOME-06). */
+    private final HomeSettings homeSettings;
+    /** Settings → Applications → Hidden apps (APPS-19). */
+    private final HiddenAppsList hiddenApps;
     /** Settings → Recent → Time window (REC-11). */
     private final ChoiceSettings recentSettings;
-    /** Settings → Lock-screen image → "Show card in Events" (EVT-12). */
+    /** Settings → Lock-screen image (EVT-12, WALL-02 to WALL-17). */
     private final ImageSettings imageSettings;
+    /** Settings → Access: the default home app, notification and usage access (SET-02). */
+    private final AccessSettings accessSettings;
+    /** Settings → About, with Reset launcher (SET-05, SET-06). */
+    private final AboutSettings aboutSettings;
     /** Covers the home views while the image details screen is open (WALL-15). */
     private final ImageDetails imageDetails;
     private final PastImages pastImages;
@@ -404,6 +433,18 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     /** The Events row a notification menu was made for, as in {@link #EVENTS_MENU_ROW}. */
     private int eventsMenuRowShown = -1;
     private int settingsShown;
+    /**
+     * The regions Settings offers, as BCP 47 tags: the one Automatic stands for, then the feed's,
+     * read each time Settings opens (WALL-05).
+     */
+    private String[] regions = new String[0];
+    /** The region shown, as in {@link #REGION}, or -2 to show it again. */
+    private int regionShown = -2;
+    /** The Access item whose instructions show, as in {@link #ACCESS_INSTRUCTIONS}, and them. */
+    private int instructionsShown = -1;
+    private String instructions;
+    /** The dialog over Settings: the regions, the licences or Reset launcher's question. */
+    private AlertDialog settingsDialog;
     /** Hidden apps' revision as shown, as an unsigned int, or -1 before it is first read. */
     private long hiddenAppsShown = -1;
     /** The Events header's revision as shown, as an unsigned int, or -1 before it is first read. */
@@ -677,13 +718,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         settingsTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 28);
         settings.addView(settingsTitle, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
-        settingsGroup = new TextView(context);
-        settingsGroup.setText(R.string.menu_lock_screen_image);
-        settingsGroup.setTextSize(TypedValue.COMPLEX_UNIT_SP, 18);
-        settingsGroup.setVisibility(GONE);
-        settings.addView(settingsGroup, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
-        // Settings → Applications → Hidden apps (APPS-19), which scrolls when it is long.
+        // Settings → Applications → Hidden apps (APPS-19).
         hiddenApps = new HiddenAppsList(context, icons, (revision, index) -> {
             String message = nativeUnhide(revision, index);
             apply();
@@ -698,6 +733,23 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
                     toast(message);
                 });
         themeSettings.setVisibility(GONE);
+        // Settings → Home (HOME-04, HOME-06), after Appearance in SET-02's order.
+        homeSettings = new HomeSettings(context, new HomeSettings.Listener() {
+            @Override
+            public void homeTarget(int target) {
+                String message = nativeHomeTarget(target);
+                apply();
+                toast(message);
+            }
+
+            @Override
+            public void wrapAround(boolean on) {
+                String message = nativeWrapAround(on);
+                apply();
+                toast(message);
+            }
+        });
+        homeSettings.setVisibility(GONE);
         // Settings → Recent → Time window (REC-11), after Applications in SET-02's order.
         recentSettings = new ChoiceSettings(context, R.string.settings_group_recent,
                 R.string.recent_time_window, RECENT_HOURS, RECENT_LABELS, hours -> {
@@ -712,6 +764,11 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             @Override
             public void dailyImage(boolean on) {
                 answered(nativeDailyImage(on));
+            }
+
+            @Override
+            public void region() {
+                chooseRegion();
             }
 
             @Override
@@ -765,26 +822,57 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             }
         });
         imageSettings.setVisibility(GONE);
+        // Settings → Access (SET-02), after the lock-screen image in SET-02's order.
+        accessSettings = new AccessSettings(context, item -> {
+            String message;
+            switch (item) {
+                case AccessSettings.DEFAULT_HOME:
+                    message = nativeDefaultHome();
+                    break;
+                case AccessSettings.NOTIFICATIONS:
+                    message = nativeNotificationAccessSettings();
+                    break;
+                default:
+                    message = nativeUsageAccessSettings();
+                    break;
+            }
+            apply();
+            toast(message);
+        });
+        accessSettings.setVisibility(GONE);
+        // Settings → About, last (SET-05, SET-06).
+        aboutSettings = new AboutSettings(context, new AboutSettings.Listener() {
+            @Override
+            public void licences() {
+                showLicences();
+            }
+
+            @Override
+            public void resetLauncher() {
+                confirmReset();
+            }
+        });
         LinearLayout groups = new LinearLayout(context);
         groups.setOrientation(LinearLayout.VERTICAL);
-        groups.addView(themeSettings, new LinearLayout.LayoutParams(
+        // The bottom padding keeps the last item clear of the screen's edge.
+        groups.setPadding(0, 0, 0, dp(24));
+        for (View group : new View[] {
+            themeSettings, homeSettings, hiddenApps, recentSettings, imageSettings,
+            accessSettings, aboutSettings,
+        }) {
+            groups.addView(group, new LinearLayout.LayoutParams(
+                    LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
+        }
+        settingsScroll = new ScrollView(context);
+        settingsScroll.addView(groups, new ScrollView.LayoutParams(
                 LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
-        groups.addView(hiddenApps, new LinearLayout.LayoutParams(
-                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
-        groups.addView(recentSettings, new LinearLayout.LayoutParams(
-                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
-        groups.addView(imageSettings, new LinearLayout.LayoutParams(
-                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
-        ScrollView hiddenAppsScroll = new ScrollView(context);
-        hiddenAppsScroll.addView(groups, new ScrollView.LayoutParams(
-                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
-        scrolls.add(hiddenAppsScroll);
+        scrolls.add(settingsScroll);
         LinearLayout.LayoutParams scrollParams = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f);
         scrollParams.topMargin = dp(24);
         scrollParams.setMarginStart(dp(16));
         scrollParams.setMarginEnd(dp(16));
-        settings.addView(hiddenAppsScroll, scrollParams);
+        settings.addView(settingsScroll, scrollParams);
         addView(settings, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
 
         // Above Settings and the details screen, which open it (ADR 0032).
@@ -1344,7 +1432,6 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             surface = frame[SURFACE];
             settings.setBackgroundColor(surface);
             settingsTitle.setTextColor(foreground);
-            settingsGroup.setTextColor(dim);
             menuCard.setColor(surface);
             colourMenu();
             for (ScrollView scroll : scrolls) {
@@ -1932,21 +2019,216 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     }
 
     /**
-     * Shows Settings over the home views while it is open; until #34, only its name, Theme,
-     * Hidden apps, Recent's time window and the lock-screen image's items.
+     * Shows Settings over the home views while it is open, its groups in SET-02's order
+     * (ADR 0035). It opens at its top, or at the lock-screen image's group when the home menu's
+     * Lock-screen image or the details screen opened it (HOME-10, WALL-15). Each group is offered
+     * only while the feature behind it works (ARCH-09).
      */
     private void applySettings() {
         if (frame[SETTINGS] != settingsShown) {
             settingsShown = frame[SETTINGS];
             settings.setVisibility(settingsShown != 0 ? VISIBLE : GONE);
-            settingsGroup.setVisibility(
-                    settingsShown == SETTINGS_AT_LOCK_SCREEN_IMAGE ? VISIBLE : GONE);
             hidePagesFromScreenReaders();
+            if (settingsShown == 0) {
+                closeSettingsDialog();
+            } else {
+                // The device's language, and so Automatic's region, may have changed.
+                regions = nativeRegions();
+                regionShown = -2;
+                scrollSettingsTo(settingsShown == SETTINGS_AT_LOCK_SCREEN_IMAGE
+                        ? imageSettings.heading()
+                        : null);
+            }
         }
         applyThemeSettings();
+        applyHomeSettings();
         applyHiddenApps();
         applyRecentSettings();
         applyImageSettings();
+        applyAccessSettings();
+        aboutSettings.colour(foreground, dim, frame[ACCENT]);
+        aboutSettings.show(frame[RESET_OFFERED] != 0);
+    }
+
+    /**
+     * Scrolls Settings to the group headed {@code heading}, which screen readers move to, or to
+     * its top with null, once it is laid out.
+     */
+    private void scrollSettingsTo(TextView heading) {
+        ViewTreeObserver observer = settingsScroll.getViewTreeObserver();
+        observer.addOnPreDrawListener(new ViewTreeObserver.OnPreDrawListener() {
+            @Override
+            public boolean onPreDraw() {
+                settingsScroll.getViewTreeObserver().removeOnPreDrawListener(this);
+                if (heading == null) {
+                    settingsScroll.scrollTo(0, 0);
+                    return true;
+                }
+                View group = (View) heading.getParent();
+                settingsScroll.scrollTo(0, group.getTop() + heading.getTop());
+                heading.performAccessibilityAction(
+                        AccessibilityNodeInfo.ACTION_ACCESSIBILITY_FOCUS, null);
+                return true;
+            }
+        });
+    }
+
+    /**
+     * Settings → Home: "Home button opens" and Wrap-around (HOME-04, HOME-06), offered only while
+     * Settings works (ARCH-09).
+     */
+    private void applyHomeSettings() {
+        int target = frame[HOME_TARGET];
+        homeSettings.setVisibility(target >= 0 ? VISIBLE : GONE);
+        homeSettings.colour(foreground, dim, frame[ACCENT]);
+        homeSettings.show(target, frame[WRAP_AROUND] > 0);
+    }
+
+    /**
+     * Settings → Access: each item's status and shortcut, and the written instructions where a
+     * shortcut found no system screen (SET-02, SRS 8.1), offered only while Settings works
+     * (ARCH-09).
+     */
+    private void applyAccessSettings() {
+        boolean offered = frame[DEFAULT_HOME] >= 0;
+        accessSettings.setVisibility(offered ? VISIBLE : GONE);
+        if (!offered) {
+            return;
+        }
+        accessSettings.colour(foreground, dim, frame[ACCENT]);
+        int instructed = frame[ACCESS_INSTRUCTIONS];
+        if (instructed != instructionsShown) {
+            instructionsShown = instructed;
+            instructions = instructed >= 0 ? nativeAccessInstructions() : null;
+        }
+        accessSettings.show(frame[DEFAULT_HOME] > 0, frame[NOTIFICATION_ACCESS] > 0,
+                frame[USAGE_ACCESS] > 0, instructed, instructions);
+    }
+
+    /** A region by name: "Automatic (English (United States))" first, then "Deutsch (…)". */
+    private String regionName(int place) {
+        if (place < 0 || place >= regions.length) {
+            return "";
+        }
+        String name = Locale.forLanguageTag(regions[place]).getDisplayName();
+        return place == 0
+                ? getResources().getString(R.string.image_region_automatic, name)
+                : name;
+    }
+
+    /** A dialog over Settings, in MeeGone's theme as the device draws dialogs (THEME-03). */
+    private AlertDialog.Builder dialogOverSettings() {
+        boolean light = Color.luminance(background) > 0.5f;
+        return new AlertDialog.Builder(getContext(), light
+                ? android.R.style.Theme_DeviceDefault_Light_Dialog_Alert
+                : android.R.style.Theme_DeviceDefault_Dialog_Alert);
+    }
+
+    /** Shows {@code dialog} over Settings, with MeeGone's accent, closing any other. */
+    private void showSettingsDialog(AlertDialog dialog) {
+        closeSettingsDialog();
+        settingsDialog = dialog;
+        dialog.setOnDismissListener(shown -> {
+            if (settingsDialog == dialog) {
+                settingsDialog = null;
+            }
+        });
+        dialog.show();
+        for (int which : new int[] {AlertDialog.BUTTON_POSITIVE, AlertDialog.BUTTON_NEGATIVE}) {
+            Button button = dialog.getButton(which);
+            if (button != null) {
+                button.setTextColor(frame[ACCENT]);
+            }
+        }
+    }
+
+    /** Closes the dialog over Settings, as when Settings closes. */
+    private void closeSettingsDialog() {
+        AlertDialog dialog = settingsDialog;
+        settingsDialog = null;
+        if (dialog != null) {
+            dialog.dismiss();
+        }
+    }
+
+    /**
+     * Settings → Lock-screen image → Region: Automatic, then the feed's regions by name, the
+     * chosen one checked (WALL-05). A choice is saved at once (SET-03).
+     */
+    private void chooseRegion() {
+        if (regions.length == 0 || frame[REGION] < 0) {
+            return;
+        }
+        String[] names = new String[regions.length];
+        for (int place = 0; place < regions.length; place++) {
+            names[place] = regionName(place);
+        }
+        showSettingsDialog(dialogOverSettings()
+                .setTitle(R.string.image_region)
+                .setSingleChoiceItems(names, frame[REGION], (shown, place) -> {
+                    shown.dismiss();
+                    String message = nativeRegion(place);
+                    apply();
+                    toast(message);
+                })
+                .setNegativeButton(android.R.string.cancel, null)
+                .create());
+    }
+
+    /**
+     * Settings → About → "Open-source licences": what MeeGone includes, then each licence in
+     * full (LEGAL-06).
+     */
+    private void showLicences() {
+        AlertDialog.Builder builder = dialogOverSettings();
+        StringBuilder text = new StringBuilder(getResources().getString(R.string.licences_intro));
+        for (int licence : LICENCES) {
+            text.append("\n\n").append(readText(getResources(), licence));
+        }
+        TextView body = new TextView(builder.getContext());
+        body.setText(text);
+        body.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
+        body.setPaddingRelative(dp(24), dp(8), dp(24), dp(8));
+        ScrollView scroll = new ScrollView(builder.getContext());
+        scroll.addView(body);
+        showSettingsDialog(builder
+                .setTitle(R.string.about_licences)
+                .setView(scroll)
+                .setPositiveButton(android.R.string.ok, null)
+                .create());
+    }
+
+    /** A text file among the app's raw resources, or nothing if it can't be read. */
+    private static String readText(Resources res, int id) {
+        try (InputStream in = res.openRawResource(id)) {
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            byte[] buffer = new byte[8192];
+            for (int read = in.read(buffer); read > 0; read = in.read(buffer)) {
+                out.write(buffer, 0, read);
+            }
+            return new String(out.toByteArray(), StandardCharsets.UTF_8);
+        } catch (IOException | Resources.NotFoundException e) {
+            return "";
+        }
+    }
+
+    /**
+     * Settings → About → Reset launcher asks first, saying what it does (SET-06). Reset puts
+     * everything back to its default, closes Settings and shows Applications.
+     */
+    private void confirmReset() {
+        showSettingsDialog(dialogOverSettings()
+                .setTitle(R.string.reset_launcher_title)
+                .setMessage(R.string.reset_launcher_message)
+                .setPositiveButton(R.string.reset_launcher_confirm, (shown, which) -> {
+                    String message = nativeResetLauncher();
+                    apply();
+                    toast(message != null
+                            ? message
+                            : getContext().getString(R.string.launcher_reset));
+                })
+                .setNegativeButton(android.R.string.cancel, null)
+                .create());
     }
 
     /** Settings → Appearance → Theme (THEME-01): offered only while Settings works (ARCH-09). */
@@ -1969,9 +2251,10 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
 
     /**
      * Settings → Lock-screen image: the daily image's switch (WALL-02, WALL-13), the pause
-     * (WALL-14), "Daily image unavailable" (SRS 7.6), "Show card in Events" (EVT-12), "Use
-     * mobile data" (WALL-04), "Update now" (WALL-11) and, once it is off, the reset and the
-     * wallpaper settings (WALL-12), offered only while the lock-screen image works (ARCH-09).
+     * (WALL-14), "Daily image unavailable" (SRS 7.6), Region (WALL-05), "Use mobile data"
+     * (WALL-04), "Show card in Events" (EVT-12), "Update now" (WALL-11) and, once it is off, the
+     * reset and the wallpaper settings (WALL-12), offered only while the lock-screen image works
+     * (ARCH-09).
      */
     private void applyImageSettings() {
         int daily = frame[DAILY_IMAGE];
@@ -1980,6 +2263,10 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             return;
         }
         imageSettings.colour(foreground, dim, frame[ACCENT]);
+        if (frame[REGION] != regionShown) {
+            regionShown = frame[REGION];
+            imageSettings.showRegion(regionName(regionShown));
+        }
         String reason = daily == ImageSettings.DAILY_IMAGE_UNAVAILABLE
                 ? nativeImageUnavailableReason()
                 : null;
@@ -2560,6 +2847,51 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
      * (THEME-01). Returns null, or a short message to show when the choice couldn't be saved.
      */
     private native String nativeTheme(int theme);
+
+    /**
+     * Settings → Home → "Home button opens" was set to the last view, 0, or Applications, 1
+     * (HOME-06). Returns null, or a short message to show when the choice couldn't be saved.
+     */
+    private native String nativeHomeTarget(int target);
+
+    /**
+     * Settings → Home → Wrap-around was switched (HOME-04). Returns null, or a short message to
+     * show when the choice couldn't be saved.
+     */
+    private native String nativeWrapAround(boolean on);
+
+    /**
+     * Settings → Access → "Default home app" was tapped (HOME-01). Returns null, or a short
+     * message to show when something went wrong; instructions show in Access instead.
+     */
+    private native String nativeDefaultHome();
+
+    /** Settings → Access → "Notification access" was tapped (EVT-03), as nativeDefaultHome. */
+    private native String nativeNotificationAccessSettings();
+
+    /** Settings → Access → "Usage access" was tapped (REC-02), as nativeDefaultHome. */
+    private native String nativeUsageAccessSettings();
+
+    /** The written instructions below the Access item in {@link #ACCESS_INSTRUCTIONS}, or null. */
+    private native String nativeAccessInstructions();
+
+    /**
+     * The regions Settings → Lock-screen image → Region offers, as BCP 47 tags: the one
+     * Automatic stands for, then the feed's (WALL-05). Empty while it isn't offered.
+     */
+    private native String[] nativeRegions();
+
+    /**
+     * Region was set to Automatic, 0, or the region at that place in {@link #nativeRegions}
+     * (WALL-05). Returns null, or a short message to show when the choice couldn't be saved.
+     */
+    private native String nativeRegion(int place);
+
+    /**
+     * Reset launcher was confirmed (SET-06). Returns null, or a short message to show when part
+     * of it couldn't be saved.
+     */
+    private native String nativeResetLauncher();
 
     /**
      * In close mode, the ✕ of card {@code index} of Recent's cards at {@code revision} was

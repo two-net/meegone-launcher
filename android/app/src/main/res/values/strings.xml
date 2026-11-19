@@ -136,6 +136,18 @@
     <string name="recent_window_24_hours">24 hours</string>
     <string name="recent_window_3_days">3 days</string>
 
+    <!-- The Home group of Settings (SET-02). -->
+    <string name="settings_group_home">Home</string>
+    <!-- Settings → Home → "Home button opens": what the system Home action shows when MeeGone
+         comes back from an app (HOME-06). Its two choices follow: the view the user left, or
+         always Applications. -->
+    <string name="home_target">Home button opens</string>
+    <string name="home_target_last_view">Last view</string>
+    <string name="home_target_applications">Always Applications</string>
+    <!-- Settings → Home → Wrap-around: swiping past Recent comes back round to Events, and past
+         Events to Recent (HOME-04). -->
+    <string name="wrap_around">Wrap-around</string>
+
     <!-- The Events header's alarm row: when the next alarm rings, e.g. "Alarm 07:00", or
          "Alarm Wed 07:00" when it is more than a day away (EVT-02). %1$s is the time, in the
          device's 12- or 24-hour setting. Tapping it opens the app that set the alarm. -->
@@ -151,8 +163,9 @@
          notification-access screen. -->
     <string name="events_access_explainer">MeeGone reads your notifications only to list them here, and they never leave this phone.</string>
     <string name="events_access_allow">Allow</string>
-    <!-- Shown briefly when no system screen for notification access could open (EVT-03). -->
-    <string name="notification_access_unavailable">Notification access can\'t open right now</string>
+    <!-- Written instructions, shown when no system screen for notification access could open:
+         briefly in Events, and below the item in Settings → Access (EVT-03, SRS 8.1). -->
+    <string name="notification_access_unavailable">Notification access can\'t open from here. In the system Settings, find Notification access, usually under Apps, Special app access, and turn MeeGone on.</string>
     <!-- The heading over Events' notifications, drawn in capitals (EVT-04, SRS 5.2). -->
     <string name="events_notifications">Notifications</string>
     <!-- Events with nothing to show (EVT-11). -->
@@ -303,8 +316,9 @@
          screen. -->
     <string name="recent_access_explainer">MeeGone reads which apps you used recently only to show them here, and that never leaves this phone.</string>
     <string name="recent_access_allow">Allow</string>
-    <!-- Shown briefly when no system screen for usage access could open (REC-02). -->
-    <string name="usage_access_unavailable">Usage access can\'t open right now</string>
+    <!-- Written instructions, shown when no system screen for usage access could open: briefly
+         in Recent, and below the item in Settings → Access (REC-02, SRS 8.1). -->
+    <string name="usage_access_unavailable">Usage access can\'t open from here. In the system Settings, find Usage access, usually under Apps, Special app access, and turn MeeGone on.</string>
     <!-- Recent with usage access and no app used lately (REC-10). -->
     <string name="recent_empty">No recent apps</string>
     <!-- How long ago an app was last used, below its label on its Recent card (REC-04). It
@@ -365,4 +379,57 @@
     <!-- The name of a card's ✕ in close mode, which removes it from Recent (REC-08, A11Y-01).
          Screen readers offer it as an action. %1$s is the app's name. -->
     <string name="action_remove_from_recent">Remove %1$s from Recent</string>
+
+    <!-- Settings → Lock-screen image → Region: where the daily image comes for (WALL-05). Below it
+         is the region chosen; tapping it opens the choices. -->
+    <string name="image_region">Region</string>
+    <!-- The first region choice, which follows the device's language. %1$s is the region it
+         stands for, e.g. "Automatic (English (United States))". -->
+    <string name="image_region_automatic">Automatic (%1$s)</string>
+
+    <!-- The Access group of Settings: each item with its status and a button to its system
+         screen (SET-02). -->
+    <string name="settings_group_access">Access</string>
+    <string name="access_default_home">Default home app</string>
+    <string name="access_default_home_on">MeeGone is your home screen</string>
+    <string name="access_default_home_off">MeeGone isn\'t your home screen</string>
+    <string name="access_notifications">Notification access</string>
+    <string name="access_notifications_on">Allowed. Events lists your notifications.</string>
+    <string name="access_notifications_off">Not allowed. Events can\'t list your notifications.</string>
+    <string name="access_usage">Usage access</string>
+    <string name="access_usage_on">Allowed. Recent shows the apps you used.</string>
+    <string name="access_usage_off">Not allowed. Recent can\'t show the apps you used.</string>
+    <!-- The buttons of the Access items: Allow and Make default while not granted, Change
+         once granted. -->
+    <string name="access_allow">Allow</string>
+    <string name="access_make_default">Make default</string>
+    <string name="access_change">Change</string>
+    <!-- What screen readers read for an Access item's button, e.g. "Usage access: Allow"
+         (A11Y-01). %1$s is the item, %2$s the button. -->
+    <string name="access_button_description">%1$s: %2$s</string>
+    <!-- Written instructions, shown below Settings → Access → "Default home app" when no system
+         screen for choosing the home app could open (HOME-01, SRS 8.1). -->
+    <string name="default_home_instructions">To make MeeGone your home screen, open the system Settings, then Apps, Default apps, Home app, and choose MeeGone.</string>
+
+    <!-- The About group of Settings, its last (SET-05). -->
+    <string name="settings_group_about">About</string>
+    <!-- Above the installed version, e.g. "0.1.0". -->
+    <string name="about_version">Version</string>
+    <!-- The privacy notice (PRIV-04): exactly what PRIV-01 to PRIV-03 and PRIV-05 promise, and
+         that the layout and settings join the system's backup (ADR 0018). -->
+    <string name="about_privacy">Privacy notice</string>
+    <string name="about_privacy_notice">MeeGone has no accounts, analytics, advertising or tracking, and collects nothing about you. Its only connection is to Bing\'s image feed, for the daily image, and those requests carry only the region and image size, never anything that identifies you or your device. Your notifications and app-usage history are read on this device, in memory only; the only usage data kept is which apps you removed from Recent, and when. Your layout and settings are included in the system\'s backup. Uninstalling MeeGone or clearing its data removes everything it stored.</string>
+    <!-- The non-affiliation statement (LEGAL-05), word for word. -->
+    <string name="about_independent">MeeGone Launcher is an independent project and is not affiliated with or endorsed by Nokia or Microsoft.</string>
+    <!-- Opens the third-party code MeeGone includes, with their licences (LEGAL-06). -->
+    <string name="about_licences">Open-source licences</string>
+    <!-- At the top of the licences, before their full texts. -->
+    <string name="licences_intro">MeeGone includes the Rust standard library and the crates it is built with, by the Rust Project Developers and others, under the MIT licence or the Apache License 2.0, at your option. Its Unicode tables are © Unicode, Inc., under the Unicode License v3. The full licences follow.</string>
+    <!-- Settings → About → Reset launcher, and the question it asks first (SET-06). -->
+    <string name="reset_launcher">Reset launcher</string>
+    <string name="reset_launcher_title">Reset launcher?</string>
+    <string name="reset_launcher_message">Applications goes back to its first order, without folders and with hidden apps shown again, and every setting goes back to its default. The daily image turns off, and the lock screen keeps the picture it has. The access you allowed stays.</string>
+    <string name="reset_launcher_confirm">Reset</string>
+    <!-- Shown briefly once the launcher has been reset. -->
+    <string name="launcher_reset">Launcher reset</string>
 </resources>

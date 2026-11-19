@@ -14,8 +14,9 @@ import android.widget.TextView;
 /**
  * A Settings item that is one of a few choices (SET-02), under its group's heading: Appearance →
  * Theme, System, Light or Dark (THEME-01, ADR 0033), and Recent → Time window, 12 hours, 24
- * hours or 3 days (REC-11, ADR 0026). A choice takes effect at once (SET-03). Until #34 draws the
- * rest of Settings, they sit among the sections drawn so far, in SET-02's order.
+ * hours or 3 days (REC-11, ADR 0026). Inside a group with other items, such as Home → "Home
+ * button opens" (HOME-06, ADR 0035), it has no heading of its own. A choice takes effect at once
+ * (SET-03).
  */
 final class ChoiceSettings extends LinearLayout {
     /** A choice was made: one of the values the item was made with. */
@@ -30,6 +31,7 @@ final class ChoiceSettings extends LinearLayout {
     private static final float GAP_DP = 16f;
 
     private final int[] values;
+    /** The group's heading, or null inside a group that has its own. */
     private final TextView group;
     private final TextView title;
     private final RadioGroup choices;
@@ -39,8 +41,8 @@ final class ChoiceSettings extends LinearLayout {
     private int accent = -1;
 
     /**
-     * An item headed {@code group} and {@code title}, offering {@code values} with the matching
-     * {@code labels}, as the Rust app numbers them.
+     * An item headed {@code group}, or 0 for none, and {@code title}, offering {@code values}
+     * with the matching {@code labels}, as the Rust app numbers them.
      */
     ChoiceSettings(Context context, int group, int title, int[] values, int[] labels,
             Choice choice) {
@@ -49,10 +51,13 @@ final class ChoiceSettings extends LinearLayout {
         float density = getResources().getDisplayMetrics().density;
         int gap = Math.round(GAP_DP * density);
         setOrientation(VERTICAL);
-        setPadding(0, gap, 0, 0);
-
-        this.group = heading(group, GROUP_SP);
-        addView(this.group, wrap());
+        if (group != 0) {
+            setPadding(0, gap, 0, 0);
+            this.group = heading(group, GROUP_SP);
+            addView(this.group, wrap());
+        } else {
+            this.group = null;
+        }
         this.title = heading(title, TITLE_SP);
         this.title.setId(generateViewId());
         LayoutParams titleParams = wrap();
@@ -125,7 +130,9 @@ final class ChoiceSettings extends LinearLayout {
         this.foreground = foreground;
         this.dim = dim;
         this.accent = accent;
-        group.setTextColor(dim);
+        if (group != null) {
+            group.setTextColor(dim);
+        }
         title.setTextColor(foreground);
         int[][] states = {{android.R.attr.state_checked}, {}};
         ColorStateList tint = new ColorStateList(states, new int[] {accent, dim});

@@ -34,14 +34,16 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use meegone_core_data::android::{self, Env, JObject, LocalRef, RawEnv};
-use meegone_core_data::{App, RecentDensity, RecentWindow, Rect, Rgb, ThemeChoice, accent};
+use meegone_core_data::{
+    App, HomeTarget, RecentDensity, RecentWindow, Rect, Rgb, ThemeChoice, accent,
+};
 
 use crate::{
-    Age, AppMenuItem, BADGE_ROWS, Bounds, Cell, CellKey, CheckStatus, DailyImage, Direction,
-    EventsListMode, EventsRow, FOLDER_COLUMNS, FolderId, GridLayout, HomeFrame, HomeView, Launcher,
-    Layout, MenuItem, NotificationMenuItem, PREVIEW_APPS, PastAction, PinchEvent, PinchKind,
-    PointerEvent, PointerKind, RECENT_ROWS, RecentMode, RowTarget, SavedHome, SettingsGroup,
-    Shared, ShellIntent, ShownCard, Surface,
+    AccessItem, Age, AppMenuItem, BADGE_ROWS, Bounds, Cell, CellKey, CheckStatus, DailyImage,
+    Direction, EventsListMode, EventsRow, FOLDER_COLUMNS, FolderId, GridLayout, HomeFrame,
+    HomeView, Launcher, Layout, MenuItem, NotificationMenuItem, PREVIEW_APPS, PastAction,
+    PinchEvent, PinchKind, PointerEvent, PointerKind, RECENT_ROWS, RecentMode, RowTarget,
+    SavedHome, SettingsGroup, Shared, ShellIntent, ShownCard, Surface,
 };
 
 /// JNI's `jboolean`.
@@ -155,6 +157,26 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeActivity_nativeH
     let env = unsafe { Env::from_raw(env) };
     with_launcher(env, |launcher| {
         launcher.dispatch(ShellIntent::Home);
+        launcher.frame();
+    });
+}
+
+/// `void nativeOpenSettings()`: the system's settings entry for the home app, such as the gear
+/// beside MeeGone in the system's Default apps → Home app, opened MeeGone's Settings at its top
+/// (SET-01, ADR 0035).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeActivity_nativeOpenSettings(
+    env: RawEnv,
+    _activity: JObject,
+) {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_launcher(env, |launcher| {
+        launcher.dispatch(ShellIntent::OpenSettings);
         launcher.frame();
     });
 }
@@ -1413,6 +1435,274 @@ fn theme_code(choice: ThemeChoice) -> i32 {
         ThemeChoice::Light => 1,
         ThemeChoice::Dark => 2,
     }
+}
+
+/// `String nativeHomeTarget(int target)`: Settings → Home → "Home button opens" was set to the
+/// last view, 0, or Applications, 1, as [`home_target_code`] numbers them (HOME-06). The choice
+/// is saved and the next Home follows it (SET-03). Returns `null`, or a short message to show
+/// when it couldn't be saved. Other numbers do nothing, and so does a Settings that isn't
+/// working (ARCH-09).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeHomeTarget(
+    env: RawEnv,
+    _views: JObject,
+    target: i32,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_settings_message(env, |launcher| {
+        let Some(choice) = [HomeTarget::LastView, HomeTarget::Applications]
+            .into_iter()
+            .find(|choice| home_target_code(*choice) == target)
+        else {
+            return false;
+        };
+        launcher.view().settings().home_target_chosen(choice);
+        true
+    })
+}
+
+/// The number the host knows each Home target by, in the frame's slot 142 and in
+/// `nativeHomeTarget`; `HomeViews.java` mirrors them.
+fn home_target_code(target: HomeTarget) -> i32 {
+    match target {
+        HomeTarget::LastView => 0,
+        HomeTarget::Applications => 1,
+    }
+}
+
+/// `String nativeWrapAround(boolean on)`: Settings → Home → Wrap-around was switched (HOME-04).
+/// The carousel follows it at once (SET-03). Returns `null`, or a short message to show when
+/// it couldn't be saved. Does nothing while Settings isn't working (ARCH-09).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeWrapAround(
+    env: RawEnv,
+    _views: JObject,
+    on: JBoolean,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_settings_message(env, |launcher| {
+        launcher.view().settings().wrap_around_toggled(on != 0);
+        true
+    })
+}
+
+/// `String nativeDefaultHome()`: Settings → Access → "Default home app" was tapped: the system
+/// dialog for choosing the default home app opens, or its home-app settings (HOME-01). Where
+/// neither exists, the item shows written instructions instead, read with
+/// `nativeAccessInstructions` (SRS 8.1). Returns `null`, or a short message to show when
+/// something else went wrong. Does nothing while Settings isn't working (ARCH-09).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeDefaultHome(
+    env: RawEnv,
+    _views: JObject,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_settings_message(env, |launcher| {
+        launcher.view().settings().default_home_tapped();
+        true
+    })
+}
+
+/// `String nativeNotificationAccessSettings()`: Settings → Access → "Notification access" was
+/// tapped: MeeGone's page of the system's notification-access screen opens (EVT-03), or the
+/// item shows written instructions (SRS 8.1). Returns as `nativeDefaultHome` does.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeNotificationAccessSettings(
+    env: RawEnv,
+    _views: JObject,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_settings_message(env, |launcher| {
+        launcher.view().settings().notification_access_tapped();
+        true
+    })
+}
+
+/// `String nativeUsageAccessSettings()`: Settings → Access → "Usage access" was tapped:
+/// MeeGone's page of the system's usage-access screen opens (REC-02), or the item shows
+/// written instructions (SRS 8.1). Returns as `nativeDefaultHome` does.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeUsageAccessSettings(
+    env: RawEnv,
+    _views: JObject,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_settings_message(env, |launcher| {
+        launcher.view().settings().usage_access_tapped();
+        true
+    })
+}
+
+/// The number the host knows each Access item by, in the frame's slot 147; `HomeViews.java`
+/// mirrors them.
+fn access_item_code(item: AccessItem) -> i32 {
+    match item {
+        AccessItem::DefaultHome => 0,
+        AccessItem::Notifications => 1,
+        AccessItem::Usage => 2,
+    }
+}
+
+/// `String nativeAccessInstructions()`: the written instructions shown below the Access item
+/// in the frame's slot 147, or `null` while there are none (SRS 8.1).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeAccessInstructions(
+    env: RawEnv,
+    _views: JObject,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    let mut instructions = std::ptr::null_mut();
+    guarded(env, || {
+        LAUNCHER.with_borrow(|launcher| {
+            let Some(launcher) = launcher.as_ref().filter(|l| l.shell().settings_ready()) else {
+                return Ok(());
+            };
+            let state = launcher.shell().settings().state();
+            let text = state.instructions.as_ref().map(|(_, text)| text.as_str());
+            instructions = message(env, text)?;
+            Ok(())
+        })
+    });
+    instructions
+}
+
+/// `String[] nativeRegions()`: the regions Settings → Lock-screen image → Region offers, as
+/// BCP 47 tags: first the one Automatic stands for on this device, then the feed's, in the
+/// order the frame's slot 148 counts them (WALL-05). Empty while the lock-screen image isn't
+/// working (ARCH-09).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRegions(
+    env: RawEnv,
+    _views: JObject,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    let mut regions = std::ptr::null_mut();
+    guarded(env, || {
+        LAUNCHER.with_borrow(|launcher| {
+            let launcher = launcher.as_ref().ok_or("MeeGone hasn't started")?;
+            let tags: Vec<String> = if launcher.shell().lockimage_ready() {
+                let section = launcher.view().image_settings();
+                std::iter::once(section.automatic_region())
+                    .chain(section.regions())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let array = env
+                .new_string_array(tags.iter().map(String::as_str))
+                .map_err(|error| format!("Couldn't pass the regions: {error}"))?;
+            regions = array.into_raw();
+            Ok(())
+        })
+    });
+    regions
+}
+
+/// `String nativeRegion(int choice)`: Settings → Lock-screen image → Region was set to
+/// Automatic, 0, or to the feed's region at `choice` in `nativeRegions` (WALL-05). The choice
+/// is saved and takes effect with the next image (SET-03). Returns `null`, or a short message
+/// to show when it couldn't be saved. Other numbers do nothing, and so does a lock-screen image
+/// that isn't working (ARCH-09).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRegion(
+    env: RawEnv,
+    _views: JObject,
+    choice: i32,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_image_message(env, |launcher| {
+        let section = launcher.view().image_settings();
+        let region = match usize::try_from(choice) {
+            Ok(0) => None,
+            Ok(place) => match section.regions().into_iter().nth(place - 1) {
+                Some(region) => Some(region),
+                None => return false,
+            },
+            Err(_) => return false,
+        };
+        section.region_chosen(region);
+        true
+    })
+}
+
+/// `String nativeResetLauncher()`: Settings → About → Reset launcher, once the user confirmed
+/// it (SET-06). The layout and every setting go back to their defaults, Settings closes and
+/// Applications shows at its top. Returns `null`, or a short message to show when part of it
+/// couldn't be saved. Does nothing unless the frame offers it (ARCH-09).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeResetLauncher(
+    env: RawEnv,
+    _views: JObject,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    let mut shown = std::ptr::null_mut();
+    guarded(env, || {
+        LAUNCHER.with_borrow_mut(|launcher| {
+            let launcher = launcher.as_mut().ok_or("MeeGone hasn't started")?;
+            if !launcher.shell().reset_offered() {
+                return Ok(());
+            }
+            launcher.view().settings().reset_launcher_confirmed();
+            launcher.frame();
+            let shell = launcher.shell();
+            let problem = shell
+                .apps()
+                .state()
+                .problem
+                .clone()
+                .or_else(|| shell.recent().state().problem.clone())
+                .or_else(|| shell.lockimage().state().problem.clone())
+                .or_else(|| shell.settings().state().problem.clone());
+            shown = message(env, problem.as_deref())?;
+            Ok(())
+        })
+    });
+    shown
 }
 
 /// `String nativeRecentDensity(int rows)`: a screen reader chose bigger cards, 2, or more cards,
@@ -3096,7 +3386,7 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRead
 }
 
 /// How many slots the frame has.
-const FRAME_SLOTS: usize = 142;
+const FRAME_SLOTS: usize = 150;
 /// The first of Recent's close-mode slots.
 const CLOSE_SLOTS: usize = 104;
 
@@ -3210,6 +3500,14 @@ const CLOSE_SLOTS: usize = 104;
 /// | 139 | How far the whole screen has faded from the theme it was drawn in to the colours of this frame, 0 to 10 000: below 10 000, the host fades a picture of the old screen out over the new one (THEME-06, ANIM-19) |
 /// | 140 | Settings → Appearance → Theme: 0 System, 1 Light, 2 Dark, as [`theme_code`] says, or -1 while Settings isn't working, so it isn't offered (THEME-01, ARCH-09) |
 /// | 141 | The scale a card leaving Recent shrinks to by the time it has gone, in ten-thousandths, from `motion::CARD_REMOVE_SCALE` (ANIM-18) |
+/// | 142 | Settings → Home → "Home button opens": 0 the last view, 1 Applications, as [`home_target_code`] says, or -1 while Settings isn't working, so it isn't offered (HOME-06, ARCH-09) |
+/// | 143 | Settings → Home → Wrap-around: 1 on, 0 off, or -1 while Settings isn't working (HOME-04) |
+/// | 144 | Settings → Access → "Default home app": 1 MeeGone is, 0 it isn't, or -1 while Settings isn't working, so Access isn't offered (SET-02, HOME-01) |
+/// | 145 | Settings → Access → "Notification access": 1 granted, 0 not, or -1 while Settings isn't working (EVT-03) |
+/// | 146 | Settings → Access → "Usage access": 1 granted, 0 not, or -1 while Settings isn't working (REC-02) |
+/// | 147 | The Access item showing written instructions, read with `nativeAccessInstructions`: 0 default home app, 1 notification access, 2 usage access, as [`access_item_code`] says, or -1 for none (SRS 8.1) |
+/// | 148 | Settings → Lock-screen image → Region: 0 Automatic, otherwise the region's place in `nativeRegions`, or -1 while the lock-screen image isn't working, so it isn't offered (WALL-05) |
+/// | 149 | 1 while Settings → About offers Reset launcher: every feature it resets works (SET-06, ARCH-09); otherwise 0 |
 fn frame_slots(frame: &HomeFrame) -> [i32; FRAME_SLOTS] {
     let [events, applications, recent] = frame.pages;
     let menu_items = frame.menu.map_or(0, |menu| {
@@ -3426,6 +3724,23 @@ fn frame_slots(frame: &HomeFrame) -> [i32; FRAME_SLOTS] {
     slots[window + 12] = i32::from(frame.theme_change);
     slots[window + 13] = frame.theme_choice.map_or(-1, theme_code);
     slots[window + 14] = recent.map_or(10_000, |recent| i32::from(recent.leave_scale));
+    slots[window + 15] = frame.home_target.map_or(-1, home_target_code);
+    slots[window + 16] = frame.wrap_around.map_or(-1, i32::from);
+    slots[window + 17] = frame
+        .access
+        .map_or(-1, |access| i32::from(access.default_home));
+    slots[window + 18] = frame
+        .access
+        .map_or(-1, |access| i32::from(access.notifications));
+    slots[window + 19] = frame.access.map_or(-1, |access| i32::from(access.usage));
+    slots[window + 20] = frame
+        .access
+        .and_then(|access| access.instructions)
+        .map_or(-1, access_item_code);
+    slots[window + 21] = frame
+        .region
+        .map_or(-1, |choice| i32::try_from(choice).unwrap_or(-1));
+    slots[window + 22] = i32::from(frame.reset_offered);
     slots
 }
 
