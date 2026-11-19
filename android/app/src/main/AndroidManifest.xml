@@ -63,15 +63,17 @@
 
         <!-- The home screen. singleTask keeps one home task; a Home press while it shows reaches
              onNewIntent. Configuration changes that resize, rotate, fold or unfold are handled
-             in place; any other, such as a new density, recreates the activity, and the shared
-             launcher keeps all state (COMP-03, ADR 0009). The orientation follows the screen's
+             in place, and so is the device's dark theme, which the System theme follows with a
+             cross-fade (THEME-02, THEME-06, ADR 0033); any other, such as a new density,
+             recreates the activity, and the shared launcher keeps all state (COMP-03,
+             ADR 0009). The orientation follows the screen's
              size at run time (HOME-12). adjustResize hands the keyboard's height to HomeViews as
              an inset, which only search's results take (ADR 0016); edge to edge, the window
              itself never resizes. -->
         <activity
             android:name=".HomeActivity"
             android:clearTaskOnLaunch="true"
-            android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenLayout|screenSize|smallestScreenSize"
+            android:configChanges="keyboard|keyboardHidden|navigation|orientation|screenLayout|screenSize|smallestScreenSize|uiMode"
             android:exported="true"
             android:launchMode="singleTask"
             android:resizeableActivity="true"

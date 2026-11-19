@@ -21,8 +21,10 @@ import android.window.OnBackInvokedDispatcher;
  *
  * <p>It draws edge to edge on every Android version, stays in portrait on phones and turns with
  * the device on large screens (HOME-11, HOME-12, ADR 0009). Size and orientation changes are
- * handled in place; any other configuration change, such as a new density when a foldable
- * changes screens, recreates it. Either way the shared launcher keeps everything (COMP-03).
+ * handled in place, and so is the device's dark theme turning on or off, which MeeGone's System
+ * theme follows with a cross-fade, keeping everything open (THEME-02, THEME-06, ADR 0033). Any
+ * other configuration change, such as a new density when a foldable changes screens, recreates
+ * it. Either way the shared launcher keeps everything (COMP-03).
  */
 public final class HomeActivity extends Activity {
     static {
@@ -48,11 +50,14 @@ public final class HomeActivity extends Activity {
     private boolean away;
     /** The system Home action arrived while the home was out of sight. */
     private boolean homeWhileAway;
+    /** The device's dark-theme bits as this instance last saw them (THEME-02). */
+    private int night;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         bridge = Bridge.get(this);
+        night = nightOf(getResources().getConfiguration());
         int savedView = NONE;
         int savedAppsScroll = 0;
         if (savedInstanceState != null) {
@@ -141,6 +146,18 @@ public final class HomeActivity extends Activity {
         // Folding or unfolding can move the home to a screen of another size (HOME-12).
         // HomeViews follows its own new size.
         followScreenSize();
+        // The device's dark theme turned on or off, by the user or on its schedule. A home out
+        // of sight hears of it when it shows again, and Resumed checks too (THEME-02).
+        int nowNight = nightOf(newConfig);
+        if (nowNight != night) {
+            night = nowNight;
+            nativeSystemThemeChanged();
+            views.refresh();
+        }
+    }
+
+    private static int nightOf(Configuration config) {
+        return config.uiMode & Configuration.UI_MODE_NIGHT_MASK;
     }
 
     @Override
@@ -330,6 +347,9 @@ public final class HomeActivity extends Activity {
 
     /** The daily image's check reached the feed (ADR 0029); nothing before MeeGone starts. */
     private static native void nativeImageChecked();
+
+    /** The device's dark theme turned on or off (THEME-02, ADR 0033). */
+    private static native void nativeSystemThemeChanged();
 
     /** Taps the banner's "make default" button; only debug builds' {@link DebugHooks} call it. */
     private native void nativeRequestDefaultHome();

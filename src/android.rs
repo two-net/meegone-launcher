@@ -34,7 +34,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use meegone_core_data::android::{self, Env, JObject, LocalRef, RawEnv};
-use meegone_core_data::{App, RecentDensity, RecentWindow, Rect, Rgb, accent};
+use meegone_core_data::{App, RecentDensity, RecentWindow, Rect, Rgb, ThemeChoice, accent};
 
 use crate::{
     Age, AppMenuItem, BADGE_ROWS, Bounds, Cell, CellKey, CheckStatus, DailyImage, Direction,
@@ -240,6 +240,26 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeActivity_nativeC
     let env = unsafe { Env::from_raw(env) };
     with_launcher(env, |launcher| {
         launcher.dispatch(ShellIntent::ClockChanged);
+        launcher.frame();
+    });
+}
+
+/// `static void nativeSystemThemeChanged()`: the device's dark theme turned on or off, by the
+/// user or on its schedule (THEME-02, ADR 0033). With the System theme, MeeGone follows it,
+/// cross-fading to the new theme (ANIM-19).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeActivity_nativeSystemThemeChanged(
+    env: RawEnv,
+    _class: JObject,
+) {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_launcher(env, |launcher| {
+        launcher.dispatch(ShellIntent::SystemThemeChanged);
         launcher.frame();
     });
 }
@@ -1221,6 +1241,25 @@ fn with_recent_message(env: Env, step: impl FnOnce(&Launcher) -> bool) -> JObjec
     shown
 }
 
+/// Asks something of Settings with `step`, applies it, and returns Settings' `problem` as a
+/// message for the host to show, or `null`. Does nothing while Settings isn't working
+/// (ARCH-09).
+fn with_settings_message(env: Env, step: impl FnOnce(&Launcher) -> bool) -> JObject {
+    let mut shown = std::ptr::null_mut();
+    guarded(env, || {
+        LAUNCHER.with_borrow_mut(|launcher| {
+            let launcher = launcher.as_mut().ok_or("MeeGone hasn't started")?;
+            if !launcher.shell().settings_ready() || !step(launcher) {
+                return Ok(());
+            }
+            launcher.frame();
+            shown = message(env, launcher.shell().settings().state().problem.as_deref())?;
+            Ok(())
+        })
+    });
+    shown
+}
+
 /// `String nativeRecentCardTapped(int revision, int index, int left, int top, int right, int
 /// bottom)`: card `index` of Recent's cards at `revision` was tapped, and is at that rect on the
 /// screen. Its app comes to the front, resumed if the system kept it, its window growing from
@@ -1309,6 +1348,45 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRece
         launcher.view().recent_settings().window_chosen(window);
         true
     })
+}
+
+/// `String nativeTheme(int theme)`: Settings → Appearance → Theme was set to System, Light or
+/// Dark, numbered by [`theme_code`] (THEME-01). The choice is saved and the whole screen
+/// cross-fades to it at once (SET-03, ANIM-19). Returns `null`, or a short message to show when
+/// it couldn't be saved. Other numbers do nothing, and so does a Settings that isn't working
+/// (ARCH-09).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeTheme(
+    env: RawEnv,
+    _views: JObject,
+    theme: i32,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_settings_message(env, |launcher| {
+        let Some(choice) = [ThemeChoice::System, ThemeChoice::Light, ThemeChoice::Dark]
+            .into_iter()
+            .find(|choice| theme_code(*choice) == theme)
+        else {
+            return false;
+        };
+        launcher.view().settings().theme_chosen(choice);
+        true
+    })
+}
+
+/// The number the host knows each theme choice by, in the frame's slot 140 and in
+/// `nativeTheme`; `HomeViews.java` mirrors them.
+fn theme_code(choice: ThemeChoice) -> i32 {
+    match choice {
+        ThemeChoice::System => 0,
+        ThemeChoice::Light => 1,
+        ThemeChoice::Dark => 2,
+    }
 }
 
 /// `String nativeRecentDensity(int rows)`: a screen reader chose bigger cards, 2, or more cards,
@@ -2842,8 +2920,8 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeSear
 }
 
 /// `String nativeSearchQuery()`: what the search field says while search is open, or `null`.
-/// The host asks only when it shows the field again, such as after a theme change recreated
-/// it (THEME-06).
+/// The host asks only when it shows the field again, such as after a new density or language
+/// recreated it. A theme change keeps the field as it is (THEME-06, ADR 0033).
 ///
 /// # Safety
 ///
@@ -2991,7 +3069,7 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRead
 }
 
 /// How many slots the frame has.
-const FRAME_SLOTS: usize = 139;
+const FRAME_SLOTS: usize = 141;
 /// The first of Recent's close-mode slots.
 const CLOSE_SLOTS: usize = 104;
 
@@ -3102,6 +3180,8 @@ const CLOSE_SLOTS: usize = 104;
 /// | 136 | The daily image's status line's revision, in Settings and on the details screen: when it changes, it is read again with `nativeImageStatus`; -1 while the daily image is off or the lock-screen image isn't working (WALL-16, ARCH-09) |
 /// | 137 | 1 while the past week's images cover the home views, over the details screen or Settings (WALL-17); otherwise 0 |
 /// | 138 | The past week's screen's revision while it is open: when it changes, the screen is read again with `nativePastImages`; -1 while it is closed (WALL-17) |
+/// | 139 | How far the whole screen has faded from the theme it was drawn in to the colours of this frame, 0 to 10 000: below 10 000, the host fades a picture of the old screen out over the new one (THEME-06, ANIM-19) |
+/// | 140 | Settings → Appearance → Theme: 0 System, 1 Light, 2 Dark, as [`theme_code`] says, or -1 while Settings isn't working, so it isn't offered (THEME-01, ARCH-09) |
 fn frame_slots(frame: &HomeFrame) -> [i32; FRAME_SLOTS] {
     let [events, applications, recent] = frame.pages;
     let menu_items = frame.menu.map_or(0, |menu| {
@@ -3315,6 +3395,8 @@ fn frame_slots(frame: &HomeFrame) -> [i32; FRAME_SLOTS] {
     slots[window + 9] = revision(frame.image_status);
     slots[window + 10] = i32::from(frame.past_images_open);
     slots[window + 11] = revision(frame.past_images);
+    slots[window + 12] = i32::from(frame.theme_change);
+    slots[window + 13] = frame.theme_choice.map_or(-1, theme_code);
     slots
 }
 

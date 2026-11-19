@@ -212,7 +212,21 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     // The past week's images (WALL-17, ADR 0032):
     private static final int PAST_IMAGES = 137; // 1 while the screen shows
     private static final int PAST_IMAGES_REVISION = 138; // changes when it changes; -1 closed
-    private static final int FRAME_SIZE = 139;
+    // The theme (THEME-01, THEME-06, ANIM-19, ADR 0033):
+    private static final int THEME_CHANGE = 139; // how far the new theme has faded in, to 10 000
+    private static final int THEME = 140; // a value of THEMES; -1 not offered
+    private static final int FRAME_SIZE = 141;
+    /** Settings → Appearance → Theme: System, Light and Dark, as the Rust app numbers them. */
+    private static final int[] THEMES = {0, 1, 2};
+    private static final int[] THEME_LABELS = {
+        R.string.theme_system, R.string.theme_light, R.string.theme_dark,
+    };
+    /** Settings → Recent → Time window, in hours, as {@code RecentWindow::hours} gives them. */
+    private static final int[] RECENT_HOURS = {12, 24, 72};
+    private static final int[] RECENT_LABELS = {
+        R.string.recent_window_12_hours, R.string.recent_window_24_hours,
+        R.string.recent_window_3_days,
+    };
     private static final int SEARCH_OPEN = 1; // the field has the keyboard
     private static final int SEARCH_RESULTS = 2; // the results show instead of the grid
     private static final int SEARCH_NOTHING = 4; // nothing matches
@@ -308,13 +322,19 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private final TextView settingsTitle;
     private final TextView settingsGroup;
     private final HiddenAppsList hiddenApps;
+    /** Settings → Appearance → Theme (THEME-01). */
+    private final ChoiceSettings themeSettings;
     /** Settings → Recent → Time window (REC-11). */
-    private final RecentSettings recentSettings;
+    private final ChoiceSettings recentSettings;
     /** Settings → Lock-screen image → "Show card in Events" (EVT-12). */
     private final ImageSettings imageSettings;
     /** Covers the home views while the image details screen is open (WALL-15). */
     private final ImageDetails imageDetails;
     private final PastImages pastImages;
+    /** The Events and Recent pages' and Settings' scrolling, which the theme colours. */
+    private final List<ScrollView> scrolls = new ArrayList<>();
+    /** The whole screen cross-fading to a new theme (ANIM-19). */
+    private final ThemeFade themeFade;
     /**
      * The home menu (HOME-10), a card at the finger, or an app's menu (APPS-11), a card at its
      * icon: over the home views. Its items are made for the menu that opens.
@@ -411,6 +431,9 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     /** The folder the rename dialog is for, or -1, and the dialog while it shows (FOLD-03). */
     private int renameShown = -1;
     private AlertDialog renameDialog;
+    /** The rename dialog's field, and whether the dialog is in a light theme. */
+    private EditText renameField;
+    private boolean renameLight;
     /** How far content stays from each edge, in px (HOME-11). */
     private Insets safe = Insets.NONE;
 
@@ -422,6 +445,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         // Carries the screen-reader actions that switch views and open the menu (A11Y-05).
         setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_YES);
 
+        themeFade = new ThemeFade(this);
         icons = new AppIcons(context, AppCell.iconPx(context), this::refreshIcons);
         apps = new AppsGrid(context, AppsGrid.GRID, icons, this::apply, this::announce);
         apps.setScreen(this);
@@ -549,6 +573,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
                 scroll.setOverScrollMode(OVER_SCROLL_IF_CONTENT_SCROLLS);
                 scroll.addView(content, new LayoutParams(
                         LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
+                scrolls.add(scroll);
                 page.addView(scroll, new LayoutParams(
                         LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
             } else {
@@ -558,6 +583,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
                 scroll.setOverScrollMode(OVER_SCROLL_IF_CONTENT_SCROLLS);
                 scroll.addView(recentList, new LayoutParams(
                         LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
+                scrolls.add(scroll);
                 page.addView(scroll, new LayoutParams(
                         LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
             }
@@ -663,12 +689,21 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             toast(message);
         });
         hiddenApps.setVisibility(GONE);
+        // Settings → Appearance → Theme (THEME-01), first in SET-02's order.
+        themeSettings = new ChoiceSettings(context, R.string.settings_group_appearance,
+                R.string.theme, THEMES, THEME_LABELS, theme -> {
+                    String message = nativeTheme(theme);
+                    apply();
+                    toast(message);
+                });
+        themeSettings.setVisibility(GONE);
         // Settings → Recent → Time window (REC-11), after Applications in SET-02's order.
-        recentSettings = new RecentSettings(context, hours -> {
-            String message = nativeRecentWindow(hours);
-            apply();
-            toast(message);
-        });
+        recentSettings = new ChoiceSettings(context, R.string.settings_group_recent,
+                R.string.recent_time_window, RECENT_HOURS, RECENT_LABELS, hours -> {
+                    String message = nativeRecentWindow(hours);
+                    apply();
+                    toast(message);
+                });
         recentSettings.setVisibility(GONE);
         // Settings → Lock-screen image (EVT-12, ADR 0029, ADR 0030), after Recent in SET-02's
         // order.
@@ -731,6 +766,8 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         imageSettings.setVisibility(GONE);
         LinearLayout groups = new LinearLayout(context);
         groups.setOrientation(LinearLayout.VERTICAL);
+        groups.addView(themeSettings, new LinearLayout.LayoutParams(
+                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
         groups.addView(hiddenApps, new LinearLayout.LayoutParams(
                 LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
         groups.addView(recentSettings, new LinearLayout.LayoutParams(
@@ -740,6 +777,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         ScrollView hiddenAppsScroll = new ScrollView(context);
         hiddenAppsScroll.addView(groups, new ScrollView.LayoutParams(
                 LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
+        scrolls.add(hiddenAppsScroll);
         LinearLayout.LayoutParams scrollParams = new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f);
         scrollParams.topMargin = dp(24);
@@ -1252,6 +1290,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         // The activity is going: its dialog goes with it, and the Rust app keeps the rename
         // open for the next one.
         closeRenameDialog();
+        themeFade.clear();
         super.onDetachedFromWindow();
     }
 
@@ -1269,6 +1308,13 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     /** Draws what the Rust app says, and asks for another frame while anything moves. */
     private void apply() {
         nativeRead(frame);
+        // A new theme fades in over a picture of the screen in the old one, taken before
+        // anything changes (THEME-06, ANIM-19). Not on the first frame after attaching, which
+        // has nothing drawn to fade from.
+        if (frame[THEME_CHANGE] < 10_000 && frame[BACKGROUND] != background && background != 0) {
+            themeFade.capture();
+        }
+        themeFade.fade(frame[THEME_CHANGE]);
         int width = getWidth();
         // The content comes back from an app scaled down and faded out (ANIM-09); the
         // background stays opaque.
@@ -1300,6 +1346,9 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             settingsGroup.setTextColor(dim);
             menuCard.setColor(surface);
             colourMenu();
+            for (ScrollView scroll : scrolls) {
+                Themed.scrolling(scroll, dim);
+            }
         }
         if (coloursChanged || frame[INDICATOR_SELECTED] != selected) {
             selected = frame[INDICATOR_SELECTED];
@@ -1480,12 +1529,26 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
      * Asks for a folder's new name while the Rust app says it is being renamed (FOLD-03): a
      * dialog with the name as it is, at most {@link #MAX_FOLDER_NAME} characters. OK names it,
      * and Cancel, Back or a touch outside leaves it. In its own window, the dialog has the
-     * keyboard and Back to itself. It follows MeeGone's theme, not the system's.
+     * keyboard and Back to itself.
+     *
+     * <p>It follows MeeGone's theme, not the system's (THEME-03). It is another window, so it
+     * can't fade with the screen: when the theme changes while it is open, it opens again in
+     * the new one at once, with the name as it was being typed (THEME-06, ADR 0033).
      */
     private void applyRename() {
         int folder = frame[RENAMING];
-        if (folder == renameShown) {
+        boolean light = Color.luminance(background) > 0.5f;
+        boolean retheme = renameDialog != null && folder == renameShown && light != renameLight;
+        if (folder == renameShown && !retheme) {
             return;
+        }
+        CharSequence typed = null;
+        int selectionStart = 0;
+        int selectionEnd = 0;
+        if (retheme) {
+            typed = renameField.getText().toString();
+            selectionStart = renameField.getSelectionStart();
+            selectionEnd = renameField.getSelectionEnd();
         }
         closeRenameDialog();
         renameShown = folder;
@@ -1498,12 +1561,18 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         field.setSingleLine(true);
         field.setHint(R.string.folder_name);
         field.setFilters(new InputFilter[] {new InputFilter.LengthFilter(MAX_FOLDER_NAME)});
-        field.setText(name);
-        field.setSelectAllOnFocus(true);
+        if (typed == null) {
+            field.setText(name);
+            field.setSelectAllOnFocus(true);
+        } else {
+            field.setText(typed);
+            int length = field.length();
+            field.setSelection(Math.min(Math.max(selectionStart, 0), length),
+                    Math.min(Math.max(selectionEnd, 0), length));
+        }
         FrameLayout box = new FrameLayout(getContext());
         box.setPaddingRelative(dp(24), dp(8), dp(24), 0);
         box.addView(field);
-        boolean light = Color.luminance(background) > 0.5f;
         AlertDialog dialog = new AlertDialog.Builder(getContext(), light
                         ? android.R.style.Theme_DeviceDefault_Light_Dialog_Alert
                         : android.R.style.Theme_DeviceDefault_Dialog_Alert)
@@ -1525,9 +1594,18 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             }
         });
         renameDialog = dialog;
+        renameField = field;
+        renameLight = light;
         dialog.getWindow().setSoftInputMode(
                 WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE);
         dialog.show();
+        // The dialog's theme is the device's light or dark one, matched to MeeGone's; its
+        // buttons and field take MeeGone's accent too (THEME-03).
+        int accent = frame[ACCENT];
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setTextColor(accent);
+        dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setTextColor(accent);
+        field.setBackgroundTintList(ColorStateList.valueOf(accent));
+        Themed.textField(field, accent);
         field.requestFocus();
     }
 
@@ -1535,6 +1613,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private void closeRenameDialog() {
         AlertDialog dialog = renameDialog;
         renameDialog = null;
+        renameField = null;
         if (dialog != null) {
             dialog.dismiss();
         }
@@ -1852,8 +1931,8 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     }
 
     /**
-     * Shows Settings over the home views while it is open; until #34, only its name, Hidden
-     * apps, Recent's time window and "Show card in Events".
+     * Shows Settings over the home views while it is open; until #34, only its name, Theme,
+     * Hidden apps, Recent's time window and the lock-screen image's items.
      */
     private void applySettings() {
         if (frame[SETTINGS] != settingsShown) {
@@ -1863,9 +1942,18 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
                     settingsShown == SETTINGS_AT_LOCK_SCREEN_IMAGE ? VISIBLE : GONE);
             hidePagesFromScreenReaders();
         }
+        applyThemeSettings();
         applyHiddenApps();
         applyRecentSettings();
         applyImageSettings();
+    }
+
+    /** Settings → Appearance → Theme (THEME-01): offered only while Settings works (ARCH-09). */
+    private void applyThemeSettings() {
+        int theme = frame[THEME];
+        themeSettings.setVisibility(theme >= 0 ? VISIBLE : GONE);
+        themeSettings.colour(foreground, dim, frame[ACCENT]);
+        themeSettings.show(theme);
     }
 
     /**
@@ -2465,6 +2553,12 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
      * short message to show when the choice couldn't be saved.
      */
     private native String nativeRecentWindow(int hours);
+
+    /**
+     * Settings → Appearance → Theme was set to System, Light or Dark, a value of {@link #THEMES}
+     * (THEME-01). Returns null, or a short message to show when the choice couldn't be saved.
+     */
+    private native String nativeTheme(int theme);
 
     /**
      * In close mode, the ✕ of card {@code index} of Recent's cards at {@code revision} was

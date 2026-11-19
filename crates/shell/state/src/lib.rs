@@ -10,11 +10,11 @@
 //! [`Shared`] holds what the home shares with the daily image's job (ADR 0029).
 
 mod carousel;
+mod crossfade;
 mod events_change;
 mod folder;
 mod grid_change;
 mod home_menu;
-mod image_change;
 mod lift;
 mod mode;
 mod pinch;
@@ -33,9 +33,11 @@ use meegone_apps_state::{
     AppsHolder, AppsIntent, AppsState, CellKey, FolderId, Surface, cells_moved,
 };
 use meegone_core_data::{HomeTarget, Platform, SettingsStore, SystemConfigAdapter};
-use meegone_core_state::motion::{CARD_REMOVE, MODE_SCALE, RECENT_PINCH, VIEW_FLING_VELOCITY_DP};
+use meegone_core_state::motion::{
+    CARD_REMOVE, IMAGE_CROSSFADE, MODE_SCALE, RECENT_PINCH, THEME_CROSSFADE, VIEW_FLING_VELOCITY_DP,
+};
 use meegone_core_state::{
-    Access, App, AppId, Health, RecentDensity, Store, ThemeHolder, ThemeIntent,
+    Access, App, AppId, Health, RecentDensity, Store, Theme, ThemeHolder, ThemeIntent,
 };
 use meegone_events_state::{
     EventsHolder, EventsIntent, GroupId, NotificationGroup, RowKey, RowTarget, rows_came_or_went,
@@ -46,6 +48,8 @@ use meegone_settings_state::{SettingsHolder, SettingsIntent, SettingsState};
 
 use carousel::{Carousel, Release};
 pub use carousel::{CarouselState, Layout, PointerEvent, PointerKind};
+use crossfade::CrossFade;
+pub use crossfade::CrossFadeState;
 use events_change::EventsChange;
 pub use events_change::EventsChangeState;
 use folder::FolderMotion;
@@ -53,8 +57,6 @@ pub use folder::FolderState;
 use grid_change::GridChange;
 pub use grid_change::GridChangeState;
 pub use home_menu::{HomeMenu, MenuItem};
-use image_change::ImageChange;
-pub use image_change::ImageChangeState;
 use lift::{DragSurfaces, DropAt, Lift, LiftEvent, SurfaceView};
 pub use lift::{HoverState, LiftState, MergeState};
 pub use meegone_apps_state::{FOLDER_COLUMNS, GridItem, PREVIEW_APPS, preview_slot};
@@ -190,7 +192,10 @@ pub struct ShellState {
     /// (ANIM-20).
     pub events_change: EventsChangeState,
     /// How far the image-of-the-day card's new thumbnail has faded in (ANIM-22).
-    pub image_change: ImageChangeState,
+    pub image_change: CrossFadeState,
+    /// How far the whole screen has faded from the theme it was drawn in to the one it is drawn
+    /// in now (THEME-06, ANIM-19).
+    pub theme_change: CrossFadeState,
     /// Recent's cards as two fingers pinch them, and as they reflow to their places (REC-05,
     /// ANIM-17).
     pub pinch: PinchState,
@@ -401,7 +406,10 @@ pub struct HomeShell {
     /// rows cards left (ANIM-18).
     seen_recent: (Vec<AppId>, usize),
     events_change: EventsChange,
-    image_change: ImageChange,
+    image_change: CrossFade,
+    theme_change: CrossFade,
+    /// The theme drawn as of the last intent, to tell when it changes (ANIM-19).
+    seen_theme: Theme,
     /// Events' groups and expanded group as of the last intent, to tell cheaply whether its
     /// rows may have changed, and the keys of those rows, to tell which came or went (ANIM-20).
     seen_groups: Arc<[NotificationGroup]>,
@@ -450,7 +458,9 @@ impl HomeShell {
             recent_change: RecentChange::default(),
             seen_recent: (Vec::new(), 0),
             events_change: EventsChange::default(),
-            image_change: ImageChange::default(),
+            image_change: CrossFade::new(IMAGE_CROSSFADE),
+            theme_change: CrossFade::new(THEME_CROSSFADE),
+            seen_theme: Theme::default(),
             seen_groups: Arc::new([]),
             seen_expanded: None,
             seen_rows: Vec::new(),
@@ -503,6 +513,8 @@ impl HomeShell {
         shell.lockimage.dispatch(LockImageIntent::Refresh);
         shell.settings.dispatch(SettingsIntent::Refresh);
         shell.configure_carousel();
+        // MeeGone starts in its theme: nothing fades (ANIM-19).
+        shell.seen_theme = shell.theme.state().theme;
         // The grid as it starts is shown as it is: nothing moves (ANIM-21).
         shell.seen_cells = shell.apps.state().items.clone();
         // Recent read the hidden apps and its density as it loaded: nothing reflows, and no
@@ -558,6 +570,11 @@ impl HomeShell {
     /// its details screen are offered only then (ARCH-09).
     pub fn lockimage_ready(&self) -> bool {
         *self.lockimage.health() == Health::Ready
+    }
+
+    /// Whether Settings works. Its own items, such as Theme, are offered only then (ARCH-09).
+    pub fn settings_ready(&self) -> bool {
+        *self.settings.health() == Health::Ready
     }
 
     pub fn events(&self) -> &Store<EventsHolder> {
@@ -658,6 +675,7 @@ impl HomeShell {
                 self.grid_change.frame(at);
                 self.events_change.frame(at);
                 self.image_change.frame(at);
+                self.theme_change.frame(at);
                 self.mode.frame(at);
                 self.close.frame(at);
                 self.recent_change.frame(at);
@@ -695,6 +713,8 @@ impl HomeShell {
                 self.lockimage.dispatch(LockImageIntent::Refresh);
                 // The animation speed may have changed in system settings (ANIM-05).
                 self.configure_carousel();
+                // So may the device's dark theme, by the user or on its schedule (THEME-02).
+                self.theme.dispatch(ThemeIntent::Refresh);
             }
             ShellIntent::Returned { home } => self.returned(home),
             ShellIntent::Restore(saved) => self.restore(saved),
@@ -745,6 +765,7 @@ impl HomeShell {
         self.keep_past_images_in_step();
         self.keep_recent_in_step();
         self.keep_close_in_step();
+        self.keep_theme_in_step();
         self.lift.sync(&self.drag_surfaces());
         self.state.carousel = self.carousel.state();
         self.state.return_home = self.return_home.state();
@@ -755,6 +776,7 @@ impl HomeShell {
         self.state.grid_change = self.grid_change.state();
         self.state.events_change = self.events_change.state();
         self.state.image_change = self.image_change.state();
+        self.state.theme_change = self.theme_change.state();
         self.state.mode = self.mode_state();
         self.state.app_menu_open = self.app_menu_shown();
         self.state.events_menu_open = self.events_menu_shown();
@@ -1035,6 +1057,16 @@ impl HomeShell {
             self.pinch.end_gesture(scale);
         }
         self.keep_recent_cards_in_step();
+    }
+
+    /// When the theme drawn changes, by the device or in Settings, the whole screen cross-fades
+    /// to it, keeping everything open where it is (THEME-06, ANIM-19). A refresh that resolves
+    /// to the same theme, such as Dark chosen while the device is dark, fades nothing.
+    fn keep_theme_in_step(&mut self) {
+        let theme = self.theme.state().theme;
+        if theme != std::mem::replace(&mut self.seen_theme, theme) {
+            self.theme_change.start(self.carousel.animation_scale());
+        }
     }
 
     /// When cards leave Recent while it shows, by a ✕, Clear all or a refresh, they shrink and
@@ -1862,6 +1894,82 @@ mod tests {
     }
 
     #[test]
+    fn a_new_theme_cross_fades_the_whole_screen_in_250_ms() {
+        // THEME-06, ANIM-19
+        let fakes = Fakes::default();
+        let mut shell = laid_out(&fakes);
+        assert_eq!(shell.state().theme_change, CrossFadeState::default());
+
+        *fakes.system.dark.lock().unwrap() = true;
+        shell.dispatch(ShellIntent::SystemThemeChanged);
+        assert!(shell.state().theme_change.animating);
+        assert_eq!(shell.state().theme_change.progress, 0.0);
+
+        let mut at = 7_000;
+        shell.dispatch(ShellIntent::Frame(ms(at)));
+        while shell.state().theme_change.animating {
+            at += 8;
+            shell.dispatch(ShellIntent::Frame(ms(at)));
+        }
+        assert_eq!(at, 7_256);
+        assert_eq!(shell.state().theme_change, CrossFadeState::default());
+
+        // Choosing a theme in Settings fades the same way.
+        shell.dispatch(ShellIntent::Settings(SettingsIntent::SetTheme(
+            ThemeChoice::Light,
+        )));
+        assert_eq!(shell.theme().state().theme, Theme::Light);
+        assert!(shell.state().theme_change.animating);
+
+        // ANIM-05: with animations removed, the new theme shows at once.
+        *fakes.system.animation_scale.lock().unwrap() = 0.0;
+        shell.dispatch(ShellIntent::Resumed);
+        shell.dispatch(ShellIntent::Settings(SettingsIntent::SetTheme(
+            ThemeChoice::Dark,
+        )));
+        assert_eq!(shell.theme().state().theme, Theme::Dark);
+        assert_eq!(shell.state().theme_change, CrossFadeState::default());
+    }
+
+    #[test]
+    fn only_a_change_in_the_theme_drawn_cross_fades() {
+        // ANIM-19: MeeGone starts in its theme, and a refresh that resolves to the theme
+        // already drawn changes nothing on screen.
+        let fakes = Fakes::default();
+        *fakes.system.dark.lock().unwrap() = true;
+        let mut shell = laid_out(&fakes);
+        assert_eq!(shell.theme().state().theme, Theme::Dark);
+        assert_eq!(shell.state().theme_change, CrossFadeState::default());
+
+        // Another setting.
+        shell.dispatch(ShellIntent::Settings(SettingsIntent::SetWrapAround(false)));
+        // Dark, while the device is dark.
+        shell.dispatch(ShellIntent::Settings(SettingsIntent::SetTheme(
+            ThemeChoice::Dark,
+        )));
+        // The device turning light while Dark is chosen (AC-06).
+        *fakes.system.dark.lock().unwrap() = false;
+        shell.dispatch(ShellIntent::SystemThemeChanged);
+        shell.dispatch(ShellIntent::Resumed);
+
+        assert_eq!(shell.theme().state().theme, Theme::Dark);
+        assert_eq!(shell.state().theme_change, CrossFadeState::default());
+    }
+
+    #[test]
+    fn a_device_theme_changed_while_meegone_was_away_is_taken_on_when_it_comes_back() {
+        // THEME-02: the host may not hear of a change made while another app showed.
+        let fakes = Fakes::default();
+        let mut shell = laid_out(&fakes);
+
+        *fakes.system.dark.lock().unwrap() = true;
+        shell.dispatch(ShellIntent::Resumed);
+
+        assert_eq!(shell.theme().state().theme, Theme::Dark);
+        assert!(shell.state().theme_change.animating);
+    }
+
+    #[test]
     fn an_installed_app_reaches_applications_and_a_removed_one_leaves() {
         // APPS-06, APPS-08: the system reports the change and the shell refreshes.
         let fakes = Fakes::default();
@@ -2426,7 +2534,7 @@ mod tests {
         // ANIM-22
         let fakes = Fakes::default();
         let mut shell = laid_out(&fakes);
-        assert_eq!(shell.state().image_change, ImageChangeState::default());
+        assert_eq!(shell.state().image_change, CrossFadeState::default());
 
         shell.dispatch(ShellIntent::NewImageShown);
         assert!(shell.state().image_change.animating);
@@ -2439,13 +2547,13 @@ mod tests {
             shell.dispatch(ShellIntent::Frame(ms(at)));
         }
         assert_eq!(at, 7_304);
-        assert_eq!(shell.state().image_change, ImageChangeState::default());
+        assert_eq!(shell.state().image_change, CrossFadeState::default());
 
         // ANIM-05: with animations removed, the new thumbnail shows at once.
         *fakes.system.animation_scale.lock().unwrap() = 0.0;
         shell.dispatch(ShellIntent::Resumed);
         shell.dispatch(ShellIntent::NewImageShown);
-        assert_eq!(shell.state().image_change, ImageChangeState::default());
+        assert_eq!(shell.state().image_change, CrossFadeState::default());
     }
 
     /// Works like [`FakeNotifications`], except that it panics when asked for the active

@@ -108,6 +108,14 @@
 
     <!-- Settings' title (SET-01). -->
     <string name="settings_title">Launcher settings</string>
+    <!-- The Appearance group of Settings, its first (SET-02). -->
+    <string name="settings_group_appearance">Appearance</string>
+    <!-- Settings → Appearance → Theme (THEME-01). Its three choices follow: System follows the
+         device's dark-theme setting; Light and Dark stay as they are. -->
+    <string name="theme">Theme</string>
+    <string name="theme_system">System</string>
+    <string name="theme_light">Light</string>
+    <string name="theme_dark">Dark</string>
     <!-- The Applications group of Settings (SET-02). -->
     <string name="settings_group_applications">Applications</string>
     <!-- Settings → Applications → Hidden apps: the apps hidden from their long-press menu,

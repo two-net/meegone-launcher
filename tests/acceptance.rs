@@ -2446,6 +2446,131 @@ fn ac05_given_theme_system_and_an_open_folder_the_app_turns_dark_with_the_folder
     assert_eq!(frame.apps.scroll_px, 120);
     // …and 60 % in Dark.
     assert_eq!(frame.scrim, 153);
+    // Issue #32: the whole screen cross-fades to Dark, done within 300 ms (ANIM-19).
+    assert!(frame.theme_change < 10_000);
+    let switched = clock;
+    come_to_rest(&mut launcher, &mut clock);
+    assert!(clock - switched <= 300, "faded in {} ms", clock - switched);
+    let frame = launcher.frame();
+    assert_eq!(frame.theme_change, 10_000);
+    assert!(frame.folder.expect("still open").open);
+    assert_eq!(frame.apps.scroll_px, 120);
+}
+
+#[test]
+fn theme01_settings_offers_system_light_and_dark_and_the_screen_takes_their_colours() {
+    // Issue #32: THEME-01, THEME-02, THEME-04, SET-03, AC-06.
+    let fakes = Fakes::default();
+    let (mut launcher, mut clock) = on_a_phone(&fakes);
+    launcher.dispatch(ShellIntent::OpenSettings);
+    let frame = launcher.frame();
+    assert_eq!(frame.theme_choice, Some(ThemeChoice::System));
+    assert_eq!(frame.background, tokens::LIGHT.background);
+
+    launcher.view().settings().theme_chosen(ThemeChoice::Dark);
+    let frame = launcher.frame();
+    assert_eq!(frame.theme_choice, Some(ThemeChoice::Dark));
+    assert!(
+        frame.animating && frame.theme_change < 10_000,
+        "it cross-fades"
+    );
+    // True black home views (THEME-04), and every colour from the Dark tokens (SRS 5.3).
+    assert_eq!(frame.background, Rgb::hex(0x000000));
+    let dark = tokens::DARK;
+    assert_eq!(
+        (
+            frame.surface,
+            frame.foreground,
+            frame.dim,
+            frame.divider,
+            frame.accent
+        ),
+        (
+            dark.surface,
+            dark.text_primary,
+            dark.text_secondary,
+            dark.divider,
+            dark.accent
+        )
+    );
+    come_to_rest(&mut launcher, &mut clock);
+    assert_eq!(launcher.frame().theme_change, 10_000);
+
+    // Light stays light while the device is dark (AC-06)…
+    *fakes.system.dark.lock().unwrap() = true;
+    launcher.view().settings().theme_chosen(ThemeChoice::Light);
+    assert_eq!(launcher.frame().background, tokens::LIGHT.background);
+    launcher.dispatch(ShellIntent::SystemThemeChanged);
+    assert_eq!(launcher.frame().background, tokens::LIGHT.background);
+    // …and System follows the device again.
+    launcher.view().settings().theme_chosen(ThemeChoice::System);
+    assert_eq!(launcher.frame().background, tokens::DARK.background);
+    assert!(
+        launcher.shell().state().settings_open,
+        "Settings stays open"
+    );
+}
+
+#[test]
+fn theme06_a_theme_chosen_in_settings_keeps_edit_mode_and_the_scroll_position_below_it() {
+    // Issue #32: THEME-06, SET-03.
+    let fakes = Fakes::default();
+    let (mut launcher, mut clock) = on_a_phone(&fakes);
+    launcher.view().apps().scrolled(Surface::Grid, 600.0);
+    long_press(&mut launcher, &mut clock, 540.0, 1800.0);
+    launcher.dispatch(ShellIntent::ChooseMenuItem(MenuItem::EditApplications));
+    launcher.dispatch(ShellIntent::OpenSettings);
+    launcher.frame();
+
+    launcher.view().settings().theme_chosen(ThemeChoice::Dark);
+    come_to_rest(&mut launcher, &mut clock);
+    assert_eq!(launcher.shell().theme().state().theme, Theme::Dark);
+    assert!(launcher.shell().state().settings_open);
+
+    launcher.dispatch(ShellIntent::Back);
+    let frame = launcher.frame();
+    assert_eq!(frame.current, HomeView::Applications);
+    assert!(frame.edit.on);
+    assert_eq!(frame.apps.scroll_px, 600);
+}
+
+#[test]
+fn theme06_the_device_turning_dark_keeps_search_open_with_its_query_and_results() {
+    // Issue #32: THEME-02, THEME-06.
+    let fakes = Fakes::default();
+    let (mut launcher, mut clock) = ready_to_search(&fakes);
+    open_search(&mut launcher, &mut clock);
+    type_in(&mut launcher, "ma");
+    let found = results(&launcher);
+    assert!(!found.is_empty());
+
+    *fakes.system.dark.lock().unwrap() = true;
+    launcher.dispatch(ShellIntent::SystemThemeChanged);
+    come_to_rest(&mut launcher, &mut clock);
+
+    assert_eq!(launcher.shell().theme().state().theme, Theme::Dark);
+    let search = launcher.frame().search;
+    assert!(search.open && search.results_shown);
+    assert_eq!(launcher.view().apps().query(), Some("ma"));
+    assert_eq!(results(&launcher), found);
+}
+
+#[test]
+fn theme06_the_device_turning_dark_keeps_recent_showing_in_close_mode() {
+    // Issue #32: THEME-02, THEME-06.
+    let fakes = Fakes::default();
+    let (mut launcher, mut clock) = six_on_recent(&fakes);
+    long_press(&mut launcher, &mut clock, 540.0, 1200.0);
+    assert!(recent_frame(&mut launcher).close.on);
+
+    *fakes.system.dark.lock().unwrap() = true;
+    launcher.dispatch(ShellIntent::SystemThemeChanged);
+    come_to_rest(&mut launcher, &mut clock);
+
+    assert_eq!(launcher.shell().theme().state().theme, Theme::Dark);
+    assert_eq!(launcher.shell().state().current, HomeView::Recent);
+    assert!(recent_frame(&mut launcher).close.on);
+    assert_eq!(recent_cards(&mut launcher).1.len(), 6);
 }
 
 /// The search field's band on that phone: 176 px tall, below the 82 px status bar.

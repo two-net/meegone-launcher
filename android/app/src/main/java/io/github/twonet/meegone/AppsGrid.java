@@ -278,6 +278,7 @@ final class AppsGrid extends ScrollView {
             this.dim = dim;
             this.accent = accent;
             this.plate = plate;
+            Themed.scrolling(this, dim);
             for (int i = 0; i < cells.getChildCount(); i++) {
                 ((AppCell) cells.getChildAt(i)).setColours(foreground, dim, accent, plate);
             }

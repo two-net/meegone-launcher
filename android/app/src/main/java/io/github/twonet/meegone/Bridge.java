@@ -26,6 +26,7 @@ import android.content.pm.LauncherUserInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.content.pm.ShortcutInfo;
+import android.content.res.Configuration;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.BitmapRegionDecoder;
@@ -316,6 +317,17 @@ final class Bridge {
         if (neverShown && !isDefaultHome()) {
             openHomeSettings(from);
         }
+    }
+
+    /**
+     * Whether the device's dark theme is on now, set by the user or by its schedule (THEME-02,
+     * ADR 0033). The application's configuration follows the device even while the home
+     * handles the change itself, so this answers for every instance of it. Called from Rust.
+     */
+    boolean isDark() {
+        int night = context.getResources().getConfiguration().uiMode
+                & Configuration.UI_MODE_NIGHT_MASK;
+        return night == Configuration.UI_MODE_NIGHT_YES;
     }
 
     /**

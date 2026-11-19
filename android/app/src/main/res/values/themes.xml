@@ -1,8 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Follows the device's dark theme. The home views draw the theme's solid background, so
-         the wallpaper isn't shown behind them, and draw it edge to edge, behind the transparent
-         system bars and into any display cut-out (HOME-11, ADR 0006, ADR 0009). -->
+    <!-- Follows the device's dark theme until the first frame; from then on, MeeGone's own
+         theme colours everything it draws (THEME-03, ADR 0033). The home views draw the
+         theme's solid background, so the wallpaper isn't shown behind them, and draw it edge to
+         edge, behind the transparent system bars and into any display cut-out (HOME-11,
+         ADR 0006, ADR 0009). -->
     <style name="Theme.MeeGone.Base" parent="@android:style/Theme.DeviceDefault.DayNight">
         <item name="android:windowNoTitle">true</item>
         <item name="android:windowActionBar">false</item>
@@ -18,6 +20,9 @@
         <item name="android:windowLightNavigationBar">@bool/light_system_bars</item>
         <!-- Android 10 knows only cut-outs on the short edges; values-v30 adds the long ones. -->
         <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+        <!-- MeeGone draws its own Light and Dark themes: Android's "override force-dark" never
+             darkens the Light one. -->
+        <item name="android:forceDarkAllowed">false</item>
     </style>
 
     <style name="Theme.MeeGone" parent="Theme.MeeGone.Base" />

@@ -10,9 +10,10 @@ mod android;
 
 pub use meegone_core_data::{Platform, Rect};
 pub use meegone_shell_state::{
-    Direction, EventsChangeState, FOLDER_COLUMNS, GridChangeState, HomeMenu, HomeShell, HomeView,
-    ImageChangeState, Layout, LiftState, MenuItem, PREVIEW_APPS, PinchEvent, PinchKind, PinchState,
-    PointerEvent, PointerKind, PressState, SavedHome, SettingsGroup, Shared, ShellIntent,
+    CrossFadeState, Direction, EventsChangeState, FOLDER_COLUMNS, GridChangeState, HomeMenu,
+    HomeShell, HomeView, Layout, LiftState, MenuItem, PREVIEW_APPS, PinchEvent, PinchKind,
+    PinchState, PointerEvent, PointerKind, PressState, SavedHome, SettingsGroup, Shared,
+    ShellIntent,
 };
 use meegone_shell_ui::ShellView;
 pub use meegone_shell_ui::{

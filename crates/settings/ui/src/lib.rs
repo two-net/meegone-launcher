@@ -5,7 +5,8 @@
 //! This feature also provides [`HomeBanner`], which the shell shows on the home views while
 //! MeeGone isn't the default home app (ONB-04).
 
-use meegone_core_state::{HomeTarget, ThemeChoice};
+use meegone_core_state::HomeTarget;
+pub use meegone_core_state::ThemeChoice;
 use meegone_core_ui::{Dispatch, Latest, Slot, Tokens, View};
 use meegone_settings_state::{SettingsIntent, SettingsState};
 

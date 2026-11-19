@@ -362,6 +362,7 @@ final class ImageSettings extends LinearLayout {
         int[][] states = {{android.R.attr.state_checked}, {}};
         for (Switch row : new Switch[] {dailyImage, showCard, useMobileData}) {
             row.setTextColor(foreground);
+            row.setBackground(new RippleDrawable(pressed, null, new ColorDrawable(Color.WHITE)));
             row.setThumbTintList(new ColorStateList(states, new int[] {accent, foreground}));
             row.setTrackTintList(new ColorStateList(states, new int[] {accent, dim}));
         }

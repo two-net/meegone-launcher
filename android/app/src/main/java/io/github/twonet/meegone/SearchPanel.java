@@ -40,8 +40,9 @@ import java.util.function.Consumer;
  * first result or searches the web (SRCH-03, SRCH-05).
  *
  * <p>The field owns its text while the user types. It takes the keyboard when search opens, and
- * lets it go and empties when search closes. Only after a theme change made a new one does it
- * take the text back from the Rust app (THEME-06). The results scroll above the keyboard: their
+ * lets it go and empties when search closes. Only after a configuration change, such as a new
+ * density, made a new one does it take the text back from the Rust app; a theme change keeps the
+ * field as it is (THEME-06, ADR 0033). The results scroll above the keyboard: their
  * grid's bottom padding is the larger of the safe area and the keyboard.
  */
 final class SearchPanel extends FrameLayout {
@@ -265,6 +266,7 @@ final class SearchPanel extends FrameLayout {
         pill.setColor(surface);
         field.setTextColor(foreground);
         field.setHintTextColor(dim);
+        Themed.textField(field, accent);
         none.setTextColor(dim);
         web.setTextColor(accent);
         ColorStateList pressed = ColorStateList.valueOf((foreground & 0x00FFFFFF) | 0x1F000000);
@@ -273,7 +275,7 @@ final class SearchPanel extends FrameLayout {
 
     /**
      * Search opened: the field takes the keyboard (SRCH-01). {@code text}, if not null, is what
-     * it says, as after a theme change made this view anew.
+     * it says, as after a configuration change made this view anew.
      */
     void focus(String text) {
         if (text != null && !text.contentEquals(field.getText())) {

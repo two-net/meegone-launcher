@@ -1,5 +1,6 @@
-//! [`SystemConfigAdapter`] on Android: the home-app role, the clock (HOME-01, ONB-04), whether
-//! the system animates the return home (ANIM-09), the haptic tick (ANIM-24), whether a browser
+//! [`SystemConfigAdapter`] on Android: the home-app role, the clock (HOME-01, ONB-04), the
+//! device's dark theme (THEME-02, ADR 0033), whether the system animates the return home
+//! (ANIM-09), the haptic tick (ANIM-24), whether a browser
 //! is installed, opening links in it and web search (SRCH-05, WALL-15, ADR 0016, ADR 0031), the
 //! Events header's dates, times and next alarm (EVT-01, EVT-02, L10N-03, ADR 0019), the
 //! device's locale (WALL-05, ADR 0027), how much free storage there is (SRS 7.6, ADR 0028), and
@@ -27,6 +28,8 @@ pub struct AndroidSystem {
     utc_offset_ms: MethodId,
     /// `long installedMs()`: `PackageInfo.firstInstallTime`, or 0.
     installed_ms: MethodId,
+    /// `boolean isDark()`: the device's dark theme is on now, by the user or on its schedule.
+    is_dark: MethodId,
     /// `boolean animatesReturnHome()`
     animates_return_home: MethodId,
     /// `boolean hapticTick()`: whether a view could play it.
@@ -67,6 +70,7 @@ impl AndroidSystem {
             )?,
             utc_offset_ms: env.method_id(bridge, c"utcOffsetMs", c"(J)J")?,
             installed_ms: env.method_id(bridge, c"installedMs", c"()J")?,
+            is_dark: env.method_id(bridge, c"isDark", c"()Z")?,
             animates_return_home: env.method_id(bridge, c"animatesReturnHome", c"()Z")?,
             haptic_tick: env.method_id(bridge, c"hapticTick", c"()Z")?,
             has_browser: env.method_id(bridge, c"hasBrowser", c"()Z")?,
@@ -103,8 +107,12 @@ fn style_code(style: TimeStyle) -> i32 {
 }
 
 impl SystemConfigAdapter for AndroidSystem {
+    /// If the bridge can't answer, the device is taken to be light, as SRS 5.3's default.
     fn is_dark(&self) -> bool {
-        false // The device's dark theme arrives with #32.
+        self.vm
+            .env()
+            .and_then(|env| env.call_bool(&self.bridge, self.is_dark, &[]))
+            .unwrap_or(false)
     }
 
     fn animation_scale(&self) -> f64 {

@@ -246,6 +246,7 @@ final class ImageDetails extends ScrollView {
         this.surface = surface;
         this.accent = accent;
         setBackgroundColor(surface);
+        Themed.scrolling(this, dim);
         title.setTextColor(foreground);
         attribution.setTextColor(dim);
         dateRegion.setTextColor(dim);

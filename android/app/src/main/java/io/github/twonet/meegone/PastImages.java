@@ -244,6 +244,7 @@ final class PastImages extends ScrollView {
         this.surface = surface;
         this.accent = accent;
         setBackgroundColor(surface);
+        Themed.scrolling(this, dim);
         title.setTextColor(foreground);
         loading.setTextColor(dim);
         problem.setTextColor(foreground);

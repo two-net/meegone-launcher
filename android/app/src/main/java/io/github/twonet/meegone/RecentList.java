@@ -530,6 +530,10 @@ final class RecentList extends LinearLayout {
         for (Card card : shown) {
             card.colour(foreground, dim, surface);
         }
+        // Cards still shrinking away are on screen too.
+        for (Card card : leaving) {
+            card.colour(foreground, dim, surface);
+        }
     }
 
     private int dp(float value) {

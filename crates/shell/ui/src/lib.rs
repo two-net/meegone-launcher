@@ -8,8 +8,9 @@
 //! apps come, go and move, a cell's long-press menu, the dragged icon, edit mode, the open
 //! folder, search, Settings' Hidden apps list and "Show card in Events" switch, the Events
 //! header, list and a notification's long-press menu, the image-of-the-day card, the image
-//! details screen and the image's update status, and Recent's cards (ADR 0006 to ADR 0008,
-//! ADR 0010, ADR 0012 to ADR 0017, ADR 0019 to ADR 0023, ADR 0031).
+//! details screen and the image's update status, Recent's cards, the theme chosen and the
+//! cross-fade to a new theme (ADR 0006 to ADR 0008, ADR 0010, ADR 0012 to ADR 0017, ADR 0019
+//! to ADR 0023, ADR 0031, ADR 0033).
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -33,6 +34,7 @@ pub use meegone_lockimage_ui::{
 use meegone_lockimage_ui::{ImageCard, ImageDetailsScreen, ImageSettingsSection, PastImagesScreen};
 pub use meegone_recent_ui::{Age, RecentMode, RecentWindow, ShownCard};
 use meegone_recent_ui::{RecentSettingsSection, RecentView};
+pub use meegone_settings_ui::ThemeChoice;
 use meegone_settings_ui::{HomeBanner, SettingsView};
 pub use meegone_shell_state::{BADGE_ROWS, RECENT_ROWS};
 use meegone_shell_state::{HomeShell, HomeView, MenuItem, SettingsGroup, ShellIntent};
@@ -317,6 +319,13 @@ pub struct HomeFrame {
     /// How far the card's new thumbnail has faded in over the old one, from 0 to 10 000
     /// (ANIM-22).
     pub image_change: u16,
+    /// How far the whole screen has faded from the theme it was drawn in to this frame's, from
+    /// 0 to 10 000 (THEME-06, ANIM-19). The host fades a picture of the old screen out over
+    /// the new one.
+    pub theme_change: u16,
+    /// Settings → Appearance → Theme (THEME-01): the theme chosen, or `None` while Settings
+    /// isn't working, so it isn't offered (ARCH-09).
+    pub theme_choice: Option<ThemeChoice>,
     /// The image details screen covers the home views (WALL-15).
     pub image_details_open: bool,
     /// What the image details screen shows: its revision, which changes whenever that does,
@@ -577,6 +586,7 @@ impl ShellView {
                 || state.search.animating
                 || state.events_change.animating
                 || state.image_change.animating
+                || state.theme_change.animating
                 || state.pinch.animating
                 || state.close.animating
                 || state.recent_change.animating,
@@ -610,6 +620,10 @@ impl ShellView {
             image_card: (shell.lockimage_ready() && self.image_card.is_visible())
                 .then(|| self.image_card.revision()),
             image_change: ten_thousandths(state.image_change.progress),
+            theme_change: ten_thousandths(state.theme_change.progress),
+            theme_choice: shell
+                .settings_ready()
+                .then(|| shell.settings().state().theme),
             image_details_open: state.image_details_open,
             // The shell opens the screen only while the lock-screen image works and has an
             // image, and closes it once it hasn't.
