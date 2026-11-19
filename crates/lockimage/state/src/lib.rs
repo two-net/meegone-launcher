@@ -1,8 +1,8 @@
 //! Lock-screen image state (SRS 4.5): whether the daily image is on or available, the current
 //! image's details, the feed region (WALL-05), "Use mobile data" (WALL-04), how the daily
 //! checks are going (SRS 7.6), "Update now" (WALL-11), whether daily updates are paused
-//! because someone else changed the lock screen (WALL-14), and resetting the lock screen once
-//! the image is off (WALL-12).
+//! because someone else changed the lock screen (WALL-14), resetting the lock screen once the
+//! image is off (WALL-12), and what the image details screen shows and opens (WALL-15, WALL-16).
 //!
 //! Its options live in the settings store (ADR 0002); the image details and the check log live
 //! in this feature's image cache. [`ImageUpdater`] runs the daily check and sets the
@@ -14,7 +14,8 @@ mod updater;
 use std::sync::Arc;
 
 use meegone_core_data::{
-    DataError, ImageOptions, SchedulerAdapter, SettingsStore, SystemConfigAdapter, WallpaperAdapter,
+    DataError, ImageOptions, SchedulerAdapter, SettingsStore, SystemConfigAdapter, TimeStyle,
+    WallpaperAdapter,
 };
 use meegone_core_state::StateHolder;
 use meegone_lockimage_data::{ImageCache, ImageFeed, region};
@@ -57,6 +58,14 @@ pub struct LockImageState {
     /// Whether the device didn't keep the image as the lock screen's wallpaper, so it may not
     /// appear there (SRS C5, ADR 0030).
     pub may_not_show: bool,
+    /// The current image's date, written in the device's language, such as "15 November";
+    /// empty when there is none or it isn't a date (WALL-15, L10N-03).
+    pub date: String,
+    /// When MeeGone last set an image on the lock screen, written in the device's language,
+    /// such as "19 November, 07:00" (WALL-16, L10N-03).
+    pub updated: Option<String>,
+    /// Whether a web browser is installed, without which More info is hidden (SRS 8.1).
+    pub has_browser: bool,
     pub problem: Option<String>,
 }
 
@@ -64,6 +73,16 @@ impl LockImageState {
     /// The region the feed is asked for: the one chosen, or Automatic's (WALL-05).
     pub fn region_in_use(&self) -> &str {
         self.region.as_deref().unwrap_or(&self.automatic_region)
+    }
+
+    /// Whether the image details screen has something to show: the daily image is on and has
+    /// an image (WALL-15, ADR 0031).
+    pub fn has_details(&self) -> bool {
+        self.status == ImageStatus::On
+            && self
+                .current
+                .as_ref()
+                .is_some_and(|current| current.image.is_some())
     }
 }
 
@@ -94,9 +113,16 @@ pub enum LockImageIntent {
     ResetLockScreen,
     /// Opens the system's wallpaper settings (WALL-12).
     OpenWallpaperSettings,
-    /// Opens the image details screen, from the card in Events (EVT-12, WALL-15). The screen
-    /// covers the home views, so the shell opens it (ADR 0022); the holder ignores it.
+    /// Opens the image details screen, from the card in Events or the home menu (EVT-12,
+    /// WALL-15). The screen covers the home views, so the shell opens it (ADR 0022, ADR 0031);
+    /// the holder ignores it.
     OpenDetails,
+    /// More info: opens the current image's info link in the browser. Only while the daily image
+    /// is on, and only an `https://` link (WALL-15, SEC-02).
+    OpenInfoLink,
+    /// Opens Settings at its Lock-screen image group, from the details screen (WALL-15).
+    /// Settings covers the home views, so the shell opens it (ADR 0031); the holder ignores it.
+    OpenSettings,
 }
 
 pub struct LockImageHolder {
@@ -155,6 +181,25 @@ impl LockImageHolder {
             .is_some_and(|current| updater::changed_by_someone_else(current, &*self.wallpaper));
         self.state.may_not_show =
             current.is_some_and(|current| current.marker == Some(Marker::NotKept));
+        self.write_times();
+        self.state.has_browser = self.system.has_browser();
+    }
+
+    /// Writes the current image's date and when it was set, in the device's language. The date
+    /// is written at noon, so a time zone far from UTC doesn't move it (WALL-15, WALL-16).
+    fn write_times(&mut self) {
+        let offset = |at| self.system.utc_offset_ms(at);
+        let current = self.state.current.as_ref();
+        self.state.date = current
+            .and_then(|current| checks::day_of(&current.date))
+            .map(|day| {
+                let noon = checks::local_noon_ms(day, &offset);
+                self.system.format_time(noon, TimeStyle::DayMonth)
+            })
+            .unwrap_or_default();
+        self.state.updated = current
+            .and_then(|current| current.applied_at_ms)
+            .map(|at| self.system.format_time(at, TimeStyle::DayMonthTime));
     }
 
     fn set_enabled(&mut self, on: bool) {
@@ -246,6 +291,25 @@ impl LockImageHolder {
         self.state.problem = result.err().map(|error| error.to_string());
     }
 
+    /// Only a link the details screen offers opens: the daily image is on, the current image
+    /// has one, it is `https://`, and a browser is installed (WALL-15, SEC-02, SRS 8.1).
+    fn open_info_link(&mut self) {
+        if self.state.status != ImageStatus::On || !self.state.has_browser {
+            return;
+        }
+        let Some(link) = self
+            .state
+            .current
+            .as_ref()
+            .and_then(|current| current.info_link.as_deref())
+            .filter(|link| link.starts_with("https://"))
+        else {
+            return;
+        };
+        let result = self.system.open_in_browser(link);
+        self.state.problem = result.err().map(|error| error.to_string());
+    }
+
     fn apply(&self, options: &ImageOptions) -> Result<(), DataError> {
         if options.enabled {
             self.arm(true, options.use_mobile_data)
@@ -288,7 +352,8 @@ impl StateHolder for LockImageHolder {
             LockImageIntent::Checked => self.checked(),
             LockImageIntent::ResetLockScreen => self.reset_lock_screen(),
             LockImageIntent::OpenWallpaperSettings => self.open_wallpaper_settings(),
-            LockImageIntent::OpenDetails => {}
+            LockImageIntent::OpenInfoLink => self.open_info_link(),
+            LockImageIntent::OpenDetails | LockImageIntent::OpenSettings => {}
         }
     }
 }
@@ -725,13 +790,151 @@ mod tests {
     }
 
     #[test]
-    fn the_holder_leaves_opening_the_details_to_the_shell() {
+    fn the_holder_leaves_opening_the_details_and_settings_to_the_shell() {
         let Setup { mut holder, .. } = setup();
         let before = holder.state().clone();
 
         holder.handle(LockImageIntent::OpenDetails);
+        holder.handle(LockImageIntent::OpenSettings);
 
         assert_eq!(*holder.state(), before);
+    }
+
+    /// 19 November 2026, 00:00 UTC.
+    const NOV_19: u64 = 1_795_046_400_000;
+    const HOUR: u64 = 3_600_000;
+
+    /// The daily image on, with a current image from `date` with `info_link`, set on the lock
+    /// screen at `applied_at_ms`.
+    fn with_a_record(
+        setup: &mut Setup,
+        date: &str,
+        info_link: Option<&str>,
+        applied_at_ms: Option<u64>,
+    ) {
+        setup.holder.handle(LockImageIntent::SetEnabled(true));
+        setup
+            .cache
+            .put(
+                ImageRecord {
+                    date: date.into(),
+                    region: "en-GB".into(),
+                    title: "Puffins on a cliff".into(),
+                    attribution: "© A Photographer".into(),
+                    info_link: info_link.map(Into::into),
+                    applied_at_ms,
+                    image: None,
+                    id: None,
+                    marker: None,
+                },
+                b"image",
+            )
+            .unwrap();
+        setup.holder.handle(LockImageIntent::Refresh);
+    }
+
+    #[test]
+    fn the_images_date_and_when_it_was_set_are_written_in_the_devices_language() {
+        // WALL-15, WALL-16, L10N-03: eight hours behind UTC, the image was set late on the
+        // 18th; its date is still the 15th.
+        let mut setup = setup();
+        *setup.fakes.system.utc_offset_ms.lock().unwrap() = -8 * HOUR as i64;
+
+        with_a_record(&mut setup, "20261115", None, Some(NOV_19 + 7 * HOUR));
+
+        let state = setup.holder.state();
+        assert_eq!(state.date, "15 November");
+        assert_eq!(state.updated.as_deref(), Some("18 November, 11:00 PM"));
+        assert!(state.has_browser);
+    }
+
+    #[test]
+    fn an_image_not_yet_set_or_without_a_date_writes_neither() {
+        // WALL-16
+        let mut setup = setup();
+        assert_eq!(setup.holder.state().date, "");
+        assert_eq!(setup.holder.state().updated, None);
+
+        with_a_record(&mut setup, "2026-11-15", None, None);
+
+        assert_eq!(setup.holder.state().date, "");
+        assert_eq!(setup.holder.state().updated, None);
+    }
+
+    #[test]
+    fn more_info_opens_the_images_link_in_the_browser() {
+        // WALL-15, SEC-02
+        let mut setup = setup();
+        with_a_record(
+            &mut setup,
+            "20261115",
+            Some("https://example.com/puffins"),
+            None,
+        );
+
+        setup.holder.handle(LockImageIntent::OpenInfoLink);
+
+        assert_eq!(
+            *setup.fakes.system.opened_urls.lock().unwrap(),
+            ["https://example.com/puffins"]
+        );
+        assert_eq!(setup.holder.state().problem, None);
+    }
+
+    #[test]
+    fn more_info_opens_nothing_without_a_link_a_browser_https_or_the_daily_image() {
+        // WALL-15, SEC-02, SRS 8.1
+        let opened = |link: Option<&str>, change: &dyn Fn(&mut Setup)| {
+            let mut setup = setup();
+            with_a_record(&mut setup, "20261115", link, None);
+            change(&mut setup);
+            setup.holder.handle(LockImageIntent::OpenInfoLink);
+            setup.fakes.system.opened_urls.lock().unwrap().len()
+        };
+        let link = Some("https://example.com/puffins");
+        assert_eq!(opened(link, &|_| {}), 1);
+
+        assert_eq!(opened(None, &|_| {}), 0);
+        assert_eq!(opened(Some("http://example.com/puffins"), &|_| {}), 0);
+        assert_eq!(
+            opened(link, &|setup| {
+                *setup.fakes.system.browser.lock().unwrap() = false;
+                setup.holder.handle(LockImageIntent::Refresh);
+            }),
+            0
+        );
+        assert_eq!(
+            opened(link, &|setup| {
+                setup
+                    .settings
+                    .update(&mut |s| s.image.enabled = false)
+                    .unwrap();
+                setup.holder.handle(LockImageIntent::Refresh);
+            }),
+            0
+        );
+    }
+
+    #[test]
+    fn a_link_the_browser_cant_open_says_why() {
+        // WALL-15, ARCH-09
+        let mut setup = setup();
+        with_a_record(
+            &mut setup,
+            "20261115",
+            Some("https://example.com/puffins"),
+            None,
+        );
+        *setup.fakes.system.error.lock().unwrap() = Some(DataError::Unsupported(
+            "No browser can open this link".into(),
+        ));
+
+        setup.holder.handle(LockImageIntent::OpenInfoLink);
+
+        assert_eq!(
+            setup.holder.state().problem.as_deref(),
+            Some("No browser can open this link")
+        );
     }
 
     /// The daily image on, with an image the updater has set as the lock-screen wallpaper.

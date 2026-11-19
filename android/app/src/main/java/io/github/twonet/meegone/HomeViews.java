@@ -51,8 +51,9 @@ import java.util.List;
  * Applications page, with its own {@link AppsGrid}; renaming it asks for the name in a dialog
  * (FOLD-03, FOLD-04, ADR 0015). Pulling down at the top of Applications reveals the search field
  * of a {@link SearchPanel}, whose results are a third {@link AppsGrid} (SRCH-01, ADR 0016).
- * Below the notifications, Events shows the image of the day in an {@link ImageCard}, whose tap
- * opens the image details screen over the home views (EVT-12, ADR 0022).
+ * Below the notifications, Events shows the image of the day in an {@link ImageCard}, whose tap,
+ * like the home menu's Lock-screen image, opens the {@link ImageDetails} screen over the home
+ * views (EVT-12, WALL-15, ADR 0022, ADR 0031).
  *
  * <p>The Rust app owns the gesture, the motion, the view indicator and the menus. This view
  * passes it every touch, frame time and layout change, says when a finger has been held on
@@ -203,7 +204,10 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private static final int IMAGE_PAUSED = 132; // 1 while someone else changed the lock screen
     private static final int IMAGE_MAY_NOT_SHOW = 133; // 1 while the device didn't keep it
     private static final int IMAGE_OFF_ACTIONS = 134; // 1 while the reset is offered
-    private static final int FRAME_SIZE = 135;
+    // The image details screen and the daily image's status line (WALL-15, WALL-16, ADR 0031):
+    private static final int IMAGE_DETAILS_REVISION = 135; // changes when it changes; -1 closed
+    private static final int IMAGE_STATUS_REVISION = 136; // changes when it changes; -1 none
+    private static final int FRAME_SIZE = 137;
     private static final int SEARCH_OPEN = 1; // the field has the keyboard
     private static final int SEARCH_RESULTS = 2; // the results show instead of the grid
     private static final int SEARCH_NOTHING = 4; // nothing matches
@@ -303,12 +307,8 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private final RecentSettings recentSettings;
     /** Settings → Lock-screen image → "Show card in Events" (EVT-12). */
     private final ImageSettings imageSettings;
-    /**
-     * Covers the home views while the image details screen is open (WALL-15). Until #30 draws
-     * it, it shows its name.
-     */
-    private final LinearLayout imageDetails;
-    private final TextView imageDetailsTitle;
+    /** Covers the home views while the image details screen is open (WALL-15). */
+    private final ImageDetails imageDetails;
     /**
      * The home menu (HOME-10), a card at the finger, or an app's menu (APPS-11), a card at its
      * icon: over the home views. Its items are made for the menu that opens.
@@ -388,6 +388,9 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     /** Recent's revision as shown, as an unsigned int, or -1 before it is first read. */
     private long recentShown = -1;
     private int imageDetailsShown;
+    /** The revisions of the image details and the status line last read, or -1. */
+    private int imageDetailsRead = -1;
+    private int imageStatusRead = -1;
     private int menuOffered = -1;
     /** The density action screen readers were last offered: its rows, or 0 for none. */
     private int densityOffered = -1;
@@ -588,20 +591,29 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         status.setAccessibilityLiveRegion(ACCESSIBILITY_LIVE_REGION_POLITE);
         addView(status, new LayoutParams(1, 1, Gravity.TOP | Gravity.START));
 
-        // Below Settings, which can open over it.
-        imageDetails = new LinearLayout(context);
-        imageDetails.setOrientation(LinearLayout.VERTICAL);
-        imageDetails.setGravity(Gravity.TOP | Gravity.CENTER_HORIZONTAL);
-        // Touches on it stay there.
-        imageDetails.setClickable(true);
+        // Below Settings, which can open over it (ADR 0031).
+        imageDetails = new ImageDetails(context, new ImageDetails.Listener() {
+            @Override
+            public void moreInfo() {
+                String message = nativeImageMoreInfo();
+                apply();
+                toast(message);
+            }
+
+            @Override
+            public void updateNow() {
+                String message = nativeImageUpdateNow();
+                apply();
+                toast(message);
+            }
+
+            @Override
+            public void settings() {
+                nativeImageDetailsSettings();
+                apply();
+            }
+        });
         imageDetails.setVisibility(GONE);
-        imageDetails.setAccessibilityPaneTitle(
-                getResources().getString(R.string.image_of_the_day));
-        imageDetailsTitle = new TextView(context);
-        imageDetailsTitle.setText(R.string.image_of_the_day);
-        imageDetailsTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 28);
-        imageDetails.addView(imageDetailsTitle, new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
         addView(imageDetails, new LayoutParams(
                 LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
 
@@ -1220,8 +1232,6 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             surface = frame[SURFACE];
             settings.setBackgroundColor(surface);
             settingsTitle.setTextColor(foreground);
-            imageDetails.setBackgroundColor(surface);
-            imageDetailsTitle.setTextColor(foreground);
             settingsGroup.setTextColor(dim);
             menuCard.setColor(surface);
             colourMenu();
@@ -1561,13 +1571,45 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         toast(message);
     }
 
-    /** Shows the image details screen over the home views while it is open (WALL-15). */
+    /**
+     * Shows the image details screen over the home views while it is open (WALL-15), read again
+     * whenever its revision changes, with Update now as Settings offers it (WALL-11).
+     */
     private void applyImageDetails() {
         if (frame[IMAGE_DETAILS] != imageDetailsShown) {
             imageDetailsShown = frame[IMAGE_DETAILS];
             imageDetails.setVisibility(imageDetailsShown != 0 ? VISIBLE : GONE);
+            if (imageDetailsShown != 0) {
+                imageDetails.opened();
+            }
             hidePagesFromScreenReaders();
         }
+        applyImageStatus();
+        if (imageDetailsShown == 0) {
+            return;
+        }
+        imageDetails.colour(foreground, dim, surface, frame[ACCENT]);
+        int revision = frame[IMAGE_DETAILS_REVISION];
+        if (revision >= 0 && revision != imageDetailsRead) {
+            imageDetailsRead = revision;
+            imageDetails.fill(nativeImageDetails());
+        }
+        imageDetails.showUpdateNow(frame[UPDATE_NOW]);
+    }
+
+    /**
+     * The daily image's status line, in Settings and on the details screen (WALL-16): read again
+     * only when its revision changes, and hidden while the daily image is off.
+     */
+    private void applyImageStatus() {
+        int revision = frame[IMAGE_STATUS_REVISION];
+        if (revision == imageStatusRead) {
+            return;
+        }
+        imageStatusRead = revision;
+        String[] status = revision >= 0 ? nativeImageStatus() : null;
+        imageSettings.showStatus(status);
+        imageDetails.showStatus(status);
     }
 
     /**
@@ -2436,6 +2478,27 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
 
     /** Why the device can't set the lock-screen wallpaper, or null while it can (WALL-13). */
     private native String nativeImageUnavailableReason();
+
+    /**
+     * What the image details screen shows as of the last frame, in {@link ImageDetails#FIELDS}
+     * fields (WALL-15). Empty while it doesn't show.
+     */
+    private native String[] nativeImageDetails();
+
+    /**
+     * The daily image's status line as of the last frame, in {@link
+     * ImageSettings#STATUS_FIELDS} fields (WALL-16). Empty while it doesn't show.
+     */
+    private native String[] nativeImageStatus();
+
+    /**
+     * More info was tapped (WALL-15): the image's link opens in the browser. Returns null, or a
+     * short message to show when it couldn't open.
+     */
+    private native String nativeImageMoreInfo();
+
+    /** Settings on the image details screen was tapped: Settings opens over it. */
+    private native void nativeImageDetailsSettings();
 
     /** Fills {@code frame} with what to draw now, in the slots above. */
     private native void nativeRead(int[] frame);

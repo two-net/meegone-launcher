@@ -37,11 +37,11 @@ use meegone_core_data::android::{self, Env, JObject, LocalRef, RawEnv};
 use meegone_core_data::{App, RecentDensity, RecentWindow, Rect, Rgb, accent};
 
 use crate::{
-    Age, AppMenuItem, BADGE_ROWS, Bounds, Cell, CellKey, DailyImage, Direction, EventsListMode,
-    EventsRow, FOLDER_COLUMNS, FolderId, GridLayout, HomeFrame, HomeView, Launcher, Layout,
-    MenuItem, NotificationMenuItem, PREVIEW_APPS, PinchEvent, PinchKind, PointerEvent, PointerKind,
-    RECENT_ROWS, RecentMode, RowTarget, SavedHome, SettingsGroup, Shared, ShellIntent, ShownCard,
-    Surface,
+    Age, AppMenuItem, BADGE_ROWS, Bounds, Cell, CellKey, CheckStatus, DailyImage, Direction,
+    EventsListMode, EventsRow, FOLDER_COLUMNS, FolderId, GridLayout, HomeFrame, HomeView, Launcher,
+    Layout, MenuItem, NotificationMenuItem, PREVIEW_APPS, PinchEvent, PinchKind, PointerEvent,
+    PointerKind, RECENT_ROWS, RecentMode, RowTarget, SavedHome, SettingsGroup, Shared, ShellIntent,
+    ShownCard, Surface,
 };
 
 /// JNI's `jboolean`.
@@ -1742,6 +1742,147 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeImag
     reason
 }
 
+/// `String[] nativeImageDetails()`: what the image details screen shows, as of the last frame
+/// (WALL-15, ADR 0031), mirrored in `ImageDetails.java`:
+/// 1. the image's title, as plain text (SEC-02);
+/// 2. its attribution, as the source provides it (LEGAL-03);
+/// 3. its date in the device's language, or empty to leave it out (L10N-03);
+/// 4. the feed region it is from, a BCP 47 tag such as `en-GB`, which the host names;
+/// 5. the file that holds the image, relative to the folder `nativeStart` was given;
+/// 6. the image's key, which changes only when the image does;
+/// 7. "1" while More info is offered: the image has a link and a browser can open it.
+///
+/// Empty unless the frame's slot 135 says the screen shows.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeImageDetails(
+    env: RawEnv,
+    _views: JObject,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    let mut fields = std::ptr::null_mut();
+    guarded(env, || {
+        LAUNCHER.with_borrow(|launcher| {
+            let launcher = launcher.as_ref().ok_or("MeeGone hasn't started")?;
+            let content = launcher
+                .shell()
+                .image_details_offered()
+                .then(|| launcher.view().image_details().content())
+                .flatten();
+            let texts: Vec<&str> = content.as_ref().map_or_else(Vec::new, |content| {
+                vec![
+                    content.title.as_str(),
+                    content.attribution.as_str(),
+                    content.date.as_str(),
+                    content.region.as_str(),
+                    content.image_path,
+                    content.image_key.as_str(),
+                    if content.more_info { "1" } else { "" },
+                ]
+            });
+            let array = env
+                .new_string_array(texts.into_iter())
+                .map_err(|error| format!("Couldn't pass the image details: {error}"))?;
+            fields = array.into_raw();
+            Ok(())
+        })
+    });
+    fields
+}
+
+/// `String[] nativeImageStatus()`: the daily image's status line, in Settings and on the
+/// details screen, as of the last frame (WALL-16, ADR 0031), mirrored in `ImageSettings.java`:
+/// 1. when MeeGone last set an image on the lock screen, in the device's language, or empty
+///    before the first;
+/// 2. the last problem, in plain words, or empty while nothing fails;
+/// 3. how the checks are going: "retrying", "unavailable" after 3 days of failures (SRS 7.6),
+///    or empty.
+///
+/// Empty unless the frame's slot 136 says the status shows.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeImageStatus(
+    env: RawEnv,
+    _views: JObject,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    let mut fields = std::ptr::null_mut();
+    guarded(env, || {
+        LAUNCHER.with_borrow(|launcher| {
+            let launcher = launcher.as_ref().ok_or("MeeGone hasn't started")?;
+            let status = launcher
+                .shell()
+                .lockimage_ready()
+                .then(|| launcher.view().image_settings().update_status())
+                .flatten();
+            let texts: Vec<&str> = status.as_ref().map_or_else(Vec::new, |status| {
+                let (problem, kind) = match &status.checks {
+                    CheckStatus::Fine => ("", ""),
+                    CheckStatus::Retrying(problem) => (problem.as_str(), "retrying"),
+                    CheckStatus::Unavailable(problem) => (problem.as_str(), "unavailable"),
+                };
+                vec![status.updated.as_deref().unwrap_or(""), problem, kind]
+            });
+            let array = env
+                .new_string_array(texts.into_iter())
+                .map_err(|error| format!("Couldn't pass the image's status: {error}"))?;
+            fields = array.into_raw();
+            Ok(())
+        })
+    });
+    fields
+}
+
+/// `String nativeImageMoreInfo()`: More info on the image details screen was tapped, so the
+/// image's link opens in the browser (WALL-15, SEC-02). Returns `null`, or a short message to
+/// show when it couldn't open. Does nothing while More info isn't offered, or while the
+/// lock-screen image isn't working (ARCH-09).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeImageMoreInfo(
+    env: RawEnv,
+    _views: JObject,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_image_message(env, |launcher| {
+        launcher.shell().image_details_offered() && launcher.view().image_details().more_info()
+    })
+}
+
+/// `void nativeImageDetailsSettings()`: Settings on the image details screen was tapped, so
+/// Settings opens over it at its Lock-screen image group (WALL-15, ADR 0031).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeImageDetailsSettings(
+    env: RawEnv,
+    _views: JObject,
+) {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_launcher(env, |launcher| {
+        if launcher.shell().image_details_offered()
+            && launcher.view().image_details().open_settings()
+        {
+            launcher.frame();
+        }
+    });
+}
+
 /// Asks something of the lock-screen image with `step`, applies it, and returns its `problem`
 /// as a message for the host to show, or `null`. Does nothing while it isn't working (ARCH-09).
 fn with_image_message(env: Env, step: impl FnOnce(&Launcher) -> bool) -> JObject {
@@ -2638,7 +2779,7 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRead
 }
 
 /// How many slots the frame has.
-const FRAME_SLOTS: usize = 135;
+const FRAME_SLOTS: usize = 137;
 /// The first of Recent's close-mode slots.
 const CLOSE_SLOTS: usize = 104;
 
@@ -2745,6 +2886,8 @@ const CLOSE_SLOTS: usize = 104;
 /// | 132 | 1 while Settings says someone else changed the lock screen, with Resume (WALL-14); otherwise 0 |
 /// | 133 | 1 while Settings says the image may not appear on this device's lock screen (SRS C5); otherwise 0 |
 /// | 134 | 1 while Settings offers "Reset lock screen to home wallpaper" and the wallpaper settings (WALL-12); otherwise 0 |
+/// | 135 | The image details screen's revision while it is open: when it changes, the screen is read again with `nativeImageDetails`; -1 while it is closed (WALL-15) |
+/// | 136 | The daily image's status line's revision, in Settings and on the details screen: when it changes, it is read again with `nativeImageStatus`; -1 while the daily image is off or the lock-screen image isn't working (WALL-16, ARCH-09) |
 fn frame_slots(frame: &HomeFrame) -> [i32; FRAME_SLOTS] {
     let [events, applications, recent] = frame.pages;
     let menu_items = frame.menu.map_or(0, |menu| {
@@ -2952,6 +3095,10 @@ fn frame_slots(frame: &HomeFrame) -> [i32; FRAME_SLOTS] {
     slots[window + 5] = i32::from(frame.image_paused);
     slots[window + 6] = i32::from(frame.image_may_not_show);
     slots[window + 7] = i32::from(frame.image_off_actions);
+    // Revisions travel as Java's `int`, as non-negative values below 2³¹; -1 means none.
+    let revision = |revision: Option<u32>| revision.map_or(-1, |r| (r & 0x7FFF_FFFF) as i32);
+    slots[window + 8] = revision(frame.image_details);
+    slots[window + 9] = revision(frame.image_status);
     slots
 }
 

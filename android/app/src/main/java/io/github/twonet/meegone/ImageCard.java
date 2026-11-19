@@ -59,8 +59,11 @@ final class ImageCard extends LinearLayout {
     private static final int TITLE_LINES = 2;
     private static final int OPAQUE = 10_000;
 
-    /** One thread for the whole process: thumbnails decode behind the scenes. */
-    private static final ExecutorService DECODER = Executors.newSingleThreadExecutor(task -> {
+    /**
+     * One thread for the whole process: thumbnails, and the image details screen's image, decode
+     * behind the scenes.
+     */
+    static final ExecutorService DECODER = Executors.newSingleThreadExecutor(task -> {
         Thread thread = new Thread(task, "MeeGone image");
         thread.setPriority(Thread.NORM_PRIORITY - 1);
         return thread;
@@ -269,7 +272,7 @@ final class ImageCard extends LinearLayout {
      * screen. Null if it can't be read.
      */
     @SuppressWarnings("deprecation") // newInstance(String) arrived in Android 12.
-    private static Bitmap decode(File file, int width, int height) {
+    static Bitmap decode(File file, int width, int height) {
         try {
             BitmapRegionDecoder decoder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
                     ? BitmapRegionDecoder.newInstance(file.getPath())

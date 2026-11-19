@@ -26,10 +26,11 @@ use meegone_core_data::{
 use meegone_core_state::{Access, Health, Theme};
 use meegone_core_ui::tokens;
 use meegone_launcher::{
-    Age, AppMenuItem, BADGE_ROWS, Bounds, CardContent, CellKey, CheckStatus, DailyImage, Direction,
-    EventsListMode, EventsMenuFrame, FolderId, GridLayout, HomeView, Launcher, Layout, LiftFrame,
-    MenuItem, NotificationMenuItem, PinchEvent, PinchKind, PointerEvent, PointerKind, RECENT_ROWS,
-    RecentFrame, RecentMode, RecentWindow, SettingsGroup, Shared, ShellIntent, Surface,
+    Age, AppMenuItem, BADGE_ROWS, Bounds, CardContent, CellKey, CheckStatus, DailyImage,
+    DetailsContent, Direction, EventsListMode, EventsMenuFrame, FolderId, GridLayout, HomeView,
+    Launcher, Layout, LiftFrame, MenuItem, NotificationMenuItem, PinchEvent, PinchKind,
+    PointerEvent, PointerKind, RECENT_ROWS, RecentFrame, RecentMode, RecentWindow, SettingsGroup,
+    Shared, ShellIntent, Surface, UpdateStatus,
 };
 
 /// A phone 1080 × 2400 px at 2.75 px per dp.
@@ -2896,14 +2897,22 @@ fn apps21_given_a_backed_up_app_comes_after_a_week_then_it_is_new_at_the_end() {
 /// The image cache holding today's image, Puffins on a cliff, in its first file, as the daily
 /// image's updater leaves it (WALL-09, ADR 0022).
 fn image_cached(fakes: &Fakes) {
+    image_cached_with_link(fakes, None);
+}
+
+/// [`image_cached`], with `info_link` as the image's link to more about it (WALL-15).
+fn image_cached_with_link(fakes: &Fakes, info_link: Option<&str>) {
+    let link = info_link.unwrap_or("-");
     let mut files = fakes.storage.files.lock().unwrap();
     files.insert(
         StoredFile::ImageDetails,
         seal(
             "image-cache",
             2,
-            "current 20261116 en-GB Puffins\\son\\sa\\scliff,\\sSkomer \
-             ©\\sA\\sPhotographer\\s/\\sAgency - 1763272800000 a\nprevious -\n",
+            &format!(
+                "current 20261116 en-GB Puffins\\son\\sa\\scliff,\\sSkomer \
+                 ©\\sA\\sPhotographer\\s/\\sAgency {link} 1763272800000 a\nprevious -\n"
+            ),
         ),
     );
     files.insert(StoredFile::ImageA, b"\xff\xd8 a JPEG".to_vec());
@@ -2912,9 +2921,16 @@ fn image_cached(fakes: &Fakes) {
 /// MeeGone with today's image cached, its daily image turned on in Settings, showing Events.
 fn with_the_daily_image(fakes: &Fakes) -> Launcher {
     image_cached(fakes);
+    daily_image_on(fakes)
+}
+
+/// MeeGone with its daily image turned on in Settings, showing Events.
+fn daily_image_on(fakes: &Fakes) -> Launcher {
     let mut launcher = Launcher::start(fakes.platform());
     launcher.dispatch(ShellIntent::OpenSettings);
     launcher.view().image_settings().daily_image_toggled(true);
+    // The switch takes effect with the frame, as on the device.
+    launcher.frame();
     launcher.dispatch(ShellIntent::Back);
     launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
     launcher
@@ -2924,6 +2940,18 @@ fn with_the_daily_image(fakes: &Fakes) -> Launcher {
 fn image_card(launcher: &mut Launcher) -> Option<CardContent> {
     launcher.frame().image_card?;
     launcher.view().image_card().content()
+}
+
+/// Taps the image-of-the-day card, which opens the image details screen (EVT-12).
+fn tap_the_image_card(launcher: &mut Launcher) {
+    let revision = launcher.frame().image_card.expect("the card shows");
+    assert!(launcher.view().image_card().tapped(revision));
+}
+
+/// What the image details screen shows after a frame, or `None` while it doesn't (WALL-15).
+fn image_details(launcher: &mut Launcher) -> Option<DetailsContent> {
+    launcher.frame().image_details?;
+    launcher.view().image_details().content()
 }
 
 #[test]
@@ -3313,8 +3341,8 @@ fn ac15_given_the_daily_image_is_on_and_wifi_when_a_new_image_is_published_then_
         .clone()
         .unwrap();
     assert_eq!(current.applied_at_ms, Some(NOV_19_MS));
-    // The details screen opens from the card, which shows its title and attribution
-    // (LEGAL-03); the screen draws them with #30.
+    // The details screen opens from the card, and both show its title and attribution
+    // (LEGAL-03).
     launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
     let card = image_card(&mut launcher).expect("the card shows");
     assert_eq!(card.title, "Hunting from dusk till dawn");
@@ -3322,11 +3350,151 @@ fn ac15_given_the_daily_image_is_on_and_wifi_when_a_new_image_is_published_then_
         card.attribution,
         "Pair of barn owls (© Zahoor Salmi/Getty Images)"
     );
-    let revision = launcher.frame().image_card.unwrap();
-    assert!(launcher.view().image_card().tapped(revision));
+    tap_the_image_card(&mut launcher);
     assert!(launcher.frame().image_details_open);
+    let details = image_details(&mut launcher).expect("the details show");
+    assert_eq!(details.title, card.title);
+    assert_eq!(details.attribution, card.attribution);
+    assert_eq!(details.date, "18 November");
+    assert_eq!(details.region, "en-US");
+    assert!(details.more_info);
     assert_eq!(current.title, card.title);
     assert_eq!(current.attribution, card.attribution);
+    // And when it went on the lock screen (WALL-16).
+    assert_eq!(
+        launcher.view().image_settings().update_status(),
+        Some(UpdateStatus {
+            updated: Some("19 November, 12:00 AM".into()),
+            checks: CheckStatus::Fine,
+        })
+    );
+}
+
+#[test]
+fn wall15_given_a_cached_image_with_an_info_link_then_more_info_opens_it_in_the_browser_and_without_one_it_is_hidden()
+ {
+    // Issue #30: WALL-15, SEC-02.
+    let link = "https://www.bing.com/search?q=Atlantic+puffin&form=hpcapt";
+    let fakes = Fakes::default();
+    image_cached_with_link(&fakes, Some(link));
+    let mut launcher = daily_image_on(&fakes);
+    tap_the_image_card(&mut launcher);
+
+    let details = image_details(&mut launcher).expect("the details show");
+    assert!(details.more_info);
+    assert!(launcher.view().image_details().more_info());
+    let frame = launcher.frame();
+
+    // It opens in the browser; MeeGone stays where it was.
+    assert_eq!(*fakes.system.opened_urls.lock().unwrap(), [link]);
+    assert!(frame.image_details_open);
+
+    // Without a link, More info is hidden, and nothing opens.
+    let fakes = Fakes::default();
+    image_cached(&fakes);
+    let mut launcher = daily_image_on(&fakes);
+    tap_the_image_card(&mut launcher);
+
+    assert!(!image_details(&mut launcher).unwrap().more_info);
+    assert!(!launcher.view().image_details().more_info());
+    launcher.frame();
+    assert!(fakes.system.opened_urls.lock().unwrap().is_empty());
+
+    // Nor without a browser to open it (SRS 8.1).
+    let fakes = Fakes::default();
+    image_cached_with_link(&fakes, Some(link));
+    *fakes.system.browser.lock().unwrap() = false;
+    let mut launcher = daily_image_on(&fakes);
+    tap_the_image_card(&mut launcher);
+    assert!(!image_details(&mut launcher).unwrap().more_info);
+}
+
+#[test]
+fn wall16_given_the_last_attempt_failed_for_lack_of_connection_then_settings_says_no_connection_will_try_again_later()
+ {
+    // Issue #30: WALL-16. Today's image went on the lock screen; then the next check found no
+    // connection. The host words it: "Last updated 16 November, 6:00 AM" and "No connection.
+    // Will try again later."
+    let fakes = Fakes::default();
+    image_cached(&fakes);
+    let (shared, mut launcher) = with_the_daily_check(&fakes);
+
+    assert_eq!(
+        run_the_daily_job(&fakes, &shared, &mut launcher, NOV_19_MS + 1),
+        1
+    );
+
+    let frame = launcher.frame();
+    assert!(frame.image_status.is_some());
+    let status = UpdateStatus {
+        updated: Some("16 November, 6:00 AM".into()),
+        checks: CheckStatus::Retrying("No connection".into()),
+    };
+    assert_eq!(
+        launcher.view().image_settings().update_status(),
+        Some(status)
+    );
+
+    // The details screen says the same.
+    launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
+    tap_the_image_card(&mut launcher);
+    let frame = launcher.frame();
+    assert!(frame.image_details.is_some());
+    assert!(frame.image_status.is_some());
+
+    // Once the daily image is off, there is no status to show.
+    launcher.view().image_settings().daily_image_toggled(false);
+    assert_eq!(launcher.frame().image_status, None);
+}
+
+#[test]
+fn wall15_given_an_image_then_the_home_menus_lock_screen_image_opens_its_details_and_settings_open_over_them()
+ {
+    // Issue #30: HOME-10, WALL-15, HOME-08. Before the first image, the item opens Settings
+    // (home10_in_events_the_home_menu_has_no_edit_applications).
+    let fakes = Fakes::default();
+    let mut launcher = with_the_daily_image(&fakes);
+    launcher.dispatch(ShellIntent::OpenMenu);
+
+    launcher.dispatch(ShellIntent::ChooseMenuItem(MenuItem::LockScreenImage));
+
+    let frame = launcher.frame();
+    assert!(frame.image_details_open);
+    assert!(!frame.settings_open);
+    assert_eq!(
+        image_details(&mut launcher),
+        Some(DetailsContent {
+            title: "Puffins on a cliff, Skomer".into(),
+            attribution: "© A Photographer / Agency".into(),
+            date: "16 November".into(),
+            region: "en-GB".into(),
+            image_path: "images/a",
+            image_key: "20261116 en-GB images/a".into(),
+            more_info: false,
+        })
+    );
+
+    // Settings opens over the details at its Lock-screen image group; Back comes back to them.
+    assert!(launcher.view().image_details().open_settings());
+    let frame = launcher.frame();
+    assert!(frame.settings_open);
+    assert_eq!(frame.settings_group, Some(SettingsGroup::LockScreenImage));
+    assert!(frame.image_details_open);
+    launcher.dispatch(ShellIntent::Back);
+    let frame = launcher.frame();
+    assert!(!frame.settings_open);
+    assert!(frame.image_details_open);
+
+    // Turned off in Settings over them, the details close: Back goes home, not to an empty
+    // screen.
+    assert!(launcher.view().image_details().open_settings());
+    launcher.frame();
+    launcher.view().image_settings().daily_image_toggled(false);
+    launcher.dispatch(ShellIntent::Back);
+    let frame = launcher.frame();
+    assert!(!frame.settings_open);
+    assert!(!frame.image_details_open);
+    assert_eq!(frame.current, HomeView::Events);
 }
 
 #[test]

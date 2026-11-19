@@ -5,8 +5,8 @@
 //! ([`jni`]), and keep MeeGone's files in the folder the activity passes in, its private
 //! `Context.getFilesDir()` (PRIV-05). Only `jni.rs` contains `unsafe` code.
 //!
-//! - [`system`]: the home-app role, the clock, the device's locale, free storage, and web search
-//!   (HOME-01, ONB-04, WALL-05, SRCH-05).
+//! - [`system`]: the home-app role, the clock, the device's locale, free storage, opening links
+//!   and web search (HOME-01, ONB-04, WALL-05, WALL-15, SRCH-05).
 //! - [`apps`]: the app catalogue, launching and search keys (APPS-01, APPS-10, SRCH-02,
 //!   ADR 0010).
 //! - [`notifications`]: notification access, the active notifications, opening and dismissing
@@ -19,8 +19,7 @@
 //! - [`scheduler`]: the daily image's job, and "Update now" (ARCH-07, WALL-03, WALL-11,
 //!   ADR 0029, ADR 0030).
 //!
-//! What isn't built yet answers with its "if unavailable" value (SRS 8.1), through
-//! [`not_yet`].
+//! What isn't built yet answers with its "if unavailable" value (SRS 8.1).
 
 mod apps;
 mod jni;
@@ -53,9 +52,4 @@ pub fn platform(env: Env, bridge: &LocalRef, files_dir: &LocalRef) -> Result<Pla
         system: Arc::new(system::AndroidSystem::new(env, bridge)?),
         storage: Arc::new(FileStorage::new(files_dir)),
     })
-}
-
-/// What a request answers until its issue builds it.
-fn not_yet() -> DataError {
-    DataError::Unsupported("Not available yet".into())
 }

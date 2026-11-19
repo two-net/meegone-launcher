@@ -9,7 +9,9 @@ use crate::HomeView;
 pub enum MenuItem {
     /// Opens Settings (SET-01).
     LauncherSettings,
-    /// Opens Settings at its Lock-screen image group (SET-02).
+    /// Opens the image details screen while it has an image to show (WALL-15), and otherwise
+    /// Settings at its Lock-screen image group, so it works before the first image (SET-02,
+    /// WALL-02, WALL-10).
     LockScreenImage,
     /// Enters edit mode. Applications only.
     EditApplications,

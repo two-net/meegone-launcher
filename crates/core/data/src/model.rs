@@ -207,6 +207,10 @@ pub enum TimeStyle {
     Time,
     /// The short weekday and the time, such as "Wed 07:00" (EVT-02).
     WeekdayTime,
+    /// The day of the month, the month in full and the time, in the language's order, such as
+    /// "19 November, 07:00" or "November 19, 7:00 AM": when the daily image last updated
+    /// (WALL-16).
+    DayMonthTime,
 }
 
 /// A size in physical pixels.

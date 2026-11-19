@@ -390,3 +390,197 @@ fn once_off_settings_offer_the_reset_and_the_wallpaper_settings() {
     }));
     assert!(!section.off_actions_offered());
 }
+
+fn details(state: LockImageState) -> (Latest<LockImageState>, ImageDetailsScreen, Sent) {
+    let latest = Latest::new(Arc::new(state));
+    let sent: Sent = Rc::default();
+    let dispatch = Dispatch::new({
+        let sent = sent.clone();
+        move |intent| sent.borrow_mut().push(intent)
+    });
+    (
+        latest.clone(),
+        ImageDetailsScreen::new(latest, dispatch),
+        sent,
+    )
+}
+
+/// [`on`], with a date written and an image with an info link, and a browser to open it.
+fn on_with_link() -> LockImageState {
+    let mut state = on();
+    let current = state.current.as_mut().unwrap();
+    current.info_link = Some("https://example.com/puffins".into());
+    state.date = "16 November".into();
+    state.has_browser = true;
+    state
+}
+
+#[test]
+fn the_details_show_the_image_its_title_attribution_date_and_region() {
+    // WALL-15, LEGAL-03
+    let (_, details, _) = details(on_with_link());
+
+    assert!(details.is_offered());
+    details.revision();
+    assert_eq!(
+        details.content(),
+        Some(DetailsContent {
+            title: "Puffins on a cliff, Skomer".into(),
+            attribution: "© A Photographer / Agency".into(),
+            date: "16 November".into(),
+            region: "en-GB".into(),
+            image_path: "images/a",
+            image_key: "20261116 en-GB images/a".into(),
+            more_info: true,
+        })
+    );
+}
+
+#[test]
+fn the_details_are_offered_only_while_the_daily_image_is_on_and_has_an_image() {
+    // WALL-15, ARCH-09: the hidden card doesn't hide them.
+    let shown = |state: LockImageState| details(state).1.is_offered();
+    assert!(shown(LockImageState {
+        show_card: false,
+        ..on()
+    }));
+
+    assert!(!shown(LockImageState {
+        status: ImageStatus::Off,
+        ..on()
+    }));
+    assert!(!shown(LockImageState {
+        status: ImageStatus::Unavailable("Blocked".into()),
+        ..on()
+    }));
+    assert!(!shown(LockImageState {
+        current: None,
+        ..on()
+    }));
+    assert!(!shown(LockImageState {
+        current: Some(record("20261116", None)),
+        ..on()
+    }));
+}
+
+#[test]
+fn more_info_opens_the_link_and_is_hidden_without_one_or_a_browser() {
+    // WALL-15, SEC-02, SRS 8.1
+    let (latest, details, sent) = details(on_with_link());
+    assert!(details.more_info());
+    assert!(matches!(sent.borrow()[..], [LockImageIntent::OpenInfoLink]));
+
+    for state in [
+        on(),
+        LockImageState {
+            has_browser: false,
+            ..on_with_link()
+        },
+        {
+            let mut state = on_with_link();
+            state.current.as_mut().unwrap().info_link = Some("http://example.com".into());
+            state
+        },
+    ] {
+        latest.set(Arc::new(state));
+        details.revision();
+        assert!(!details.content().unwrap().more_info);
+        assert!(!details.more_info());
+    }
+    assert_eq!(sent.borrow().len(), 1);
+}
+
+#[test]
+fn settings_on_the_details_opens_settings_while_they_are_offered() {
+    // WALL-15
+    let (latest, details, sent) = details(on());
+    assert!(details.open_settings());
+    assert!(matches!(sent.borrow()[..], [LockImageIntent::OpenSettings]));
+
+    latest.set(Arc::new(LockImageState {
+        status: ImageStatus::Off,
+        ..on()
+    }));
+    assert!(!details.open_settings());
+    assert_eq!(sent.borrow().len(), 1);
+}
+
+#[test]
+fn the_details_revision_changes_only_when_what_they_show_does() {
+    // ADR 0031
+    let (latest, details, _) = details(on());
+    let first = details.revision();
+    assert_eq!(details.revision(), first);
+
+    latest.set(Arc::new(LockImageState {
+        updating: true,
+        ..on()
+    }));
+    assert_eq!(details.revision(), first);
+
+    latest.set(Arc::new(on_with_link()));
+    let second = details.revision();
+    assert_ne!(second, first);
+    assert!(details.content().unwrap().more_info);
+
+    // With nothing to show, it keeps what it last showed.
+    latest.set(Arc::new(LockImageState {
+        status: ImageStatus::Off,
+        ..on()
+    }));
+    assert_eq!(details.revision(), second);
+    assert!(details.content().is_some());
+}
+
+#[test]
+fn the_status_line_says_when_the_image_last_updated_and_the_last_problem() {
+    // WALL-16, SRS 7.6
+    let retrying = CheckStatus::Retrying("No connection".into());
+    let (latest, section, _) = section(LockImageState {
+        updated: Some("19 November, 07:00".into()),
+        checks: retrying.clone(),
+        ..on()
+    });
+
+    assert_eq!(
+        section.update_status(),
+        Some(UpdateStatus {
+            updated: Some("19 November, 07:00".into()),
+            checks: retrying,
+        })
+    );
+
+    // Before the first image, it says so; while the daily image is off, there is none.
+    latest.set(Arc::new(on()));
+    assert_eq!(
+        section.update_status(),
+        Some(UpdateStatus {
+            updated: None,
+            checks: CheckStatus::Fine,
+        })
+    );
+    latest.set(Arc::new(LockImageState {
+        status: ImageStatus::Off,
+        updated: Some("19 November, 07:00".into()),
+        ..on()
+    }));
+    assert_eq!(section.update_status(), None);
+}
+
+#[test]
+fn the_status_line_revision_changes_only_when_it_does() {
+    // WALL-16, ADR 0031
+    let (latest, section, _) = section(on());
+    let first = section.status_revision();
+    latest.set(Arc::new(LockImageState {
+        show_card: false,
+        ..on()
+    }));
+    assert_eq!(section.status_revision(), first);
+
+    latest.set(Arc::new(LockImageState {
+        checks: CheckStatus::Retrying("No connection".into()),
+        ..on()
+    }));
+    assert_ne!(section.status_revision(), first);
+}

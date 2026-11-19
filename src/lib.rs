@@ -17,11 +17,11 @@ pub use meegone_shell_state::{
 use meegone_shell_ui::ShellView;
 pub use meegone_shell_ui::{
     Age, AppMenuFrame, AppMenuItem, AppsFrame, BADGE_ROWS, Bounds, CardContent, Cell, CellKey,
-    CheckStatus, CloseFrame, DailyImage, EditFrame, EventsListFrame, EventsListMode,
-    EventsMenuFrame, EventsRow, FolderFrame, FolderId, GridChangeFrame, GridLayout, HomeFrame,
-    HoverFrame, LiftFrame, MenuFrame, MergeFrame, NotificationMenuItem, RECENT_ROWS, RecentFrame,
-    RecentMode, RecentWindow, RenameFrame, RowTarget, SearchFrame, ShownCard, Surface,
-    SurfaceCellsFrame,
+    CheckStatus, CloseFrame, DailyImage, DetailsContent, EditFrame, EventsListFrame,
+    EventsListMode, EventsMenuFrame, EventsRow, FolderFrame, FolderId, GridChangeFrame, GridLayout,
+    HomeFrame, HoverFrame, LiftFrame, MenuFrame, MergeFrame, NotificationMenuItem, RECENT_ROWS,
+    RecentFrame, RecentMode, RecentWindow, RenameFrame, RowTarget, SearchFrame, ShownCard, Surface,
+    SurfaceCellsFrame, UpdateStatus,
 };
 
 pub struct Launcher {

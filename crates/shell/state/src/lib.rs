@@ -141,7 +141,7 @@ pub struct ShellState {
     /// The group Settings opened at, or `None` for its top.
     pub settings_group: Option<SettingsGroup>,
     /// The image details screen covers the home views (WALL-15). The image-of-the-day card in
-    /// Events opens it (EVT-12, ADR 0022).
+    /// Events and the home menu's Lock-screen image open it (EVT-12, ADR 0022, ADR 0031).
     pub image_details_open: bool,
     /// The home menu, open over the current view (HOME-10). It covers the home views: they get
     /// no touches while it is open.
@@ -698,7 +698,12 @@ impl HomeShell {
                 self.events.dispatch(EventsIntent::RefreshNotifications);
             }
             ShellIntent::UsageAccessChanged => self.recent.dispatch(RecentIntent::Refresh),
-            ShellIntent::ClockChanged => self.events.dispatch(EventsIntent::RefreshHeader),
+            ShellIntent::ClockChanged => {
+                self.events.dispatch(EventsIntent::RefreshHeader);
+                // The image's date and when it last updated are written in the time zone and
+                // the 12- or 24-hour setting (L10N-03).
+                self.lockimage.dispatch(LockImageIntent::Refresh);
+            }
             ShellIntent::NewImageShown => {
                 self.image_change.start(self.carousel.animation_scale());
             }
@@ -708,6 +713,11 @@ impl HomeShell {
             ShellIntent::Events(intent) => self.events.dispatch(intent),
             ShellIntent::Recent(intent) => self.recent.dispatch(intent),
             ShellIntent::LockImage(LockImageIntent::OpenDetails) => self.open_image_details(),
+            ShellIntent::LockImage(LockImageIntent::OpenSettings) => {
+                if self.state.image_details_open {
+                    self.open_settings(Some(SettingsGroup::LockScreenImage));
+                }
+            }
             ShellIntent::LockImage(intent) => self.lockimage.dispatch(intent),
             ShellIntent::Settings(intent) => {
                 self.settings.dispatch(intent);
@@ -723,6 +733,7 @@ impl HomeShell {
         self.keep_mode_in_step();
         self.keep_cells_in_step();
         self.keep_events_in_step();
+        self.keep_image_details_in_step();
         self.keep_recent_in_step();
         self.keep_close_in_step();
         self.lift.sync(&self.drag_surfaces());
@@ -972,6 +983,15 @@ impl HomeShell {
             self.events_change.start(self.carousel.animation_scale());
         }
         self.seen_rows = rows;
+    }
+
+    /// The image details screen closes once it has nothing to show, such as when the daily image
+    /// is turned off in Settings over it, or the lock-screen image stops working (WALL-15,
+    /// ARCH-09).
+    fn keep_image_details_in_step(&mut self) {
+        if self.state.image_details_open && !self.image_details_offered() {
+            self.close_image_details();
+        }
     }
 
     /// Recent leaves out the apps Applications hides (APPS-19, REC-03). When they change, by a
@@ -1445,6 +1465,8 @@ impl HomeShell {
         self.state.menu = None;
         match item {
             MenuItem::LauncherSettings => self.open_settings(None),
+            // Before the first image, the details would have nothing to show (WALL-02, WALL-10).
+            MenuItem::LockScreenImage if self.image_details_offered() => self.open_image_details(),
             MenuItem::LockScreenImage => self.open_settings(Some(SettingsGroup::LockScreenImage)),
             MenuItem::EditApplications => self.apps.dispatch(AppsIntent::EnterEditMode),
         }
@@ -1475,10 +1497,20 @@ impl HomeShell {
         std::mem::take(&mut self.state.settings_open)
     }
 
-    /// Opens the image details screen over the home views (EVT-12, WALL-15), while the
-    /// lock-screen image works (ARCH-09). It shows only its name until #30 draws it.
+    /// Whether the image details screen can open: the lock-screen image works (ARCH-09), and
+    /// its daily image is on with an image to show (WALL-15).
+    pub fn image_details_offered(&self) -> bool {
+        self.lockimage_ready() && self.lockimage.state().has_details()
+    }
+
+    /// Opens the image details screen over the home views (EVT-12, WALL-15), while it has
+    /// something to show. The image and its status are read again, so they are current.
     fn open_image_details(&mut self) {
-        if !self.lockimage_ready() {
+        if !self.image_details_offered() {
+            return;
+        }
+        self.lockimage.dispatch(LockImageIntent::Refresh);
+        if !self.image_details_offered() {
             return;
         }
         // It covers the home views as Settings does.
@@ -1646,7 +1678,7 @@ mod tests {
     use meegone_core_state::{Access, Health, Theme, ThemeChoice};
     use meegone_events_state::NotificationMenuItem;
     use meegone_lockimage_data::{ImageCache, PersistentImageCache};
-    use meegone_lockimage_state::{CheckStatus, ImageRecord};
+    use meegone_lockimage_state::{CheckStatus, ImageFile, ImageRecord};
 
     use super::*;
 
@@ -2000,10 +2032,19 @@ mod tests {
             .unwrap();
     }
 
+    /// Laid out, with the daily image on and `20261116`'s image cached.
+    fn with_an_image(fakes: &Fakes) -> HomeShell {
+        let mut shell = laid_out(fakes);
+        shell.dispatch(ShellIntent::LockImage(LockImageIntent::SetEnabled(true)));
+        cache_image(fakes, "20261116");
+        shell.dispatch(ShellIntent::LockImage(LockImageIntent::Refresh));
+        shell
+    }
+
     #[test]
     fn the_image_card_opens_its_details_over_the_home_views() {
         // EVT-12, WALL-15: they cover the views as Settings does, and Back or Home closes them.
-        let mut shell = laid_out(&Fakes::default());
+        let mut shell = with_an_image(&Fakes::default());
         go(&mut shell, Direction::Previous);
         shell.dispatch(ShellIntent::OpenMenu);
 
@@ -2026,9 +2067,92 @@ mod tests {
     }
 
     #[test]
+    fn the_image_details_open_only_with_an_image_to_show() {
+        // WALL-15, WALL-02, WALL-10
+        let fakes = Fakes::default();
+        let mut shell = laid_out(&fakes);
+        cache_image(&fakes, "20261116");
+        shell.dispatch(ShellIntent::LockImage(LockImageIntent::Refresh));
+        assert!(!shell.image_details_offered());
+
+        // While the daily image is off, its image is never shown.
+        shell.dispatch(ShellIntent::LockImage(LockImageIntent::OpenDetails));
+        assert!(!shell.state().image_details_open);
+
+        // On, but before the first image.
+        let mut shell = laid_out(&Fakes::default());
+        shell.dispatch(ShellIntent::LockImage(LockImageIntent::SetEnabled(true)));
+        shell.dispatch(ShellIntent::LockImage(LockImageIntent::OpenDetails));
+        assert!(!shell.state().image_details_open);
+
+        let mut shell = with_an_image(&Fakes::default());
+        assert!(shell.image_details_offered());
+        shell.dispatch(ShellIntent::LockImage(LockImageIntent::OpenDetails));
+        assert!(shell.state().image_details_open);
+    }
+
+    #[test]
+    fn settings_on_the_image_details_opens_at_the_lock_screen_image_over_them() {
+        // WALL-15, HOME-08
+        let mut shell = with_an_image(&Fakes::default());
+        shell.dispatch(ShellIntent::LockImage(LockImageIntent::OpenSettings));
+        assert!(!shell.state().settings_open);
+
+        shell.dispatch(ShellIntent::LockImage(LockImageIntent::OpenDetails));
+        shell.dispatch(ShellIntent::LockImage(LockImageIntent::OpenSettings));
+        assert!(shell.state().settings_open);
+        assert_eq!(
+            shell.state().settings_group,
+            Some(SettingsGroup::LockScreenImage)
+        );
+        assert!(shell.state().image_details_open);
+
+        shell.dispatch(ShellIntent::Back);
+        assert!(!shell.state().settings_open);
+        assert!(shell.state().image_details_open);
+    }
+
+    #[test]
+    fn the_image_details_close_once_there_is_nothing_to_show() {
+        // WALL-15, WALL-12: turned off in Settings over them, Back goes home, not to an empty
+        // screen.
+        let mut shell = with_an_image(&Fakes::default());
+        shell.dispatch(ShellIntent::LockImage(LockImageIntent::OpenDetails));
+        shell.dispatch(ShellIntent::LockImage(LockImageIntent::OpenSettings));
+
+        shell.dispatch(ShellIntent::LockImage(LockImageIntent::SetEnabled(false)));
+
+        assert!(!shell.state().image_details_open);
+        assert!(shell.state().settings_open);
+        shell.dispatch(ShellIntent::Back);
+        assert!(!shell.state().settings_open);
+        assert!(!shell.covered());
+    }
+
+    #[test]
+    fn a_change_of_clock_writes_the_images_times_again() {
+        // WALL-16, L10N-03
+        let fakes = Fakes::default();
+        let mut shell = with_an_image(&fakes);
+        let set_at = 1_795_046_400_000 + 7 * 3_600_000;
+        PersistentImageCache::new(fakes.storage.clone())
+            .applied(ImageFile::A, set_at, None)
+            .unwrap();
+        shell.dispatch(ShellIntent::LockImage(LockImageIntent::Refresh));
+        let updated = |shell: &HomeShell| shell.lockimage().state().updated.clone();
+        assert_eq!(updated(&shell).as_deref(), Some("19 November, 7:00 AM"));
+        assert_eq!(shell.lockimage().state().date, "16 November");
+
+        *fakes.system.hour_24.lock().unwrap() = true;
+        shell.dispatch(ShellIntent::ClockChanged);
+
+        assert_eq!(updated(&shell).as_deref(), Some("19 November, 07:00"));
+    }
+
+    #[test]
     fn settings_opened_over_the_image_details_close_first() {
         // HOME-08: Back closes the topmost screen.
-        let mut shell = laid_out(&Fakes::default());
+        let mut shell = with_an_image(&Fakes::default());
         shell.dispatch(ShellIntent::LockImage(LockImageIntent::OpenDetails));
         shell.dispatch(ShellIntent::OpenSettings);
 
@@ -2043,7 +2167,7 @@ mod tests {
     #[test]
     fn home_from_an_app_closes_the_image_details_for_always_applications() {
         // HOME-06
-        let mut shell = laid_out(&Fakes::default());
+        let mut shell = with_an_image(&Fakes::default());
         go(&mut shell, Direction::Previous);
         shell.dispatch(ShellIntent::Settings(SettingsIntent::SetHomeTarget(
             HomeTarget::Applications,
@@ -3361,6 +3485,22 @@ mod tests {
         shell.dispatch(ShellIntent::ChooseMenuItem(MenuItem::EditApplications));
         assert_eq!(shell.state().menu, None);
         assert!(shell.apps().state().edit_mode);
+    }
+
+    #[test]
+    fn lock_screen_image_opens_the_image_details_once_there_is_an_image() {
+        // HOME-10, WALL-15: before the first image it opens Settings, as above.
+        let mut shell = with_an_image(&Fakes::default());
+        go(&mut shell, Direction::Previous);
+
+        shell.dispatch(ShellIntent::OpenMenu);
+        shell.dispatch(ShellIntent::ChooseMenuItem(MenuItem::LockScreenImage));
+
+        assert_eq!(shell.state().menu, None);
+        assert!(shell.state().image_details_open);
+        assert!(!shell.state().settings_open);
+        shell.dispatch(ShellIntent::Back);
+        assert!(!shell.covered());
     }
 
     #[test]

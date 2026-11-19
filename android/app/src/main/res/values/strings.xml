@@ -240,6 +240,29 @@
     <string name="lock_screen_reset_failed">The lock screen couldn\'t be reset.</string>
     <!-- Written instructions when the system has no wallpaper settings to open (SRS 8.1). -->
     <string name="wallpaper_settings_unavailable">To change the wallpaper, open Settings, then Wallpaper.</string>
+    <!-- Settings → Lock-screen image and the image details screen: when MeeGone last put an
+         image on the lock screen (WALL-16). %1$s is the date and time, such as
+         "19 November, 07:00". -->
+    <string name="image_last_updated">Last updated %1$s</string>
+    <!-- The same line before the first image is on the lock screen (WALL-16). -->
+    <string name="image_not_updated_yet">Not updated yet</string>
+    <!-- Below it while the daily check fails and will run again (WALL-16, REL-04). %1$s is the
+         problem in plain words, such as "No connection". -->
+    <string name="image_will_try_again">%1$s. Will try again later.</string>
+    <!-- Below "Daily image unavailable": the problem that made it so (SRS 7.6). %1$s is the
+         problem in plain words. -->
+    <string name="image_last_problem">%1$s.</string>
+    <!-- The image details screen: the image's date and the feed region it is from (WALL-15).
+         %1$s is the date, such as "15 November"; %2$s the region, such as
+         "English (United Kingdom)". -->
+    <string name="image_date_region">%1$s · %2$s</string>
+    <!-- The image details screen: opens the image source's page about the image in the browser
+         (WALL-15). Hidden when there is no page or no browser. -->
+    <string name="image_more_info">More info</string>
+    <!-- The image details screen: opens Settings at its Lock-screen image group (WALL-15). -->
+    <string name="image_open_settings">Settings</string>
+    <!-- Shown briefly when no browser could open a link (SEC-02, SRS 8.1). -->
+    <string name="browser_unavailable">No browser can open this link</string>
     <!-- Recent's card while MeeGone has no usage access: one plain sentence saying what is
          read and why (REC-02, ONB-02), and the button that opens the system's usage-access
          screen. -->

@@ -58,6 +58,7 @@ import android.provider.Telephony;
 import android.service.notification.NotificationListenerService;
 import android.service.notification.StatusBarNotification;
 import android.telecom.TelecomManager;
+import android.text.TextUtils;
 import android.util.Log;
 import android.view.Display;
 import android.view.HapticFeedbackConstants;
@@ -186,6 +187,7 @@ final class Bridge {
     private static final int STYLE_DAY_MONTH = 1;
     private static final int STYLE_TIME = 2;
     private static final int STYLE_WEEKDAY_TIME = 3;
+    private static final int STYLE_DAY_MONTH_TIME = 4;
     private static final char[] HEX = "0123456789abcdef".toCharArray();
     /** Accents and other marks that sit on a letter, removed for search (L10N-04). */
     private static final Pattern MARKS = Pattern.compile("\\p{Mn}+");
@@ -402,6 +404,59 @@ final class Bridge {
             Log.w(TAG, "Couldn't search the web: " + e.getClass().getSimpleName());
             return context.getString(R.string.web_search_unavailable);
         }
+    }
+
+    /**
+     * Opens {@code url} in the device's browser, outside MeeGone (WALL-15, SEC-02, ADR 0031).
+     * Anything but an {@code https:} link with a host is refused. Where a default browser is
+     * set, the link goes to it, so an app that claims the site's links doesn't take it. Returns
+     * null, or a short message if no browser could open it. The link is never logged. Called
+     * from Rust.
+     */
+    String openInBrowser(String url) {
+        try {
+            Uri link = Uri.parse(url);
+            if (!"https".equals(link.getScheme()) || TextUtils.isEmpty(link.getHost())) {
+                return context.getString(R.string.browser_unavailable);
+            }
+            Intent view = new Intent(Intent.ACTION_VIEW, link)
+                    .addCategory(Intent.CATEGORY_BROWSABLE)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            String browser = defaultBrowser();
+            Activity current = activity;
+            Context from = current != null ? current : context;
+            try {
+                from.startActivity(new Intent(view).setPackage(browser));
+            } catch (ActivityNotFoundException e) {
+                if (browser == null) {
+                    throw e;
+                }
+                // The default browser can't take it after all: any browser may.
+                from.startActivity(view);
+            }
+            return null;
+        } catch (RuntimeException e) {
+            // ActivityNotFoundException: no browser is installed.
+            Log.w(TAG, "Couldn't open a link: " + e.getClass().getSimpleName());
+            return context.getString(R.string.browser_unavailable);
+        }
+    }
+
+    /**
+     * The default browser's package, or null where none is set and the system would ask which
+     * app to use. The manifest's queries let MeeGone see browsers.
+     */
+    private String defaultBrowser() {
+        Intent browse = new Intent(Intent.ACTION_VIEW, Uri.parse("https://"))
+                .addCategory(Intent.CATEGORY_BROWSABLE);
+        ResolveInfo found = context.getPackageManager()
+                .resolveActivity(browse, PackageManager.MATCH_DEFAULT_ONLY);
+        if (found == null || found.activityInfo == null) {
+            return null;
+        }
+        // Without a default, the system's chooser answers, from the "android" package.
+        String browser = found.activityInfo.packageName;
+        return "android".equals(browser) ? null : browser;
     }
 
     /**
@@ -875,7 +930,8 @@ final class Bridge {
 
     /**
      * {@code atMs} in the style numbered by {@code style}, in the device's language, time zone
-     * and 12- or 24-hour setting, or null (EVT-01, EVT-02, L10N-03, ADR 0019). The language's
+     * and 12- or 24-hour setting, or null (EVT-01, EVT-02, WALL-16, L10N-03, ADR 0019,
+     * ADR 0031). The language's
      * own patterns order the fields, such as "17 November" or "November 17", and a weekday or a
      * month shown on its own is capitalised as the language does at the start of a line. Called
      * from Rust.
@@ -896,6 +952,9 @@ final class Bridge {
                     break;
                 case STYLE_WEEKDAY_TIME:
                     skeleton = hour24 ? "EHm" : "Ehm";
+                    break;
+                case STYLE_DAY_MONTH_TIME:
+                    skeleton = hour24 ? "MMMMdHm" : "MMMMdhm";
                     break;
                 default:
                     return null;

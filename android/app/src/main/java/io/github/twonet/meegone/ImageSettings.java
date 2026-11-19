@@ -2,6 +2,7 @@ package io.github.twonet.meegone;
 
 import android.content.Context;
 import android.content.res.ColorStateList;
+import android.content.res.Resources;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.ColorDrawable;
@@ -13,13 +14,15 @@ import android.widget.Switch;
 import android.widget.TextView;
 
 /**
- * Settings → Lock-screen image (SET-02, ADR 0022, ADR 0029, ADR 0030), as far as #21, #28 and
- * #29 draw it:
+ * Settings → Lock-screen image (SET-02, ADR 0022, ADR 0029 to ADR 0031), as far as #21 and #28
+ * to #30 draw it:
  *
  * <ul>
  *   <li>"Daily lock-screen image", the switch that confirms the feature, before which the lock
  *       screen never changes (WALL-02), disabled with the reason where the device can't set it
  *       (WALL-13);
+ *   <li>while it is on, when the image last updated, and the last problem in plain words, such
+ *       as "No connection. Will try again later." (WALL-16);
  *   <li>while someone else has changed the lock screen, that daily updates are paused, with
  *       Resume (WALL-14);
  *   <li>where the device didn't keep the image, that it may not appear on the lock screen (SRS
@@ -67,6 +70,14 @@ final class ImageSettings extends LinearLayout {
     /** "Update now", as the frame gives it. */
     static final int UPDATE_NOW_OFFERED = 0;
     static final int UPDATE_NOW_RUNNING = 1;
+    // The fields of nativeImageStatus, mirrored in src/android.rs: when the image last updated,
+    // the last problem, and how the checks are going.
+    static final int STATUS_FIELDS = 3;
+    private static final int STATUS_UPDATED = 0;
+    private static final int STATUS_PROBLEM = 1;
+    private static final int STATUS_KIND = 2;
+    private static final String RETRYING = "retrying";
+    private static final String UNAVAILABLE = "unavailable";
 
     private static final float GROUP_SP = 14f;
     private static final float TEXT_SP = 16f;
@@ -82,6 +93,8 @@ final class ImageSettings extends LinearLayout {
     private final TextView group;
     private final Switch dailyImage;
     private final TextView unavailableReason;
+    private final TextView updated;
+    private final TextView problem;
     private final LinearLayout paused;
     private final TextView pausedText;
     private final TextView resume;
@@ -115,6 +128,8 @@ final class ImageSettings extends LinearLayout {
         dailyImage = row(context, R.string.daily_image, density);
         dailyImage.setOnClickListener(view -> listener.dailyImage(dailyImage.isChecked()));
         unavailableReason = note(context);
+        // WALL-16: when the image last updated, right below the switch.
+        updated = note(context);
 
         // What needs the user's answer comes next, where it is seen, and only while it applies.
         pausedText = new TextView(context);
@@ -130,6 +145,8 @@ final class ImageSettings extends LinearLayout {
         unavailable = withAction(context, unavailableText, tryAgain, R.string.image_try_again,
                 density);
         tryAgain.setOnClickListener(view -> listener.tryAgain());
+        // The last problem, below "Daily image unavailable" when that shows (WALL-16).
+        problem = note(context);
 
         showCard = row(context, R.string.show_image_card, density);
         showCard.setOnClickListener(view -> listener.showCard(showCard.isChecked()));
@@ -245,6 +262,48 @@ final class ImageSettings extends LinearLayout {
         wallpaperSettings.setVisibility(offActions ? VISIBLE : GONE);
     }
 
+    /**
+     * Shows the status line as the Rust app says, in {@link #STATUS_FIELDS} fields, or hides it
+     * with null while the daily image is off (WALL-16).
+     */
+    void showStatus(String[] status) {
+        boolean shown = status != null && status.length >= STATUS_FIELDS;
+        Resources res = getResources();
+        updated.setText(shown ? updatedLine(res, status) : null);
+        updated.setVisibility(shown ? VISIBLE : GONE);
+        String line = shown ? problemLine(res, status) : null;
+        problem.setText(line);
+        problem.setVisibility(line != null ? VISIBLE : GONE);
+    }
+
+    /** When the image last updated, in words: "Last updated 19 November, 07:00" (WALL-16). */
+    static String updatedLine(Resources res, String[] status) {
+        String when = status[STATUS_UPDATED];
+        return when.isEmpty()
+                ? res.getString(R.string.image_not_updated_yet)
+                : res.getString(R.string.image_last_updated, when);
+    }
+
+    /**
+     * The last problem in words, "No connection. Will try again later." while the checks retry,
+     * or just "No connection." below "Daily image unavailable"; null while nothing fails
+     * (WALL-16, SRS 7.6).
+     */
+    static String problemLine(Resources res, String[] status) {
+        String problem = status[STATUS_PROBLEM];
+        if (problem.isEmpty()) {
+            return null;
+        }
+        switch (status[STATUS_KIND]) {
+            case RETRYING:
+                return res.getString(R.string.image_will_try_again, problem);
+            case UNAVAILABLE:
+                return res.getString(R.string.image_last_problem, problem);
+            default:
+                return null;
+        }
+    }
+
     /** The theme's colours (THEME-03). */
     void colour(int foreground, int dim, int accent) {
         if (foreground == this.foreground && dim == this.dim && accent == this.accent) {
@@ -255,6 +314,8 @@ final class ImageSettings extends LinearLayout {
         this.accent = accent;
         group.setTextColor(dim);
         unavailableReason.setTextColor(dim);
+        updated.setTextColor(dim);
+        problem.setTextColor(foreground);
         mayNotShow.setTextColor(dim);
         ColorStateList pressed = ColorStateList.valueOf((foreground & 0x00FFFFFF) | 0x1F000000);
         for (TextView text : new TextView[] {pausedText, unavailableText}) {

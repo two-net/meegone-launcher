@@ -1,19 +1,17 @@
 //! [`SystemConfigAdapter`] on Android: the home-app role, the clock (HOME-01, ONB-04), whether
 //! the system animates the return home (ANIM-09), the haptic tick (ANIM-24), whether a browser
-//! is installed and web search (SRCH-05, ADR 0016), the Events header's dates, times and next
-//! alarm (EVT-01, EVT-02, L10N-03, ADR 0019), the device's locale (WALL-05, ADR 0027), how
-//! much free storage there is (SRS 7.6, ADR 0028), and whether the device is saving battery
-//! (WALL-04, PWR-04, ADR 0029).
+//! is installed, opening links in it and web search (SRCH-05, WALL-15, ADR 0016, ADR 0031), the
+//! Events header's dates, times and next alarm (EVT-01, EVT-02, L10N-03, ADR 0019), the
+//! device's locale (WALL-05, ADR 0027), how much free storage there is (SRS 7.6, ADR 0028), and
+//! whether the device is saving battery (WALL-04, PWR-04, ADR 0029).
 //!
 //! Questions go to the Java `Bridge` object (`android/app/src/main/java/…/Bridge.java`), whose
 //! method names and signatures must stay in step with the ones looked up here. The other device
-//! settings and opening links answer with their "if unavailable" values until their issues
-//! build them.
+//! settings answer with their "if unavailable" values until their issues build them.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::jni::{Env, GlobalRef, JValue, LocalRef, MethodId, Vm};
-use super::not_yet;
 use crate::adapters::SystemConfigAdapter;
 use crate::model::{DataError, TimeStyle};
 
@@ -35,6 +33,9 @@ pub struct AndroidSystem {
     haptic_tick: MethodId,
     /// `boolean hasBrowser()`: whether anything opens an `https:` link.
     has_browser: MethodId,
+    /// `String openInBrowser(String url)`: `null`, or a short message when no browser could
+    /// open it.
+    open_in_browser: MethodId,
     /// `String webSearch(String query)`: `null`, or a short message when nothing could search.
     web_search: MethodId,
     /// `String formatTime(long atMs, int style)`: `at_ms` in the style numbered by
@@ -69,6 +70,11 @@ impl AndroidSystem {
             animates_return_home: env.method_id(bridge, c"animatesReturnHome", c"()Z")?,
             haptic_tick: env.method_id(bridge, c"hapticTick", c"()Z")?,
             has_browser: env.method_id(bridge, c"hasBrowser", c"()Z")?,
+            open_in_browser: env.method_id(
+                bridge,
+                c"openInBrowser",
+                c"(Ljava/lang/String;)Ljava/lang/String;",
+            )?,
             web_search: env.method_id(
                 bridge,
                 c"webSearch",
@@ -92,6 +98,7 @@ fn style_code(style: TimeStyle) -> i32 {
         TimeStyle::DayMonth => 1,
         TimeStyle::Time => 2,
         TimeStyle::WeekdayTime => 3,
+        TimeStyle::DayMonthTime => 4,
     }
 }
 
@@ -235,8 +242,18 @@ impl SystemConfigAdapter for AndroidSystem {
             .unwrap_or(false)
     }
 
-    fn open_in_browser(&self, _https_url: &str) -> Result<(), DataError> {
-        Err(not_yet()) // Links arrive with #30.
+    /// Opens the link in the device's browser, never inside MeeGone, and only over HTTPS: the
+    /// bridge checks the scheme again (SEC-02, WALL-15).
+    fn open_in_browser(&self, https_url: &str) -> Result<(), DataError> {
+        if !https_url.starts_with("https://") {
+            return Err(DataError::Invalid("Only HTTPS links open".into()));
+        }
+        let env = self.vm.env()?;
+        let url = env.new_string(https_url)?;
+        match env.call_string(&self.bridge, self.open_in_browser, &[JValue::object(&url)])? {
+            None => Ok(()),
+            Some(message) => Err(DataError::Unsupported(message)),
+        }
     }
 
     /// Hands the query to the device's default search handler, `ACTION_WEB_SEARCH` (SRCH-05).

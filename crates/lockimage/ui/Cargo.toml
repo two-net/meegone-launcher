@@ -1,6 +1,6 @@
 [package]
 name = "meegone-lockimage-ui"
-description = "Lock-screen image UI: the image-of-the-day card and the settings section."
+description = "Lock-screen image UI: the image-of-the-day card, the settings section and the image details screen."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

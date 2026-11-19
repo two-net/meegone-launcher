@@ -710,7 +710,8 @@ impl SystemConfigAdapter for FakeSystem {
     }
 
     /// English in every locale, day before month as in the SRS's layout mock: "Tuesday",
-    /// "17 November", "07:00" or "7:00 AM", "Wed 07:00". Local time is `utc_offset_ms` from UTC.
+    /// "17 November", "07:00" or "7:00 AM", "Wed 07:00", "17 November, 07:00". Local time is
+    /// `utc_offset_ms` from UTC.
     fn format_time(&self, at_ms: u64, style: TimeStyle) -> String {
         let local = i64::try_from(at_ms)
             .unwrap_or(i64::MAX)
@@ -727,14 +728,16 @@ impl SystemConfigAdapter for FakeSystem {
             let hour = if hour % 12 == 0 { 12 } else { hour % 12 };
             format!("{hour}:{minute:02} {half}")
         };
+        let day_month = || {
+            let (month, day) = month_and_day(days);
+            format!("{day} {}", MONTHS[month - 1])
+        };
         match style {
             TimeStyle::Weekday => weekday.to_owned(),
-            TimeStyle::DayMonth => {
-                let (month, day) = month_and_day(days);
-                format!("{day} {}", MONTHS[month - 1])
-            }
+            TimeStyle::DayMonth => day_month(),
             TimeStyle::Time => time,
             TimeStyle::WeekdayTime => format!("{} {time}", &weekday[..3]),
+            TimeStyle::DayMonthTime => format!("{}, {time}", day_month()),
         }
     }
 
@@ -906,12 +909,20 @@ mod tests {
             system.format_time(at, TimeStyle::WeekdayTime),
             "Tue 7:05 AM"
         );
+        assert_eq!(
+            system.format_time(at, TimeStyle::DayMonthTime),
+            "17 November, 7:05 AM"
+        );
 
         *system.hour_24.lock().unwrap() = true;
         assert_eq!(system.format_time(at, TimeStyle::Time), "07:05");
         *system.utc_offset_ms.lock().unwrap() = -8 * 3_600_000;
         assert_eq!(system.format_time(at, TimeStyle::WeekdayTime), "Mon 23:05");
         assert_eq!(system.format_time(at, TimeStyle::DayMonth), "16 November");
+        assert_eq!(
+            system.format_time(at, TimeStyle::DayMonthTime),
+            "16 November, 23:05"
+        );
 
         // Leap days and the turn of the year.
         assert_eq!(month_and_day(0), (1, 1));

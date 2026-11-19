@@ -7,9 +7,9 @@
 //! from an app, the home menu, the Applications grid, the pressed icon, the grid's cells as
 //! apps come, go and move, a cell's long-press menu, the dragged icon, edit mode, the open
 //! folder, search, Settings' Hidden apps list and "Show card in Events" switch, the Events
-//! header, list and a notification's long-press menu, the image-of-the-day card and its
-//! details screen, and Recent's cards (ADR 0006 to ADR 0008, ADR 0010, ADR 0012 to ADR 0017,
-//! ADR 0019 to ADR 0023).
+//! header, list and a notification's long-press menu, the image-of-the-day card, the image
+//! details screen and the image's update status, and Recent's cards (ADR 0006 to ADR 0008,
+//! ADR 0010, ADR 0012 to ADR 0017, ADR 0019 to ADR 0023, ADR 0031).
 
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -26,8 +26,10 @@ use meegone_events_ui::EventsView;
 pub use meegone_events_ui::{
     EventsListMode, EventsMenuFrame, EventsRow, NotificationMenuItem, RowTarget,
 };
-pub use meegone_lockimage_ui::{CardContent, CheckStatus, DailyImage};
-use meegone_lockimage_ui::{ImageCard, ImageSettingsSection};
+pub use meegone_lockimage_ui::{
+    CardContent, CheckStatus, DailyImage, DetailsContent, UpdateStatus,
+};
+use meegone_lockimage_ui::{ImageCard, ImageDetailsScreen, ImageSettingsSection};
 pub use meegone_recent_ui::{Age, RecentMode, RecentWindow, ShownCard};
 use meegone_recent_ui::{RecentSettingsSection, RecentView};
 use meegone_settings_ui::{HomeBanner, SettingsView};
@@ -316,6 +318,13 @@ pub struct HomeFrame {
     pub image_change: u16,
     /// The image details screen covers the home views (WALL-15).
     pub image_details_open: bool,
+    /// What the image details screen shows: its revision, which changes whenever that does,
+    /// or `None` while the screen isn't open (WALL-15, ADR 0031).
+    pub image_details: Option<u32>,
+    /// The daily image's status line, in Settings and on the details screen: its revision,
+    /// which changes whenever it does, or `None` while the daily image is off or the
+    /// lock-screen image isn't working (WALL-16, ARCH-09).
+    pub image_status: Option<u32>,
     /// Settings → Lock-screen image → "Show card in Events" (EVT-12): whether it is on, or
     /// `None` while the lock-screen image isn't working, so Settings doesn't offer it
     /// (ARCH-09).
@@ -371,6 +380,7 @@ pub struct ShellView {
     settings: SettingsView,
     hidden_apps: HiddenAppsSection,
     image_card: ImageCard,
+    image_details: ImageDetailsScreen,
     image_settings: ImageSettingsSection,
     recent_settings: RecentSettingsSection,
     home_banner: HomeBanner,
@@ -380,16 +390,18 @@ impl ShellView {
     pub fn new(shell: &mut HomeShell) -> Self {
         let outbox = Outbox::default();
 
-        // The lock-screen image shows its card in Events and its section in Settings. Both read
-        // the latest image state, which the shell keeps current.
+        // The lock-screen image shows its card in Events, its section in Settings and its own
+        // details screen. All read the latest image state, which the shell keeps current.
         let image = Latest::new(shell.lockimage().state());
         shell.subscribe_lockimage({
             let image = image.clone();
             move |state| image.set(Arc::clone(state))
         });
 
-        // The shell keeps a handle on each for the host (ADR 0022).
+        // The shell keeps a handle on each for the host (ADR 0022, ADR 0031).
         let image_card = ImageCard::new(image.clone(), dispatch(&outbox, ShellIntent::LockImage));
+        let image_details =
+            ImageDetailsScreen::new(image.clone(), dispatch(&outbox, ShellIntent::LockImage));
         let image_settings =
             ImageSettingsSection::new(image, dispatch(&outbox, ShellIntent::LockImage));
 
@@ -438,6 +450,7 @@ impl ShellView {
             settings,
             hidden_apps,
             image_card,
+            image_details,
             image_settings,
             recent_settings,
             home_banner,
@@ -586,6 +599,14 @@ impl ShellView {
                 .then(|| self.image_card.revision()),
             image_change: ten_thousandths(state.image_change.progress),
             image_details_open: state.image_details_open,
+            // The shell opens the screen only while the lock-screen image works and has an
+            // image, and closes it once it hasn't.
+            image_details: state
+                .image_details_open
+                .then(|| self.image_details.revision()),
+            image_status: (shell.lockimage_ready()
+                && self.image_settings.update_status().is_some())
+            .then(|| self.image_settings.status_revision()),
             show_image_card: shell
                 .lockimage_ready()
                 .then(|| self.image_settings.show_card()),
@@ -645,7 +666,7 @@ impl ShellView {
             return;
         }
         if shell.state().image_details_open {
-            // The host draws the image details screen's name until #30 draws the rest.
+            // The host draws the image details screen from `image_details` (ADR 0031).
             return;
         }
         match shell.state().current {
@@ -682,6 +703,11 @@ impl ShellView {
     /// [`HomeFrame::image_card`] is.
     pub fn image_card(&self) -> &ImageCard {
         &self.image_card
+    }
+
+    /// The image details screen (WALL-15). Shown only while [`HomeFrame::image_details`] is.
+    pub fn image_details(&self) -> &ImageDetailsScreen {
+        &self.image_details
     }
 
     /// Settings → Lock-screen image (SET-02). Offered only while

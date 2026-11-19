@@ -78,6 +78,41 @@ fn shift(at_ms: u64, by_ms: i64) -> u64 {
     at_ms.saturating_add_signed(by_ms)
 }
 
+/// The day a feed date such as `20261115` names, in days since 1 January 1970, or `None` if it
+/// isn't a date on or after then (WALL-15).
+pub fn day_of(date: &str) -> Option<u64> {
+    if date.len() != 8 || !date.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let year: i64 = date[..4].parse().ok()?;
+    let month: i64 = date[4..6].parse().ok()?;
+    let day: i64 = date[6..].parse().ok()?;
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        1..=12 => 31,
+        _ => return None,
+    };
+    if !(1..=days_in_month).contains(&day) {
+        return None;
+    }
+    // Days from the civil date, counting years from March so the leap day comes last.
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    u64::try_from(era * 146_097 + day_of_era - 719_468).ok()
+}
+
+/// Noon on local `day`: a moment that is on that day in the local time zone, to write the day
+/// with (WALL-15).
+pub fn local_noon_ms(day: u64, offset: Offset<'_>) -> u64 {
+    day_start_ms(day, offset).saturating_add(12 * HOUR_MS)
+}
+
 /// `checks` as they stand on `now_ms`'s local day: on a new day, the day's counts start again.
 /// The failure streak and its problem carry on (SRS 7.6).
 pub fn today(checks: &Checks, now_ms: u64, offset: Offset<'_>) -> Checks {
@@ -427,6 +462,43 @@ mod tests {
             next_job(&checks, NOV_19, &utc, true).network,
             JobNetwork::Any
         );
+    }
+
+    #[test]
+    fn a_feed_date_names_its_day() {
+        // WALL-15
+        assert_eq!(day_of("19700101"), Some(0));
+        assert_eq!(day_of("20261119"), Some(NOV_19 / DAY_MS));
+        assert_eq!(day_of("20000229"), Some(11_016));
+        assert_eq!(day_of("20261231"), Some(20_818));
+        assert_eq!(day_of("20270101"), Some(20_819));
+        for not_a_date in [
+            "",
+            "2026111",
+            "202611190",
+            "2026-1-19",
+            "20261319",
+            "20261100",
+            "20261131",
+            "20260229",
+            "21000229",
+            "19691231",
+            "２０２６１１１９",
+        ] {
+            assert_eq!(day_of(not_a_date), None, "{not_a_date}");
+        }
+    }
+
+    #[test]
+    fn local_noon_is_on_that_day_in_every_zone() {
+        // WALL-15: written at noon, the date is right wherever the device is.
+        let day = NOV_19 / DAY_MS;
+        let zones: [Offset<'_>; 4] = [&utc, &bangkok, &|_| -11 * HOUR_MS as i64, &|_| {
+            14 * HOUR_MS as i64
+        }];
+        for offset in zones {
+            assert_eq!(local_day(local_noon_ms(day, offset), offset), day);
+        }
     }
 
     #[test]
