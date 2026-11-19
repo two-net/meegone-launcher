@@ -194,7 +194,10 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private static final int RECENT_LEAVE = 118; // how far each row's cards have gone
     // Settings → Recent → Time window (REC-11, ADR 0026):
     private static final int RECENT_WINDOW = 127; // 12, 24 or 72 hours; -1 not offered
-    private static final int FRAME_SIZE = 128;
+    // Settings → Lock-screen image's daily checks (WALL-04, SRS 7.6, ADR 0029):
+    private static final int USE_MOBILE_DATA = 128; // 1 on, 0 off, -1 not offered
+    private static final int IMAGE_UNAVAILABLE = 129; // 1 while "Daily image unavailable" shows
+    private static final int FRAME_SIZE = 130;
     private static final int SEARCH_OPEN = 1; // the field has the keyboard
     private static final int SEARCH_RESULTS = 2; // the results show instead of the grid
     private static final int SEARCH_NOTHING = 4; // nothing matches
@@ -628,11 +631,27 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             toast(message);
         });
         recentSettings.setVisibility(GONE);
-        // Settings → Lock-screen image (EVT-12), after Recent in SET-02's order.
-        imageSettings = new ImageSettings(context, on -> {
-            String message = nativeShowImageCard(on);
-            apply();
-            toast(message);
+        // Settings → Lock-screen image (EVT-12, ADR 0029), after Recent in SET-02's order.
+        imageSettings = new ImageSettings(context, new ImageSettings.Listener() {
+            @Override
+            public void showCard(boolean on) {
+                answered(nativeShowImageCard(on));
+            }
+
+            @Override
+            public void useMobileData(boolean on) {
+                answered(nativeUseMobileData(on));
+            }
+
+            @Override
+            public void tryAgain() {
+                answered(nativeImageTryAgain());
+            }
+
+            private void answered(String message) {
+                apply();
+                toast(message);
+            }
         });
         imageSettings.setVisibility(GONE);
         LinearLayout groups = new LinearLayout(context);
@@ -1694,14 +1713,16 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     }
 
     /**
-     * Settings → Lock-screen image → "Show card in Events" (EVT-12): offered only while the
-     * lock-screen image works (ARCH-09).
+     * Settings → Lock-screen image: "Show card in Events" (EVT-12), "Use mobile data" (WALL-04)
+     * and "Daily image unavailable" (SRS 7.6), offered only while the lock-screen image works
+     * (ARCH-09).
      */
     private void applyImageSettings() {
         int showCard = frame[SHOW_IMAGE_CARD];
         imageSettings.setVisibility(showCard >= 0 ? VISIBLE : GONE);
         imageSettings.colour(foreground, dim, frame[ACCENT]);
-        imageSettings.show(showCard > 0);
+        imageSettings.show(
+                showCard > 0, frame[USE_MOBILE_DATA] > 0, frame[IMAGE_UNAVAILABLE] != 0);
     }
 
     /**
@@ -2330,6 +2351,18 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
      * the choice couldn't be saved.
      */
     private native String nativeShowImageCard(boolean on);
+
+    /**
+     * "Use mobile data" was switched (WALL-04). Returns null, or a short message to show when
+     * the choice couldn't be saved.
+     */
+    private native String nativeUseMobileData(boolean on);
+
+    /**
+     * Try again was tapped below "Daily image unavailable" (SRS 7.6). Returns null, or a short
+     * message to show when it couldn't be done.
+     */
+    private native String nativeImageTryAgain();
 
     /** Fills {@code frame} with what to draw now, in the slots above. */
     private native void nativeRead(int[] frame);

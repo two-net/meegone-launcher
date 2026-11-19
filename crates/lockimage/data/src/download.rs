@@ -12,7 +12,8 @@
 //! 6. Cache the cropped image with its details, as the current one (WALL-09).
 //!
 //! Picking, checking and planning are pure, so they are tested without a device (MAINT-01).
-//! The updater (#28) decides when to download, and the wallpaper is set from the cache (#29).
+//! The updater, `ImageUpdater` in `meegone-lockimage-state`, decides when to download (ADR 0029),
+//! and the wallpaper is set from the cache (#29).
 
 use std::sync::Arc;
 
@@ -215,6 +216,7 @@ impl Downloader {
             info_link: image.info_link.clone(),
             applied_at_ms: None,
             image: None,
+            id: Some(image.id.clone()),
         };
         self.cache.put(record, &cropped)
     }
@@ -560,6 +562,7 @@ mod tests {
                 info_link: Some("https://www.bing.com/search?q=20261119".into()),
                 applied_at_ms: None,
                 image: Some(ImageFile::A),
+                id: Some("OHR.Test20261119".into()),
             }
         );
         assert_eq!(cache.current(), Some(record.clone()));

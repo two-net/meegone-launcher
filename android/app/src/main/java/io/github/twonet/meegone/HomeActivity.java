@@ -62,6 +62,11 @@ public final class HomeActivity extends Activity {
         // Before MeeGone starts, so no icon or accent is drawn without it.
         DebugHooks.readIconExtras(getIntent());
         boolean started = nativeStart(bridge, getFilesDir().getPath(), savedView, savedAppsScroll);
+        if (started) {
+            // Checks the daily image if a check is due, and schedules its job again, which a
+            // restart or a force stop drops (SRS 8.1, ADR 0029).
+            ImageJobService.checkAtStart(this);
+        }
         // Applications follows the system's app and profile changes (ADR 0010).
         bridge.watchApps();
         // Events' header follows the date, the clock and the next alarm (ADR 0019).
@@ -265,6 +270,18 @@ public final class HomeActivity extends Activity {
         }
     }
 
+    /**
+     * The daily image's check reached the feed (ADR 0029). The shared launcher, if it has
+     * started, reads the image and how the checks are going again, and {@code resumed}, if it is
+     * a home, redraws. Called by {@link Bridge} on the main thread.
+     */
+    static void imageChecked(Activity resumed) {
+        nativeImageChecked();
+        if (resumed instanceof HomeActivity) {
+            ((HomeActivity) resumed).views.refresh();
+        }
+    }
+
     private static boolean isHome(Intent intent) {
         return Intent.ACTION_MAIN.equals(intent.getAction())
                 && intent.hasCategory(Intent.CATEGORY_HOME);
@@ -310,6 +327,9 @@ public final class HomeActivity extends Activity {
 
     /** Usage access was granted or revoked (ADR 0023). */
     private static native void nativeUsageAccessChanged();
+
+    /** The daily image's check reached the feed (ADR 0029); nothing before MeeGone starts. */
+    private static native void nativeImageChecked();
 
     /** Taps the banner's "make default" button; only debug builds' {@link DebugHooks} call it. */
     private native void nativeRequestDefaultHome();

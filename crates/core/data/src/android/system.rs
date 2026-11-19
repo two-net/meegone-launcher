@@ -1,8 +1,9 @@
 //! [`SystemConfigAdapter`] on Android: the home-app role, the clock (HOME-01, ONB-04), whether
 //! the system animates the return home (ANIM-09), the haptic tick (ANIM-24), whether a browser
 //! is installed and web search (SRCH-05, ADR 0016), the Events header's dates, times and next
-//! alarm (EVT-01, EVT-02, L10N-03, ADR 0019), the device's locale (WALL-05, ADR 0027), and how
-//! much free storage there is (SRS 7.6, ADR 0028).
+//! alarm (EVT-01, EVT-02, L10N-03, ADR 0019), the device's locale (WALL-05, ADR 0027), how
+//! much free storage there is (SRS 7.6, ADR 0028), and whether the device is saving battery
+//! (WALL-04, PWR-04, ADR 0029).
 //!
 //! Questions go to the Java `Bridge` object (`android/app/src/main/java/…/Bridge.java`), whose
 //! method names and signatures must stay in step with the ones looked up here. The other device
@@ -46,6 +47,8 @@ pub struct AndroidSystem {
     /// `long freeStorageBytes()`: the bytes MeeGone can still store, or -1 if the system can't
     /// say.
     free_storage_bytes: MethodId,
+    /// `boolean savesBattery()`: battery saver is on or the battery is low.
+    saves_battery: MethodId,
     /// `String openNextAlarm()`: `null`, or a short message when nothing could be opened.
     open_next_alarm: MethodId,
 }
@@ -75,6 +78,7 @@ impl AndroidSystem {
             locale: env.method_id(bridge, c"locale", c"()Ljava/lang/String;")?,
             next_alarm_ms: env.method_id(bridge, c"nextAlarmMs", c"()J")?,
             free_storage_bytes: env.method_id(bridge, c"freeStorageBytes", c"()J")?,
+            saves_battery: env.method_id(bridge, c"savesBattery", c"()Z")?,
             open_next_alarm: env.method_id(bridge, c"openNextAlarm", c"()Ljava/lang/String;")?,
             bridge: env.global_ref(bridge)?,
         })
@@ -152,6 +156,16 @@ impl SystemConfigAdapter for AndroidSystem {
             .and_then(|env| env.call_long(&self.bridge, self.free_storage_bytes, &[]))
             .ok()
             .and_then(|bytes| u64::try_from(bytes).ok())
+    }
+
+    /// `PowerManager.isPowerSaveMode`, or the battery's own "low" flag. False if the bridge
+    /// can't answer, so the daily image isn't held back for good; the job's scheduler still
+    /// waits while the battery is low (WALL-04).
+    fn saves_battery(&self) -> bool {
+        self.vm
+            .env()
+            .and_then(|env| env.call_bool(&self.bridge, self.saves_battery, &[]))
+            .unwrap_or(false)
     }
 
     /// Written by `android.text.format.DateFormat` in the default locale and time zone, so it

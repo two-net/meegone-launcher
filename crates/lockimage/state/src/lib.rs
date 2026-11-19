@@ -1,19 +1,25 @@
 //! Lock-screen image state (SRS 4.5): whether the daily image is on or available, the current
-//! image's details, and the feed region (WALL-05).
+//! image's details, the feed region (WALL-05), "Use mobile data" (WALL-04), and how the daily
+//! checks are going (SRS 7.6).
 //!
-//! Its options live in the settings store (ADR 0002); the image details live in this feature's
-//! image cache.
+//! Its options live in the settings store (ADR 0002); the image details and the check log live
+//! in this feature's image cache. [`ImageUpdater`] runs the daily check, off the main thread
+//! (ADR 0029); [`checks`] decides when.
+
+pub mod checks;
+mod updater;
 
 use std::sync::Arc;
 
 use meegone_core_data::{
-    DataError, ImageJob, ImageOptions, JobNetwork, SchedulerAdapter, SettingsStore,
-    SystemConfigAdapter, WallpaperAdapter,
+    DataError, ImageOptions, SchedulerAdapter, SettingsStore, SystemConfigAdapter, WallpaperAdapter,
 };
 use meegone_core_state::StateHolder;
 use meegone_lockimage_data::{ImageCache, ImageFeed, region};
 
+pub use checks::CheckStatus;
 pub use meegone_lockimage_data::{ImageFile, ImageRecord};
+pub use updater::{Checked, ImageUpdater, Wait};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ImageStatus {
@@ -37,6 +43,10 @@ pub struct LockImageState {
     pub region: Option<String>,
     /// The region Automatic stands for on this device (WALL-05).
     pub automatic_region: String,
+    /// Whether automatic downloads may use mobile data (WALL-04).
+    pub use_mobile_data: bool,
+    /// How the daily checks are going (WALL-16, SRS 7.6).
+    pub checks: CheckStatus,
     pub problem: Option<String>,
 }
 
@@ -57,6 +67,11 @@ pub enum LockImageIntent {
     /// Chooses the feed region, or Automatic with `None` (WALL-05). A region the feed doesn't
     /// support is ignored.
     SetRegion(Option<String>),
+    /// Lets automatic downloads use mobile data, or not (WALL-04).
+    SetUseMobileData(bool),
+    /// After days of failures, checks again as soon as the network and battery allow, within
+    /// the day's budget (SRS 7.6, REL-04).
+    TryAgain,
     /// Opens the image details screen, from the card in Events (EVT-12, WALL-15). The screen
     /// covers the home views, so the shell opens it (ADR 0022); the holder ignores it.
     OpenDetails,
@@ -101,7 +116,9 @@ impl LockImageHolder {
         self.state.automatic_region = region::automatic(&self.system.locale(), &regions);
         self.state.region = options.region.filter(|chosen| regions.contains(chosen));
         self.state.regions = regions;
+        self.state.use_mobile_data = options.use_mobile_data;
         self.state.current = self.cache.current();
+        self.state.checks = checks::status(&self.cache.checks(), self.system.now_ms());
         self.state.status = match self.wallpaper.lock_screen_support() {
             Err(reason) => ImageStatus::Unavailable(reason.to_string()),
             Ok(()) if options.enabled => ImageStatus::On,
@@ -145,22 +162,48 @@ impl LockImageHolder {
         self.refresh();
     }
 
+    /// The lock-screen image is the one writer of "Use mobile data" (ARCH-06). The waiting job
+    /// takes the new network at once (SET-03).
+    fn set_use_mobile_data(&mut self, on: bool) {
+        let result = self
+            .settings
+            .update(&mut |settings| settings.image.use_mobile_data = on)
+            .and_then(|settings| self.arm(settings.image.enabled, settings.image.use_mobile_data));
+        self.state.problem = result.err().map(|error| error.to_string());
+        self.refresh();
+    }
+
+    /// Forgets the failures, so "Daily image unavailable" goes, and the job runs as soon as it
+    /// may (SRS 7.6).
+    fn try_again(&mut self) {
+        let options = self.settings.get().image;
+        let result = self
+            .cache
+            .update_checks(&mut checks::try_again)
+            .and_then(|_| self.arm(options.enabled, options.use_mobile_data));
+        self.state.problem = result.err().map(|error| error.to_string());
+        self.refresh();
+    }
+
     fn apply(&self, options: &ImageOptions) -> Result<(), DataError> {
         if options.enabled {
-            // When the job runs again after this is decided by the updater (WALL-03, #28).
-            self.scheduler.schedule_image_job(ImageJob {
-                not_before_ms: 0,
-                network: if options.use_mobile_data {
-                    JobNetwork::Any
-                } else {
-                    JobNetwork::Unmetered
-                },
-            })
+            self.arm(true, options.use_mobile_data)
         } else {
             // The current lock-screen wallpaper stays as it is (WALL-12).
             self.scheduler.cancel_image_job()?;
             self.cache.clear()
         }
+    }
+
+    /// Schedules the job for the next check, while the daily image is on (WALL-03, WALL-04).
+    fn arm(&self, enabled: bool, use_mobile_data: bool) -> Result<(), DataError> {
+        if !enabled || matches!(self.state.status, ImageStatus::Unavailable(_)) {
+            return Ok(());
+        }
+        let now = self.system.now_ms();
+        let offset = |at| self.system.utc_offset_ms(at);
+        let job = checks::next_job(&self.cache.checks(), now, &offset, use_mobile_data);
+        self.scheduler.schedule_image_job(job)
     }
 }
 
@@ -178,6 +221,8 @@ impl StateHolder for LockImageHolder {
             LockImageIntent::SetEnabled(on) => self.set_enabled(on),
             LockImageIntent::SetShowCard(on) => self.set_show_card(on),
             LockImageIntent::SetRegion(choice) => self.set_region(choice),
+            LockImageIntent::SetUseMobileData(on) => self.set_use_mobile_data(on),
+            LockImageIntent::TryAgain => self.try_again(),
             LockImageIntent::OpenDetails => {}
         }
     }
@@ -185,8 +230,8 @@ impl StateHolder for LockImageHolder {
 
 #[cfg(test)]
 mod tests {
-    use meegone_core_data::PersistentSettingsStore;
     use meegone_core_data::fakes::Fakes;
+    use meegone_core_data::{JobNetwork, PersistentSettingsStore};
     use meegone_lockimage_data::PersistentImageCache;
     use meegone_lockimage_data::fakes::FakeFeed;
 
@@ -298,6 +343,125 @@ mod tests {
     }
 
     #[test]
+    fn use_mobile_data_is_saved_and_the_waiting_job_takes_it_at_once() {
+        // WALL-04, SET-03
+        let Setup {
+            fakes,
+            settings,
+            mut holder,
+            ..
+        } = setup();
+        holder.handle(LockImageIntent::SetEnabled(true));
+        assert!(!holder.state().use_mobile_data);
+
+        holder.handle(LockImageIntent::SetUseMobileData(true));
+
+        assert!(holder.state().use_mobile_data);
+        assert!(settings.get().image.use_mobile_data);
+        assert_eq!(
+            fakes.scheduler.job.lock().unwrap().map(|job| job.network),
+            Some(JobNetwork::Any)
+        );
+
+        holder.handle(LockImageIntent::SetUseMobileData(false));
+
+        assert!(!settings.get().image.use_mobile_data);
+        assert_eq!(
+            fakes.scheduler.job.lock().unwrap().map(|job| job.network),
+            Some(JobNetwork::Unmetered)
+        );
+    }
+
+    #[test]
+    fn use_mobile_data_while_off_schedules_nothing() {
+        // WALL-02
+        let Setup {
+            fakes,
+            settings,
+            mut holder,
+            ..
+        } = setup();
+
+        holder.handle(LockImageIntent::SetUseMobileData(true));
+
+        assert!(settings.get().image.use_mobile_data);
+        assert_eq!(*fakes.scheduler.job.lock().unwrap(), None);
+    }
+
+    /// The checks failing since `since_ms`, the last with "No connection".
+    fn failing_since(cache: &PersistentImageCache, since_ms: u64) {
+        cache
+            .update_checks(&mut |checks| {
+                checks.day = since_ms / 86_400_000;
+                checks.attempts = 6;
+                checks.failures = 6;
+                checks.last_attempt_ms = Some(since_ms);
+                checks.failing_since_ms = Some(since_ms);
+                checks.problem = Some("No connection".into());
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn three_days_of_failures_show_daily_image_unavailable() {
+        // SRS 7.6
+        let Setup {
+            fakes,
+            cache,
+            mut holder,
+            ..
+        } = setup();
+        holder.handle(LockImageIntent::SetEnabled(true));
+        let day = 86_400_000;
+        failing_since(&cache, 10 * day);
+
+        *fakes.system.now_ms.lock().unwrap() = 10 * day + 3_600_000;
+        holder.handle(LockImageIntent::Refresh);
+        assert_eq!(
+            holder.state().checks,
+            CheckStatus::Retrying("No connection".into())
+        );
+
+        *fakes.system.now_ms.lock().unwrap() = 13 * day;
+        holder.handle(LockImageIntent::Refresh);
+        assert_eq!(
+            holder.state().checks,
+            CheckStatus::Unavailable("No connection".into())
+        );
+    }
+
+    #[test]
+    fn try_again_clears_the_failures_and_runs_the_job_as_soon_as_it_may() {
+        // SRS 7.6, REL-04
+        let Setup {
+            fakes,
+            cache,
+            mut holder,
+            ..
+        } = setup();
+        holder.handle(LockImageIntent::SetEnabled(true));
+        let day = 86_400_000;
+        failing_since(&cache, 10 * day);
+        *fakes.system.now_ms.lock().unwrap() = 13 * day + 3_600_000;
+
+        holder.handle(LockImageIntent::TryAgain);
+
+        assert_eq!(holder.state().checks, CheckStatus::Fine);
+        assert_eq!(cache.checks().failing_since_ms, None);
+        // A new day, so the job may run at once: since that day's midnight.
+        assert_eq!(
+            fakes
+                .scheduler
+                .job
+                .lock()
+                .unwrap()
+                .map(|job| job.not_before_ms),
+            Some(13 * day)
+        );
+        assert_eq!(holder.state().problem, None);
+    }
+
+    #[test]
     fn turning_it_off_cancels_the_job_and_deletes_the_cache() {
         // WALL-12
         let Setup {
@@ -317,6 +481,7 @@ mod tests {
                     info_link: None,
                     applied_at_ms: Some(1),
                     image: None,
+                    id: None,
                 },
                 b"image",
             )

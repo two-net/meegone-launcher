@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use meegone_core_ui::{Dispatch, Latest};
 use meegone_lockimage_state::{
-    ImageFile, ImageRecord, ImageStatus, LockImageIntent, LockImageState,
+    CheckStatus, ImageFile, ImageRecord, ImageStatus, LockImageIntent, LockImageState,
 };
 
 use super::*;
@@ -18,6 +18,7 @@ fn record(date: &str, image: Option<ImageFile>) -> ImageRecord {
         info_link: None,
         applied_at_ms: None,
         image,
+        id: None,
     }
 }
 
@@ -233,4 +234,63 @@ fn settings_show_and_choose_the_region() {
             LockImageIntent::SetRegion(Some(region)),
         ] if region == "en-US"
     ));
+}
+
+fn section(state: LockImageState) -> (Latest<LockImageState>, ImageSettingsSection, Sent) {
+    let latest = Latest::new(Arc::new(state));
+    let sent: Sent = Rc::default();
+    let dispatch = Dispatch::new({
+        let sent = sent.clone();
+        move |intent| sent.borrow_mut().push(intent)
+    });
+    (
+        latest.clone(),
+        ImageSettingsSection::new(latest, dispatch),
+        sent,
+    )
+}
+
+#[test]
+fn settings_show_and_switch_use_mobile_data() {
+    // WALL-04, SET-02
+    let (_, section, sent) = section(LockImageState {
+        use_mobile_data: true,
+        ..on()
+    });
+
+    assert!(section.use_mobile_data());
+    section.use_mobile_data_toggled(false);
+
+    assert!(matches!(
+        sent.borrow()[..],
+        [LockImageIntent::SetUseMobileData(false)]
+    ));
+}
+
+#[test]
+fn settings_say_the_daily_image_is_unavailable_after_3_days_of_failures() {
+    // SRS 7.6
+    let unavailable = CheckStatus::Unavailable("No connection".into());
+    let (latest, section, sent) = section(LockImageState {
+        checks: unavailable.clone(),
+        ..on()
+    });
+
+    assert!(section.daily_image_unavailable());
+    assert_eq!(section.checks(), unavailable);
+    section.try_again();
+    assert!(matches!(sent.borrow()[..], [LockImageIntent::TryAgain]));
+
+    // Not while it is only retrying, or while the daily image is off.
+    latest.set(Arc::new(LockImageState {
+        checks: CheckStatus::Retrying("No connection".into()),
+        ..on()
+    }));
+    assert!(!section.daily_image_unavailable());
+    latest.set(Arc::new(LockImageState {
+        status: ImageStatus::Off,
+        checks: unavailable,
+        ..on()
+    }));
+    assert!(!section.daily_image_unavailable());
 }

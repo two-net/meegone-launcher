@@ -8,8 +8,10 @@
 //! - [`Downloader`]: turns the feed's image into the lock-screen image. It picks a version,
 //!   downloads it, checks it, has the platform crop it, and caches the result (WALL-06 to
 //!   WALL-09, ADR 0028).
+//! - [`Checks`]: what the daily image's checks have done, kept with the images so the updater
+//!   keeps to its budget across restarts (WALL-03, REL-04, ADR 0029).
 //!
-//! The updater that decides when to download (SRS 7.5) arrives with #28.
+//! The updater that decides when to check (SRS 7.5) is in `meegone-lockimage-state`.
 
 mod bing;
 mod download;
@@ -36,10 +38,11 @@ pub use feed::{FORMAT_CHANGED, FeedImage, ImageFeed, ImageVersion};
 /// Version of the saved image-details format (MAINT-04). Changing the format means a new
 /// version, a migration in [`IMAGE_CACHE_MIGRATIONS`] and a fixture (ARCHITECTURE.md,
 /// "Persistence").
-pub const IMAGE_CACHE_VERSION: u32 = 2;
+pub const IMAGE_CACHE_VERSION: u32 = 3;
 
 /// Brings image details saved by older versions up to date, one version at a time.
-const IMAGE_CACHE_MIGRATIONS: [Migration; IMAGE_CACHE_VERSION as usize - 1] = [add_image_file];
+const IMAGE_CACHE_MIGRATIONS: [Migration; IMAGE_CACHE_VERSION as usize - 1] =
+    [add_image_file, add_ids_and_checks];
 
 /// Version 2 names the file that holds each record's image (ADR 0022). Records saved before
 /// had no image.
@@ -53,6 +56,23 @@ fn add_image_file(body: &str) -> Option<String> {
         }
         migrated.push('\n');
     }
+    Some(migrated)
+}
+
+/// Version 3 keeps the feed's id with each record, and the check log (ADR 0029). Records saved
+/// before have no id, so the next check takes the feed's image as a new one; there were no
+/// checks.
+fn add_ids_and_checks(body: &str) -> Option<String> {
+    let mut migrated = String::with_capacity(body.len() + 16);
+    for line in body.lines() {
+        let (key, value) = line.split_once(' ')?;
+        migrated.push_str(line);
+        if matches!(key, "current" | "previous") && value != "-" {
+            migrated.push_str(" -");
+        }
+        migrated.push('\n');
+    }
+    migrated.push_str("checks -\n");
     Some(migrated)
 }
 
@@ -100,6 +120,33 @@ pub struct ImageRecord {
     /// The file that holds the image. [`ImageCache::put`] picks it; a record saved before
     /// images were kept has none.
     pub image: Option<ImageFile>,
+    /// The feed's id for the image, which tells it apart from the next day's (WALL-03). A
+    /// record saved before ids were kept has none.
+    pub id: Option<String>,
+}
+
+/// What the daily image's checks have done (ADR 0029). The updater keeps it, so its budget
+/// holds across restarts (WALL-03, REL-04), and Settings says how the checks went (SRS 7.6).
+///
+/// Counts are for one local day, [`Checks::day`]; the updater starts them again each day.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Checks {
+    /// The local day the counts are for, in days since 1 January 1970.
+    pub day: u64,
+    /// Network attempts that day, at most 6 (REL-04).
+    pub attempts: u32,
+    /// Checks that day that found no new image (WALL-03).
+    pub same: u32,
+    /// Whether that day's new image was cached.
+    pub updated: bool,
+    /// Attempts in a row that failed that day, for the back-off (REL-04).
+    pub failures: u32,
+    /// When the last attempt started.
+    pub last_attempt_ms: Option<u64>,
+    /// When the first attempt failed since the feed last answered (SRS 7.6).
+    pub failing_since_ms: Option<u64>,
+    /// The last failure, in plain words for Settings (WALL-16).
+    pub problem: Option<String>,
 }
 
 pub trait ImageCache: Send + Sync {
@@ -111,8 +158,13 @@ pub trait ImageCache: Send + Sync {
     fn put(&self, record: ImageRecord, image: &[u8]) -> Result<ImageRecord, DataError>;
     /// The bytes of `record`'s image, or `None` if it has none.
     fn image(&self, record: &ImageRecord) -> Result<Option<Vec<u8>>, DataError>;
-    /// Deletes every cached image and its details (WALL-12).
+    /// Deletes every cached image and its details, the check log included (WALL-12).
     fn clear(&self) -> Result<(), DataError>;
+    /// What the daily image's checks have done (ADR 0029).
+    fn checks(&self) -> Checks;
+    /// Changes the check log in one write that no `put` or `clear` interleaves with, and
+    /// returns it as saved. A failed save leaves it as it was.
+    fn update_checks(&self, change: &mut dyn FnMut(&mut Checks)) -> Result<Checks, DataError>;
 }
 
 /// Keeps the details of the current and previous images in [`StoredFile::ImageDetails`], and
@@ -202,30 +254,47 @@ impl ImageCache for PersistentImageCache {
         }
         Ok(())
     }
+
+    fn checks(&self) -> Checks {
+        self.cached().checks
+    }
+
+    fn update_checks(&self, change: &mut dyn FnMut(&mut Checks)) -> Result<Checks, DataError> {
+        let _changing = self.changing();
+        let mut cached = self.cached();
+        change(&mut cached.checks);
+        self.save(&cached)?;
+        Ok(cached.checks)
+    }
 }
 
-/// What the image cache keeps (WALL-09).
+/// What the image cache keeps (WALL-09), and the check log (ADR 0029).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct Cached {
     current: Option<ImageRecord>,
     previous: Option<ImageRecord>,
+    checks: Checks,
 }
 
-/// Two records, `current` and `previous`, each holding a record or none.
+/// Three records: `current` and `previous`, each holding a record or none, and `checks`, none
+/// until a check has been made.
 impl Format for Cached {
     const KIND: &'static str = "image-cache";
     const VERSION: u32 = IMAGE_CACHE_VERSION;
     const MIGRATIONS: &'static [Migration] = &IMAGE_CACHE_MIGRATIONS;
 
     fn write(&self, out: &mut Writer) {
+        let checks = (self.checks != Checks::default()).then_some(&self.checks);
         out.line("current", &self.current)
-            .line("previous", &self.previous);
+            .line("previous", &self.previous)
+            .line("checks", checks);
     }
 
     fn read(input: &mut Reader<'_>) -> Option<Self> {
         Some(Self {
             current: input.line("current")?,
             previous: input.line("previous")?,
+            checks: input.line::<Option<Checks>>("checks")?.unwrap_or_default(),
         })
     }
 }
@@ -239,6 +308,7 @@ impl Encode for ImageRecord {
         self.info_link.encode(line);
         self.applied_at_ms.encode(line);
         self.image.encode(line);
+        self.id.encode(line);
     }
 }
 
@@ -252,6 +322,35 @@ impl Decode for ImageRecord {
             info_link: Option::decode(fields)?,
             applied_at_ms: Option::decode(fields)?,
             image: Option::decode(fields)?,
+            id: Option::decode(fields)?,
+        })
+    }
+}
+
+impl Encode for Checks {
+    fn encode(&self, line: &mut Line<'_>) {
+        self.day.encode(line);
+        self.attempts.encode(line);
+        self.same.encode(line);
+        self.updated.encode(line);
+        self.failures.encode(line);
+        self.last_attempt_ms.encode(line);
+        self.failing_since_ms.encode(line);
+        self.problem.encode(line);
+    }
+}
+
+impl Decode for Checks {
+    fn decode(fields: &mut Fields<'_>) -> Option<Self> {
+        Some(Self {
+            day: u64::decode(fields)?,
+            attempts: u32::decode(fields)?,
+            same: u32::decode(fields)?,
+            updated: bool::decode(fields)?,
+            failures: u32::decode(fields)?,
+            last_attempt_ms: Option::decode(fields)?,
+            failing_since_ms: Option::decode(fields)?,
+            problem: Option::decode(fields)?,
         })
     }
 }
@@ -291,7 +390,8 @@ mod tests {
     /// change or remove a fixture; add one for each new version.
     const FIXTURES: [Fixture; IMAGE_CACHE_VERSION as usize] = [
         (include_str!("../fixtures/image-cache-v1.txt"), sample_v1),
-        (include_str!("../fixtures/image-cache-v2.txt"), sample),
+        (include_str!("../fixtures/image-cache-v2.txt"), sample_v2),
+        (include_str!("../fixtures/image-cache-v3.txt"), sample),
     ];
 
     fn record(date: &str) -> ImageRecord {
@@ -303,6 +403,7 @@ mod tests {
             info_link: None,
             applied_at_ms: None,
             image: None,
+            id: None,
         }
     }
 
@@ -316,17 +417,41 @@ mod tests {
                 info_link: Some("https://example.com/details?id=1 2".into()),
                 applied_at_ms: Some(1_763_272_800_000),
                 image: Some(ImageFile::B),
+                id: Some("OHR.Puffins_EN-GB0123456789".into()),
             }),
             previous: Some(ImageRecord {
                 image: Some(ImageFile::A),
                 ..record("20261115")
             }),
+            checks: Checks {
+                day: 20_408,
+                attempts: 3,
+                same: 1,
+                updated: false,
+                failures: 2,
+                last_attempt_ms: Some(1_763_283_600_000),
+                failing_since_ms: Some(1_763_280_000_000),
+                problem: Some("No connection".into()),
+            },
         }
     }
 
-    /// Version 1 kept no images.
-    fn sample_v1() -> Cached {
+    /// Version 2 kept no ids and no checks.
+    fn sample_v2() -> Cached {
         let mut cached = sample();
+        for record in [&mut cached.current, &mut cached.previous]
+            .into_iter()
+            .flatten()
+        {
+            record.id = None;
+        }
+        cached.checks = Checks::default();
+        cached
+    }
+
+    /// Version 1 kept no images either.
+    fn sample_v1() -> Cached {
+        let mut cached = sample_v2();
         for record in [&mut cached.current, &mut cached.previous]
             .into_iter()
             .flatten()
@@ -429,6 +554,50 @@ mod tests {
     }
 
     #[test]
+    fn the_check_log_is_kept_beside_the_images_and_cleared_with_them() {
+        // ADR 0029, WALL-12
+        let (storage, cache) = cache();
+        assert_eq!(cache.checks(), Checks::default());
+
+        let saved = cache
+            .update_checks(&mut |checks| {
+                checks.day = 20_408;
+                checks.attempts = 1;
+            })
+            .unwrap();
+        // An image cached after it keeps it.
+        cache.put(record("20261116"), b"one").unwrap();
+
+        let restarted = PersistentImageCache::new(storage.clone());
+        assert_eq!(restarted.checks(), saved);
+        assert_eq!(restarted.checks().attempts, 1);
+        assert_eq!(restarted.current().unwrap().date, "20261116");
+
+        restarted.clear().unwrap();
+        assert_eq!(restarted.checks(), Checks::default());
+        assert!(storage.files.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_check_log_that_cant_be_saved_stays_as_it_was() {
+        // REL-03
+        let (storage, cache) = cache();
+        cache
+            .update_checks(&mut |checks| checks.attempts = 1)
+            .unwrap();
+        *storage.error.lock().unwrap() = Some(DataError::Failed("Disk error".into()));
+
+        assert!(
+            cache
+                .update_checks(&mut |checks| checks.attempts = 2)
+                .is_err()
+        );
+
+        *storage.error.lock().unwrap() = None;
+        assert_eq!(cache.checks().attempts, 1);
+    }
+
+    #[test]
     fn a_failed_save_leaves_the_previous_details() {
         // REL-03
         let (storage, cache) = cache();
@@ -488,6 +657,11 @@ mod tests {
                 "current 1 en-US T A - - c\nprevious -\n",
             ),
             seal("image-cache", 1, "current\nprevious -\n"),
+            seal(
+                "image-cache",
+                IMAGE_CACHE_VERSION,
+                "current -\nprevious -\nchecks 1 2\n",
+            ),
             damaged,
             b"garbage".to_vec(),
         ] {

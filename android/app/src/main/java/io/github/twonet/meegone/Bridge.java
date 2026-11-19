@@ -39,10 +39,12 @@ import android.net.ConnectivityManager;
 import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.Uri;
+import android.os.BatteryManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.PowerManager;
 import android.os.Process;
 import android.os.SystemClock;
 import android.os.UserHandle;
@@ -1466,6 +1468,72 @@ final class Bridge {
         } catch (RuntimeException e) {
             Log.w(TAG, "Couldn't read the free storage: " + e.getClass().getSimpleName());
             return -1;
+        }
+    }
+
+    /**
+     * Whether battery saver is on or the battery is low, when automatic downloads wait (WALL-04,
+     * PWR-04, ADR 0029). The battery's "low" flag comes from the system's last battery report,
+     * which needs no receiver. False if the system can't say. Called from Rust.
+     */
+    boolean savesBattery() {
+        try {
+            PowerManager power = context.getSystemService(PowerManager.class);
+            if (power != null && power.isPowerSaveMode()) {
+                return true;
+            }
+            Intent battery =
+                    context.registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+            return battery != null
+                    && battery.getBooleanExtra(BatteryManager.EXTRA_BATTERY_LOW, false);
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Couldn't read the battery: " + e.getClass().getSimpleName());
+            return false;
+        }
+    }
+
+    /**
+     * Whether Data Saver keeps MeeGone's background work off metered networks (PWR-04, ADR
+     * 0029). True if the system can't say, so automatic downloads wait for Wi-Fi. Called from
+     * Rust.
+     */
+    boolean savesData() {
+        try {
+            return context.getSystemService(ConnectivityManager.class)
+                    .getRestrictBackgroundStatus()
+                    == ConnectivityManager.RESTRICT_BACKGROUND_STATUS_ENABLED;
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Couldn't read Data Saver: " + e.getClass().getSimpleName());
+            return true;
+        }
+    }
+
+    /**
+     * Schedules the daily image's job to run no earlier than {@code notBeforeMs}, on any network
+     * if {@code anyNetwork} is 1 or only an unmetered one (WALL-04, ADR 0029). Returns null, or a
+     * short message when the system can't schedule it. Called from Rust.
+     */
+    String scheduleImageJob(long notBeforeMs, int anyNetwork) {
+        return ImageJobService.schedule(context, notBeforeMs, anyNetwork != 0);
+    }
+
+    /** Cancels the daily image's job (WALL-12). As {@link #scheduleImageJob}. Called from Rust. */
+    String cancelImageJob() {
+        return ImageJobService.cancel(context);
+    }
+
+    /**
+     * The daily image's check reached the feed, on its own thread: the home reads the image and
+     * how the checks are going again, on the main thread (ADR 0029). Does nothing before there
+     * is a bridge.
+     */
+    static void imageChecked() {
+        Bridge bridge;
+        synchronized (Bridge.class) {
+            bridge = instance;
+        }
+        if (bridge != null) {
+            bridge.main.post(() -> HomeActivity.imageChecked(bridge.activity));
         }
     }
 

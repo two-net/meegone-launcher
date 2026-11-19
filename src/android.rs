@@ -1,10 +1,12 @@
 //! The native methods of `HomeActivity` (ADR 0005, ADR 0007) and `HomeViews` (ADR 0006,
-//! ADR 0008), called by Android on the main thread. The one exception is `AppAccents`'
-//! `nativeAccent`, which is pure and runs on its own thread (ADR 0011).
+//! ADR 0008), called by Android on the main thread. The exceptions run on threads of their own:
+//! `AppAccents`' `nativeAccent`, which is pure (ADR 0011), and `ImageJobService`'s
+//! `nativeCheckImage`, the daily image's check (ADR 0029).
 //!
 //! The process has one [`Launcher`], kept on the main thread. Every `HomeActivity` shares it:
 //! the one opened from the app drawer and the one Home starts can be alive at once, and two
-//! launchers would both write MeeGone's files.
+//! launchers would both write MeeGone's files. It shares its stores with the daily image's job
+//! through the process's one [`Shared`], which the job may build first, without the home.
 //!
 //! `HomeViews` draws the home views with Android's own views. It passes touches, frame times
 //! and its layout in, then reads what to draw with `nativeRead`, whose slots are listed in
@@ -28,6 +30,7 @@
 use std::any::Any;
 use std::cell::RefCell;
 use std::panic::{self, AssertUnwindSafe};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use meegone_core_data::android::{self, Env, JObject, LocalRef, RawEnv};
@@ -37,7 +40,8 @@ use crate::{
     Age, AppMenuItem, BADGE_ROWS, Bounds, Cell, CellKey, Direction, EventsListMode, EventsRow,
     FOLDER_COLUMNS, FolderId, GridLayout, HomeFrame, HomeView, Launcher, Layout, MenuItem,
     NotificationMenuItem, PREVIEW_APPS, PinchEvent, PinchKind, PointerEvent, PointerKind,
-    RECENT_ROWS, RecentMode, RowTarget, SavedHome, SettingsGroup, ShellIntent, ShownCard, Surface,
+    RECENT_ROWS, RecentMode, RowTarget, SavedHome, SettingsGroup, Shared, ShellIntent, ShownCard,
+    Surface,
 };
 
 /// JNI's `jboolean`.
@@ -45,6 +49,20 @@ type JBoolean = u8;
 
 thread_local! {
     static LAUNCHER: RefCell<Option<Launcher>> = const { RefCell::new(None) };
+}
+
+/// What the home and the daily image's job share, built by whichever starts first (ADR 0029).
+static SHARED: OnceLock<Shared> = OnceLock::new();
+
+/// The process's [`Shared`], built from `bridge` and `files_dir` (a `String`) the first time.
+fn shared(env: Env, bridge: &LocalRef, files_dir: &LocalRef) -> Result<&'static Shared, String> {
+    if let Some(shared) = SHARED.get() {
+        return Ok(shared);
+    }
+    let platform = android::platform(env, bridge, files_dir)
+        .map_err(|error| format!("MeeGone couldn't start: {error}"))?;
+    // If another thread built one meanwhile, that one is kept.
+    Ok(SHARED.get_or_init(|| Shared::new(platform)))
 }
 
 /// `boolean nativeStart(Bridge bridge, String filesDir, int savedView, int savedAppsScrollPx)`:
@@ -79,9 +97,7 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeActivity_nativeS
     guarded(env, || {
         LAUNCHER.with_borrow_mut(|launcher| {
             if launcher.is_none() {
-                let platform = android::platform(env, &bridge, &files_dir)
-                    .map_err(|error| format!("MeeGone couldn't start: {error}"))?;
-                let mut new = Launcher::start(platform);
+                let mut new = Launcher::start_shared(shared(env, &bridge, &files_dir)?);
                 if let Some(view) = usize::try_from(saved_view)
                     .ok()
                     .and_then(HomeView::from_index)
@@ -225,6 +241,64 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeActivity_nativeC
     with_launcher(env, |launcher| {
         launcher.dispatch(ShellIntent::ClockChanged);
         launcher.frame();
+    });
+}
+
+/// `static boolean nativeCheckImage(Bridge bridge, String filesDir)`: runs the daily image's
+/// check if one is due, and schedules the job for the next one (WALL-03, ADR 0029). Called by
+/// `ImageJobService` on its own thread, never the main one, when the system starts the job and
+/// once at each start of MeeGone. Returns whether it reached the feed, so the home reads the
+/// image again (`nativeImageChecked`).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_ImageJobService_nativeCheckImage(
+    env: RawEnv,
+    _class: JObject,
+    bridge: JObject,
+    files_dir: JObject,
+) -> JBoolean {
+    // SAFETY: the JVM passes this thread's environment and live local references, which are
+    // used only during this call.
+    let (env, bridge, files_dir) = unsafe {
+        (
+            Env::from_raw(env),
+            LocalRef::from_raw(bridge),
+            LocalRef::from_raw(files_dir),
+        )
+    };
+    let mut attempted = false;
+    guarded(env, || {
+        attempted = shared(env, &bridge, &files_dir)?.check_image();
+        Ok(())
+    });
+    JBoolean::from(attempted)
+}
+
+/// `static void nativeImageChecked()`: the daily image's check reached the feed, so the image
+/// and how the checks are going are read again (ADR 0029). Does nothing before the home has
+/// started, as the job may run without it.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeActivity_nativeImageChecked(
+    env: RawEnv,
+    _class: JObject,
+) {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    guarded(env, || {
+        LAUNCHER.with_borrow_mut(|launcher| {
+            if let Some(launcher) = launcher {
+                launcher.dispatch(ShellIntent::ImageChecked);
+                launcher.frame();
+            }
+        });
+        Ok(())
     });
 }
 
@@ -1464,6 +1538,54 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeShow
     })
 }
 
+/// `String nativeUseMobileData(boolean on)`: Settings → Lock-screen image → "Use mobile data"
+/// was switched (WALL-04, SET-03). Returns `null`, or a short message to show when the choice
+/// couldn't be saved. Does nothing while the lock-screen image isn't working (ARCH-09).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeUseMobileData(
+    env: RawEnv,
+    _views: JObject,
+    on: JBoolean,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_image_message(env, |launcher| {
+        launcher
+            .view()
+            .image_settings()
+            .use_mobile_data_toggled(on != 0);
+        true
+    })
+}
+
+/// `String nativeImageTryAgain()`: Try again was tapped below "Daily image unavailable"
+/// (SRS 7.6). Returns `null`, or a short message to show when it couldn't be done. Does nothing
+/// unless Settings says the daily image is unavailable.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeImageTryAgain(
+    env: RawEnv,
+    _views: JObject,
+) -> JObject {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    with_image_message(env, |launcher| {
+        let section = launcher.view().image_settings();
+        let offered = section.daily_image_unavailable();
+        if offered {
+            section.try_again();
+        }
+        offered
+    })
+}
+
 /// Asks something of the lock-screen image with `step`, applies it, and returns its `problem`
 /// as a message for the host to show, or `null`. Does nothing while it isn't working (ARCH-09).
 fn with_image_message(env: Env, step: impl FnOnce(&Launcher) -> bool) -> JObject {
@@ -2360,7 +2482,7 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRead
 }
 
 /// How many slots the frame has.
-const FRAME_SLOTS: usize = 128;
+const FRAME_SLOTS: usize = 130;
 /// The first of Recent's close-mode slots.
 const CLOSE_SLOTS: usize = 104;
 
@@ -2460,6 +2582,8 @@ const CLOSE_SLOTS: usize = 104;
 /// | 109–117 | The ✕ scale of each row of cards, in ten-thousandths (ANIM-12) |
 /// | 118–126 | How far the cards that left each row of the cards last read have gone, 0 to 10 000: they shrink and fade (ANIM-18) |
 /// | 127 | Settings → Recent → Time window: 12, 24 or 72 hours, or -1 while Recent isn't working, so Settings doesn't offer it (REC-11) |
+/// | 128 | Settings → "Use mobile data": 1 on, 0 off, or -1 while the lock-screen image isn't working, so it isn't offered (WALL-04, ARCH-09) |
+/// | 129 | 1 while Settings shows "Daily image unavailable", with Try again (SRS 7.6); otherwise 0 |
 fn frame_slots(frame: &HomeFrame) -> [i32; FRAME_SLOTS] {
     let [events, applications, recent] = frame.pages;
     let menu_items = frame.menu.map_or(0, |menu| {
@@ -2656,6 +2780,8 @@ fn frame_slots(frame: &HomeFrame) -> [i32; FRAME_SLOTS] {
     slots[window] = frame
         .recent_window
         .map_or(-1, |window| window.hours() as i32);
+    slots[window + 1] = frame.use_mobile_data.map_or(-1, i32::from);
+    slots[window + 2] = i32::from(frame.image_unavailable);
     slots
 }
 

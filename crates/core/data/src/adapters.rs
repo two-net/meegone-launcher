@@ -109,6 +109,10 @@ pub trait WallpaperAdapter: Send + Sync {
 /// HTTPS downloads and network state (SEC-01, WALL-04, WALL-11).
 pub trait NetworkAdapter: Send + Sync {
     fn state(&self) -> NetworkState;
+    /// Whether the system's Data Saver keeps MeeGone's background work off metered networks.
+    /// Automatic downloads then wait for an unmetered one, even with "Use mobile data" on
+    /// (PWR-04, ADR 0029).
+    fn saves_data(&self) -> bool;
     /// Fetches an `https://` URL with the platform's certificate validation, following only
     /// `https://` redirects. The request carries the URL and nothing that tells the device or
     /// the user apart (PRIV-02). It blocks: on Android, call it from a JVM thread other than the
@@ -120,13 +124,15 @@ pub trait NetworkAdapter: Send + Sync {
     fn get(&self, https_url: &str, max_bytes: usize) -> Result<Vec<u8>, DataError>;
 }
 
-/// The one scheduled background job, the daily image (ARCH-07).
+/// The one scheduled background job, the daily image (ARCH-07, ADR 0029).
 pub trait SchedulerAdapter: Send + Sync {
-    /// Schedules the image job, replacing any job already scheduled. The system also waits
-    /// while battery saver is on or the battery is low (WALL-04).
+    /// Schedules the image job, replacing any job already scheduled. The system runs it no
+    /// earlier than `job.not_before_ms`, once `job.network` is available and the battery isn't
+    /// low (WALL-04). The job asks `ImageUpdater::check` what to do, and that schedules the next
+    /// run.
     ///
     /// `Unsupported` if background scheduling isn't available; the image is then checked at
-    /// the next MeeGone start.
+    /// the next MeeGone start (SRS 8.1).
     fn schedule_image_job(&self, job: ImageJob) -> Result<(), DataError>;
     fn cancel_image_job(&self) -> Result<(), DataError>;
 }
@@ -158,6 +164,9 @@ pub trait SystemConfigAdapter: Send + Sync {
     /// (SRS 7.6, ADR 0028). It may take a moment, so ask it off the main thread, as the daily
     /// image does.
     fn free_storage_bytes(&self) -> Option<u64>;
+    /// Whether battery saver is on or the battery is low, when automatic downloads wait
+    /// (WALL-04, PWR-04, ADR 0029).
+    fn saves_battery(&self) -> bool;
     /// `at_ms` written in `style`, in the device's language, time zone and 12- or 24-hour
     /// setting (L10N-03), for the Events header (EVT-01, EVT-02). Empty if the platform can't
     /// write it.

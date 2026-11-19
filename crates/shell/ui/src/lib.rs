@@ -26,7 +26,7 @@ use meegone_events_ui::EventsView;
 pub use meegone_events_ui::{
     EventsListMode, EventsMenuFrame, EventsRow, NotificationMenuItem, RowTarget,
 };
-pub use meegone_lockimage_ui::CardContent;
+pub use meegone_lockimage_ui::{CardContent, CheckStatus};
 use meegone_lockimage_ui::{ImageCard, ImageSettingsSection};
 pub use meegone_recent_ui::{Age, RecentMode, RecentWindow, ShownCard};
 use meegone_recent_ui::{RecentSettingsSection, RecentView};
@@ -320,6 +320,12 @@ pub struct HomeFrame {
     /// `None` while the lock-screen image isn't working, so Settings doesn't offer it
     /// (ARCH-09).
     pub show_image_card: Option<bool>,
+    /// Settings → Lock-screen image → "Use mobile data" (WALL-04): whether it is on, or `None`
+    /// while the lock-screen image isn't working, so Settings doesn't offer it (ARCH-09).
+    pub use_mobile_data: Option<bool>,
+    /// Settings → Lock-screen image shows "Daily image unavailable", with Try again: its checks
+    /// have failed for 3 days (SRS 7.6, ADR 0029).
+    pub image_unavailable: bool,
     /// Settings → Recent → Time window (REC-11): the window chosen, or `None` while Recent isn't
     /// working, so Settings doesn't offer it (ARCH-09).
     pub recent_window: Option<RecentWindow>,
@@ -567,6 +573,11 @@ impl ShellView {
             show_image_card: shell
                 .lockimage_ready()
                 .then(|| self.image_settings.show_card()),
+            use_mobile_data: shell
+                .lockimage_ready()
+                .then(|| self.image_settings.use_mobile_data()),
+            image_unavailable: shell.lockimage_ready()
+                && self.image_settings.daily_image_unavailable(),
             recent_window: shell.recent_ready().then(|| self.recent_settings.window()),
             recent: shell.recent_ready().then(|| {
                 let revision = self.recent.show_cards(&shell.recent().state(), tokens);

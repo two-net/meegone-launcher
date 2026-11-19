@@ -100,5 +100,12 @@
                 <action android:name="android.service.notification.NotificationListenerService" />
             </intent-filter>
         </service>
+
+        <!-- The daily image's check, MeeGone's one scheduled job (ARCH-07, ADR 0029). Only the
+             system's job scheduler may start it. -->
+        <service
+            android:name=".ImageJobService"
+            android:exported="false"
+            android:permission="android.permission.BIND_JOB_SERVICE" />
     </application>
 </manifest>

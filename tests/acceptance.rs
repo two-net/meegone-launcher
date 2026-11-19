@@ -3,8 +3,8 @@
 //!
 //! Not automated yet, because the behaviour isn't built:
 //! - AC-01: first-run setup (#35)
-//! - AC-15 to AC-17: the daily image (#27 to #30). Its card in Events (EVT-12, #21) is
-//!   automated below.
+//! - AC-15 and AC-17: the daily image as the lock-screen wallpaper (#29). Its card in Events
+//!   (EVT-12, #21), AC-16 and the daily check's conditions (#28) are automated below.
 //!
 //! AC-18 to AC-20 (animation scale, screen reader, timing) need a device; they belong to the
 //! device matrix (#43). Their core logic is tested without one: the carousel with animations
@@ -16,19 +16,21 @@ mod backup;
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use meegone_core_data::fakes::{Fakes, WORK_PROFILE, app, app_id, notification, used, work_app};
+use meegone_core_data::fakes::{
+    self, Fakes, WORK_PROFILE, app, app_id, notification, used, work_app,
+};
 use meegone_core_data::storage::format::seal;
 use meegone_core_data::{
-    App, DataError, HomeTarget, Notification, NotificationsAdapter, Profile, ProfileId,
-    RecentDensity, Rect, Rgb, Shortcut, StoredFile, ThemeChoice, accent,
+    App, DataError, HomeTarget, JobNetwork, NetworkState, Notification, NotificationsAdapter,
+    Profile, ProfileId, RecentDensity, Rect, Rgb, Shortcut, Size, StoredFile, ThemeChoice, accent,
 };
 use meegone_core_state::{Access, Health, Theme};
 use meegone_core_ui::tokens;
 use meegone_launcher::{
-    Age, AppMenuItem, BADGE_ROWS, Bounds, CardContent, CellKey, Direction, EventsListMode,
-    EventsMenuFrame, FolderId, GridLayout, HomeView, Launcher, Layout, LiftFrame, MenuItem,
-    NotificationMenuItem, PinchEvent, PinchKind, PointerEvent, PointerKind, RECENT_ROWS,
-    RecentFrame, RecentMode, RecentWindow, SettingsGroup, ShellIntent, Surface,
+    Age, AppMenuItem, BADGE_ROWS, Bounds, CardContent, CellKey, CheckStatus, Direction,
+    EventsListMode, EventsMenuFrame, FolderId, GridLayout, HomeView, Launcher, Layout, LiftFrame,
+    MenuItem, NotificationMenuItem, PinchEvent, PinchKind, PointerEvent, PointerKind, RECENT_ROWS,
+    RecentFrame, RecentMode, RecentWindow, SettingsGroup, Shared, ShellIntent, Surface,
 };
 
 /// A phone 1080 × 2400 px at 2.75 px per dp.
@@ -3046,6 +3048,221 @@ fn evt12_given_a_new_image_arrives_then_the_card_shows_it_and_its_thumbnail_cros
     come_to_rest(&mut launcher, &mut clock);
     assert_eq!(clock, 9_304);
     assert_eq!(launcher.frame().image_change, 10_000);
+}
+
+/// 19 November 2026, 00:00 UTC, the daily check's first day.
+const NOV_19_MS: u64 = 1_795_046_400_000;
+/// Where Bing's feed gives today's image in the device's region, United States English.
+const FEED_URL: &str = "https://www.bing.com/HPImageArchive.aspx?format=js&idx=0&n=1&mkt=en-US";
+/// The feed's largest version of that image, the one picked for this phone's lock screen.
+const UHD_URL: &str = "https://www.bing.com/th?id=OHR.BarnOwlsUnite_EN-US9661992435_UHD.jpg";
+
+/// MeeGone, on its first day, with its daily image turned on in Settings, and the job its
+/// updater shares the stores with (ADR 0029). Its own clock starts at local midnight in UTC.
+fn with_the_daily_check(fakes: &Fakes) -> (Shared, Launcher) {
+    *fakes.system.now_ms.lock().unwrap() = NOV_19_MS;
+    let shared = Shared::new(fakes.platform());
+    let mut launcher = Launcher::start_shared(&shared);
+    launcher.view().image_settings().daily_image_toggled(true);
+    launcher.frame();
+    (shared, launcher)
+}
+
+/// Plays the system's job scheduler until `until_ms`: whenever MeeGone's one job is due, the
+/// clock moves to it and the job runs, then the home hears it checked (ARCH-07). It runs the job
+/// even where the system would wait for its network, as MeeGone's start may. Returns how many
+/// times it ran.
+fn run_the_daily_job(
+    fakes: &Fakes,
+    shared: &Shared,
+    launcher: &mut Launcher,
+    until_ms: u64,
+) -> u32 {
+    let mut runs = 0;
+    loop {
+        let now = *fakes.system.now_ms.lock().unwrap();
+        let Some(job) = *fakes.scheduler.job.lock().unwrap() else {
+            return runs;
+        };
+        let at = job.not_before_ms.max(now);
+        if at >= until_ms {
+            return runs;
+        }
+        *fakes.system.now_ms.lock().unwrap() = at;
+        if shared.check_image() {
+            launcher.dispatch(ShellIntent::ImageChecked);
+        }
+        runs += 1;
+    }
+}
+
+#[test]
+fn ac16_given_no_connection_the_daily_check_keeps_the_wallpaper_says_it_will_try_again_and_makes_at_most_6_attempts()
+ {
+    // AC-16, issue #28: WALL-08, WALL-16, REL-04. Today's image is already cached; then the
+    // connection goes for the whole day.
+    let fakes = Fakes::default();
+    image_cached(&fakes);
+    let (shared, mut launcher) = with_the_daily_check(&fakes);
+    let cached = fakes.storage.files.lock().unwrap()[&StoredFile::ImageA].clone();
+
+    let runs = run_the_daily_job(&fakes, &shared, &mut launcher, NOV_19_MS + 24 * HOUR_MS);
+
+    // Six attempts, each one request to the feed, backing off 15, 30, 60, 120 and 240 minutes.
+    assert_eq!(runs, 6);
+    assert_eq!(*fakes.network.requests.lock().unwrap(), [FEED_URL; 6]);
+    // The lock-screen image and its wallpaper are as they were (WALL-08).
+    assert_eq!(
+        fakes.storage.files.lock().unwrap()[&StoredFile::ImageA],
+        cached
+    );
+    assert_eq!(*fakes.wallpaper.lock_screen_images_set.lock().unwrap(), 0);
+    // Settings says why, and that it will try again (WALL-16).
+    let settings = launcher.view().image_settings();
+    assert_eq!(
+        settings.checks(),
+        CheckStatus::Retrying("No connection".into())
+    );
+    assert!(!settings.daily_image_unavailable());
+    // The next attempt is the next day's check, after local midnight (WALL-03).
+    assert_eq!(
+        fakes
+            .scheduler
+            .job
+            .lock()
+            .unwrap()
+            .map(|job| job.not_before_ms),
+        Some(NOV_19_MS + 24 * HOUR_MS)
+    );
+}
+
+#[test]
+fn srs7_6_after_3_days_of_failures_settings_says_daily_image_unavailable_with_try_again() {
+    // Issue #28, SRS 7.6: the connection is gone for three days, then comes back.
+    let fakes = Fakes::default();
+    let (shared, mut launcher) = with_the_daily_check(&fakes);
+    let three_days = NOV_19_MS + 72 * HOUR_MS;
+
+    run_the_daily_job(&fakes, &shared, &mut launcher, three_days + HOUR_MS);
+
+    // Six attempts a day, and three in the fourth day's first hour, backing off (REL-04).
+    assert_eq!(fakes.network.requests.lock().unwrap().len(), 3 * 6 + 3);
+    assert!(launcher.frame().image_unavailable);
+    assert!(launcher.view().image_settings().daily_image_unavailable());
+
+    // Try again: the message goes, and the job runs as soon as it may.
+    serve_todays_image(&fakes);
+    launcher.view().image_settings().try_again();
+    assert!(!launcher.frame().image_unavailable);
+    run_the_daily_job(&fakes, &shared, &mut launcher, three_days + 24 * HOUR_MS);
+
+    assert_eq!(launcher.view().image_settings().checks(), CheckStatus::Fine);
+    assert_eq!(
+        fakes
+            .network
+            .requests
+            .lock()
+            .unwrap()
+            .last()
+            .map(String::as_str),
+        Some(UHD_URL)
+    );
+}
+
+/// The network serves Bing's feed with today's image, Barn owls, and that image's largest
+/// version, on Wi-Fi.
+fn serve_todays_image(fakes: &Fakes) {
+    *fakes.network.state.lock().unwrap() = NetworkState::Unmetered;
+    let mut responses = fakes.network.responses.lock().unwrap();
+    responses.insert(
+        FEED_URL.into(),
+        include_bytes!("../crates/lockimage/data/fixtures/bing-en-US.json").to_vec(),
+    );
+    responses.insert(
+        UHD_URL.into(),
+        fakes::jpeg(Size {
+            width: 3840,
+            height: 2160,
+        }),
+    );
+}
+
+#[test]
+fn wall04_given_mobile_data_only_and_use_mobile_data_off_no_automatic_download_happens() {
+    // Issue #28: WALL-04, PWR-04. Only mobile data all day, with "Use mobile data" off.
+    let fakes = Fakes::default();
+    serve_todays_image(&fakes);
+    *fakes.network.state.lock().unwrap() = NetworkState::Metered;
+    let (shared, mut launcher) = with_the_daily_check(&fakes);
+    assert_eq!(launcher.frame().use_mobile_data, Some(false));
+
+    run_the_daily_job(&fakes, &shared, &mut launcher, NOV_19_MS + 24 * HOUR_MS);
+
+    // Nothing was asked of the network, and the job waits for an unmetered one.
+    assert!(fakes.network.requests.lock().unwrap().is_empty());
+    assert_eq!(launcher.view().image_settings().checks(), CheckStatus::Fine);
+    assert_eq!(
+        fakes.scheduler.job.lock().unwrap().map(|job| job.network),
+        Some(JobNetwork::Unmetered)
+    );
+
+    // With Data Saver on, turning "Use mobile data" on still downloads nothing (PWR-04).
+    *fakes.network.saves_data.lock().unwrap() = true;
+    launcher
+        .view()
+        .image_settings()
+        .use_mobile_data_toggled(true);
+    assert_eq!(launcher.frame().use_mobile_data, Some(true));
+    assert_eq!(
+        fakes.scheduler.job.lock().unwrap().map(|job| job.network),
+        Some(JobNetwork::Any)
+    );
+    run_the_daily_job(&fakes, &shared, &mut launcher, NOV_19_MS + 25 * HOUR_MS);
+    assert!(fakes.network.requests.lock().unwrap().is_empty());
+
+    // Without it, today's image downloads over mobile data.
+    *fakes.network.saves_data.lock().unwrap() = false;
+    run_the_daily_job(&fakes, &shared, &mut launcher, NOV_19_MS + 26 * HOUR_MS);
+    assert_eq!(*fakes.network.requests.lock().unwrap(), [FEED_URL, UHD_URL]);
+    launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
+    assert_eq!(
+        image_card(&mut launcher).map(|card| card.title),
+        Some("Hunting from dusk till dawn".into())
+    );
+}
+
+#[test]
+fn wall03_a_new_image_is_fetched_once_a_day_after_local_midnight() {
+    // Issue #28: WALL-03, PWR-03. On Wi-Fi in Bangkok, the image is fetched just after local
+    // midnight, and the next day's checks find the same image and download nothing: one image
+    // a day, about 4 MB from the feed, and a few small details responses.
+    let fakes = Fakes::default();
+    serve_todays_image(&fakes);
+    *fakes.system.utc_offset_ms.lock().unwrap() = 7 * HOUR_MS as i64;
+    let (shared, mut launcher) = with_the_daily_check(&fakes);
+    let bangkok_midnight = NOV_19_MS + 17 * HOUR_MS;
+
+    run_the_daily_job(&fakes, &shared, &mut launcher, bangkok_midnight);
+    assert_eq!(*fakes.network.requests.lock().unwrap(), [FEED_URL, UHD_URL]);
+
+    // The next local day: four checks two hours apart find the same image.
+    run_the_daily_job(
+        &fakes,
+        &shared,
+        &mut launcher,
+        bangkok_midnight + 24 * HOUR_MS,
+    );
+    let requests = fakes.network.requests.lock().unwrap().clone();
+    assert_eq!(requests[2..], [FEED_URL; 4]);
+    assert_eq!(
+        fakes
+            .scheduler
+            .job
+            .lock()
+            .unwrap()
+            .map(|job| job.not_before_ms),
+        Some(bangkok_midnight + 24 * HOUR_MS)
+    );
 }
 
 /// A card's on-screen rect, which its app grows from (ANIM-08).

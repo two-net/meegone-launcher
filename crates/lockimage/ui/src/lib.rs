@@ -10,6 +10,8 @@ use std::rc::Rc;
 use meegone_core_ui::{Dispatch, Latest, Slot, Tokens};
 use meegone_lockimage_state::{ImageStatus, LockImageIntent, LockImageState};
 
+pub use meegone_lockimage_state::CheckStatus;
+
 #[cfg(test)]
 mod tests;
 
@@ -171,11 +173,40 @@ impl ImageSettingsSection {
     pub fn region_chosen(&self, region: Option<String>) {
         self.dispatch.send(LockImageIntent::SetRegion(region));
     }
+
+    /// Whether "Use mobile data" is on (WALL-04).
+    pub fn use_mobile_data(&self) -> bool {
+        self.latest.get().use_mobile_data
+    }
+
+    /// "Use mobile data" was switched (WALL-04, SET-03).
+    pub fn use_mobile_data_toggled(&self, on: bool) {
+        self.dispatch.send(LockImageIntent::SetUseMobileData(on));
+    }
+
+    /// How the daily checks are going: the last problem while they retry, for the status line
+    /// #30 draws (WALL-16, SRS 7.6).
+    pub fn checks(&self) -> CheckStatus {
+        self.latest.get().checks.clone()
+    }
+
+    /// Whether the section says "Daily image unavailable", with Try again: the daily image is
+    /// on, and its checks have failed for 3 days (SRS 7.6).
+    pub fn daily_image_unavailable(&self) -> bool {
+        let state = self.latest.get();
+        state.status == ImageStatus::On && matches!(state.checks, CheckStatus::Unavailable(_))
+    }
+
+    /// Try again was tapped (SRS 7.6).
+    pub fn try_again(&self) {
+        self.dispatch.send(LockImageIntent::TryAgain);
+    }
 }
 
 impl Slot for ImageSettingsSection {
     fn render(&mut self, _tokens: &Tokens) {
-        // The host draws "Show card in Events" until the Settings screen, #34, draws the rest,
-        // Region included (ADR 0006, ADR 0022, ADR 0027).
+        // The host draws "Show card in Events", "Use mobile data" and "Daily image unavailable"
+        // until the Settings screen, #34, draws the rest, Region included (ADR 0006, ADR 0022,
+        // ADR 0027, ADR 0029).
     }
 }

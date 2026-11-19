@@ -15,13 +15,16 @@
 //! - [`network`]: the network's state and HTTPS requests (SEC-01, SEC-02, ADR 0027).
 //! - [`wallpaper`]: the lock screen's size and cropping the daily image (WALL-06, ADR 0028).
 //!   Setting the wallpaper arrives with #29.
-//! - [`stubs`]: every adapter not built yet, answering with its "if unavailable" value.
+//! - [`scheduler`]: the daily image's job (ARCH-07, WALL-03, ADR 0029).
+//!
+//! What isn't built yet answers with its "if unavailable" value (SRS 8.1), through
+//! [`not_yet`].
 
 mod apps;
 mod jni;
 mod network;
 mod notifications;
-mod stubs;
+mod scheduler;
 mod system;
 mod usage;
 mod wallpaper;
@@ -44,7 +47,7 @@ pub fn platform(env: Env, bridge: &LocalRef, files_dir: &LocalRef) -> Result<Pla
         usage: Arc::new(usage::AndroidUsage::new(env, bridge)?),
         wallpaper: Arc::new(wallpaper::AndroidWallpaper::new(env, bridge)?),
         network: Arc::new(network::AndroidNetwork::new(env, bridge)?),
-        scheduler: Arc::new(stubs::NotBuiltYet),
+        scheduler: Arc::new(scheduler::AndroidScheduler::new(env, bridge)?),
         system: Arc::new(system::AndroidSystem::new(env, bridge)?),
         storage: Arc::new(FileStorage::new(files_dir)),
     })

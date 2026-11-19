@@ -7,6 +7,7 @@
 //!
 //! [`HomeShell::compose`] is the only place features are put together (ARCH-03). Each feature
 //! runs in its own [`Store`], so a failing feature never takes down the shell (ARCH-09).
+//! [`Shared`] holds what the home shares with the daily image's job (ADR 0029).
 
 mod carousel;
 mod events_change;
@@ -21,6 +22,7 @@ mod press;
 mod recent_change;
 mod return_home;
 mod search;
+mod shared;
 mod timed;
 
 use std::sync::Arc;
@@ -30,9 +32,7 @@ use meegone_apps_data::PersistentLayoutStore;
 use meegone_apps_state::{
     AppsHolder, AppsIntent, AppsState, CellKey, FolderId, Surface, cells_moved,
 };
-use meegone_core_data::{
-    HomeTarget, PersistentSettingsStore, Platform, SettingsStore, SystemConfigAdapter,
-};
+use meegone_core_data::{HomeTarget, Platform, SettingsStore, SystemConfigAdapter};
 use meegone_core_state::motion::{CARD_REMOVE, MODE_SCALE, RECENT_PINCH, VIEW_FLING_VELOCITY_DP};
 use meegone_core_state::{
     Access, App, AppId, Health, RecentDensity, Store, ThemeHolder, ThemeIntent,
@@ -40,7 +40,6 @@ use meegone_core_state::{
 use meegone_events_state::{
     EventsHolder, EventsIntent, GroupId, NotificationGroup, RowKey, RowTarget, rows_came_or_went,
 };
-use meegone_lockimage_data::{BingFeed, PersistentImageCache};
 use meegone_lockimage_state::{LockImageHolder, LockImageIntent, LockImageState};
 use meegone_recent_state::{MAX_ROWS, RecentHolder, RecentIntent, RecentState, other_density};
 use meegone_settings_state::{SettingsHolder, SettingsIntent, SettingsState};
@@ -65,6 +64,7 @@ pub use meegone_recent_state::MAX_ROWS as RECENT_ROWS;
 pub use meegone_settings_state::SettingsGroup;
 use mode::Mode;
 pub use mode::{BADGE_ROWS, ModeState};
+pub use shared::Shared;
 // Close mode's badges come from a `ModeState`, which has a scale for this many rows.
 const _: () = assert!(RECENT_ROWS <= BADGE_ROWS);
 use pinch::{Ended, PinchMotion};
@@ -346,6 +346,9 @@ pub enum ShellIntent {
     /// The host decoded the image-of-the-day card's new thumbnail and is about to draw it over
     /// the one it showed, so the cross-fade starts (ANIM-22, ADR 0022).
     NewImageShown,
+    /// The daily image's check, off the main thread, reached the feed: it may have cached a
+    /// new image or changed how the checks are going (ADR 0029).
+    ImageChecked,
     Apps(AppsIntent),
     Events(EventsIntent),
     Recent(RecentIntent),
@@ -410,8 +413,14 @@ impl HomeShell {
     /// Builds every feature's stores and state holders from the platform adapters. The three
     /// persistent stores share the platform's storage (SRS 7.1, REL-03).
     pub fn compose(platform: Platform) -> Self {
-        let settings_store: Arc<dyn SettingsStore> =
-            Arc::new(PersistentSettingsStore::new(platform.storage.clone()));
+        Self::compose_shared(&Shared::new(platform))
+    }
+
+    /// As [`HomeShell::compose`], with the settings store and image cache that the daily
+    /// image's job uses too (ADR 0029).
+    pub fn compose_shared(shared: &Shared) -> Self {
+        let platform = &shared.platform;
+        let settings_store: Arc<dyn SettingsStore> = shared.settings.clone();
         let mut shell = Self {
             state: ShellState::default(),
             system: platform.system.clone(),
@@ -464,9 +473,8 @@ impl HomeShell {
             )),
             lockimage: Store::new(LockImageHolder::new(
                 settings_store.clone(),
-                Arc::new(PersistentImageCache::new(platform.storage.clone())),
-                // The feed's only implementation, which alone knows its format (ADR 0027).
-                Arc::new(BingFeed::new(platform.network.clone())),
+                shared.image_cache.clone(),
+                shared.feed.clone(),
                 platform.wallpaper.clone(),
                 platform.scheduler.clone(),
                 platform.system.clone(),
@@ -693,6 +701,7 @@ impl HomeShell {
             ShellIntent::NewImageShown => {
                 self.image_change.start(self.carousel.animation_scale());
             }
+            ShellIntent::ImageChecked => self.lockimage.dispatch(LockImageIntent::Refresh),
             ShellIntent::Apps(AppsIntent::OpenSearch) => self.open_search(),
             ShellIntent::Apps(intent) => self.apps.dispatch(intent),
             ShellIntent::Events(intent) => self.events.dispatch(intent),
@@ -1634,8 +1643,8 @@ mod tests {
     use meegone_core_state::motion::{DRAG_LIFT_SCALE, ICON_PRESS_SCALE};
     use meegone_core_state::{Access, Health, Theme, ThemeChoice};
     use meegone_events_state::NotificationMenuItem;
-    use meegone_lockimage_data::ImageCache;
-    use meegone_lockimage_state::ImageRecord;
+    use meegone_lockimage_data::{ImageCache, PersistentImageCache};
+    use meegone_lockimage_state::{CheckStatus, ImageRecord};
 
     use super::*;
 
@@ -1981,6 +1990,7 @@ mod tests {
                     info_link: None,
                     applied_at_ms: None,
                     image: None,
+                    id: Some(format!("OHR.{date}")),
                 },
                 date.as_bytes(),
             )
@@ -2108,6 +2118,35 @@ mod tests {
         cache_image(&fakes, "20261117");
         go(&mut shell, Direction::Previous);
         assert_eq!(date(&shell), "20261117");
+    }
+
+    #[test]
+    fn the_home_reads_what_the_daily_images_job_did_once_it_has_checked() {
+        // ADR 0029: the job runs on a thread of its own, through the same stores.
+        let fakes = Fakes::default();
+        let shared = Shared::new(fakes.platform());
+        let mut shell = HomeShell::compose_shared(&shared);
+        shell.dispatch(ShellIntent::LockImage(LockImageIntent::SetEnabled(true)));
+
+        let job = {
+            let shared = shared.clone();
+            std::thread::spawn(move || shared.check_image())
+        };
+        assert!(job.join().unwrap());
+        // Offline: one request, which failed.
+        assert_eq!(fakes.network.requests.lock().unwrap().len(), 1);
+        assert_eq!(shell.lockimage().state().checks, CheckStatus::Fine);
+
+        shell.dispatch(ShellIntent::ImageChecked);
+        assert_eq!(
+            shell.lockimage().state().checks,
+            CheckStatus::Retrying("No connection".into())
+        );
+
+        // Turned off in the home, the job has nothing to do.
+        shell.dispatch(ShellIntent::LockImage(LockImageIntent::SetEnabled(false)));
+        assert!(!shared.check_image());
+        assert_eq!(fakes.network.requests.lock().unwrap().len(), 1);
     }
 
     #[test]

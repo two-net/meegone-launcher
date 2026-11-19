@@ -1,5 +1,5 @@
-//! [`NetworkAdapter`] on Android: the network's state, and HTTPS requests (SEC-01, SEC-02,
-//! PRIV-02, ADR 0027).
+//! [`NetworkAdapter`] on Android: the network's state, whether Data Saver is on (PWR-04,
+//! ADR 0029), and HTTPS requests (SEC-01, SEC-02, PRIV-02, ADR 0027).
 //!
 //! Questions go to the Java `Bridge` object, whose method names and signatures must stay in
 //! step with the ones looked up here. `Bridge.httpsGet` makes one request at a time with the
@@ -21,6 +21,8 @@ pub struct AndroidNetwork {
     bridge: GlobalRef,
     /// `int networkState()`: 0 offline, 1 metered, 2 unmetered.
     network_state: MethodId,
+    /// `boolean savesData()`: Data Saver restricts MeeGone's background data.
+    saves_data: MethodId,
     /// `byte[] httpsGet(String url, int maxBytes, String[] outcome)`: the body, or `null`, with
     /// the outcome's kind and detail in `outcome` (see [`https`]).
     https_get: MethodId,
@@ -32,6 +34,7 @@ impl AndroidNetwork {
         Ok(Self {
             vm: env.vm()?,
             network_state: env.method_id(bridge, c"networkState", c"()I")?,
+            saves_data: env.method_id(bridge, c"savesData", c"()Z")?,
             https_get: env.method_id(
                 bridge,
                 c"httpsGet",
@@ -68,6 +71,15 @@ impl NetworkAdapter for AndroidNetwork {
             Ok(1) => NetworkState::Metered,
             _ => NetworkState::Offline,
         }
+    }
+
+    /// `ConnectivityManager.getRestrictBackgroundStatus`. True if the bridge can't answer, so
+    /// automatic downloads wait for an unmetered network rather than risk the user's data.
+    fn saves_data(&self) -> bool {
+        self.vm
+            .env()
+            .and_then(|env| env.call_bool(&self.bridge, self.saves_data, &[]))
+            .unwrap_or(true)
     }
 
     fn get(&self, https_url: &str, max_bytes: usize) -> Result<Vec<u8>, DataError> {

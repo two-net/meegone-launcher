@@ -476,12 +476,18 @@ pub struct FakeNetwork {
     pub responses: Mutex<BTreeMap<String, Vec<u8>>>,
     /// Every URL asked for, including failed attempts, to check call budgets (REL-04).
     pub requests: Mutex<Vec<String>>,
+    /// Whether Data Saver is on: false unless set (PWR-04).
+    pub saves_data: Mutex<bool>,
     pub error: Mutex<Option<DataError>>,
 }
 
 impl NetworkAdapter for FakeNetwork {
     fn state(&self) -> NetworkState {
         *self.state.lock().unwrap()
+    }
+
+    fn saves_data(&self) -> bool {
+        *self.saves_data.lock().unwrap()
     }
 
     fn get(&self, https_url: &str, max_bytes: usize) -> Result<Vec<u8>, DataError> {
@@ -539,6 +545,8 @@ pub struct FakeSystem {
     pub locale: Mutex<String>,
     /// 1 GB unless set; `None` when the system can't say.
     pub free_storage_bytes: Mutex<Option<u64>>,
+    /// Whether battery saver is on or the battery is low: false unless set (WALL-04).
+    pub saves_battery: Mutex<bool>,
     /// The device's 24-hour setting: false unless set, as in `en-US` (L10N-03).
     pub hour_24: Mutex<bool>,
     pub default_home: Mutex<bool>,
@@ -564,6 +572,7 @@ impl Default for FakeSystem {
             utc_offset_ms: Mutex::default(),
             locale: Mutex::new("en-US".into()),
             free_storage_bytes: Mutex::new(Some(1_000_000_000)),
+            saves_battery: Mutex::default(),
             hour_24: Mutex::default(),
             default_home: Mutex::default(),
             default_home_requested: Mutex::default(),
@@ -620,6 +629,10 @@ impl SystemConfigAdapter for FakeSystem {
 
     fn free_storage_bytes(&self) -> Option<u64> {
         *self.free_storage_bytes.lock().unwrap()
+    }
+
+    fn saves_battery(&self) -> bool {
+        *self.saves_battery.lock().unwrap()
     }
 
     /// English in every locale, day before month as in the SRS's layout mock: "Tuesday",

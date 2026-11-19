@@ -12,14 +12,14 @@ pub use meegone_core_data::{Platform, Rect};
 pub use meegone_shell_state::{
     Direction, EventsChangeState, FOLDER_COLUMNS, GridChangeState, HomeMenu, HomeShell, HomeView,
     ImageChangeState, Layout, LiftState, MenuItem, PREVIEW_APPS, PinchEvent, PinchKind, PinchState,
-    PointerEvent, PointerKind, PressState, SavedHome, SettingsGroup, ShellIntent,
+    PointerEvent, PointerKind, PressState, SavedHome, SettingsGroup, Shared, ShellIntent,
 };
 use meegone_shell_ui::ShellView;
 pub use meegone_shell_ui::{
     Age, AppMenuFrame, AppMenuItem, AppsFrame, BADGE_ROWS, Bounds, CardContent, Cell, CellKey,
-    CloseFrame, EditFrame, EventsListFrame, EventsListMode, EventsMenuFrame, EventsRow,
-    FolderFrame, FolderId, GridChangeFrame, GridLayout, HomeFrame, HoverFrame, LiftFrame,
-    MenuFrame, MergeFrame, NotificationMenuItem, RECENT_ROWS, RecentFrame, RecentMode,
+    CheckStatus, CloseFrame, EditFrame, EventsListFrame, EventsListMode, EventsMenuFrame,
+    EventsRow, FolderFrame, FolderId, GridChangeFrame, GridLayout, HomeFrame, HoverFrame,
+    LiftFrame, MenuFrame, MergeFrame, NotificationMenuItem, RECENT_ROWS, RecentFrame, RecentMode,
     RecentWindow, RenameFrame, RowTarget, SearchFrame, ShownCard, Surface, SurfaceCellsFrame,
 };
 
@@ -30,7 +30,13 @@ pub struct Launcher {
 
 impl Launcher {
     pub fn start(platform: Platform) -> Self {
-        let mut shell = HomeShell::compose(platform);
+        Self::start_shared(&Shared::new(platform))
+    }
+
+    /// Starts the home with the stores the daily image's job shares, so each sees the other's
+    /// writes (ADR 0029).
+    pub fn start_shared(shared: &Shared) -> Self {
+        let mut shell = HomeShell::compose_shared(shared);
         let view = ShellView::new(&mut shell);
         Self { shell, view }
     }
