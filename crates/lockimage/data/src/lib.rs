@@ -4,14 +4,19 @@
 //!   their details;
 //! - [`ImageFeed`], the interface to the image-of-the-day feed, and [`BingFeed`], its one
 //!   implementation and the only code that knows the feed's format (ARCH-04, ADR 0027);
-//! - [`region`]: the feed region, Automatic or chosen (WALL-05).
+//! - [`region`]: the feed region, Automatic or chosen (WALL-05);
+//! - [`Downloader`]: turns the feed's image into the lock-screen image. It picks a version,
+//!   downloads it, checks it, has the platform crop it, and caches the result (WALL-06 to
+//!   WALL-09, ADR 0028).
 //!
-//! The daily updater (SRS 7.5) arrives with #27 and #28.
+//! The updater that decides when to download (SRS 7.5) arrives with #28.
 
 mod bing;
+mod download;
 #[cfg(feature = "fakes")]
 pub mod fakes;
 mod feed;
+mod jpeg;
 mod json;
 pub mod region;
 
@@ -22,6 +27,10 @@ use meegone_core_data::storage::{Decode, Encode, Format, Migration, Reader, Writ
 use meegone_core_data::{DataError, StorageAdapter, StoredFile};
 
 pub use bing::BingFeed;
+pub use download::{
+    Downloader, IMAGE_TOO_LARGE, IMAGE_TOO_SMALL, LOW_STORAGE, MAX_DOWNLOAD_BYTES, MAX_SIDE,
+    MIN_SHORT_SIDE, NOT_AN_IMAGE, check_image, pick_version, plan_crop,
+};
 pub use feed::{FORMAT_CHANGED, FeedImage, ImageFeed, ImageVersion};
 
 /// Version of the saved image-details format (MAINT-04). Changing the format means a new
@@ -98,8 +107,8 @@ pub trait ImageCache: Send + Sync {
     fn previous(&self) -> Option<ImageRecord>;
     /// Makes `record` current with its `image`, and keeps the one it replaces; older ones are
     /// deleted (WALL-09). The cache picks the file the image goes in, whatever `record.image`
-    /// says.
-    fn put(&self, record: ImageRecord, image: &[u8]) -> Result<(), DataError>;
+    /// says. Returns the record as cached, naming that file.
+    fn put(&self, record: ImageRecord, image: &[u8]) -> Result<ImageRecord, DataError>;
     /// The bytes of `record`'s image, or `None` if it has none.
     fn image(&self, record: &ImageRecord) -> Result<Option<Vec<u8>>, DataError>;
     /// Deletes every cached image and its details (WALL-12).
@@ -151,7 +160,7 @@ impl ImageCache for PersistentImageCache {
     /// 3. The image is written.
     /// 4. The details make it current, and the current one previous. The oldest record is gone,
     ///    and its file is the one the next image goes in.
-    fn put(&self, mut record: ImageRecord, image: &[u8]) -> Result<(), DataError> {
+    fn put(&self, mut record: ImageRecord, image: &[u8]) -> Result<ImageRecord, DataError> {
         let _changing = self.changing();
         let mut cached = self.cached();
         let file = cached
@@ -169,8 +178,9 @@ impl ImageCache for PersistentImageCache {
         }
         self.storage.write(file.stored(), image)?;
         record.image = Some(file);
-        cached.previous = cached.current.replace(record);
-        self.save(&cached)
+        cached.previous = cached.current.replace(record.clone());
+        self.save(&cached)?;
+        Ok(record)
     }
 
     fn image(&self, record: &ImageRecord) -> Result<Option<Vec<u8>>, DataError> {
@@ -370,7 +380,7 @@ mod tests {
         let mut files = Vec::new();
 
         for date in ["20261113", "20261114", "20261115"] {
-            cache
+            let cached = cache
                 .put(
                     ImageRecord {
                         // Whatever the caller says, the cache picks the file.
@@ -380,7 +390,9 @@ mod tests {
                     date.as_bytes(),
                 )
                 .unwrap();
-            files.push(cache.current().unwrap().image.unwrap());
+            // It says which it picked.
+            assert_eq!(cache.current(), Some(cached.clone()));
+            files.push(cached.image.unwrap());
         }
 
         assert_eq!(files, [ImageFile::A, ImageFile::B, ImageFile::A]);

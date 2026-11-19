@@ -5,14 +5,16 @@
 //! ([`jni`]), and keep MeeGone's files in the folder the activity passes in, its private
 //! `Context.getFilesDir()` (PRIV-05). Only `jni.rs` contains `unsafe` code.
 //!
-//! - [`system`]: the home-app role, the clock, the device's locale, and web search (HOME-01,
-//!   ONB-04, WALL-05, SRCH-05).
+//! - [`system`]: the home-app role, the clock, the device's locale, free storage, and web search
+//!   (HOME-01, ONB-04, WALL-05, SRCH-05).
 //! - [`apps`]: the app catalogue, launching and search keys (APPS-01, APPS-10, SRCH-02,
 //!   ADR 0010).
 //! - [`notifications`]: notification access, the active notifications, opening and dismissing
 //!   them, and an app's notification settings (EVT-03 to EVT-08, ADR 0020, ADR 0021).
 //! - [`usage`]: usage access and the apps used recently (REC-02, REC-03, ADR 0023).
 //! - [`network`]: the network's state and HTTPS requests (SEC-01, SEC-02, ADR 0027).
+//! - [`wallpaper`]: the lock screen's size and cropping the daily image (WALL-06, ADR 0028).
+//!   Setting the wallpaper arrives with #29.
 //! - [`stubs`]: every adapter not built yet, answering with its "if unavailable" value.
 
 mod apps;
@@ -22,6 +24,7 @@ mod notifications;
 mod stubs;
 mod system;
 mod usage;
+mod wallpaper;
 
 use std::sync::Arc;
 
@@ -35,14 +38,13 @@ use crate::storage::FileStorage;
 /// `files_dir` (a `String`).
 pub fn platform(env: Env, bridge: &LocalRef, files_dir: &LocalRef) -> Result<Platform, DataError> {
     let files_dir = env.string(files_dir)?;
-    let not_built = Arc::new(stubs::NotBuiltYet);
     Ok(Platform {
         apps: Arc::new(apps::AndroidApps::new(env, bridge)?),
         notifications: Arc::new(notifications::AndroidNotifications::new(env, bridge)?),
         usage: Arc::new(usage::AndroidUsage::new(env, bridge)?),
-        wallpaper: not_built.clone(),
+        wallpaper: Arc::new(wallpaper::AndroidWallpaper::new(env, bridge)?),
         network: Arc::new(network::AndroidNetwork::new(env, bridge)?),
-        scheduler: not_built,
+        scheduler: Arc::new(stubs::NotBuiltYet),
         system: Arc::new(system::AndroidSystem::new(env, bridge)?),
         storage: Arc::new(FileStorage::new(files_dir)),
     })

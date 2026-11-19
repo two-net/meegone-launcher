@@ -1628,8 +1628,8 @@ mod tests {
         FakeApps, FakeNotifications, Fakes, app, app_id, notification, used,
     };
     use meegone_core_data::{
-        App, AppId, AppsAdapter, DataError, Notification, NotificationsAdapter, Profile, ProfileId,
-        RecentUse, Rect, Shortcut, Size, UsageAdapter, WallpaperAdapter,
+        App, AppId, AppsAdapter, DataError, ImageCrop, Notification, NotificationsAdapter, Profile,
+        ProfileId, RecentUse, Rect, Shortcut, Size, UsageAdapter, WallpaperAdapter,
     };
     use meegone_core_state::motion::{DRAG_LIFT_SCALE, ICON_PRESS_SCALE};
     use meegone_core_state::{Access, Health, Theme, ThemeChoice};
@@ -2054,6 +2054,10 @@ mod tests {
 
         fn lock_screen_size(&self) -> Size {
             Size::default()
+        }
+
+        fn crop_image(&self, _jpeg: &[u8], _crop: &ImageCrop) -> Result<Vec<u8>, DataError> {
+            panic!("wallpaper bug");
         }
 
         fn set_lock_screen(&self, _image: &[u8]) -> Result<(), DataError> {

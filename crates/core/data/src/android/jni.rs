@@ -51,8 +51,10 @@ mod env_slot {
     pub const NEW_OBJECT_ARRAY: usize = 172;
     pub const GET_OBJECT_ARRAY_ELEMENT: usize = 173;
     pub const SET_OBJECT_ARRAY_ELEMENT: usize = 174;
+    pub const NEW_BYTE_ARRAY: usize = 176;
     pub const GET_BYTE_ARRAY_REGION: usize = 200;
     pub const GET_INT_ARRAY_REGION: usize = 203;
+    pub const SET_BYTE_ARRAY_REGION: usize = 208;
     pub const SET_INT_ARRAY_REGION: usize = 211;
     pub const GET_JAVA_VM: usize = 219;
     pub const EXCEPTION_CHECK: usize = 228;
@@ -434,6 +436,19 @@ impl Env {
         }
     }
 
+    /// Calls a method returning `int[]`, which may be `null`.
+    pub fn call_ints(
+        &self,
+        object: &GlobalRef,
+        method: MethodId,
+        args: &[JValue],
+    ) -> Result<Option<Vec<i32>>, DataError> {
+        match self.call_object(object, method, args)? {
+            Some(array) => self.ints_of(array.raw).map(Some),
+            None => Ok(None),
+        }
+    }
+
     /// Owns `raw`, a local reference this binding just got, unless it is `null`.
     fn local(&self, raw: JObject) -> Option<Local> {
         (!raw.is_null()).then_some(Local { env: *self, raw })
@@ -506,6 +521,35 @@ impl Env {
         let string = self.local(raw);
         self.check()?;
         string.ok_or_else(|| DataError::Failed("The system couldn't do that".into()))
+    }
+
+    /// A new `byte[]` holding `bytes`, such as an image for Java to decode.
+    pub fn new_bytes(&self, bytes: &[u8]) -> Result<Local, DataError> {
+        type NewByteArray = unsafe extern "system" fn(RawEnv, JInt) -> JObject;
+        type SetByteArrayRegion =
+            unsafe extern "system" fn(RawEnv, JObject, JInt, JInt, *const JByte);
+        let failed = || DataError::Failed("The system couldn't do that".into());
+        let length = JInt::try_from(bytes.len()).map_err(|_| failed())?;
+        // SAFETY: the signature matches `jni.h`. Without the memory, the JVM returns `null`
+        // with an `OutOfMemoryError` pending, which `check` reports.
+        let array =
+            unsafe { self.function::<NewByteArray>(env_slot::NEW_BYTE_ARRAY)(self.0, length) };
+        let array = self.local(array);
+        self.check()?;
+        let array = array.ok_or_else(failed)?;
+        // SAFETY: the signature matches `jni.h`; `array` is a live `byte[]` of `length` bytes,
+        // `bytes` holds as many, and a `jbyte` has a `u8`'s size and alignment.
+        unsafe {
+            self.function::<SetByteArrayRegion>(env_slot::SET_BYTE_ARRAY_REGION)(
+                self.0,
+                array.raw,
+                0,
+                length,
+                bytes.as_ptr().cast(),
+            );
+        }
+        self.check()?;
+        Ok(array)
     }
 
     /// A new `String[]` holding `texts`, in order.
@@ -590,11 +634,16 @@ impl Env {
 
     /// Every element of `array`, a Java `int[]` passed to the running native method.
     pub fn int_array(&self, array: &LocalRef) -> Result<Vec<i32>, DataError> {
+        self.ints_of(array.0)
+    }
+
+    /// Every element of `array`, a live, non-null `int[]`.
+    fn ints_of(&self, array: JObject) -> Result<Vec<i32>, DataError> {
         type GetArrayLength = unsafe extern "system" fn(RawEnv, JObject) -> JInt;
         type GetIntArrayRegion = unsafe extern "system" fn(RawEnv, JObject, JInt, JInt, *mut JInt);
         // SAFETY: the signature matches `jni.h`, and `array` is a live array reference.
         let length =
-            unsafe { self.function::<GetArrayLength>(env_slot::GET_ARRAY_LENGTH)(self.0, array.0) };
+            unsafe { self.function::<GetArrayLength>(env_slot::GET_ARRAY_LENGTH)(self.0, array) };
         self.check()?;
         let mut values = vec![0; usize::try_from(length).unwrap_or(0)];
         // SAFETY: the signature matches `jni.h`; `array` is a live `int[]` of `length` ints, and
@@ -602,7 +651,7 @@ impl Env {
         unsafe {
             self.function::<GetIntArrayRegion>(env_slot::GET_INT_ARRAY_REGION)(
                 self.0,
-                array.0,
+                array,
                 0,
                 length,
                 values.as_mut_ptr(),

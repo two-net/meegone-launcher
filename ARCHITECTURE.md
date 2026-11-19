@@ -28,7 +28,7 @@ Each crate is `crates/<area>/<layer>`, with the package name `meegone-<area>-<la
 | **apps** | Layout store | Grid, its columns, scroll position and geometry, an app's long-press menu, edit mode and its arrangement, folders, search and its ranking, hidden apps, keeping the layout in step with the installed apps, the apps a restore waits for | `AppsView`, `HiddenAppsSection` | Layout store; hidden apps (in the settings store) |
 | **events** | – | The header with the date and the next alarm, notifications grouped by app, the expanded group, a notification's long-press menu, what opening, Dismiss and Clear remove | `EventsView` | Nothing (memory only) |
 | **recent** | – | Which launchable app each use is, filtering by the time window, ordering, how long ago, opening an app from its card, the density and its columns, close mode, removing cards and forgetting old removals | `RecentView`, `RecentSettingsSection` | Time window, density and removed-apps list (in the settings store) |
-| **lockimage** | Image cache (the current and previous images and their details), the image feed: its interface, `BingFeed` and the region | On/off, availability, current image, whether Events shows its card, the feed region | `ImageCard`, `ImageSettingsSection` | Image cache; image options (in the settings store) |
+| **lockimage** | Image cache (the current and previous images and their details), the image feed: its interface, `BingFeed` and the region, and the download: picking a version, checking the image and cropping it | On/off, availability, current image, whether Events shows its card, the feed region | `ImageCard`, `ImageSettingsSection` | Image cache; image options (in the settings store) |
 | **settings** | – | Settings, access status, the home-app banner (ONB-04) | `SettingsView`, `HomeBanner` | The settings screens |
 | **shell** | – | `HomeShell`: the carousel of views, the home menu, which long-press counts, Home and Back, coming back to the home, the icon press, the dragged icon across the grid and the open folder, the grid's motion as apps come, go and move, edit mode's motion, a folder's opening and closing, the search field's pull, the Events list's motion as notifications come and go and groups expand, which long-press on an Events row counts, the image details screen and the image card's cross-fade, Recent following the hidden apps and usage access, Recent's pinch and its cards' reflow, which long-press counts in Recent, close mode's motion and cards leaving Recent, composes every feature | `ShellView`, `HomeFrame` | Nothing persistent |
 
@@ -138,6 +138,14 @@ AppsView.cell_tapped(revision, 4, icon)          ui     sends AppsIntent::Launch
   - It gives the date, the headline as the title, the whole credit line as the attribution (LEGAL-03), an `https://` info link if there is one, whether the image is offered as a wallpaper, and three sizes, each built on `https://www.bing.com` from the image's checked name (PRIV-02).
   - The region is Automatic unless the user chose one the feed lists. Automatic matches the device's language and country, then its language, then falls back to en-US (`region.rs`, WALL-05). The lock-screen image saves the choice (`LockImageIntent::SetRegion`); #34 draws the picker.
   - On Android, `Bridge.httpsGet` makes one HTTPS request with the platform's certificate checks and follows no redirect. `https::fetch` follows at most 3, only to `https://` (SEC-01). Requests carry a fixed user agent, no cookies and no cache. The network security config refuses cleartext. `get` blocks, so it runs only on a JVM thread other than the main one.
+- **The daily image's download** ([ADR 0028](docs/adr/0028-downloading-and-cropping-the-daily-image.md)). `Downloader::download` turns one feed image into the lock-screen image. It caches the result only when every step succeeds, so any failure keeps the current image and the wallpaper set from it (WALL-08).
+  - The pure steps are tested without a device:
+    - `pick_version` takes the smallest portrait version that covers the lock screen, or else the largest (WALL-06).
+    - `check_image` reads the JPEG header strictly (`jpeg.rs`) and requires 720 to 8192 px on each side (WALL-07, SEC-02).
+    - `plan_crop` keeps the middle in the lock screen's proportions and never scales up. It decodes at a power-of-two fraction, so the decoded picture is less than twice the result.
+  - Downloads stop at 20 MB. With less free storage than that, nothing is requested ("Not enough storage space"). Every failure is plain words for the status line (WALL-16).
+  - The platform decodes and crops (`WallpaperAdapter::crop_image`). On Android, `Bridge.cropImage` uses `BitmapRegionDecoder` and writes a new JPEG without metadata. What comes back is checked again, and the cache keeps the crop, never the download (PERF-08).
+  - It blocks, so it runs only on a JVM thread other than the main one. #28's job will call it.
 
 ## Drawing (ADR 0006)
 
@@ -209,6 +217,7 @@ On Android, `meegone_core_data::android` builds the `Platform` ([ADR 0005](docs/
   - Notification access, the active notifications through MeeGone's `NotificationListener`, and the access screen ([ADR 0020](docs/adr/0020-listing-notifications-in-events.md)). Opening and dismissing notifications through the listener, and an app's notification settings ([ADR 0021](docs/adr/0021-acting-on-notifications-in-events.md)).
   - Usage access, the apps used recently through `UsageStatsManager`, and the access screen ([ADR 0023](docs/adr/0023-recent-cards.md)).
   - The network's state, HTTPS requests, and the device's locale ([ADR 0027](docs/adr/0027-the-image-feed-client.md)).
+  - The lock screen's size, cropping the daily image, and free storage ([ADR 0028](docs/adr/0028-downloading-and-cropping-the-daily-image.md)). Setting the wallpaper waits for #29.
 - Every other adapter answers with its "If unavailable" value below until its issue builds it.
 
 | Capability (SRS 8.1) | Adapter | Methods | If unavailable |
@@ -220,6 +229,7 @@ On Android, `meegone_core_data::android` builds the `Platform` ([ADR 0005](docs/
 | Notification access | `NotificationsAdapter` | `access`, `active`, `open`, `dismiss`, `open_app_settings`; `ShellIntent::NotificationsChanged` | `access` is `Missing`: explainer card |
 | Usage access | `UsageAdapter` | `access`, `used_since`; `ShellIntent::UsageAccessChanged` | `access` is `Missing`: explainer card |
 | Setting the wallpaper | `WallpaperAdapter` | `lock_screen_support`, `lock_screen_size`, `set_lock_screen`, `reset_lock_screen` | `lock_screen_support` is `Unsupported`: feature unavailable |
+| Decoding and cropping the lock-screen image (ADR 0028) | `WallpaperAdapter` | `crop_image` | `Invalid`: the image is discarded and the current one kept |
 | Network and network state | `NetworkAdapter` | `state`, `get` | `Offline`: retry later |
 | Uninstall requests (`REQUEST_DELETE_PACKAGES`, granted at install) | `AppsAdapter` | `request_uninstall`, and `App::can_uninstall` | No Uninstall item, no ✕ |
 | Background scheduling | `SchedulerAdapter` | `schedule_image_job`, `cancel_image_job` | `Unsupported`: check at the next start |
@@ -229,6 +239,7 @@ On Android, `meegone_core_data::android` builds the `Platform` ([ADR 0005](docs/
 | Web browser | `SystemConfigAdapter` | `has_browser`, `open_in_browser`, `web_search` | `has_browser` is false: link and web search hidden |
 | Device settings and clock | `SystemConfigAdapter` | `is_dark`, `animation_scale`, `animates_return_home`, `now_ms`, `utc_offset_ms`, `locale`, `format_time`; `ShellIntent::ClockChanged` | `animates_return_home` is true: no return-home motion; `format_time` is empty: that line of the header is left out |
 | MeeGone's install time (ADR 0018) | `SystemConfigAdapter` | `installed_ms` | 0: a restore is recognised only by the other device's time |
+| Free storage (ADR 0028) | `SystemConfigAdapter` | `free_storage_bytes` | `None`: the download goes ahead, and a full disk fails the write |
 | MeeGone's own files (ADR 0004) | `StorageAdapter` | `read`, `write`, `remove` | A failed save is the feature's `problem`; an unreadable file loads as defaults |
 
 - **Adapters never call back.** They answer questions and carry out requests. A change the system reports reaches MeeGone as a `ShellIntent` (`Home`, `Back`, `Resumed`, `Returned`, `Restore`, `SystemThemeChanged`, `AppsChanged`, `NotificationsChanged`, `UsageAccessChanged`, `ClockChanged`) that the platform's entry point passes to `Launcher::dispatch`. The Android activity sends `Resumed` on every `onResume`, including after the home-app role dialog, and `Returned` after it when an app or a system screen had covered the home (ADR 0007). `Bridge` sends `AppsChanged` once for each burst of app, profile and language changes (ADR 0010, ADR 0012), `ClockChanged` once for each burst of date, time, time-zone, 12- or 24-hour and next-alarm changes (ADR 0019), `NotificationsChanged` once for each burst of notifications posted or removed and of the listener connecting or disconnecting (ADR 0020), and `UsageAccessChanged` once for each burst of changes to MeeGone's usage access (ADR 0023).
@@ -299,7 +310,7 @@ MeeGone keeps three persistent stores, each in its own file under one private fo
 
 ## Not built yet
 
-The skeleton is from issue #1; the Android host and the home-app role from #4; the carousel of home views from #5; Home, Back and coming back to the home from #6; the home menu from #7; edge to edge, screen sizes and navigation modes from #8; the Applications grid and the app catalogue from #9; one icon shape and each app's accent from #10; the layout kept in step with the installed apps from #11; the app long-press menu from #12; edit mode from #13; folders from #14; app search from #15; hiding apps from #16; backup and restore from #17; the Events header from #18; Events' notifications from #19; opening, clearing and dismissing them from #20; the image-of-the-day card from #21; Recent's cards from #22; Recent's density and its pinch from #23; Recent's close mode and Clear all from #24; Recent's time window from #25; the image feed, the network adapter and the region from #26. The following arrive with later requirements:
+The skeleton is from issue #1; the Android host and the home-app role from #4; the carousel of home views from #5; Home, Back and coming back to the home from #6; the home menu from #7; edge to edge, screen sizes and navigation modes from #8; the Applications grid and the app catalogue from #9; one icon shape and each app's accent from #10; the layout kept in step with the installed apps from #11; the app long-press menu from #12; edit mode from #13; folders from #14; app search from #15; hiding apps from #16; backup and restore from #17; the Events header from #18; Events' notifications from #19; opening, clearing and dismissing them from #20; the image-of-the-day card from #21; Recent's cards from #22; Recent's density and its pinch from #23; Recent's close mode and Clear all from #24; Recent's time window from #25; the image feed, the network adapter and the region from #26; downloading, checking, cropping and caching the daily image from #27. The following arrive with later requirements:
 
 - **Android adapters.**
   - Built:
@@ -311,8 +322,9 @@ The skeleton is from issue #1; the Android host and the home-app role from #4; t
     - Notification access and the active notifications (ADR 0020), opening and dismissing them, and an app's notification settings (ADR 0021).
     - Usage access and the apps used recently (ADR 0023).
     - The network's state, HTTPS requests and the device's locale (ADR 0027).
-  - Stubs until their issues: wallpaper, scheduling, opening links (#30) and the remaining device settings.
-- **The daily image.** The updater (SRS 7.5) comes with #27 and #28. It asks `BingFeed` for today's image in `region_in_use()`, from a JVM thread other than the main one, and stores each image with `ImageCache::put` (#27). Until the wallpaper adapter is built (#29), the lock-screen image reports itself unavailable on Android, so the card in Events doesn't show there yet.
+    - The lock screen's size, cropping the daily image, and free storage (ADR 0028).
+  - Stubs until their issues: setting the wallpaper (#29), scheduling (#28), opening links (#30) and the remaining device settings.
+- **The daily image.** The updater (SRS 7.5) comes with #28. From a JVM thread other than the main one, it will ask `BingFeed` for today's image in `region_in_use()` and hand it to `Downloader::download` (#27). Until the wallpaper adapter can set the wallpaper (#29), the lock-screen image reports itself unavailable on Android, so the card in Events doesn't show there yet.
 - **Drawing.** The home views, their carousel, the view indicator, the return-home motion, the home menu, the Applications grid, its edit mode, its folders, search, Settings' Hidden apps, Recent's time window and "Show card in Events", the Events header and notifications, the image-of-the-day card, Recent's cards, their pinch and close mode are drawn (ADR 0006 to ADR 0008, ADR 0010, ADR 0014 to ADR 0017, ADR 0019 to ADR 0026). The image details screen shows only its name until #30. Expanded groups' action buttons (EVT-14, Could) come with a later issue.
   - The pages, the carousel, the safe area, the menu, Settings, the Applications columns and Recent's columns adapt (HOME-12, APPS-02, REC-05).
   - Settings covers the home views with only its name, its group's, Applications' Hidden apps, Recent's time window and "Show card in Events" until #34 draws it. "Home button opens", the image feed's Region, the home-app banner and first-run setup send intents but aren't drawn yet.

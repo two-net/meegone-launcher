@@ -1,7 +1,8 @@
 //! [`SystemConfigAdapter`] on Android: the home-app role, the clock (HOME-01, ONB-04), whether
 //! the system animates the return home (ANIM-09), the haptic tick (ANIM-24), whether a browser
 //! is installed and web search (SRCH-05, ADR 0016), the Events header's dates, times and next
-//! alarm (EVT-01, EVT-02, L10N-03, ADR 0019), and the device's locale (WALL-05, ADR 0027).
+//! alarm (EVT-01, EVT-02, L10N-03, ADR 0019), the device's locale (WALL-05, ADR 0027), and how
+//! much free storage there is (SRS 7.6, ADR 0028).
 //!
 //! Questions go to the Java `Bridge` object (`android/app/src/main/java/…/Bridge.java`), whose
 //! method names and signatures must stay in step with the ones looked up here. The other device
@@ -42,6 +43,9 @@ pub struct AndroidSystem {
     locale: MethodId,
     /// `long nextAlarmMs()`: when the next alarm rings, or -1 if none is set.
     next_alarm_ms: MethodId,
+    /// `long freeStorageBytes()`: the bytes MeeGone can still store, or -1 if the system can't
+    /// say.
+    free_storage_bytes: MethodId,
     /// `String openNextAlarm()`: `null`, or a short message when nothing could be opened.
     open_next_alarm: MethodId,
 }
@@ -70,6 +74,7 @@ impl AndroidSystem {
             format_time: env.method_id(bridge, c"formatTime", c"(JI)Ljava/lang/String;")?,
             locale: env.method_id(bridge, c"locale", c"()Ljava/lang/String;")?,
             next_alarm_ms: env.method_id(bridge, c"nextAlarmMs", c"()J")?,
+            free_storage_bytes: env.method_id(bridge, c"freeStorageBytes", c"()J")?,
             open_next_alarm: env.method_id(bridge, c"openNextAlarm", c"()Ljava/lang/String;")?,
             bridge: env.global_ref(bridge)?,
         })
@@ -137,6 +142,16 @@ impl SystemConfigAdapter for AndroidSystem {
             .flatten()
             .filter(|tag| !tag.is_empty())
             .unwrap_or_else(|| "en-US".into())
+    }
+
+    /// `StorageManager.getAllocatableBytes` for MeeGone's files, which leaves out the space the
+    /// system keeps for itself when storage runs low. `None` if the bridge can't answer.
+    fn free_storage_bytes(&self) -> Option<u64> {
+        self.vm
+            .env()
+            .and_then(|env| env.call_long(&self.bridge, self.free_storage_bytes, &[]))
+            .ok()
+            .and_then(|bytes| u64::try_from(bytes).ok())
     }
 
     /// Written by `android.text.format.DateFormat` in the default locale and time zone, so it

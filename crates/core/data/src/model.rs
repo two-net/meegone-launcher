@@ -216,6 +216,31 @@ pub struct Size {
     pub height: u32,
 }
 
+impl Size {
+    /// Whether it covers no pixels.
+    pub fn is_empty(&self) -> bool {
+        self.width == 0 || self.height == 0
+    }
+}
+
+/// How to turn a downloaded image into the lock-screen image (WALL-06): keep the region at
+/// `left`, `top`, `width` × `height` of an `image`-sized picture, decode it at 1/`sample` of its
+/// size, and scale the result to `size`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageCrop {
+    /// The whole image's size, as its header gives it. The decoder must find the same.
+    pub image: Size,
+    pub left: u32,
+    pub top: u32,
+    pub width: u32,
+    pub height: u32,
+    /// A power of two: the region is decoded at 1/`sample` of its size, so no more is decoded
+    /// than the result needs (SEC-02).
+    pub sample: u32,
+    /// The result's size.
+    pub size: Size,
+}
+
 /// An error from a platform adapter or a store. Each feature turns it into its own error state
 /// (ARCH-09).
 #[derive(Debug, Clone, PartialEq, Eq)]

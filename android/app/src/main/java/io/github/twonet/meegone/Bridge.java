@@ -25,8 +25,12 @@ import android.content.pm.LauncherUserInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.content.pm.ShortcutInfo;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
+import android.graphics.BitmapRegionDecoder;
 import android.graphics.Insets;
 import android.graphics.Rect;
+import android.hardware.display.DisplayManager;
 import android.icu.lang.UCharacter;
 import android.icu.text.Collator;
 import android.icu.text.DateFormat;
@@ -43,6 +47,7 @@ import android.os.Process;
 import android.os.SystemClock;
 import android.os.UserHandle;
 import android.os.UserManager;
+import android.os.storage.StorageManager;
 import android.provider.AlarmClock;
 import android.provider.MediaStore;
 import android.provider.Settings;
@@ -51,10 +56,12 @@ import android.service.notification.NotificationListenerService;
 import android.service.notification.StatusBarNotification;
 import android.telecom.TelecomManager;
 import android.util.Log;
+import android.view.Display;
 import android.view.HapticFeedbackConstants;
 import android.view.View;
 import android.view.WindowInsets;
 import java.io.ByteArrayOutputStream;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URL;
@@ -77,10 +84,10 @@ import javax.net.ssl.SSLException;
  *
  * <p>Rust looks these methods up by name and signature on the main thread, so keep them in step
  * with {@code crates/core/data/src/android/system.rs}, {@code apps.rs}, {@code
- * notifications.rs}, {@code usage.rs} and {@code network.rs}. Every method catches what Android may throw: an
- * exception must never reach Rust. Logs hold only yes/no answers and the kinds of errors, never
- * user data such as which apps are installed or used, or what a notification says (EVT-13,
- * PRIV-03).
+ * notifications.rs}, {@code usage.rs}, {@code network.rs} and {@code wallpaper.rs}. Every method
+ * catches what Android may throw: an exception must never reach Rust. Logs hold only yes/no
+ * answers and the kinds of errors, never user data such as which apps are installed or used, or
+ * what a notification says (EVT-13, PRIV-03).
  */
 final class Bridge {
     private static final String TAG = "MeeGone";
@@ -129,6 +136,8 @@ final class Bridge {
     private static final String USER_AGENT = "MeeGone";
     private static final int CONNECT_TIMEOUT_MS = 15_000;
     private static final int READ_TIMEOUT_MS = 30_000;
+    /** The JPEG quality the daily image is written at once cropped (ADR 0028). */
+    private static final int JPEG_QUALITY = 90;
     /**
      * The extra by which the system's notification settings learn which profile's copy of an app
      * to show: the app's uid there. Settings reads it with the package (ADR 0021).
@@ -1438,6 +1447,29 @@ final class Bridge {
     }
 
     /**
+     * How many more bytes MeeGone can store before the device runs low on storage, or -1 if the
+     * system can't say (SRS 7.6, ADR 0028). {@code StorageManager.getAllocatableBytes} counts
+     * cached files the system would clear, and leaves out the space it keeps for itself when
+     * storage runs low. It may take a moment, so it is asked off the main thread. Called from
+     * Rust.
+     */
+    long freeStorageBytes() {
+        File files = context.getFilesDir();
+        try {
+            StorageManager storage = context.getSystemService(StorageManager.class);
+            return storage.getAllocatableBytes(storage.getUuidForPath(files));
+        } catch (IOException | RuntimeException e) {
+            Log.w(TAG, "Couldn't read the allocatable storage: " + e.getClass().getSimpleName());
+        }
+        try {
+            return files.getUsableSpace();
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Couldn't read the free storage: " + e.getClass().getSimpleName());
+            return -1;
+        }
+    }
+
+    /**
      * Whether the device is online, and if so whether its network may cost the user (WALL-04):
      * {@link #NETWORK_OFFLINE}, {@link #NETWORK_METERED} or {@link #NETWORK_UNMETERED}. Offline
      * if the system can't say. Called from Rust.
@@ -1558,6 +1590,104 @@ final class Bridge {
                 body.write(buffer, 0, read);
             }
             return body.toByteArray();
+        }
+    }
+
+    /**
+     * The lock screen's width and height in pixels, which the daily image is cropped to
+     * (WALL-06, ADR 0028): the default display's, in its natural orientation, from its mode, so
+     * turning the device doesn't change it. Null if the system can't say. Called from Rust.
+     */
+    int[] lockScreenSize() {
+        try {
+            Display display =
+                    context.getSystemService(DisplayManager.class)
+                            .getDisplay(Display.DEFAULT_DISPLAY);
+            if (display == null) {
+                return null;
+            }
+            Display.Mode mode = display.getMode();
+            int width = mode.getPhysicalWidth();
+            int height = mode.getPhysicalHeight();
+            return width > 0 && height > 0 ? new int[] {width, height} : null;
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Couldn't read the display's size: " + e.getClass().getSimpleName());
+            return null;
+        }
+    }
+
+    /**
+     * The region {@code left}, {@code top}, {@code right}, {@code bottom} of a JPEG image
+     * {@code width} × {@code height} pixels, decoded at 1/{@code sample} of its size, scaled to
+     * {@code outWidth} × {@code outHeight} and written as a new JPEG. Null if it can't be made
+     * (WALL-06, WALL-07, SEC-02, ADR 0028).
+     *
+     * <p>Rust has already checked the image's header and planned the crop; this only carries it
+     * out. Only the region is decoded, and no larger than the result needs, so memory stays
+     * bounded. An image that doesn't decode, or not at the size its header gave, is refused.
+     * Writing it anew keeps none of the original's metadata. It blocks, so it answers null on
+     * the main thread without decoding. Logs hold only the kind of failure. Called from Rust,
+     * off the main thread.
+     */
+    @SuppressWarnings("deprecation") // newInstance(byte[], int, int) arrived in Android 12.
+    byte[] cropImage(
+            byte[] jpeg,
+            int width,
+            int height,
+            int left,
+            int top,
+            int right,
+            int bottom,
+            int sample,
+            int outWidth,
+            int outHeight) {
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            Log.w(TAG, "Refused to decode an image on the main thread");
+            return null;
+        }
+        BitmapRegionDecoder decoder = null;
+        Bitmap region = null;
+        Bitmap scaled = null;
+        try {
+            decoder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
+                    ? BitmapRegionDecoder.newInstance(jpeg, 0, jpeg.length)
+                    : BitmapRegionDecoder.newInstance(jpeg, 0, jpeg.length, false);
+            if (decoder == null
+                    || decoder.getWidth() != width
+                    || decoder.getHeight() != height) {
+                Log.w(TAG, "An image didn't decode at the size its header gave");
+                return null;
+            }
+            BitmapFactory.Options options = new BitmapFactory.Options();
+            options.inSampleSize = sample;
+            options.inPreferredConfig = Bitmap.Config.ARGB_8888;
+            region = decoder.decodeRegion(new Rect(left, top, right, bottom), options);
+            if (region == null) {
+                Log.w(TAG, "An image didn't decode");
+                return null;
+            }
+            scaled = region.getWidth() == outWidth && region.getHeight() == outHeight
+                    ? region
+                    : Bitmap.createScaledBitmap(region, outWidth, outHeight, true);
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            if (!scaled.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, out)) {
+                Log.w(TAG, "A cropped image couldn't be written");
+                return null;
+            }
+            return out.toByteArray();
+        } catch (IOException | RuntimeException | OutOfMemoryError e) {
+            Log.w(TAG, "Couldn't crop an image: " + e.getClass().getSimpleName());
+            return null;
+        } finally {
+            if (scaled != null && scaled != region) {
+                scaled.recycle();
+            }
+            if (region != null) {
+                region.recycle();
+            }
+            if (decoder != null) {
+                decoder.recycle();
+            }
         }
     }
 

@@ -17,8 +17,8 @@ use crate::adapters::{
     SystemConfigAdapter, UsageAdapter, WallpaperAdapter,
 };
 use crate::model::{
-    Access, App, AppId, DataError, ImageJob, NetworkState, Notification, Profile, ProfileId,
-    RecentUse, Rect, Shortcut, Size, TimeStyle,
+    Access, App, AppId, DataError, ImageCrop, ImageJob, NetworkState, Notification, Profile,
+    ProfileId, RecentUse, Rect, Shortcut, Size, TimeStyle,
 };
 use crate::storage::{MAX_STORED_BYTES, StorageAdapter, StoredFile, check_budget};
 
@@ -143,6 +143,23 @@ pub fn fold(text: &str) -> String {
         }
     }
     folded.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The header of a baseline JPEG image of `size`, with no pixels: what an image's size is read
+/// from, without anything to decode. The fake wallpaper's crops are these (ADR 0028).
+///
+/// # Panics
+///
+/// If a side is longer than a JPEG can be: 65 535 px.
+pub fn jpeg(size: Size) -> Vec<u8> {
+    let side = |pixels: u32| u16::try_from(pixels).expect("a JPEG side fits in 16 bits");
+    let mut bytes = vec![0xFF, 0xD8, 0xFF, 0xC0, 0x00, 0x11, 0x08];
+    bytes.extend(side(size.height).to_be_bytes());
+    bytes.extend(side(size.width).to_be_bytes());
+    // Three components: Y, Cb and Cr.
+    bytes.extend([0x03, 0x01, 0x22, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01]);
+    bytes.extend([0xFF, 0xD9]);
+    bytes
 }
 
 /// Fails with the error a fake was set to fail with, if any.
@@ -380,6 +397,13 @@ pub struct FakeWallpaper {
     pub lock_screen: Mutex<Option<Vec<u8>>>,
     pub lock_screen_images_set: Mutex<u32>,
     pub settings_opened: Mutex<u32>,
+    /// Every crop asked for, in order.
+    pub crops: Mutex<Vec<ImageCrop>>,
+    /// When set, every crop returns these bytes. Otherwise a crop is the [`jpeg`] header of
+    /// its size.
+    pub cropped: Mutex<Option<Vec<u8>>>,
+    /// When set, every call that can fail fails, cropping included: an image that doesn't
+    /// decode is `Invalid`.
     pub error: Mutex<Option<DataError>>,
 }
 
@@ -394,6 +418,8 @@ impl Default for FakeWallpaper {
             lock_screen: Mutex::default(),
             lock_screen_images_set: Mutex::default(),
             settings_opened: Mutex::default(),
+            crops: Mutex::default(),
+            cropped: Mutex::default(),
             error: Mutex::default(),
         }
     }
@@ -410,6 +436,17 @@ impl WallpaperAdapter for FakeWallpaper {
 
     fn lock_screen_size(&self) -> Size {
         *self.lock_screen_size.lock().unwrap()
+    }
+
+    fn crop_image(&self, _jpeg: &[u8], crop: &ImageCrop) -> Result<Vec<u8>, DataError> {
+        record(&self.crops, *crop);
+        check(&self.error)?;
+        Ok(self
+            .cropped
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| jpeg(crop.size)))
     }
 
     fn set_lock_screen(&self, image: &[u8]) -> Result<(), DataError> {
@@ -500,6 +537,8 @@ pub struct FakeSystem {
     pub utc_offset_ms: Mutex<i64>,
     /// `en-US` unless set.
     pub locale: Mutex<String>,
+    /// 1 GB unless set; `None` when the system can't say.
+    pub free_storage_bytes: Mutex<Option<u64>>,
     /// The device's 24-hour setting: false unless set, as in `en-US` (L10N-03).
     pub hour_24: Mutex<bool>,
     pub default_home: Mutex<bool>,
@@ -524,6 +563,7 @@ impl Default for FakeSystem {
             installed_ms: Mutex::default(),
             utc_offset_ms: Mutex::default(),
             locale: Mutex::new("en-US".into()),
+            free_storage_bytes: Mutex::new(Some(1_000_000_000)),
             hour_24: Mutex::default(),
             default_home: Mutex::default(),
             default_home_requested: Mutex::default(),
@@ -576,6 +616,10 @@ impl SystemConfigAdapter for FakeSystem {
 
     fn locale(&self) -> String {
         self.locale.lock().unwrap().clone()
+    }
+
+    fn free_storage_bytes(&self) -> Option<u64> {
+        *self.free_storage_bytes.lock().unwrap()
     }
 
     /// English in every locale, day before month as in the SRS's layout mock: "Tuesday",

@@ -17,8 +17,8 @@
 use std::sync::Arc;
 
 use crate::model::{
-    Access, App, AppId, DataError, ImageJob, NetworkState, Notification, Profile, ProfileId,
-    RecentUse, Rect, Shortcut, Size, TimeStyle,
+    Access, App, AppId, DataError, ImageCrop, ImageJob, NetworkState, Notification, Profile,
+    ProfileId, RecentUse, Rect, Shortcut, Size, TimeStyle,
 };
 use crate::storage::StorageAdapter;
 
@@ -88,8 +88,16 @@ pub trait UsageAdapter: Send + Sync {
 pub trait WallpaperAdapter: Send + Sync {
     /// `Ok` if the lock-screen wallpaper can be set; otherwise the reason it can't (WALL-13).
     fn lock_screen_support(&self) -> Result<(), DataError>;
-    /// The size the lock-screen image is cropped to (WALL-06).
+    /// The size the lock-screen image is cropped to (WALL-06). Empty if the system can't say.
     fn lock_screen_size(&self) -> Size;
+    /// Cuts `crop`'s region out of a JPEG image, scales it to `crop.size` and encodes it as a
+    /// JPEG, without the original's metadata (WALL-06). Decoding is bounded: only the region is
+    /// decoded, at 1/`crop.sample` of its size (SEC-02). It blocks: on Android, call it from a
+    /// JVM thread other than the main one (ADR 0028).
+    ///
+    /// Fails with [`DataError::Invalid`] if the image doesn't decode, or not at
+    /// `crop.image`'s size, so nothing undecodable is ever handed on (WALL-07).
+    fn crop_image(&self, jpeg: &[u8], crop: &ImageCrop) -> Result<Vec<u8>, DataError>;
     /// Sets the lock-screen wallpaper only; the home wallpaper is untouched (WALL-01).
     fn set_lock_screen(&self, image: &[u8]) -> Result<(), DataError>;
     /// Makes the lock screen show the home wallpaper again (WALL-12).
@@ -145,6 +153,11 @@ pub trait SystemConfigAdapter: Send + Sync {
     fn utc_offset_ms(&self, at_ms: u64) -> i64;
     /// The device's language and region as a BCP 47 tag, such as `en-US` (WALL-05, L10N).
     fn locale(&self) -> String;
+    /// How many more bytes MeeGone can store before the device runs low on storage, or `None`
+    /// if the system can't say. The daily image skips its download when this is short
+    /// (SRS 7.6, ADR 0028). It may take a moment, so ask it off the main thread, as the daily
+    /// image does.
+    fn free_storage_bytes(&self) -> Option<u64>;
     /// `at_ms` written in `style`, in the device's language, time zone and 12- or 24-hour
     /// setting (L10N-03), for the Events header (EVT-01, EVT-02). Empty if the platform can't
     /// write it.
