@@ -5,7 +5,7 @@
 //! Which cells came, went or moved is the Applications view's to say: each cell knows where it
 //! was (ADR 0012). This is only how far the change has come, on the shared [`Timed`] clock: it
 //! is pure, plays when the home is next drawn, takes a late frame in steps of at most
-//! [`MAX_FRAME_STEP`](crate::timed::MAX_FRAME_STEP), and is instant with animations removed
+//! [`MAX_FRAME_STEP`](meegone_core_state::motion::MAX_FRAME_STEP), and is instant with animations removed
 //! (ANIM-05).
 
 use std::time::Duration;
@@ -71,6 +71,12 @@ impl GridChange {
         self.timed.frame(at);
     }
 
+    /// Puts everything in place at once, as when animations are removed while it plays
+    /// (ANIM-05).
+    pub fn finish(&mut self) {
+        self.timed.finish();
+    }
+
     pub fn state(&self) -> GridChangeState {
         match self.timed.eased() {
             None => GridChangeState::default(),
@@ -82,7 +88,7 @@ impl GridChange {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::timed::MAX_FRAME_STEP;
+    use meegone_core_state::motion::MAX_FRAME_STEP;
 
     fn ms(millis: u64) -> Duration {
         Duration::from_millis(millis)

@@ -117,6 +117,9 @@ pub struct RecentFrame {
     /// ten-thousandths: they shrink and fade as it grows. 10 000 for a row no card left
     /// (ANIM-18).
     pub leave: [u16; RECENT_ROWS],
+    /// The scale a leaving card shrinks to by the time it has gone, in ten-thousandths
+    /// (ANIM-18).
+    pub leave_scale: u16,
 }
 
 /// Recent's close mode as the host draws it (REC-07, ANIM-12).
@@ -675,6 +678,7 @@ impl ShellView {
                     close_offered: state.close_offered,
                     removals: shell.recent().state().removals,
                     leave: state.recent_change.leave.map(ten_thousandths),
+                    leave_scale: scale(state.recent_change.leave_scale),
                 }
             }),
             background: tokens.background,

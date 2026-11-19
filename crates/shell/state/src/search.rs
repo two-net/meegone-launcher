@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use meegone_core_state::motion::{
     MAX_OVERSHOOT, REST_DISTANCE_PX, REST_SPEED_PX, SEARCH_PULL_RESISTANCE, SEARCH_PULL_STRETCH,
-    SETTLE, SpringMotion, VelocityTracker,
+    SETTLE, SpringMotion, VelocityTracker, motion_time,
 };
 
 use crate::carousel::{PointerEvent, PointerKind};
@@ -258,6 +258,14 @@ impl SearchMotion {
         }
     }
 
+    /// Puts a springing field where it is going at once, as when animations are removed while
+    /// it moves (ANIM-05). A finger on it keeps it.
+    pub fn finish(&mut self) {
+        if matches!(self.gesture, Gesture::Settling { .. }) {
+            self.rest();
+        }
+    }
+
     /// Springs to the side it is on from where it is, leaving at `velocity` px per second unless
     /// that would overshoot by more than 3 % of the band (ANIM-02). `at` is when the motion
     /// starts, or `None` for the next frame.
@@ -294,7 +302,7 @@ impl SearchMotion {
         };
         let scale = self.animation_scale;
         if let Some(last) = last.filter(|_| scale > 0.0) {
-            motion.advance(at.saturating_sub(last).div_f64(scale));
+            motion.advance(motion_time(at.saturating_sub(last), scale));
         }
         self.reveal = (self.target() + motion.displacement()).max(0.0);
         // Animations may have been removed while the field was moving.

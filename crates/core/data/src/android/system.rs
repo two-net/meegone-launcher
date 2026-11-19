@@ -1,14 +1,13 @@
 //! [`SystemConfigAdapter`] on Android: the home-app role, the clock (HOME-01, ONB-04), the
-//! device's dark theme (THEME-02, ADR 0033), whether the system animates the return home
-//! (ANIM-09), the haptic tick (ANIM-24), whether a browser
-//! is installed, opening links in it and web search (SRCH-05, WALL-15, ADR 0016, ADR 0031), the
-//! Events header's dates, times and next alarm (EVT-01, EVT-02, L10N-03, ADR 0019), the
-//! device's locale (WALL-05, ADR 0027), how much free storage there is (SRS 7.6, ADR 0028), and
-//! whether the device is saving battery (WALL-04, PWR-04, ADR 0029).
+//! device's dark theme (THEME-02, ADR 0033), the system animation speed (ANIM-05, ADR 0034),
+//! whether the system animates the return home (ANIM-09), the haptic tick (ANIM-24), whether a
+//! browser is installed, opening links in it and web search (SRCH-05, WALL-15, ADR 0016,
+//! ADR 0031), the Events header's dates, times and next alarm (EVT-01, EVT-02, L10N-03,
+//! ADR 0019), the device's locale (WALL-05, ADR 0027), how much free storage there is (SRS 7.6,
+//! ADR 0028), and whether the device is saving battery (WALL-04, PWR-04, ADR 0029).
 //!
 //! Questions go to the Java `Bridge` object (`android/app/src/main/java/…/Bridge.java`), whose
-//! method names and signatures must stay in step with the ones looked up here. The other device
-//! settings answer with their "if unavailable" values until their issues build them.
+//! method names and signatures must stay in step with the ones looked up here.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -30,6 +29,9 @@ pub struct AndroidSystem {
     installed_ms: MethodId,
     /// `boolean isDark()`: the device's dark theme is on now, by the user or on its schedule.
     is_dark: MethodId,
+    /// `int animationScale()`: the system animation speed in thousandths, 0 with animations
+    /// removed.
+    animation_scale: MethodId,
     /// `boolean animatesReturnHome()`
     animates_return_home: MethodId,
     /// `boolean hapticTick()`: whether a view could play it.
@@ -71,6 +73,7 @@ impl AndroidSystem {
             utc_offset_ms: env.method_id(bridge, c"utcOffsetMs", c"(J)J")?,
             installed_ms: env.method_id(bridge, c"installedMs", c"()J")?,
             is_dark: env.method_id(bridge, c"isDark", c"()Z")?,
+            animation_scale: env.method_id(bridge, c"animationScale", c"()I")?,
             animates_return_home: env.method_id(bridge, c"animatesReturnHome", c"()Z")?,
             haptic_tick: env.method_id(bridge, c"hapticTick", c"()Z")?,
             has_browser: env.method_id(bridge, c"hasBrowser", c"()Z")?,
@@ -115,8 +118,12 @@ impl SystemConfigAdapter for AndroidSystem {
             .unwrap_or(false)
     }
 
+    /// If the bridge can't answer, the speed is normal.
     fn animation_scale(&self) -> f64 {
-        1.0 // The system animation speed arrives with #33.
+        self.vm
+            .env()
+            .and_then(|env| env.call_int(&self.bridge, self.animation_scale, &[]))
+            .map_or(1.0, |thousandths| f64::from(thousandths) / 1000.0)
     }
 
     /// If the bridge can't answer, the system is taken to animate, so the two never double up.

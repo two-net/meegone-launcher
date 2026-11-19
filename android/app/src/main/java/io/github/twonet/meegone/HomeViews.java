@@ -215,7 +215,8 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     // The theme (THEME-01, THEME-06, ANIM-19, ADR 0033):
     private static final int THEME_CHANGE = 139; // how far the new theme has faded in, to 10 000
     private static final int THEME = 140; // a value of THEMES; -1 not offered
-    private static final int FRAME_SIZE = 141;
+    private static final int RECENT_LEAVE_SCALE = 141; // a leaving card's end, ten-thousandths
+    private static final int FRAME_SIZE = 142;
     /** Settings → Appearance → Theme: System, Light and Dark, as the Rust app numbers them. */
     private static final int[] THEMES = {0, 1, 2};
     private static final int[] THEME_LABELS = {
@@ -1807,7 +1808,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         recentList.progress(frame[RECENT_REFLOW_PROGRESS]);
         recentList.close(frame[RECENT_CLOSE] != 0, frame[RECENT_CLOSE_SCALE],
                 frame[RECENT_CLOSE_PROGRESS], frame, RECENT_BADGES);
-        recentList.leave(frame, RECENT_LEAVE);
+        recentList.leave(frame, RECENT_LEAVE, frame[RECENT_LEAVE_SCALE] / 10_000f);
         if (frame[RECENT_REMOVALS] != removalsShown) {
             if (removalsShown >= 0) {
                 confirmRemoval(recentList.left());

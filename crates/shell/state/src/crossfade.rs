@@ -12,6 +12,8 @@
 
 use std::time::Duration;
 
+use meegone_core_state::motion::Tween;
+
 use crate::timed::Timed;
 
 /// How a cross-fade is drawn now: an immutable snapshot inside `ShellState`.
@@ -36,23 +38,29 @@ impl Default for CrossFadeState {
 /// Runs one cross-fade. `HomeShell` owns one for each, and publishes its [`CrossFadeState`].
 #[derive(Debug)]
 pub(crate) struct CrossFade {
-    length: Duration,
+    tween: Tween,
     timed: Timed,
 }
 
 impl CrossFade {
-    /// A cross-fade `length` long at normal speed, at rest.
-    pub fn new(length: Duration) -> Self {
+    /// A cross-fade on `tween`, at rest.
+    pub fn new(tween: Tween) -> Self {
         Self {
-            length,
+            tween,
             timed: Timed::default(),
         }
     }
 
-    /// Starts the fade to the new picture. One that comes while another fades starts again
-    /// over the picture as it was last drawn.
+    /// Starts the fade to the new picture. One that comes while another fades starts again:
+    /// the theme's over a picture of the screen as it was last drawn (ADR 0033), the image
+    /// card's with the newer thumbnail over the one shown in full (ADR 0022).
     pub fn start(&mut self, animation_scale: f64) {
-        self.timed.start(self.length, animation_scale);
+        self.timed.start(self.tween, animation_scale);
+    }
+
+    /// Shows the new picture at once, as when animations are removed while it fades (ANIM-05).
+    pub fn finish(&mut self) {
+        self.timed.finish();
     }
 
     /// Advances the fade to the display's frame time (ANIM-04).
@@ -90,9 +98,9 @@ mod tests {
 
     /// The fade plays for `length` ms, decelerating, from the first frame drawn after it
     /// starts at 5 000 ms.
-    fn plays_for(length: Duration) {
-        let length = u64::try_from(length.as_millis()).unwrap();
-        let mut fade = CrossFade::new(ms(length));
+    fn plays_for(tween: Tween) {
+        let length = u64::try_from(tween.length.as_millis()).unwrap();
+        let mut fade = CrossFade::new(tween);
         assert_eq!(fade.state(), CrossFadeState::default());
 
         fade.start(1.0);

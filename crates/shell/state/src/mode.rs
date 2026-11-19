@@ -4,21 +4,21 @@
 //! badges go, last row first, and the cells grow back.
 //!
 //! The badges stagger by visible row, so the host needs one value per row rather than per cell
-//! (ADR 0014). Recent's rows all count as visible: there are at most nine (ADR 0025). Like the other motions, it is pure, its clock starts at the first frame after the
-//! change, and with animations removed it is instant (ANIM-05). A change of mind part-way
+//! (ADR 0014). Recent's rows all count as visible: there are at most nine (ADR 0025). Like the
+//! other motions, it is pure, its clock starts at the first frame after the change, and with animations removed it is instant (ANIM-05). A change of mind part-way
 //! turns it back from where it is.
 
 use std::time::Duration;
 
-use meegone_core_state::motion::{MODE_CHANGE, MODE_SCALE, MODE_STAGGER, decelerate, pop, scaled};
-
-use crate::timed::MAX_FRAME_STEP;
+use meegone_core_state::motion::{
+    MODE_BADGE, MODE_CHANGE, MODE_SCALE, MODE_STAGGER, frame_step, stagger,
+};
 
 /// How many visible rows have a badge scale of their own. Rows further down take the last one.
 pub const BADGE_ROWS: usize = 12;
 
 /// The whole motion: the last row's badges start [`MODE_STAGGER`] after the first's.
-const TOTAL: Duration = MODE_CHANGE.saturating_add(MODE_STAGGER);
+const TOTAL: Duration = MODE_BADGE.length.saturating_add(MODE_STAGGER);
 
 /// Edit or close mode as it is drawn now: an immutable snapshot inside `ShellState`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -68,23 +68,27 @@ impl Mode {
         self.on = on;
         self.last = None;
         self.animation_scale = animation_scale;
-        if scaled(MODE_CHANGE, animation_scale).is_zero() {
-            self.position = if on { TOTAL } else { Duration::ZERO };
+        if MODE_CHANGE.length_at(animation_scale).is_zero() {
+            self.finish();
         }
     }
 
-    /// Advances to the display's frame time (ANIM-04), by at most [`MAX_FRAME_STEP`] of
-    /// motion since the last frame.
+    /// Puts the cells and badges where the mode has them at once, as when animations are
+    /// removed while they move (ANIM-05).
+    pub fn finish(&mut self) {
+        self.position = if self.on { TOTAL } else { Duration::ZERO };
+    }
+
+    /// Advances to the display's frame time (ANIM-04), by at most
+    /// [`MAX_FRAME_STEP`](meegone_core_state::motion::MAX_FRAME_STEP) of real time since the
+    /// last frame.
     pub fn frame(&mut self, at: Duration) {
         if !self.moving() {
             return;
         }
         let last = *self.last.get_or_insert(at);
         self.last = Some(at.max(last));
-        let step = at
-            .saturating_sub(last)
-            .min(MAX_FRAME_STEP)
-            .div_f64(self.animation_scale.max(f64::MIN_POSITIVE));
+        let step = frame_step(at.saturating_sub(last), self.animation_scale);
         self.position = if self.on {
             self.position.saturating_add(step).min(TOTAL)
         } else {
@@ -103,20 +107,16 @@ impl Mode {
     /// The motion now, for a grid whose first visible row is `first_row`, with `visible_rows`
     /// rows on screen.
     pub fn state(&self, first_row: usize, visible_rows: usize) -> ModeState {
-        let cells = decelerate(self.position.as_secs_f64() / MODE_CHANGE.as_secs_f64());
+        let cells = MODE_CHANGE.eased(self.position);
         let rows = visible_rows.clamp(1, BADGE_ROWS);
         let badges = std::array::from_fn(|row| {
-            let rank = row.min(rows - 1);
-            let delay = if rows > 1 {
-                MODE_STAGGER.mul_f64(rank as f64 / (rows - 1) as f64)
-            } else {
-                Duration::ZERO
-            };
-            let own = self.position.saturating_sub(delay);
+            let own = self
+                .position
+                .saturating_sub(stagger(row, rows, MODE_STAGGER));
             if own.is_zero() {
                 0.0
             } else {
-                pop(own.as_secs_f64() / MODE_CHANGE.as_secs_f64())
+                MODE_BADGE.eased(own)
             }
         });
         ModeState {

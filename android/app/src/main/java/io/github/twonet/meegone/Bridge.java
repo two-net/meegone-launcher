@@ -27,6 +27,7 @@ import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.content.pm.ShortcutInfo;
 import android.content.res.Configuration;
+import android.database.ContentObserver;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.BitmapRegionDecoder;
@@ -218,6 +219,9 @@ final class Bridge {
     /** Tells the Rust app that usage access was granted or revoked (ADR 0023). */
     private final Runnable reportUsageAccessChanged =
             () -> HomeActivity.usageAccessChanged(this.activity);
+    /** Tells the Rust app that the system animation speed changed (ANIM-05, ADR 0034). */
+    private final Runnable reportAnimationScaleChanged =
+            () -> HomeActivity.animationScaleChanged(this.activity);
     /** Each app's accent colour, derived from its icon (APPS-17, ADR 0011). */
     private final AppAccents accents;
     /** The resumed activity, which can start the system's screens; null while none is. */
@@ -227,6 +231,7 @@ final class Bridge {
     private boolean watchingClock;
     private boolean watchingNotifications;
     private boolean watchingUsageAccess;
+    private boolean watchingAnimationScale;
 
     private Bridge(Context context) {
         this.context = context.getApplicationContext();
@@ -1322,6 +1327,51 @@ final class Bridge {
                     });
         } catch (RuntimeException e) {
             Log.w(TAG, "Couldn't watch usage access: " + e.getClass().getSimpleName());
+        }
+    }
+
+    /**
+     * The system animation speed (ANIM-05, A11Y-07, ADR 0034), in thousandths: 1000 is normal,
+     * and 0 means animations are removed, as Developer options' "Animator duration scale" and
+     * Accessibility's "Remove animations" set it. 1000 if the setting can't be read. Called from
+     * Rust.
+     */
+    int animationScale() {
+        try {
+            float scale = Settings.Global.getFloat(context.getContentResolver(),
+                    Settings.Global.ANIMATOR_DURATION_SCALE, 1f);
+            if (Float.isNaN(scale) || scale < 0f) {
+                return 1000;
+            }
+            return Math.round(Math.min(scale, 10f) * 1000f);
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Couldn't read the animation speed: " + e.getClass().getSimpleName());
+            return 1000;
+        }
+    }
+
+    /**
+     * Tells the Rust app whenever the system animation speed changes, even while the home shows,
+     * such as from the accessibility shortcut (ANIM-05, ADR 0034). Once per process.
+     */
+    void watchAnimationScale() {
+        if (watchingAnimationScale) {
+            return;
+        }
+        watchingAnimationScale = true;
+        try {
+            context.getContentResolver().registerContentObserver(
+                    Settings.Global.getUriFor(Settings.Global.ANIMATOR_DURATION_SCALE), false,
+                    new ContentObserver(main) {
+                        @Override
+                        public void onChange(boolean selfChange) {
+                            // On the main thread, through the handler.
+                            main.removeCallbacks(reportAnimationScaleChanged);
+                            main.post(reportAnimationScaleChanged);
+                        }
+                    });
+        } catch (RuntimeException e) {
+            Log.w(TAG, "Couldn't watch the animation speed: " + e.getClass().getSimpleName());
         }
     }
 

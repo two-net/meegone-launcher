@@ -34,7 +34,8 @@ use meegone_apps_state::{
 };
 use meegone_core_data::{HomeTarget, Platform, SettingsStore, SystemConfigAdapter};
 use meegone_core_state::motion::{
-    CARD_REMOVE, IMAGE_CROSSFADE, MODE_SCALE, RECENT_PINCH, THEME_CROSSFADE, VIEW_FLING_VELOCITY_DP,
+    CARD_REMOVE, IMAGE_CROSSFADE, MODE_SCALE, RECENT_REFLOW, THEME_CROSSFADE,
+    VIEW_FLING_VELOCITY_DP,
 };
 use meegone_core_state::{
     Access, App, AppId, Health, RecentDensity, Store, Theme, ThemeHolder, ThemeIntent,
@@ -343,6 +344,9 @@ pub enum ShellIntent {
     Restore(SavedHome),
     /// The device's dark-theme setting changed (THEME-02).
     SystemThemeChanged,
+    /// The system animation speed changed, such as animations being removed in the system's
+    /// settings while MeeGone shows (ANIM-05, A11Y-07).
+    AnimationScaleChanged,
     /// An app was installed, updated or removed, or a profile was paused or resumed
     /// (APPS-06, APPS-08, APPS-09).
     AppsChanged,
@@ -388,6 +392,8 @@ pub struct HomeShell {
     was_lifted: bool,
     /// Edit mode was just entered by picking an icon up, whose long-press already ticked.
     picked_up: bool,
+    /// Close mode was just entered by a long-press, which already ticked.
+    close_long_pressed: bool,
     folder: FolderMotion,
     /// The open folder's cells as of the last intent, and which folder they were.
     seen_folder: (Option<FolderId>, Arc<[GridItem]>),
@@ -405,6 +411,9 @@ pub struct HomeShell {
     /// The apps of Recent's cards as of the last intent, and its columns then, to tell which
     /// rows cards left (ANIM-18).
     seen_recent: (Vec<AppId>, usize),
+    /// Recent's state as of the last intent: while the store publishes no new one, its cards
+    /// haven't changed, so they aren't compared on every frame (ANIM-04).
+    seen_recent_state: Option<Arc<RecentState>>,
     events_change: EventsChange,
     image_change: CrossFade,
     theme_change: CrossFade,
@@ -447,6 +456,7 @@ impl HomeShell {
             seen_cells: Arc::new([]),
             was_lifted: false,
             picked_up: false,
+            close_long_pressed: false,
             folder: FolderMotion::default(),
             seen_folder: (None, Arc::new([])),
             seen_folders_made: 0,
@@ -457,6 +467,7 @@ impl HomeShell {
             close: Mode::default(),
             recent_change: RecentChange::default(),
             seen_recent: (Vec::new(), 0),
+            seen_recent_state: None,
             events_change: EventsChange::default(),
             image_change: CrossFade::new(IMAGE_CROSSFADE),
             theme_change: CrossFade::new(THEME_CROSSFADE),
@@ -638,6 +649,8 @@ impl HomeShell {
             }
             ShellIntent::Pointer(event) => {
                 if event.kind == PointerKind::Down {
+                    // A row as good as at rest lands, so the touch is the content's (ANIM-03).
+                    self.carousel.touch_down(event.at);
                     // A touch never waits for the return motion (ANIM-03).
                     self.return_home.finish();
                     // A new gesture, which no pinch holds yet.
@@ -659,6 +672,12 @@ impl HomeShell {
                 if !self.covered() || matches!(event.kind, PointerKind::Up | PointerKind::Cancel) {
                     let release = self.carousel.pointer(event, self.state.current);
                     self.settle(release);
+                }
+                if event.kind == PointerKind::Down && self.lift.is_lifted() {
+                    // A finger caught a settling icon (ANIM-03): the rest of the gesture is
+                    // the drag's, as after a long-press, so neither the row nor the content
+                    // below gets any of it.
+                    self.carousel.long_press();
                 }
                 if self.carousel.state().dragging {
                     // The views move, so the icon under the finger lets go (ANIM-10).
@@ -719,6 +738,7 @@ impl HomeShell {
             ShellIntent::Returned { home } => self.returned(home),
             ShellIntent::Restore(saved) => self.restore(saved),
             ShellIntent::SystemThemeChanged => self.theme.dispatch(ThemeIntent::Refresh),
+            ShellIntent::AnimationScaleChanged => self.configure_carousel(),
             ShellIntent::AppsChanged => self.apps_changed(),
             ShellIntent::NotificationsChanged => {
                 self.events.dispatch(EventsIntent::RefreshNotifications);
@@ -1051,7 +1071,7 @@ impl HomeShell {
         let scale = self.carousel.animation_scale();
         let density = self.recent.state().density;
         if density != std::mem::replace(&mut self.seen_density, density) {
-            self.pinch.reflow(RECENT_PINCH, scale);
+            self.pinch.reflow(RECENT_REFLOW, scale);
         }
         if self.pinch.pinching() && !self.density_offered() {
             self.pinch.end_gesture(scale);
@@ -1073,6 +1093,15 @@ impl HomeShell {
     /// fade where they were, row by row, and the others close the gap (ANIM-18). Cards that go
     /// because access went, or while Recent is out of sight, just go.
     fn keep_recent_cards_in_step(&mut self) {
+        let recent = self.recent.state();
+        if self
+            .seen_recent_state
+            .as_ref()
+            .is_some_and(|seen| Arc::ptr_eq(seen, &recent))
+        {
+            return;
+        }
+        self.seen_recent_state = Some(recent);
         let (cards, columns) = self.recent_cards();
         if cards == self.seen_recent.0 {
             self.seen_recent.1 = columns;
@@ -1114,12 +1143,17 @@ impl HomeShell {
         (cards, usize::from(recent.columns()))
     }
 
-    /// Close mode's motion follows Recent (ANIM-12). Entering it doesn't tick here: the
-    /// long-press that entered it just did, and a screen reader's request doesn't (ANIM-24).
+    /// Close mode's motion follows Recent (ANIM-12), and entering it ticks (ANIM-24), as edit
+    /// mode's does: from a screen reader's "Edit Recent" too, but not after the long-press that
+    /// entered it, which just ticked.
     fn keep_close_in_step(&mut self) {
         let closing = self.close_shown();
+        let long_pressed = std::mem::take(&mut self.close_long_pressed);
         if closing != self.close.is_on() {
             self.close.set(closing, self.carousel.animation_scale());
+            if closing && !long_pressed {
+                self.system.haptic_tick();
+            }
         }
     }
 
@@ -1335,11 +1369,36 @@ impl HomeShell {
     }
 
     /// Takes on the wrap-around setting and the system animation speed, which the carousel
-    /// keeps rather than reading them on every touch.
+    /// keeps rather than reading them on every touch, and every motion takes when it starts.
+    /// Once animations are removed, whatever still moves is where it was going at once
+    /// (ANIM-05).
     fn configure_carousel(&mut self) {
         let wrap = self.settings_store.get().wrap_around;
+        let was = self.carousel.animation_scale();
         self.carousel.configure(wrap, self.system.animation_scale());
+        if was != 0.0 && self.carousel.animation_scale() == 0.0 {
+            self.finish_motions();
+        }
         self.state.carousel = self.carousel.state();
+    }
+
+    /// Ends every motion at once, where it was going (ANIM-05). A finger keeps what it holds:
+    /// the dragged row, the pulled field, a lifted icon and a pinch stay under it.
+    fn finish_motions(&mut self) {
+        self.carousel.finish();
+        self.return_home.finish();
+        self.press.land();
+        self.lift.finish();
+        self.grid_change.finish();
+        self.events_change.finish();
+        self.image_change.finish();
+        self.theme_change.finish();
+        self.mode.finish();
+        self.close.finish();
+        self.recent_change.finish();
+        self.pinch.finish();
+        self.folder.finish();
+        self.search.finish();
     }
 
     fn swipe(&mut self, direction: Direction) {
@@ -1412,7 +1471,10 @@ impl HomeShell {
             return;
         };
         match self.state.current {
-            HomeView::Recent => self.recent.dispatch(RecentIntent::EnterCloseMode),
+            HomeView::Recent => {
+                self.close_long_pressed = true;
+                self.recent.dispatch(RecentIntent::EnterCloseMode);
+            }
             HomeView::Events | HomeView::Applications => self.open_menu(Some(at)),
         }
         self.system.haptic_tick();
@@ -1420,20 +1482,22 @@ impl HomeShell {
 
     /// APPS-11: a long-press on an app's or a folder's icon opens its menu and ticks (ANIM-24).
     /// It counts only on Applications, while the gesture is still a press, nothing covers the
-    /// views, and the icon's surface takes touches: in the open folder only once its panel is
-    /// all the way open. Then the rest of the gesture is the shell's, so lifting the finger
+    /// views, and the icon's surface takes touches. In a folder still opening, the panel opens
+    /// all the way at once, so its cells are where the host laid them out: no animation blocks
+    /// input (ANIM-03). Then the rest of the gesture is the shell's, so lifting the finger
     /// launches nothing, and dragging on picks the icon up.
     fn long_press_cell(&mut self, surface: Surface, key: CellKey) {
-        let opening = surface == Surface::Folder && !self.folder.fully_open();
         // Search's cells have no menu, and neither does the grid below its field.
         if self.covered()
             || !self.touchable(surface)
             || self.search_shown()
-            || opening
             || self.state.current != HomeView::Applications
             || self.carousel.pressed_at().is_none()
         {
             return;
+        }
+        if surface == Surface::Folder && self.folder.opening() {
+            self.folder.finish();
         }
         self.apps.dispatch(AppsIntent::OpenMenu(key.clone()));
         if !self.app_menu_shown() {
@@ -3496,7 +3560,7 @@ mod tests {
 
     #[test]
     fn a_tap_on_empty_space_back_home_or_another_view_leaves_close_mode() {
-        // REC-07. A screen reader enters it without a tick (A11Y-05, ANIM-24).
+        // REC-07. A screen reader enters it with a tick, as edit mode (A11Y-05, ANIM-24).
         let fakes = Fakes::default();
         let mut shell = on_recent(&fakes);
         let enter = |shell: &mut HomeShell| {
@@ -3521,7 +3585,8 @@ mod tests {
         shell.dispatch(ShellIntent::Swipe(Direction::Previous));
         assert!(!shell.recent().state().close_mode);
         assert!(!shell.state().close.on);
-        assert_eq!(ticks(&fakes), 0);
+        // Each entry ticked, as a screen reader's does (ANIM-24); leaving never does.
+        assert_eq!(ticks(&fakes), 4);
     }
 
     #[test]
@@ -4686,6 +4751,88 @@ mod tests {
     }
 
     #[test]
+    fn a_finger_on_a_settling_icon_picks_it_up_again_and_keeps_the_gesture() {
+        // ANIM-03, ANIM-13: the icon stops where it is drawn and follows the finger; the row
+        // never moves, and the next drop is kept as the first was.
+        let fakes = Fakes::default();
+        let mut shell = with_four(&fakes);
+        maps_moved_first(&mut shell);
+        pointer_at(&mut shell, PointerKind::Up, 110.0, 290.0, 10_300);
+        shell.dispatch(ShellIntent::Frame(ms(10_300)));
+        shell.dispatch(ShellIntent::Frame(ms(10_340)));
+        let settling = shell.state().lift.clone();
+        assert!(settling.settling);
+        assert!((settling.x, settling.y) != (110.0, 190.0), "it has moved");
+
+        pointer_at(
+            &mut shell,
+            PointerKind::Down,
+            settling.x,
+            settling.y,
+            10_348,
+        );
+        let state = shell.state();
+        assert!(!state.lift.settling);
+        assert_eq!(state.lift.key, settling.key);
+        assert_eq!((state.lift.x, state.lift.y), (settling.x, settling.y));
+        assert!(state.carousel.held, "the rest of the gesture is the drag's");
+
+        pointer_at(
+            &mut shell,
+            PointerKind::Move,
+            settling.x + 300.0,
+            settling.y,
+            10_360,
+        );
+        let state = shell.state();
+        assert_eq!(state.carousel.offset, 0.0);
+        assert!(!state.carousel.dragging);
+        assert_eq!(state.lift.x, settling.x + 300.0);
+
+        pointer_at(
+            &mut shell,
+            PointerKind::Up,
+            settling.x + 300.0,
+            settling.y,
+            10_400,
+        );
+        assert!(shell.state().lift.settling);
+        come_to_rest(&mut shell, 10_400);
+        assert_eq!(shell.state().lift, LiftState::default());
+        assert!(shell.apps().state().edit_mode);
+        assert!(fakes.apps.launched.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn removing_animations_puts_whatever_moves_where_it_was_going() {
+        // ANIM-05, A11Y-07: even while MeeGone shows, such as from the accessibility shortcut.
+        let (fakes, mut shell) = with_a_folder();
+        shell.dispatch(ShellIntent::Apps(AppsIntent::OpenFolder(FolderId(1))));
+        *fakes.system.dark.lock().unwrap() = true;
+        shell.dispatch(ShellIntent::SystemThemeChanged);
+        shell.dispatch(ShellIntent::Frame(ms(0)));
+        shell.dispatch(ShellIntent::Frame(ms(16)));
+        let state = shell.state();
+        assert!(state.folder.animating && state.folder.progress < 1.0);
+        assert!(state.theme_change.animating);
+
+        *fakes.system.animation_scale.lock().unwrap() = 0.0;
+        shell.dispatch(ShellIntent::AnimationScaleChanged);
+
+        let state = shell.state();
+        assert!(state.folder_open);
+        assert_eq!(state.folder.progress, 1.0);
+        assert!(!state.folder.animating);
+        assert!(!state.theme_change.animating);
+        assert_eq!(state.theme_change.progress, 1.0);
+
+        // And what starts from now on is instant.
+        shell.dispatch(ShellIntent::Apps(AppsIntent::CloseFolder));
+        assert!(!shell.state().folder.animating);
+        assert_eq!(shell.state().folder.folder, None);
+    }
+
+    #[test]
     fn a_drop_before_the_wait_is_over_still_takes_the_place_under_it() {
         // APPS-12
         let fakes = Fakes::default();
@@ -4965,8 +5112,9 @@ mod tests {
         assert_eq!(shell.state().carousel.offset, 0.0);
         pointer_at(&mut shell, PointerKind::Up, 700.0, 400.0, 100);
 
-        // A long-press in the panel waits for it to finish opening; one on the grid behind it
-        // never counts.
+        // A long-press on the grid behind the panel never counts. One in the panel counts even
+        // while it still opens: the panel opens all the way at once, so its cells are where the
+        // host laid them out, and nothing waits for the motion (ANIM-03).
         let maps = CellKey::App(app_id("maps"));
         let long_press = |shell: &mut HomeShell, surface: Surface| {
             pointer_at(shell, PointerKind::Down, 300.0, 400.0, 1_000);
@@ -4975,15 +5123,14 @@ mod tests {
                 key: maps.clone(),
             });
         };
-        long_press(&mut shell, Surface::Folder);
-        assert!(!shell.state().app_menu_open);
-        pointer_at(&mut shell, PointerKind::Up, 300.0, 400.0, 1_100);
-        come_to_rest(&mut shell, 2_000);
         long_press(&mut shell, Surface::Grid);
         assert!(!shell.state().app_menu_open);
         pointer_at(&mut shell, PointerKind::Up, 300.0, 400.0, 1_100);
+        assert!(shell.state().folder.animating, "the panel still opens");
         long_press(&mut shell, Surface::Folder);
         assert!(shell.state().app_menu_open);
+        assert_eq!(shell.state().folder.progress, 1.0);
+        assert!(!shell.state().folder.animating);
         assert_eq!(ticks(&fakes), 1);
 
         // Presses count only in the panel.

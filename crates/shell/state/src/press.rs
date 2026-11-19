@@ -9,13 +9,9 @@ use std::time::Duration;
 
 use meegone_apps_state::Surface;
 use meegone_core_state::motion::{
-    ICON_PRESS, ICON_PRESS_SCALE, ICON_RELEASE, SpringMotion, decelerate, scaled,
+    ICON_PRESS, ICON_PRESS_SCALE, ICON_RELEASE, REST_DISTANCE_SCALE, REST_SPEED_SCALE,
+    SpringMotion, motion_time,
 };
-
-/// Closer to full size than this, and slower than [`REST_SPEED`] per second, the spring back
-/// has finished: well under a pixel on any icon.
-const REST_DISTANCE: f64 = 0.001;
-const REST_SPEED: f64 = 0.05;
 
 /// The pressed item as it is drawn now: an immutable snapshot inside `ShellState`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -53,8 +49,13 @@ enum Phase {
     },
     /// At 92 % while the finger stays.
     Held,
-    /// Springing back to full size; `at` is the time the motion has reached.
-    Releasing { motion: SpringMotion, at: Duration },
+    /// Springing back to full size; `at` is the time the motion has reached, and its clock
+    /// runs at the system animation `speed` (ANIM-05).
+    Releasing {
+        motion: SpringMotion,
+        at: Duration,
+        speed: f64,
+    },
 }
 
 /// Runs the icon press. `HomeShell` owns it and publishes its [`PressState`].
@@ -86,7 +87,7 @@ impl Press {
             _ => 1.0,
         };
         self.surface = surface;
-        let length = scaled(ICON_PRESS, animation_scale);
+        let length = ICON_PRESS.length_at(animation_scale);
         let phase = if length.is_zero() {
             self.scale = ICON_PRESS_SCALE;
             Phase::Held
@@ -107,12 +108,32 @@ impl Press {
         let Some((item, _)) = self.pressed else {
             return;
         };
-        if scaled(ICON_PRESS, animation_scale).is_zero() {
+        if ICON_PRESS.length_at(animation_scale).is_zero() {
             self.finish();
             return;
         }
         let motion = SpringMotion::new(ICON_RELEASE, self.scale - 1.0, 0.0);
-        self.pressed = Some((item, Phase::Releasing { motion, at }));
+        self.pressed = Some((
+            item,
+            Phase::Releasing {
+                motion,
+                at,
+                speed: animation_scale,
+            },
+        ));
+    }
+
+    /// Ends its motion at once, where it was going: a held icon at 92 %, a released one at full
+    /// size (ANIM-05).
+    pub fn land(&mut self) {
+        match self.pressed {
+            Some((item, Phase::Shrinking { .. })) => {
+                self.scale = ICON_PRESS_SCALE;
+                self.pressed = Some((item, Phase::Held));
+            }
+            Some((_, Phase::Releasing { .. })) => self.finish(),
+            Some((_, Phase::Held)) | None => {}
+        }
     }
 
     /// Shows the item at full size at once, such as when Settings covers it.
@@ -137,17 +158,19 @@ impl Press {
                     self.scale = ICON_PRESS_SCALE;
                     *phase = Phase::Held;
                 } else {
-                    self.scale = *from + (ICON_PRESS_SCALE - *from) * decelerate(progress);
+                    self.scale =
+                        *from + (ICON_PRESS_SCALE - *from) * ICON_PRESS.easing.at(progress);
                 }
             }
             Phase::Held => {}
             Phase::Releasing {
                 motion,
                 at: reached,
+                speed,
             } => {
-                motion.advance(at.saturating_sub(*reached));
+                motion.advance(motion_time(at.saturating_sub(*reached), *speed));
                 *reached = (*reached).max(at);
-                if motion.is_at_rest(REST_DISTANCE, REST_SPEED) {
+                if motion.is_at_rest(REST_DISTANCE_SCALE, REST_SPEED_SCALE * *speed) {
                     self.finish();
                 } else {
                     self.scale = 1.0 + motion.displacement();
@@ -296,6 +319,28 @@ mod tests {
         );
         removed.release(ms(10), 0.0);
         assert_eq!(removed.state(), PressState::default());
+    }
+
+    #[test]
+    fn it_springs_back_at_the_system_animation_speed() {
+        // ANIM-05: at half speed, the spring back takes twice as long.
+        let back_in = |speed: f64| {
+            let mut press = Press::default();
+            press.press(Surface::Grid, 0, ms(0), speed);
+            press.frame(ms(1_000));
+            press.release(ms(1_000), speed);
+            let mut at = 1_000;
+            while press.state().animating {
+                at += 4;
+                press.frame(ms(at));
+            }
+            (at - 1_000) as f64
+        };
+        let (normal, slow) = (back_in(1.0), back_in(2.0));
+        assert!(
+            (1.8..=2.2).contains(&(slow / normal)),
+            "{normal} ms, then {slow} ms"
+        );
     }
 
     #[test]

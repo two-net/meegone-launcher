@@ -452,7 +452,9 @@ final class AppCell extends View {
         float y = event.getY();
         switch (event.getActionMasked()) {
             case MotionEvent.ACTION_DOWN:
-                badgeDown = hasBadge() && badgeScale > 0f && onBadge(x, y);
+                // The ✕ takes a tap as soon as edit mode is on, whether or not its row has
+                // popped in yet: no animation blocks input (ANIM-03).
+                badgeDown = hasBadge() && onBadge(x, y);
                 break;
             case MotionEvent.ACTION_MOVE:
                 badgeDown &= onBadge(x, y);

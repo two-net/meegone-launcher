@@ -5,10 +5,10 @@
 //! - AC-01: first-run setup (#35). Its lock-screen image step's promise, that nothing changes
 //!   before Continue (WALL-02), is automated below.
 //!
-//! AC-18 to AC-20 (animation scale, screen reader, timing) need a device; they belong to the
-//! device matrix (#43). Their core logic is tested without one: the carousel with animations
-//! removed and its screen-reader actions in `meegone-shell-state`, and the folders'
-//! screen-reader actions here (A11Y-05).
+//! AC-18 to AC-20 (animation scale, screen reader, timing) need a device to check in full; they
+//! belong to the device matrix (#43) and the benchmarks (#40). Their core logic is tested
+//! without one: every flow with animations removed (AC-18, ANIM-05) and the screen-reader
+//! actions (AC-19, A11Y-05) here, and the carousel's in `meegone-shell-state`.
 
 mod backup;
 
@@ -4391,10 +4391,279 @@ fn ac18_with_animations_removed_close_mode_and_removals_are_instant() {
     assert_eq!(recent_cards(&mut launcher).0, RecentMode::Empty);
 }
 
+/// Fakes whose system has animations removed (ANIM-05).
+fn animations_removed() -> Fakes {
+    let fakes = Fakes::default();
+    *fakes.system.animation_scale.lock().unwrap() = 0.0;
+    fakes
+}
+
+/// Nothing moves in the frame the host draws next, so it asks for no more.
+fn at_rest(launcher: &mut Launcher) -> bool {
+    !launcher.frame().animating
+}
+
+#[test]
+fn ac18_with_animations_removed_the_views_the_return_home_and_the_theme_change_at_once() {
+    // Issue #33: ANIM-05, A11Y-07, AC-18. Each ends in the same frame where its motion would
+    // have, and nothing is missing.
+    let fakes = animations_removed();
+    let (mut launcher, mut clock) = on_a_phone(&fakes);
+
+    // A finger moves the views: they settle at once. The indicator, which says where the views
+    // are, still stays its while, a wait rather than motion, then goes at once (ANIM-11).
+    for (kind, x) in [
+        (PointerKind::Down, 900.0),
+        (PointerKind::Move, 700.0),
+        (PointerKind::Move, 300.0),
+        (PointerKind::Up, 300.0),
+    ] {
+        finger(&mut launcher, &mut clock, kind, x, 1200.0);
+    }
+    let frame = launcher.frame();
+    assert_eq!((frame.current, frame.pages[2]), (HomeView::Recent, 0));
+    assert_eq!(frame.indicator_alpha, 255);
+    wait(&mut launcher, &mut clock, 608);
+    assert_eq!(launcher.frame().indicator_alpha, 0);
+    assert!(at_rest(&mut launcher));
+    // A screen reader's swipe.
+    launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
+    assert_eq!(launcher.frame().pages[1], 0);
+    assert!(at_rest(&mut launcher));
+
+    // Coming back from an app, where the system doesn't animate the return itself.
+    launcher.dispatch(ShellIntent::Resumed);
+    launcher.dispatch(ShellIntent::Returned { home: false });
+    let frame = launcher.frame();
+    assert_eq!((frame.content_scale, frame.content_alpha), (10_000, 255));
+    assert!(at_rest(&mut launcher));
+
+    // The device turning dark.
+    *fakes.system.dark.lock().unwrap() = true;
+    launcher.dispatch(ShellIntent::SystemThemeChanged);
+    let frame = launcher.frame();
+    assert_eq!(frame.theme_change, 10_000);
+    assert_eq!(frame.background, tokens(Theme::Dark).background);
+    assert!(at_rest(&mut launcher));
+}
+
+#[test]
+fn ac18_with_animations_removed_edit_mode_dragging_folders_and_search_are_instant() {
+    // Issue #33: ANIM-05, A11Y-07, AC-18.
+    let fakes = animations_removed();
+    *fakes.apps.apps.lock().unwrap() = vec![
+        app("camera", "Camera"),
+        app("mail", "Mail"),
+        app("maps", "Maps"),
+        app("phone", "Phone"),
+    ];
+    let (mut launcher, mut clock) = on_a_phone(&fakes);
+    grid_on_a_phone(&mut launcher);
+
+    // Edit mode: the cells are at 92 % and every ✕ shows at once (ANIM-12).
+    long_press(&mut launcher, &mut clock, 500.0, 1500.0);
+    launcher.dispatch(ShellIntent::ChooseMenuItem(MenuItem::EditApplications));
+    let frame = launcher.frame();
+    assert!(frame.edit.on);
+    assert_eq!(frame.edit.scale, 9_200);
+    assert_eq!(frame.edit.badges, [10_000; BADGE_ROWS]);
+    assert!(at_rest(&mut launcher));
+
+    // Dragging Maps first: the others are in their new places at once, and the dropped icon is
+    // in its cell as the finger lifts (ANIM-13, ANIM-21). The wait before it takes the place is
+    // the same as ever.
+    assert!(long_press_cell(&mut launcher, &mut clock, 2, 620.0, 300.0));
+    finger(&mut launcher, &mut clock, PointerKind::Move, 124.0, 451.0);
+    wait(&mut launcher, &mut clock, 192);
+    assert_eq!(grid(&launcher), ["Maps", "Camera", "Mail", "Phone"]);
+    assert_eq!(launcher.frame().grid_change.shift, 10_000);
+    finger(&mut launcher, &mut clock, PointerKind::Up, 124.0, 451.0);
+    assert_eq!(launcher.frame().lifted, None);
+    assert!(at_rest(&mut launcher));
+    launcher.dispatch(ShellIntent::Back);
+    assert_eq!(launcher.frame().edit.scale, 10_000);
+    assert!(at_rest(&mut launcher));
+
+    // A folder opens and closes at once (ANIM-15).
+    let fakes = animations_removed();
+    let (mut launcher, _) = games_and_maps(&fakes);
+    open_folder(&mut launcher, 0);
+    let folder = launcher.frame().folder.expect("open");
+    assert_eq!((folder.open, folder.progress), (true, 10_000));
+    assert!(at_rest(&mut launcher));
+    launcher.dispatch(ShellIntent::Back);
+    assert_eq!(launcher.frame().folder, None);
+    assert!(at_rest(&mut launcher));
+
+    // Pulled past its band, search snaps open at once (ANIM-16).
+    let fakes = animations_removed();
+    let (mut launcher, mut clock) = ready_to_search(&fakes);
+    open_search(&mut launcher, &mut clock);
+    let search = launcher.frame().search;
+    assert!(search.open);
+    assert_eq!(
+        search.reveal_px,
+        SEARCH_BAND.bottom as i32 - SEARCH_BAND.top as i32
+    );
+    assert!(at_rest(&mut launcher));
+}
+
+#[test]
+fn ac18_with_animations_removed_lists_change_and_recent_reflows_at_once() {
+    // Issue #33: ANIM-05, A11Y-07, AC-18.
+    let fakes = animations_removed();
+    *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail")];
+    *fakes.notifications.access.lock().unwrap() = Access::Granted;
+    let (mut launcher, _) = on_a_phone(&fakes);
+
+    // An app installed joins the grid at once (ANIM-21).
+    fakes.apps.apps.lock().unwrap().push(app("atlas", "Atlas"));
+    launcher.dispatch(ShellIntent::AppsChanged);
+    let change = launcher.frame().grid_change;
+    assert_eq!((change.appear_scale, change.appear_alpha), (10_000, 10_000));
+    assert!(at_rest(&mut launcher));
+
+    // A notification comes into Events at once (ANIM-20).
+    launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
+    fakes
+        .notifications
+        .active
+        .lock()
+        .unwrap()
+        .push(notification("m1", "mail"));
+    launcher.dispatch(ShellIntent::NotificationsChanged);
+    assert_eq!(launcher.frame().events_change, 10_000);
+    assert_eq!(events_list(&mut launcher).1.len(), 1);
+    assert!(at_rest(&mut launcher));
+
+    // Recent's cards reflow to bigger ones at once after a pinch (ANIM-17).
+    let fakes = animations_removed();
+    let (mut launcher, mut clock) = six_on_recent(&fakes);
+    pinch(&mut launcher, &mut clock, 300.0, 420.0);
+    let recent = launcher.frame().recent.expect("Recent works");
+    assert_eq!((recent.columns, recent.reflow_progress), (2, 10_000));
+    assert!(at_rest(&mut launcher));
+}
+
+#[test]
+fn anim05_a_new_animation_speed_is_taken_on_at_once() {
+    // Issue #33: ANIM-05, A11Y-07. Animations removed while the views move, such as from the
+    // accessibility shortcut over the home, put them where they were going; a slower speed
+    // makes what starts next take longer.
+    let fakes = Fakes::default();
+    let (mut launcher, mut clock) = games_and_maps(&fakes);
+    launcher.dispatch(ShellIntent::Swipe(Direction::Next));
+    clock += 16;
+    launcher.dispatch(ShellIntent::Frame(Duration::from_millis(clock)));
+    clock += 16;
+    launcher.dispatch(ShellIntent::Frame(Duration::from_millis(clock)));
+    assert!(launcher.frame().pages[2] != 0, "Recent is coming in");
+
+    *fakes.system.animation_scale.lock().unwrap() = 0.0;
+    launcher.dispatch(ShellIntent::AnimationScaleChanged);
+    let frame = launcher.frame();
+    assert_eq!((frame.current, frame.pages[2]), (HomeView::Recent, 0));
+    assert!(at_rest(&mut launcher));
+
+    *fakes.system.animation_scale.lock().unwrap() = 2.0;
+    launcher.dispatch(ShellIntent::AnimationScaleChanged);
+    launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
+    come_to_rest(&mut launcher, &mut clock);
+    open_folder(&mut launcher, 0);
+    let start = clock;
+    come_to_rest(&mut launcher, &mut clock);
+    // ANIM-15's 250 ms, at half speed.
+    assert!(
+        (490..=520).contains(&(clock - start)),
+        "{} ms",
+        clock - start
+    );
+}
+
+#[test]
+fn anim03_a_touch_catches_the_moving_row_and_a_settling_icon_where_they_are() {
+    // Issue #33: ANIM-03. The row is caught as it settles and follows the finger; so is an icon
+    // settling into its cell after a drop, which the finger picks up again.
+    let fakes = Fakes::default();
+    let (mut launcher, mut clock) = editing_four(&fakes);
+    launcher.dispatch(ShellIntent::Swipe(Direction::Next));
+    wait(&mut launcher, &mut clock, 48);
+    let caught = launcher.frame().pages[2];
+    assert!(caught > 100, "{caught} px from where it fills the screen");
+    finger(&mut launcher, &mut clock, PointerKind::Down, 540.0, 1200.0);
+    assert_eq!(launcher.frame().pages[2], caught);
+    assert!(launcher.shell().state().carousel.dragging);
+    finger(&mut launcher, &mut clock, PointerKind::Move, 640.0, 1200.0);
+    assert_eq!(launcher.frame().pages[2], caught + 100);
+    finger(&mut launcher, &mut clock, PointerKind::Up, 640.0, 1200.0);
+    come_to_rest(&mut launcher, &mut clock);
+    assert_eq!(launcher.frame().current, HomeView::Applications);
+
+    // Maps, dropped far from its cell, springs towards it…
+    assert!(long_press_cell(&mut launcher, &mut clock, 2, 620.0, 300.0));
+    finger(&mut launcher, &mut clock, PointerKind::Move, 600.0, 1500.0);
+    finger(&mut launcher, &mut clock, PointerKind::Up, 600.0, 1500.0);
+    wait(&mut launcher, &mut clock, 48);
+    let settling = launcher.frame().lifted.expect("settling");
+    assert!(settling.settling);
+    // …and a finger on it catches it there, and drags it on.
+    let (x, y) = (f64::from(settling.x), f64::from(settling.y));
+    finger(&mut launcher, &mut clock, PointerKind::Down, x, y);
+    let caught = launcher.frame().lifted.expect("caught");
+    assert!(!caught.settling);
+    assert_eq!((caught.x, caught.y), (settling.x, settling.y));
+    finger(&mut launcher, &mut clock, PointerKind::Move, x + 300.0, y);
+    assert_eq!(
+        launcher.frame().lifted.expect("dragged").x,
+        settling.x + 300
+    );
+    assert_eq!(launcher.frame().pages[1], 0, "the views stay put");
+    finger(&mut launcher, &mut clock, PointerKind::Up, x + 300.0, y);
+    come_to_rest(&mut launcher, &mut clock);
+    assert_eq!(launcher.frame().lifted, None);
+    assert!(launcher.shell().apps().state().edit_mode);
+}
+
+#[test]
+fn anim03_a_touch_on_the_last_sliver_of_a_settle_is_a_tap_on_what_is_under_it() {
+    // Issue #33: ANIM-03. Within a third of the touch slop of rest, the views are as good as
+    // there: a touch lands them and is the content's, so a tap on an icon launches it.
+    let fakes = Fakes::default();
+    *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail")];
+    let (mut launcher, mut clock) = on_a_phone(&fakes);
+    grid_on_a_phone(&mut launcher);
+    launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
+    come_to_rest(&mut launcher, &mut clock);
+    launcher.dispatch(ShellIntent::Swipe(Direction::Next));
+    // A third of the phone's 22 px slop.
+    let away = |launcher: &Launcher| launcher.shell().state().carousel.offset.abs() * WIDTH;
+    while away(&launcher) >= 22.0 / 3.0 {
+        clock += 8;
+        launcher.dispatch(ShellIntent::Frame(Duration::from_millis(clock)));
+    }
+    assert!(away(&launcher) > 0.0, "still settling");
+
+    finger(&mut launcher, &mut clock, PointerKind::Down, 168.0, 181.0);
+    let state = launcher.shell().state();
+    assert_eq!(state.carousel.offset, 0.0);
+    assert!(!state.carousel.dragging && !state.carousel.held);
+    finger(&mut launcher, &mut clock, PointerKind::Up, 168.0, 181.0);
+    let revision = launcher.frame().apps.revision;
+    assert!(
+        launcher
+            .view()
+            .apps()
+            .cell_tapped(Surface::Grid, revision, 0, Rect::default())
+    );
+    launcher.frame();
+    assert_eq!(fakes.apps.launched.lock().unwrap().len(), 1);
+}
+
 #[test]
 fn a11y05_a_screen_reader_clears_recent_without_gestures() {
-    // Issue #24: A11Y-05, AC-19. "Edit Recent" enters close mode without a tick, and the cards'
-    // "Remove ‹app› from Recent" and Clear all work as the ✕ and the button do.
+    // Issue #24: A11Y-05, AC-19. "Edit Recent" enters close mode, with a tick as edit mode's
+    // (issue #33, ANIM-24), and the cards' "Remove ‹app› from Recent" and Clear all work as the
+    // ✕ and the button do.
     let fakes = Fakes::default();
     let (mut launcher, _) = six_on_recent(&fakes);
     assert!(recent_frame(&mut launcher).close_offered);
@@ -4404,7 +4673,7 @@ fn a11y05_a_screen_reader_clears_recent_without_gestures() {
     assert!(recent.close.on);
     assert!(!recent.close_offered);
     assert!(!recent.density_offered, "no pinch while removing cards");
-    assert_eq!(*fakes.system.haptic_ticks.lock().unwrap(), 0);
+    assert_eq!(*fakes.system.haptic_ticks.lock().unwrap(), 1);
 
     recent_froms(&mut launcher);
     assert!(launcher.view().recent().badge_tapped(recent.revision, 0));

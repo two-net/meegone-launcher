@@ -17,13 +17,14 @@
 //!   app, and shrinks into the folder's preview (ANIM-14). Over a place, the icon takes it and
 //!   settles into its cell on the [`DROP`] spring. Over an icon not yet armed, it settles back
 //!   into its own gap.
+//! - **Catching.** A finger on an icon still settling catches it where it is drawn and picks it
+//!   up again (ANIM-03). A finger anywhere else lands it, or a merging one, at once.
 //!
 //! Like the icon press, it is pure: the host passes each touch and frame, with its time
 //! (ADR 0006), and the shell passes the grid and the open folder as they are now
 //! ([`DragSurfaces`]). The icon is tracked by its centre on screen, so it stays under the
 //! finger as cells move, the grid scrolls, or it changes surface.
 
-use std::f64::consts::TAU;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,27 +33,17 @@ use meegone_apps_state::{
 };
 use meegone_core_state::AppId;
 use meegone_core_state::motion::{
-    AUTO_SCROLL_MAX_DP, AUTO_SCROLL_ZONE_DP, DRAG_LIFT_SCALE, DROP, FOLDER, FOLDER_HOVER,
-    FOLDER_HOVER_SCALE, FOLDER_PULSE, FOLDER_PULSE_SCALE, REORDER_DWELL, SpringMotion, decelerate,
-    scaled,
+    AUTO_SCROLL_MAX_DP, AUTO_SCROLL_ZONE_DP, DRAG_LIFT_SCALE, DROP, FOLDER_HOVER,
+    FOLDER_HOVER_GROW, FOLDER_HOVER_SCALE, FOLDER_MERGE, FOLDER_PULSE, FOLDER_PULSE_SCALE,
+    MAX_FRAME_STEP, MERGE_AWAY_SCALE, REORDER_DWELL, REST_DISTANCE_PX, REST_DISTANCE_SCALE,
+    REST_SPEED_PX, REST_SPEED_SCALE, SpringMotion, motion_time,
 };
 
 use crate::carousel::{PointerEvent, PointerKind};
-use crate::timed::MAX_FRAME_STEP;
 
 /// A place stays the icon's target while its centre is this far, as a fraction of a cell, past
 /// the place's edges. Small, so the gaps beside an icon still take its place.
 const HYSTERESIS: f64 = 0.05;
-/// Closer than this to where it is going, in px, and slower than [`REST_SPEED_PX`] per second, a
-/// settling icon has landed.
-const REST_DISTANCE_PX: f64 = 0.5;
-const REST_SPEED_PX: f64 = 30.0;
-/// The same for its scale, which is about 1.
-const REST_DISTANCE_SCALE: f64 = 0.001;
-const REST_SPEED_SCALE: f64 = 0.05;
-/// An app dropped into a folder whose preview is full shrinks to this fraction of its size as it
-/// fades into the folder's icon.
-const MERGE_AWAY_SCALE: f64 = 0.3;
 
 /// The dragged icon as it is drawn now: an immutable snapshot inside `ShellState`.
 #[derive(Debug, Clone, PartialEq)]
@@ -247,7 +238,7 @@ impl Toward {
         }
         if let Some(last) = self.last {
             self.motion
-                .advance(at.saturating_sub(last).div_f64(animation_scale));
+                .advance(motion_time(at.saturating_sub(last), animation_scale));
         }
         self.last = Some(self.last.map_or(at, |last| last.max(at)));
     }
@@ -364,7 +355,8 @@ impl Lift {
     /// Follows the finger that made the long-press. A move past `slop` from where it went down,
     /// either way, picks the icon up. A move out of the open folder's panel takes an app out of
     /// the folder. Lifting the finger drops it; the system cancelling the gesture puts it back.
-    /// A new finger lands a settling or merging icon at once.
+    /// A new finger on a settling icon catches it where it is drawn and picks it up again
+    /// (ANIM-03); anywhere else, it lands a settling or merging icon at once.
     pub fn pointer(
         &mut self,
         event: &PointerEvent,
@@ -427,12 +419,60 @@ impl Lift {
                 drag.track(surfaces);
                 Some(LiftEvent::Dropped(drag.drop_at()))
             }
+            (PointerKind::Down, Phase::Settling { .. }) => {
+                let caught = self.catch(finger, event.at, surfaces, animation_scale);
+                self.phase = caught.map_or(Phase::Idle, |drag| Phase::Lifted(Box::new(drag)));
+                self.is_lifted().then_some(LiftEvent::PickedUp)
+            }
             (PointerKind::Move, _) => None,
             (PointerKind::Down | PointerKind::Up | PointerKind::Cancel, _) => {
                 self.phase = Phase::Idle;
                 None
             }
         }
+    }
+
+    /// The settling icon as a finger at `finger` catches it, if the finger is on it as it is
+    /// drawn: it stops where it is and follows the finger, lifting again (ANIM-03, ANIM-13).
+    fn catch(
+        &self,
+        finger: (f64, f64),
+        at: Duration,
+        surfaces: &DragSurfaces,
+        animation_scale: f64,
+    ) -> Option<Drag> {
+        let Phase::Settling {
+            key,
+            surface,
+            x,
+            y,
+            scale,
+        } = &self.phase
+        else {
+            return None;
+        };
+        let size = surfaces.view(*surface)?.layout?.icon_px * scale.value();
+        let (x, y) = (x.value(), y.value());
+        let on_it = (finger.0 - x).abs() <= size / 2.0 && (finger.1 - y).abs() <= size / 2.0;
+        if !on_it {
+            return None;
+        }
+        let mut drag = Drag {
+            key: key.clone(),
+            surface: *surface,
+            grab: (x - finger.0, y - finger.1),
+            finger,
+            over: None,
+            speed: 0.0,
+            may_scroll: (false, false),
+            scale: Toward::new(scale.value(), DRAG_LIFT_SCALE),
+            waiting: true,
+            last_frame: None,
+            now: at,
+            animation_scale,
+        };
+        drag.track(surfaces);
+        Some(drag)
     }
 
     /// The dropped icon settles into its cell on `surfaces`, from where it is drawn now, to the
@@ -474,7 +514,7 @@ impl Lift {
         let Phase::Lifted(drag) = &self.phase else {
             return;
         };
-        let length = scaled(FOLDER, animation_scale);
+        let length = FOLDER_MERGE.length_at(animation_scale);
         let folder_key = CellKey::Folder(folder);
         let at = surfaces
             .place(Surface::Grid, &folder_key)
@@ -532,9 +572,11 @@ impl Lift {
                     motion.advance(at, animation_scale);
                 }
                 scale.advance(at, animation_scale);
-                let landed = x.at_rest(REST_DISTANCE_PX, REST_SPEED_PX)
-                    && y.at_rest(REST_DISTANCE_PX, REST_SPEED_PX)
-                    && scale.at_rest(REST_DISTANCE_SCALE, REST_SPEED_SCALE);
+                // Slower than normal, rest is as slow in real time (ANIM-05).
+                let speed = animation_scale.min(1.0);
+                let landed = x.at_rest(REST_DISTANCE_PX, REST_SPEED_PX * speed)
+                    && y.at_rest(REST_DISTANCE_PX, REST_SPEED_PX * speed)
+                    && scale.at_rest(REST_DISTANCE_SCALE, REST_SPEED_SCALE * speed);
                 if landed {
                     self.phase = Phase::Idle;
                 }
@@ -548,7 +590,7 @@ impl Lift {
                 if progress >= 1.0 {
                     self.phase = Phase::Idle;
                 } else {
-                    merging.merge.progress = decelerate(progress);
+                    merging.merge.progress = FOLDER_MERGE.easing.at(progress);
                 }
                 LiftStep::default()
             }
@@ -596,6 +638,16 @@ impl Lift {
     /// layout changes or the menu closes before a drag.
     pub fn cancel(&mut self) {
         self.phase = Phase::Idle;
+    }
+
+    /// Lands a settling or merging icon at once, as when animations are removed while it moves
+    /// (ANIM-05). A lifted icon stays under the finger, at its lifted size.
+    pub fn finish(&mut self) {
+        match &mut self.phase {
+            Phase::Settling { .. } | Phase::Merging(_) => self.phase = Phase::Idle,
+            Phase::Lifted(drag) => drag.scale.advance(drag.now, 0.0),
+            Phase::Idle | Phase::Armed { .. } => {}
+        }
     }
 
     pub fn state(&self) -> LiftState {
@@ -661,13 +713,14 @@ impl Lift {
         let held = drag.now.saturating_sub(*since);
         let armed = held >= FOLDER_HOVER;
         let grow = FOLDER_HOVER_SCALE - 1.0;
+        // The grow marks the wait, which never scales; the pulse after it does (ANIM-05).
         let scale = if drag.animation_scale <= 0.0 {
             if armed { FOLDER_HOVER_SCALE } else { 1.0 }
         } else if !armed {
-            1.0 + grow * decelerate(held.as_secs_f64() / FOLDER_HOVER.as_secs_f64())
+            1.0 + grow * FOLDER_HOVER_GROW.eased(held)
         } else {
-            let pulse = (held - FOLDER_HOVER).as_secs_f64() / FOLDER_PULSE.as_secs_f64();
-            let dip = (1.0 - (pulse * TAU).cos()) / 2.0;
+            let pulsed = motion_time(held - FOLDER_HOVER, drag.animation_scale);
+            let dip = FOLDER_PULSE.repeating(pulsed);
             FOLDER_HOVER_SCALE - (FOLDER_HOVER_SCALE - FOLDER_PULSE_SCALE) * dip
         };
         HoverState {

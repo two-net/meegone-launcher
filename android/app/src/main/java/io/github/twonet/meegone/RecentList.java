@@ -108,8 +108,6 @@ final class RecentList extends LinearLayout {
     private static final float TARGET_DP = 48f;
     /** The ✕'s centre is this far inside the plate's top-start corner, so it stays on the plate. */
     private static final float BADGE_INSET_DP = 16f;
-    /** A card that leaves shrinks to this as it fades (ANIM-18), as a cell that leaves does. */
-    private static final float LEAVE_SCALE = 0.5f;
     /** An unavailable app, greyed and at half opacity as in the grid (APPS-09). */
     private static final float DIMMED_ALPHA = 0.5f;
     private static final ColorMatrixColorFilter GREYED;
@@ -370,10 +368,10 @@ final class RecentList extends LinearLayout {
 
     /**
      * How far the cards that went from each row of the cards read before have gone, from
-     * {@code frame[at]}, in ten-thousandths (ANIM-18). A card whose row has gone all the way is
-     * dropped.
+     * {@code frame[at]}, in ten-thousandths (ANIM-18). Each shrinks towards {@code endScale},
+     * the Rust app's, as it fades. A card whose row has gone all the way is dropped.
      */
-    void leave(int[] frame, int at) {
+    void leave(int[] frame, int at, float endScale) {
         boolean dropped = false;
         for (int i = leaving.size() - 1; i >= 0; i--) {
             Card card = leaving.get(i);
@@ -383,7 +381,7 @@ final class RecentList extends LinearLayout {
                 grid.removeView(card);
                 dropped = true;
             } else {
-                card.leave(Math.max(0f, gone), closeScale);
+                card.leave(Math.max(0f, gone), closeScale, endScale);
             }
         }
         if (dropped) {
@@ -823,9 +821,9 @@ final class RecentList extends LinearLayout {
             setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS);
         }
 
-        /** It shrinks and fades as it goes, from 0 to 1 (ANIM-18). */
-        void leave(float gone, float scale) {
-            scaleBody(scale * (1f - (1f - LEAVE_SCALE) * gone));
+        /** It shrinks towards {@code endScale} and fades as it goes, from 0 to 1 (ANIM-18). */
+        void leave(float gone, float scale, float endScale) {
+            scaleBody(scale * (1f - (1f - endScale) * gone));
             body.setAlpha(1f - gone);
         }
 
@@ -863,7 +861,9 @@ final class RecentList extends LinearLayout {
             float y = event.getY();
             switch (event.getActionMasked()) {
                 case MotionEvent.ACTION_DOWN:
-                    badgeDown = badgeScale > 0f && onBadge(x, y);
+                    // The ✕ takes a tap as soon as close mode is on, whether or not its row has
+                    // popped in yet: no animation blocks input (ANIM-03).
+                    badgeDown = onBadge(x, y);
                     break;
                 case MotionEvent.ACTION_MOVE:
                     badgeDown &= onBadge(x, y);

@@ -9,9 +9,7 @@
 use std::time::Duration;
 
 use meegone_apps_state::FolderId;
-use meegone_core_state::motion::{FOLDER, decelerate, scaled};
-
-use crate::timed::MAX_FRAME_STEP;
+use meegone_core_state::motion::{FOLDER, frame_step};
 
 /// The open folder's panel as it is drawn now: an immutable snapshot inside `ShellState`.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -31,7 +29,7 @@ pub struct FolderState {
 pub(crate) struct FolderMotion {
     folder: Option<FolderId>,
     open: bool,
-    /// How far it has come, from zero, closed, to [`FOLDER`], open.
+    /// How far it has come, from zero, closed, to [`FOLDER`]'s length, open.
     position: Duration,
     /// The last frame's time, or `None` until the first frame after a change.
     last: Option<Duration>,
@@ -53,28 +51,37 @@ impl FolderMotion {
         self.open = opening;
         self.last = None;
         self.animation_scale = animation_scale;
-        if scaled(FOLDER, animation_scale).is_zero() {
-            self.position = if opening { FOLDER } else { Duration::ZERO };
+        if FOLDER.length_at(animation_scale).is_zero() {
+            self.finish();
         }
         self.forget_when_closed();
     }
 
-    /// Advances to the display's frame time (ANIM-04), by at most [`MAX_FRAME_STEP`] since the
-    /// last frame.
+    /// Advances to the display's frame time (ANIM-04), by at most
+    /// [`MAX_FRAME_STEP`](meegone_core_state::motion::MAX_FRAME_STEP) since the last frame.
     pub fn frame(&mut self, at: Duration) {
         if !self.moving() {
             return;
         }
         let last = *self.last.get_or_insert(at);
         self.last = Some(at.max(last));
-        let step = at
-            .saturating_sub(last)
-            .min(MAX_FRAME_STEP)
-            .div_f64(self.animation_scale.max(f64::MIN_POSITIVE));
+        let step = frame_step(at.saturating_sub(last), self.animation_scale);
         self.position = if self.open {
-            self.position.saturating_add(step).min(FOLDER)
+            self.position.saturating_add(step).min(FOLDER.length)
         } else {
             self.position.saturating_sub(step)
+        };
+        self.forget_when_closed();
+    }
+
+    /// Puts the panel where it is heading at once: all the way open, or closed. A touch that
+    /// needs its cells where the host laid them out does this rather than wait (ANIM-03), and
+    /// so does removing animations while it moves (ANIM-05).
+    pub fn finish(&mut self) {
+        self.position = if self.open {
+            FOLDER.length
+        } else {
+            Duration::ZERO
         };
         self.forget_when_closed();
     }
@@ -82,12 +89,17 @@ impl FolderMotion {
     /// Whether the panel is all the way open, so a drag can start in it: its cells are where
     /// the host laid them out.
     pub fn fully_open(&self) -> bool {
-        self.open && self.position >= FOLDER
+        self.open && self.position >= FOLDER.length
+    }
+
+    /// Whether the panel is opening and not yet all the way open.
+    pub fn opening(&self) -> bool {
+        self.open && self.position < FOLDER.length
     }
 
     fn moving(&self) -> bool {
         if self.open {
-            self.position < FOLDER
+            self.position < FOLDER.length
         } else {
             !self.position.is_zero()
         }
@@ -103,7 +115,7 @@ impl FolderMotion {
         FolderState {
             folder: self.folder,
             open: self.open,
-            progress: decelerate(self.position.as_secs_f64() / FOLDER.as_secs_f64()),
+            progress: FOLDER.eased(self.position),
             animating: self.moving(),
         }
     }

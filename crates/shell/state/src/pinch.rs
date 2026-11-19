@@ -10,13 +10,14 @@
 //! in 180 ms (ANIM-18, ADR 0025).
 //!
 //! Once a pinch starts, the rest of the gesture is its own: the carousel and the content below
-//! get none of it, until the next gesture starts. Like the other motions it is pure, takes the
+//! get none of it, until the next gesture starts. A pinch that starts while the cards reflow
+//! catches them where they are drawn (ANIM-03). Like the other motions it is pure, takes the
 //! time with each event, and with animations removed the reflow is instant (ANIM-05).
 
 use std::time::Duration;
 
 use meegone_core_state::motion::{
-    RECENT_PINCH, RECENT_PINCH_RESISTANCE, RECENT_PINCH_STRETCH, RECENT_PINCH_THRESHOLD,
+    RECENT_PINCH_RESISTANCE, RECENT_PINCH_STRETCH, RECENT_PINCH_THRESHOLD, RECENT_REFLOW, Tween,
 };
 
 use crate::timed::Timed;
@@ -149,8 +150,9 @@ impl PinchMotion {
                 if !event.span_px.is_finite() {
                     return None;
                 }
-                // A touch never waits for the reflow (ANIM-03): the cards are in place at once.
-                self.timed = Timed::default();
+                // The fingers catch the reflowing cards where they are drawn (ANIM-03); the
+                // pinch's end reflows them on from there.
+                self.timed.freeze();
                 self.holding = true;
                 self.scale = 1.0;
                 self.pivot = (event.x, event.y);
@@ -202,16 +204,22 @@ impl PinchMotion {
 
     fn end(&mut self, animation_scale: f64) {
         self.gesture = Gesture::Idle;
-        self.reflow(RECENT_PINCH, animation_scale);
+        self.reflow(RECENT_REFLOW, animation_scale);
     }
 
-    /// The cards reflow from where they are drawn to their places over `length`: after a pinch
-    /// and whenever the density changes, [`RECENT_PINCH`] (ANIM-17), and after cards were
+    /// The cards reflow from where they are drawn to their places on `tween`: after a pinch
+    /// and whenever the density changes, [`RECENT_REFLOW`] (ANIM-17), and after cards were
     /// removed, `CARD_REMOVE` (ANIM-18).
-    pub fn reflow(&mut self, length: Duration, animation_scale: f64) {
+    pub fn reflow(&mut self, tween: Tween, animation_scale: f64) {
         self.scale = 1.0;
         self.reflow = self.reflow.wrapping_add(1);
-        self.timed.start(length, animation_scale);
+        self.timed.start(tween, animation_scale);
+    }
+
+    /// The cards are in their places at once, as when animations are removed while they
+    /// reflow (ANIM-05). A pinch in progress keeps its scale.
+    pub fn finish(&mut self) {
+        self.timed.finish();
     }
 
     /// Advances the reflow to the display's frame time (ANIM-04).
@@ -228,7 +236,7 @@ impl PinchMotion {
             holding: self.holding,
             reflow: self.reflow,
             progress: progress.unwrap_or(1.0),
-            animating: progress.is_some(),
+            animating: self.timed.moving(),
         }
     }
 }
@@ -419,13 +427,44 @@ mod tests {
         pinch.new_gesture(1.0);
         assert!(!pinch.holding());
         assert!(pinch.state().animating);
+        pinch.frame(ms(40));
+        pinch.frame(ms(120));
+        let caught = pinch.state();
+        assert!(caught.progress > 0.0 && caught.progress < 1.0);
 
-        pinch.pinch(event(PinchKind::Start, 300.0, 48), Some(GROW), 1.0);
-        assert!(
-            !pinch.state().animating,
-            "the cards are in place to be pinched"
-        );
+        pinch.pinch(event(PinchKind::Start, 300.0, 128), Some(GROW), 1.0);
+        let held = pinch.state();
         assert!(pinch.holding());
+        assert!(!held.animating, "nothing plays while the fingers hold it");
+        assert_eq!(
+            (held.reflow, held.progress),
+            (caught.reflow, caught.progress),
+            "the cards stay where they are drawn"
+        );
+        pinch.frame(ms(200));
+        assert_eq!(pinch.state().progress, caught.progress);
+
+        // The fingers scale the caught cards, and the pinch's end reflows them on from there.
+        pinch.pinch(event(PinchKind::Move, 360.0, 136), None, 1.0);
+        assert!((pinch.state().scale - 1.2).abs() < 1e-9);
+        pinch.pinch(event(PinchKind::End, 360.0, 144), None, 1.0);
+        let after = pinch.state();
+        assert_eq!(after.reflow, caught.reflow.wrapping_add(1));
+        assert_eq!((after.scale, after.progress), (1.0, 0.0));
+        assert!(after.animating);
+    }
+
+    #[test]
+    fn finishing_puts_the_cards_in_place() {
+        // ANIM-05
+        let mut pinch = pinched(450.0, GROW);
+        pinch.pinch(event(PinchKind::End, 450.0, 32), None, 1.0);
+        pinch.frame(ms(40));
+        pinch.finish();
+        assert_eq!(
+            (pinch.state().progress, pinch.state().animating),
+            (1.0, false)
+        );
     }
 
     #[test]

@@ -295,7 +295,7 @@ fn holding_an_app_over_another_arms_a_folder_and_the_icon_grows_then_pulses() {
     let armed = lift.hover();
     assert!(armed.armed);
     assert!((armed.scale - FOLDER_HOVER_SCALE).abs() < 1e-9);
-    lift.frame(FOLDER_HOVER + FOLDER_PULSE / 2, &surfaces, 1.0);
+    lift.frame(FOLDER_HOVER + FOLDER_PULSE.length / 2, &surfaces, 1.0);
     assert!((lift.hover().scale - FOLDER_PULSE_SCALE).abs() < 1e-9);
     assert!(lift.state().animating);
 
@@ -536,6 +536,68 @@ fn a_new_finger_lands_a_settling_icon_at_once() {
     lift.pointer(&at(PointerKind::Down, 0.0, 0.0, 0), SLOP, &surfaces, 1.0);
 
     assert_eq!(lift.state(), LiftState::default());
+}
+
+#[test]
+fn a_finger_on_a_settling_icon_catches_it_where_it_is() {
+    // ANIM-03, ANIM-13: dropped far from its cell, app 5 springs back towards it, and a finger
+    // on it as it goes stops it there and picks it up again.
+    let surfaces = grid(0.0);
+    let mut lift = picked_up(&surfaces, 900.0, 900.0);
+    lift.pointer(&at(PointerKind::Up, 900.0, 900.0, 0), SLOP, &surfaces, 1.0);
+    lift.settle(&surfaces, 1.0);
+    lift.frame(ms(0), &surfaces, 1.0);
+    lift.frame(ms(48), &surfaces, 1.0);
+    let settling = lift.state();
+    assert!(settling.settling);
+    let (x, y) = (settling.x, settling.y);
+    let (home_x, home_y) = icon(5);
+    assert!(
+        x < 900.0 && x > home_x && y < 900.0 && y > home_y,
+        "{x}, {y}"
+    );
+
+    let caught = lift.pointer(
+        &at(PointerKind::Down, x + 20.0, y - 10.0, 56),
+        SLOP,
+        &surfaces,
+        1.0,
+    );
+    assert_eq!(caught, Some(LiftEvent::PickedUp));
+    assert!(lift.is_lifted());
+    let state = lift.state();
+    assert_eq!(
+        (state.key, state.x, state.y, state.settling),
+        (Some(key(5)), x, y, false)
+    );
+    assert_eq!(state.scale, settling.scale);
+
+    // It follows the finger from there, held where it was caught, and lifts to 110 %.
+    finger(&mut lift, &surfaces, x + 120.0, y - 10.0, 64);
+    assert!((lift.state().x - (x + 100.0)).abs() < 1e-9);
+    lift.frame(ms(64), &surfaces, 1.0);
+    lift.frame(ms(600), &surfaces, 1.0);
+    assert!((lift.state().scale - DRAG_LIFT_SCALE).abs() < 1e-3);
+}
+
+#[test]
+fn the_pulse_follows_the_system_animation_speed_but_the_wait_does_not() {
+    // ANIM-05, FOLD-01: the 400 ms wait arms the folder at any speed; at half speed, the pulse
+    // after it takes twice as long.
+    let surfaces = grid(0.0);
+    let (x, y) = icon(6);
+    let mut lift = picked_up(&surfaces, x + 20.0, y);
+    lift.frame(ms(0), &surfaces, 2.0);
+    lift.frame(FOLDER_HOVER, &surfaces, 2.0);
+    assert!(lift.hover().armed);
+    lift.frame(FOLDER_HOVER + FOLDER_PULSE.length / 2, &surfaces, 2.0);
+    let half_way = lift.hover().scale;
+    assert!(
+        half_way > FOLDER_PULSE_SCALE && half_way < FOLDER_HOVER_SCALE,
+        "{half_way}"
+    );
+    lift.frame(FOLDER_HOVER + FOLDER_PULSE.length, &surfaces, 2.0);
+    assert!((lift.hover().scale - FOLDER_PULSE_SCALE).abs() < 1e-9);
 }
 
 /// Apps 0 to 39 in the grid, with app 6 replaced by a folder of `count` apps.

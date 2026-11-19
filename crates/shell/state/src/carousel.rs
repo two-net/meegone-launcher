@@ -9,9 +9,10 @@
 use std::time::Duration;
 
 use meegone_core_state::motion::{
-    INDICATOR_HOLD, INDICATOR_IN, INDICATOR_OUT, MAX_OVERSHOOT, REST_DISTANCE_PX, REST_SPEED_PX,
-    SETTLE, SpringMotion, VIEW_EDGE_RESISTANCE, VIEW_EDGE_STRETCH, VIEW_FLING_VELOCITY_DP,
-    VIEW_SWIPE_THRESHOLD, VelocityTracker, scaled,
+    CATCH_SLOP_FRACTION, Easing, INDICATOR_HOLD, INDICATOR_IN, INDICATOR_OUT, MAX_OVERSHOOT,
+    REST_DISTANCE_PX, REST_SPEED_PX, SETTLE, SpringMotion, Tween, VIEW_EDGE_RESISTANCE,
+    VIEW_EDGE_STRETCH, VIEW_FLING_VELOCITY_DP, VIEW_SWIPE_THRESHOLD, VelocityTracker, motion_time,
+    speed,
 };
 
 use crate::{Direction, HomeView};
@@ -167,13 +168,15 @@ enum Gesture {
     },
 }
 
-/// A linear fade of the indicator's opacity.
+/// A fade of the indicator's opacity, on [`INDICATOR_IN`] or [`INDICATOR_OUT`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Fade {
     from: f64,
     to: f64,
     start: Duration,
+    /// How long it lasts, at the system animation speed.
     length: Duration,
+    easing: Easing,
 }
 
 impl Fade {
@@ -181,9 +184,9 @@ impl Fade {
         let progress = if self.length.is_zero() {
             1.0
         } else {
-            (at.saturating_sub(self.start).as_secs_f64() / self.length.as_secs_f64()).min(1.0)
+            at.saturating_sub(self.start).as_secs_f64() / self.length.as_secs_f64()
         };
-        self.from + (self.to - self.from) * progress
+        self.from + (self.to - self.from) * self.easing.at(progress)
     }
 
     fn is_done(&self, at: Duration) -> bool {
@@ -192,25 +195,27 @@ impl Fade {
 }
 
 /// The view indicator: it fades in when a drag starts and out a while after the views settle
-/// (HOME-09, ANIM-11).
+/// (HOME-09, ANIM-11). How long it stays is a wait, not motion, so it never scales with the
+/// system animation speed: with animations removed it still shows for [`INDICATOR_HOLD`].
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct Indicator {
     opacity: f64,
     fade: Option<Fade>,
     /// When it starts fading out.
     hide_at: Option<Duration>,
-    /// How long fading out takes, at the system animation speed.
-    out_length: Duration,
+    /// The system animation speed its fades take.
+    speed: f64,
 }
 
 impl Indicator {
-    fn fade_to(&mut self, to: f64, start: Duration, length: Duration) {
+    fn fade_to(&mut self, to: f64, start: Duration, tween: Tween) {
         self.advance(start);
         self.fade = Some(Fade {
             from: self.opacity,
             to,
             start,
-            length,
+            length: tween.length_at(self.speed),
+            easing: tween.easing,
         });
         self.advance(start);
     }
@@ -218,7 +223,7 @@ impl Indicator {
     fn advance(&mut self, at: Duration) {
         if let Some(hide_at) = self.hide_at.filter(|hide_at| at >= *hide_at) {
             self.hide_at = None;
-            self.fade_to(0.0, hide_at, self.out_length);
+            self.fade_to(0.0, hide_at, INDICATOR_OUT);
         }
         if let Some(fade) = self.fade {
             self.opacity = fade.opacity_at(at);
@@ -230,6 +235,13 @@ impl Indicator {
 
     fn is_animating(&self) -> bool {
         self.fade.is_some() || self.hide_at.is_some()
+    }
+
+    /// Ends a fade at once, where it was going. The wait before it fades out stays.
+    fn finish(&mut self) {
+        if let Some(fade) = self.fade.take() {
+            self.opacity = fade.to;
+        }
     }
 }
 
@@ -269,18 +281,32 @@ impl Carousel {
         self.state
     }
 
-    /// Takes on the wrap-around setting and the system animation speed.
-    ///
-    /// Android offers speeds from 0 to 10. Anything that isn't a number counts as normal, and
-    /// a speed too slow or too fast to time with counts as off or as 10.
+    /// Takes on the wrap-around setting and the system animation speed, cleaned up by
+    /// [`speed`].
     pub fn configure(&mut self, wrap: bool, animation_scale: f64) {
         self.state.wrap = wrap;
-        self.animation_scale = match animation_scale {
-            scale if !scale.is_finite() => 1.0,
-            scale if scale < 0.01 => 0.0,
-            scale => scale.min(10.0),
-        };
-        self.indicator.out_length = self.scaled(INDICATOR_OUT);
+        self.animation_scale = speed(animation_scale);
+        self.indicator.speed = self.animation_scale;
+    }
+
+    /// Ends the row's motion and the indicator's fade at once, as when animations are removed
+    /// while they move (ANIM-05).
+    pub fn finish(&mut self) {
+        if matches!(self.gesture, Gesture::Settling { .. }) {
+            self.rest(self.now);
+        }
+        self.indicator.finish();
+        self.publish();
+    }
+
+    /// A finger touched the home views at `at`. A settling row closer to rest than a touch
+    /// catches (see [`CATCH_SLOP_FRACTION`]) lands at once, so the touch goes to what is under
+    /// it, not to the row (ANIM-03). Called before anything else decides what the touch does.
+    pub fn touch_down(&mut self, at: Duration) {
+        if matches!(self.gesture, Gesture::Settling { .. }) && !self.catchable() {
+            self.rest(at);
+            self.publish();
+        }
     }
 
     /// The system animation speed, as the carousel takes it: 0 means animations are removed
@@ -297,7 +323,7 @@ impl Carousel {
         self.gesture = Gesture::Idle;
         self.tracker.clear();
         self.indicator = Indicator {
-            out_length: self.indicator.out_length,
+            speed: self.indicator.speed,
             ..Indicator::default()
         };
         self.publish();
@@ -436,7 +462,7 @@ impl Carousel {
             // Spring time runs slower by the animation scale (ANIM-05).
             let scale = self.animation_scale;
             if let Some(last) = last.filter(|_| scale > 0.0) {
-                motion.advance(at.saturating_sub(last).div_f64(scale));
+                motion.advance(motion_time(at.saturating_sub(last), scale));
             }
             self.state.offset = motion.displacement();
             let width = self.state.layout.width_px.max(1.0);
@@ -457,20 +483,29 @@ impl Carousel {
     fn press(&mut self, event: PointerEvent, current: HomeView) {
         self.tracker.clear();
         self.tracker.add(event.at, self.logical(event.x));
-        let moving = matches!(
-            self.gesture,
-            Gesture::Settling { .. } | Gesture::Dragging { .. }
-        ) || self.state.offset != 0.0;
-        if moving {
+        let moving = matches!(self.gesture, Gesture::Dragging { .. }) || self.catchable();
+        if moving && !self.locked {
             // Touching the moving row catches it where it is (ANIM-03).
             let start = self.unstretched(self.state.offset, current);
             self.start_drag(event.x, start, event.at);
         } else {
+            // A row as good as at rest, or one locked under an open folder or search, lands at
+            // once: the touch is the content's (ANIM-03).
+            if self.state.offset != 0.0 || matches!(self.gesture, Gesture::Settling { .. }) {
+                self.rest(event.at);
+            }
             self.gesture = Gesture::Pressed {
                 x: event.x,
                 y: event.y,
             };
         }
+    }
+
+    /// Whether the row is far enough from rest for a touch to catch it: further than
+    /// [`CATCH_SLOP_FRACTION`] of the touch slop.
+    fn catchable(&self) -> bool {
+        let away_px = self.state.offset.abs() * self.state.layout.width_px;
+        self.state.offset != 0.0 && away_px > self.state.layout.touch_slop_px * CATCH_SLOP_FRACTION
     }
 
     /// Starts a drag once the finger has moved past the touch slop, sideways rather than up or
@@ -497,7 +532,7 @@ impl Carousel {
             travel: 0.0,
         };
         self.indicator.hide_at = None;
-        self.indicator.fade_to(1.0, at, self.scaled(INDICATOR_IN));
+        self.indicator.fade_to(1.0, at, INDICATOR_IN);
     }
 
     fn drag(&mut self, event: PointerEvent, current: HomeView) {
@@ -568,7 +603,7 @@ impl Carousel {
         self.state.offset = 0.0;
         self.gesture = Gesture::Idle;
         if self.indicator.opacity > 0.0 || self.indicator.fade.is_some() {
-            self.indicator.hide_at = Some(at + self.scaled(INDICATOR_HOLD));
+            self.indicator.hide_at = Some(at + INDICATOR_HOLD);
             self.indicator.advance(at);
         }
     }
@@ -584,10 +619,6 @@ impl Carousel {
     /// A position along the row that grows towards the next view (L10N-02).
     fn logical(&self, x: f64) -> f64 {
         if self.state.layout.rtl { x } else { -x }
-    }
-
-    fn scaled(&self, duration: Duration) -> Duration {
-        scaled(duration, self.animation_scale)
     }
 
     /// Whether the row can't move in the direction of `offset`: past an end, with wrap-around
@@ -875,6 +906,55 @@ mod tests {
     }
 
     #[test]
+    fn a_touch_on_the_last_sliver_of_a_settle_goes_to_what_is_under_it() {
+        // ANIM-03: within a third of the 10 px touch slop of rest, the row is as good as there.
+        // It lands at once, and the touch is a press on the content, not a catch, so the tail
+        // of a settle never swallows a tap.
+        let mut shell = shell();
+        let end = flick(&mut shell, 600.0, 500.0, 0);
+        let mut at = end;
+        while shell.state().carousel.offset.abs() * WIDTH >= 10.0 / 3.0 {
+            at += 8;
+            shell.dispatch(ShellIntent::Frame(ms(at)));
+        }
+        assert!(shell.state().carousel.offset != 0.0);
+        assert!(shell.state().carousel.animating, "still settling");
+
+        touch(&mut shell, PointerKind::Down, 300.0, at + 4);
+        let carousel = shell.state().carousel;
+        assert_eq!(carousel.offset, 0.0);
+        assert!(!carousel.dragging);
+        assert_eq!(shell.state().current, HomeView::Recent);
+        touch(&mut shell, PointerKind::Move, 304.0, at + 12);
+        assert!(!shell.state().carousel.dragging, "a press, within the slop");
+        touch(&mut shell, PointerKind::Up, 304.0, at + 20);
+        assert_eq!(shell.state().carousel.offset, 0.0);
+    }
+
+    #[test]
+    fn a_locked_row_is_never_caught() {
+        // ANIM-03, FOLD-04: a touch on an open folder or search, which lock the row, is theirs,
+        // even if the row still moved; it lands at once.
+        let mut carousel = Carousel::new(true, 1.0);
+        carousel.layout(layout(false), HomeView::Applications);
+        carousel.settle(HomeView::Applications, HomeView::Recent, 0.0, Some(ms(0)));
+        carousel.frame(ms(48));
+        assert!(carousel.state().offset.abs() * WIDTH > 10.0);
+
+        carousel.lock(true);
+        let down = PointerEvent {
+            kind: PointerKind::Down,
+            x: 300.0,
+            y: 800.0,
+            at: ms(56),
+        };
+        carousel.pointer(down, HomeView::Recent);
+        assert_eq!(carousel.state().offset, 0.0);
+        assert!(!carousel.state().dragging);
+        assert_eq!(carousel.pressed_at(), Some((300.0, 800.0)));
+    }
+
+    #[test]
     fn a_right_to_left_layout_mirrors_the_order_and_the_swipe_directions() {
         // L10N-02: Recent is on the left, so a drag to the right shows it.
         let mut shell = laid_out(&Fakes::default(), true);
@@ -976,8 +1056,14 @@ mod tests {
         let state = shell.state();
         assert_eq!(state.current, HomeView::Recent);
         assert_eq!(state.carousel.offset, 0.0);
-        assert_eq!(state.carousel.indicator, 0.0);
-        assert!(!state.carousel.animating);
+        // The indicator still stays its while, a wait rather than motion, so it is still seen
+        // (ANIM-11): then it goes at once.
+        assert_eq!(state.carousel.indicator, 1.0);
+        shell.dispatch(ShellIntent::Frame(ms(1_099)));
+        assert_eq!(shell.state().carousel.indicator, 1.0);
+        shell.dispatch(ShellIntent::Frame(ms(1_100)));
+        assert_eq!(shell.state().carousel.indicator, 0.0);
+        assert!(!shell.state().carousel.animating);
     }
 
     #[test]

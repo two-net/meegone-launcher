@@ -52,6 +52,12 @@ impl EventsChange {
         self.timed.frame(at);
     }
 
+    /// Puts everything in place at once, as when animations are removed while it plays
+    /// (ANIM-05).
+    pub fn finish(&mut self) {
+        self.timed.finish();
+    }
+
     pub fn state(&self) -> EventsChangeState {
         match self.timed.eased() {
             None => EventsChangeState::default(),
@@ -66,7 +72,7 @@ impl EventsChange {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::timed::MAX_FRAME_STEP;
+    use meegone_core_state::motion::MAX_FRAME_STEP;
 
     fn ms(millis: u64) -> Duration {
         Duration::from_millis(millis)

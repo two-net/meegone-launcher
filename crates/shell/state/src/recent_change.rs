@@ -11,10 +11,10 @@
 
 use std::time::Duration;
 
-use meegone_core_state::motion::{CARD_REMOVE, CLEAR_ALL_STAGGER, decelerate, scaled};
+use meegone_core_state::motion::{
+    CARD_REMOVE, CARD_REMOVE_SCALE, CLEAR_ALL_STAGGER, frame_step, stagger,
+};
 use meegone_recent_state::MAX_ROWS;
-
-use crate::timed::MAX_FRAME_STEP;
 
 /// The cards leaving Recent as they are drawn now: an immutable snapshot inside `ShellState`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -22,6 +22,8 @@ pub struct RecentChangeState {
     /// How far the cards that left each row have gone, from 0, as drawn, to 1, gone. Rows are
     /// those of the cards the host last read; a row no card left from is at 1.
     pub leave: [f64; MAX_ROWS],
+    /// The scale a leaving card shrinks to as it fades, by the time it has gone (ANIM-18).
+    pub leave_scale: f64,
     /// It is still moving, so the host should draw another frame.
     pub animating: bool,
 }
@@ -60,52 +62,50 @@ impl RecentChange {
         let mut rank = 0;
         self.delays = std::array::from_fn(|row| {
             leaving[row].then(|| {
-                let delay = if count > 1 {
-                    CLEAR_ALL_STAGGER.mul_f64(rank as f64 / (count - 1) as f64)
-                } else {
-                    Duration::ZERO
-                };
+                let delay = stagger(rank, count, CLEAR_ALL_STAGGER);
                 rank += 1;
                 delay
             })
         });
         self.animation_scale = animation_scale;
         self.last = None;
-        self.played = (!scaled(CARD_REMOVE, animation_scale).is_zero()).then_some(Duration::ZERO);
+        self.played = (!CARD_REMOVE.length_at(animation_scale).is_zero()).then_some(Duration::ZERO);
+    }
+
+    /// Every card that is leaving is gone at once, as when animations are removed while they
+    /// go (ANIM-05).
+    pub fn finish(&mut self) {
+        self.played = None;
     }
 
     /// The whole motion: until the last row leaving has gone.
     fn length(&self) -> Duration {
         let last = self.delays.iter().flatten().max().copied();
-        last.unwrap_or_default().saturating_add(CARD_REMOVE)
+        last.unwrap_or_default().saturating_add(CARD_REMOVE.length)
     }
 
-    /// Advances to the display's frame time (ANIM-04), by at most [`MAX_FRAME_STEP`] of motion
-    /// since the last frame.
+    /// Advances to the display's frame time (ANIM-04), by at most
+    /// [`MAX_FRAME_STEP`](meegone_core_state::motion::MAX_FRAME_STEP) of real time since the
+    /// last frame.
     pub fn frame(&mut self, at: Duration) {
         let Some(played) = self.played else {
             return;
         };
         let last = *self.last.get_or_insert(at);
         self.last = Some(at.max(last));
-        let step = at
-            .saturating_sub(last)
-            .min(MAX_FRAME_STEP)
-            .div_f64(self.animation_scale.max(f64::MIN_POSITIVE));
+        let step = frame_step(at.saturating_sub(last), self.animation_scale);
         let played = played.saturating_add(step);
         self.played = (played < self.length()).then_some(played);
     }
 
     pub fn state(&self) -> RecentChangeState {
         let leave = std::array::from_fn(|row| match (self.played, self.delays[row]) {
-            (Some(played), Some(delay)) => {
-                let own = played.saturating_sub(delay);
-                decelerate(own.as_secs_f64() / CARD_REMOVE.as_secs_f64())
-            }
+            (Some(played), Some(delay)) => CARD_REMOVE.eased(played.saturating_sub(delay)),
             _ => 1.0,
         });
         RecentChangeState {
             leave,
+            leave_scale: CARD_REMOVE_SCALE,
             animating: self.played.is_some(),
         }
     }

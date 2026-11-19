@@ -80,6 +80,8 @@ public final class HomeActivity extends Activity {
         bridge.watchNotifications();
         // Recent follows usage access, even while it shows (ADR 0023).
         bridge.watchUsageAccess();
+        // Every motion follows the system animation speed, even while the home shows (ADR 0034).
+        bridge.watchAnimationScale();
         // Saved state with a launcher this call started: the system had ended the process while
         // the user was elsewhere. A recreation after a configuration change finds it running.
         away = started && savedInstanceState != null;
@@ -288,6 +290,18 @@ public final class HomeActivity extends Activity {
     }
 
     /**
+     * The system animation speed changed (ANIM-05, A11Y-07, ADR 0034). The shared launcher takes
+     * it on, ending every motion at once if animations were removed, and {@code resumed}, if it
+     * is a home, redraws. Called by {@link Bridge} on the main thread.
+     */
+    static void animationScaleChanged(Activity resumed) {
+        nativeAnimationScaleChanged();
+        if (resumed instanceof HomeActivity) {
+            ((HomeActivity) resumed).views.refresh();
+        }
+    }
+
+    /**
      * The daily image's check reached the feed (ADR 0029). The shared launcher, if it has
      * started, reads the image and how the checks are going again, and {@code resumed}, if it is
      * a home, redraws. Called by {@link Bridge} on the main thread.
@@ -350,6 +364,9 @@ public final class HomeActivity extends Activity {
 
     /** The device's dark theme turned on or off (THEME-02, ADR 0033). */
     private static native void nativeSystemThemeChanged();
+
+    /** The system animation speed changed (ANIM-05, ADR 0034); nothing before MeeGone starts. */
+    private static native void nativeAnimationScaleChanged();
 
     /** Taps the banner's "make default" button; only debug builds' {@link DebugHooks} call it. */
     private native void nativeRequestDefaultHome();

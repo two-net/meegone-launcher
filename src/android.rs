@@ -328,6 +328,32 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_ImageJobService_nati
     });
 }
 
+/// `static void nativeAnimationScaleChanged()`: the system animation speed changed, such as
+/// animations being removed while the home shows (ANIM-05, A11Y-07, ADR 0034). Every motion
+/// takes it on, and with animations removed, whatever moves is where it was going at once. Does
+/// nothing before the home has started.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeActivity_nativeAnimationScaleChanged(
+    env: RawEnv,
+    _class: JObject,
+) {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    guarded(env, || {
+        LAUNCHER.with_borrow_mut(|launcher| {
+            if let Some(launcher) = launcher {
+                launcher.dispatch(ShellIntent::AnimationScaleChanged);
+                launcher.frame();
+            }
+        });
+        Ok(())
+    });
+}
+
 /// `static void nativeImageChecked()`: the daily image's check reached the feed, so the image
 /// and how the checks are going are read again (ADR 0029). Does nothing before the home has
 /// started, as the job may run without it.
@@ -2192,6 +2218,8 @@ fn with_image_message(env: Env, step: impl FnOnce(&Launcher) -> bool) -> JObject
 }
 
 /// `void nativeFrame(long frameTimeNanos)`: the display is about to draw a frame (ANIM-04).
+/// It only advances the motion: `HomeViews.apply` reads the frame straight after, with
+/// `nativeRead`, which builds it, so each vsync builds the frame once (PERF-03, ADR 0034).
 ///
 /// # Safety
 ///
@@ -2206,7 +2234,6 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeFram
     let env = unsafe { Env::from_raw(env) };
     with_launcher(env, |launcher| {
         launcher.dispatch(ShellIntent::Frame(uptime(frame_time_nanos)));
-        launcher.frame();
     });
 }
 
@@ -3069,7 +3096,7 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRead
 }
 
 /// How many slots the frame has.
-const FRAME_SLOTS: usize = 141;
+const FRAME_SLOTS: usize = 142;
 /// The first of Recent's close-mode slots.
 const CLOSE_SLOTS: usize = 104;
 
@@ -3182,6 +3209,7 @@ const CLOSE_SLOTS: usize = 104;
 /// | 138 | The past week's screen's revision while it is open: when it changes, the screen is read again with `nativePastImages`; -1 while it is closed (WALL-17) |
 /// | 139 | How far the whole screen has faded from the theme it was drawn in to the colours of this frame, 0 to 10 000: below 10 000, the host fades a picture of the old screen out over the new one (THEME-06, ANIM-19) |
 /// | 140 | Settings → Appearance → Theme: 0 System, 1 Light, 2 Dark, as [`theme_code`] says, or -1 while Settings isn't working, so it isn't offered (THEME-01, ARCH-09) |
+/// | 141 | The scale a card leaving Recent shrinks to by the time it has gone, in ten-thousandths, from `motion::CARD_REMOVE_SCALE` (ANIM-18) |
 fn frame_slots(frame: &HomeFrame) -> [i32; FRAME_SLOTS] {
     let [events, applications, recent] = frame.pages;
     let menu_items = frame.menu.map_or(0, |menu| {
@@ -3397,6 +3425,7 @@ fn frame_slots(frame: &HomeFrame) -> [i32; FRAME_SLOTS] {
     slots[window + 11] = revision(frame.past_images);
     slots[window + 12] = i32::from(frame.theme_change);
     slots[window + 13] = frame.theme_choice.map_or(-1, theme_code);
+    slots[window + 14] = recent.map_or(10_000, |recent| i32::from(recent.leave_scale));
     slots
 }
 

@@ -7,7 +7,7 @@
 
 use std::time::Duration;
 
-use meegone_core_state::motion::{RETURN_HOME, RETURN_HOME_FROM_SCALE, decelerate, scaled};
+use meegone_core_state::motion::{RETURN_HOME, RETURN_HOME_FROM_SCALE};
 
 /// The home content as it is drawn now: an immutable snapshot inside `ShellState`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -52,7 +52,7 @@ impl ReturnHome {
     /// time spent before the home is drawn again doesn't count. With animations removed
     /// (`animation_scale` 0), the content shows at once (ANIM-05).
     pub fn start(&mut self, animation_scale: f64) {
-        let length = scaled(RETURN_HOME, animation_scale);
+        let length = RETURN_HOME.length_at(animation_scale);
         self.motion = (!length.is_zero()).then_some(Motion {
             length,
             start: None,
@@ -75,7 +75,7 @@ impl ReturnHome {
         if progress >= 1.0 {
             self.motion = None;
         } else {
-            motion.eased = decelerate(progress);
+            motion.eased = RETURN_HOME.easing.at(progress);
         }
     }
 
