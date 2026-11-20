@@ -617,7 +617,7 @@ final class AppsGrid extends ScrollView {
      * "Mail, place 3 of 40" (A11Y-08). Returns whether it moved.
      */
     boolean moveTo(AppCell cell, int to) {
-        String label = cell.name();
+        String label = cell.spokenName();
         int place = nativeAppMoved(surface, revision, cell.index(), to);
         redraw.run();
         if (place < 0) {
@@ -633,7 +633,7 @@ final class AppsGrid extends ScrollView {
      * with…" or "Move into…". Returns whether it did.
      */
     boolean grouped(AppCell cell) {
-        String label = cell.name();
+        String label = cell.spokenName();
         int folder = nativeAppGrouped(revision, cell.index());
         redraw.run();
         if (folder < 0) {
@@ -645,7 +645,7 @@ final class AppsGrid extends ScrollView {
 
     /** A screen reader took a cell's app out of the open folder (A11Y-05). */
     boolean movedOut(AppCell cell) {
-        String label = cell.name();
+        String label = cell.spokenName();
         int place = nativeAppMovedOut(revision, cell.index());
         redraw.run();
         if (place < 0) {
@@ -678,10 +678,24 @@ final class AppsGrid extends ScrollView {
         return index >= 0 && index < shown.size() ? shown.get(index) : null;
     }
 
-    /** Cell {@code index}'s name as it shows, or null if there is none. */
+    /**
+     * Cell {@code index}'s name as screen readers read it, with "work" for a work-profile app
+     * (A11Y-01), or null if there is none.
+     */
     String label(int index) {
         AppCell cell = cellAt(index);
-        return cell == null ? null : cell.name();
+        return cell == null ? null : cell.spokenName();
+    }
+
+    /** The first cell at least partly in sight, or null if there is none. */
+    AppCell firstVisibleCell() {
+        int top = getScrollY();
+        for (AppCell cell : shown) {
+            if (cell.isLaidOut() && cell.getBottom() + cell.getTranslationY() > top) {
+                return cell;
+            }
+        }
+        return null;
     }
 
     /** A finger went down on a cell or left it (ANIM-10). */

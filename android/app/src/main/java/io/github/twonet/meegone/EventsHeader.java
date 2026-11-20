@@ -1,11 +1,7 @@
 package io.github.twonet.meegone;
 
 import android.content.Context;
-import android.content.res.ColorStateList;
-import android.graphics.Color;
 import android.graphics.Typeface;
-import android.graphics.drawable.ColorDrawable;
-import android.graphics.drawable.RippleDrawable;
 import android.text.Layout;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -36,8 +32,6 @@ final class EventsHeader extends LinearLayout {
     /** The side margins (SRS 5.2), inside the page's safe area. */
     private static final float MARGIN_DP = 16f;
     private static final float TOP_DP = 8f;
-    /** The smallest a touch target gets (A11Y-02). */
-    private static final float TARGET_DP = 48f;
 
     private final TextView weekday;
     private final TextView dayMonth;
@@ -65,7 +59,8 @@ final class EventsHeader extends LinearLayout {
 
         alarm = new TextView(context);
         alarm.setTextSize(TypedValue.COMPLEX_UNIT_SP, BODY_SP);
-        alarm.setMinHeight(Math.round(TARGET_DP * density));
+        alarm.setMinHeight(Math.round(A11y.TARGET_DP * density));
+        alarm.setMinWidth(Math.round(A11y.TARGET_DP * density));
         alarm.setGravity(Gravity.CENTER_VERTICAL | Gravity.START);
         alarm.setOnClickListener(view -> openAlarm.run());
         alarm.setAccessibilityDelegate(new AccessibilityDelegate() {
@@ -120,7 +115,6 @@ final class EventsHeader extends LinearLayout {
         weekday.setTextColor(foreground);
         dayMonth.setTextColor(foreground);
         alarm.setTextColor(dim);
-        ColorStateList pressed = ColorStateList.valueOf((foreground & 0x00FFFFFF) | 0x1F000000);
-        alarm.setBackground(new RippleDrawable(pressed, null, new ColorDrawable(Color.WHITE)));
+        alarm.setBackground(SettingsRows.ripple(foreground));
     }
 }

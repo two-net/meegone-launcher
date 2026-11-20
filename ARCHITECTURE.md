@@ -55,7 +55,11 @@ It also checks the legal rules ([ADR 0037](docs/adr/0037-branding-assets-and-the
 - Every licence text is shown in About (LEGAL-06).
 - The listing in `fastlane/metadata/android/` carries About's privacy notice and the LEGAL-05 statement word for word (PRIV-04).
 
-What a check can't decide, such as the image source's terms (LEGAL-04) and the store graphics, is in [RELEASING.md](RELEASING.md).
+And it checks two accessibility rules on the Java host ([ADR 0038](docs/adr/0038-named-reachable-legible-and-scalable.md)):
+- Every colour drawn comes from the theme's tokens: a colour literal outside `COLOUR_ALLOWED`, each entry with its reason, fails (A11Y-03, SRS 5.3). An entry that no longer matches anything fails too.
+- Every text size is in sp, so it follows the system font size (A11Y-04).
+
+What a check can't decide, such as the image source's terms (LEGAL-04) and the store graphics, is in [RELEASING.md](RELEASING.md). What only a device can show, every screen as it is drawn, is checked by the debug build's accessibility audit (`tools/a11y-audit.sh`, ADR 0038).
 
 ## How a feature works
 
@@ -254,7 +258,7 @@ HomeViews (Java)                                            Rust
     - Clear all, at the end of the section header, fades in with close mode and calls `nativeRecentClearAll`.
     - Each card says where it was in the cards read before. A card no card keeps shrinks and fades where it was, as the frame says for its row, while the others reflow into the gap. "No recent apps" shows once it has gone.
     - When the frame's removals change, "Removed from Recent" shows briefly. With touch exploration on, the status line says it instead, e.g. "Mail removed from Recent" (A11Y-08). The home views offer "Edit Recent" while the frame says so, and the status says "Editing Recent" on entering.
-- **Settings** ([ADR 0035](docs/adr/0035-the-settings-screen.md)) covers the home views with its name and one `ScrollView` of its groups, in SET-02's order. Each group is built from `SettingsRows`, so they look alike, and is offered only while its slot says so. Opened at the Lock-screen image group (slot 17 is 2), it scrolls to that group's heading, which takes screen readers' focus. Its dialogs, the region choice, the licences and Reset launcher's question, are in the device's light or dark dialog theme with MeeGone's accent, and close with Settings.
+- **Settings** ([ADR 0035](docs/adr/0035-the-settings-screen.md)) covers the home views with its name and one `ScrollView` of its groups, in SET-02's order. Each group is built from `SettingsRows`, so they look alike, and is offered only while its slot says so. Opened at the Lock-screen image group (slot 17 is 2), it scrolls to that group's heading, which takes screen readers' focus. Its dialogs, the region choice, the licences and Reset launcher's question, are laid out by the device's light or dark dialog theme and drawn by `Dialogs` in MeeGone's colours, with 48 dp buttons (ADR 0038), and close with Settings.
   - Appearance → Theme, a `ChoiceSettings` with a radio button for System, Light and Dark, which calls `nativeTheme`; the frame's slot 140 says which is chosen ([ADR 0033](docs/adr/0033-themes-and-the-theme-cross-fade.md)).
   - `HomeSettings`: Home → "Home button opens", a `ChoiceSettings` for the last view or always Applications (`nativeHomeTarget`, slot 142), and Wrap-around (`nativeWrapAround`, slot 143).
   - `HiddenAppsList`: Applications → Hidden apps, each app with its icon and Unhide, read by revision like the cells ([ADR 0017](docs/adr/0017-hiding-apps.md)).
@@ -289,7 +293,15 @@ HomeViews (Java)                                            Rust
   - When a frame brings a new background while slot 139 says the fade has just started, `ThemeFade` draws `HomeViews` into a bitmap first, in the old theme. It puts it in the view's overlay, above everything and taking no touches, fades it out as slot 139 says, and lets it go at 10 000.
   - The system bars switch at once to the new background (ADR 0006). An open rename dialog opens again at once in the new theme, with the name as it is being typed.
   - `Themed` gives Android's own widgets MeeGone's colours rather than the device's: a text field's cursor, selection handles and highlight, and every scroll view's edge glow and scrollbar thumb.
-- **Text** is in Android string resources (L10N-01). **Accessibility** comes from Android's views: the home views offer scroll, page and named actions, including "Home menu", and each app's cell offers "Open menu" as its long-click action (A11Y-05).
+- **Text** is in Android string resources (L10N-01).
+- **Accessibility** comes from Android's views ([ADR 0038](docs/adr/0038-named-reachable-legible-and-scalable.md)).
+  - The home views offer scroll, page and named actions, including "Home menu", and each app's cell offers "Open menu" as its long-click action (A11Y-05).
+  - **Names** (A11Y-01): `A11y.appName` names an app wherever it is named, with "work" for a work-profile app. `A11y.describe` adds a state, after the name on Android 10. `A11y.notAButton` keeps the containers that only keep touches, such as Settings and the menu card, from reading as buttons. The ✕ is a named action on its cell or card.
+  - **Targets** (A11Y-02): `A11y.TARGET_DP` is every target's least size. A view that takes taps in places of its own, such as the ✕, makes its target 48 dp on screen at its scale.
+  - **Contrast** (A11Y-03): every colour is a token. `PAIRINGS` in `tokens.rs` lists each pairing the host draws, which a test holds to its ratio in both themes. Every press is `SettingsRows.pressed`. Unavailable apps keep their contrast: a grey icon at half opacity, with the label, dot and Recent plate in the secondary text colour.
+  - **Large text** (A11Y-04): `ButtonRow` stacks buttons that don't fit side by side, `SectionHeader`'s title wraps before its button, and the menu card's items scroll.
+  - **Announcements** (A11Y-08) go through `HomeViews.announce` and the polite live region, a repeat read again. When a menu, a folder or search closes, screen readers' focus goes back to the cell or row it was for.
+  - **The audit:** debug builds go through every screen in both themes and check it as drawn (`A11yTour`, `A11yAudit`), started by `tools/a11y-audit.sh` at font scale 1.0 and 2.0. A view that draws its own text or targets reports them through `Audited`.
 
 ## Platform adapters (ARCH-04)
 
@@ -409,7 +421,7 @@ MeeGone keeps three persistent stores, each in its own file under one private fo
 
 ## Not built yet
 
-The skeleton is from issue #1; the Android host and the home-app role from #4; the carousel of home views from #5; Home, Back and coming back to the home from #6; the home menu from #7; edge to edge, screen sizes and navigation modes from #8; the Applications grid and the app catalogue from #9; one icon shape and each app's accent from #10; the layout kept in step with the installed apps from #11; the app long-press menu from #12; edit mode from #13; folders from #14; app search from #15; hiding apps from #16; backup and restore from #17; the Events header from #18; Events' notifications from #19; opening, clearing and dismissing them from #20; the image-of-the-day card from #21; Recent's cards from #22; Recent's density and its pinch from #23; Recent's close mode and Clear all from #24; Recent's time window from #25; the image feed, the network adapter and the region from #26; downloading, checking, cropping and caching the daily image from #27; the daily image check, its retries and back-off from #28; the daily image as the lock-screen wallpaper, "Update now", the pause and the reset from #29; the image details screen, opening links and the update status from #30; browsing the past week and pinning an image from #31; System, Light and Dark themes and the theme cross-fade from #32; the shared motion system and the system animation speed from #33; the Settings screen and Reset launcher from #34; first-run setup and the home-app banner from #35; the product's name, the asset inventory, the store listing and their checks from #36. The following arrive with later requirements:
+The skeleton is from issue #1; the Android host and the home-app role from #4; the carousel of home views from #5; Home, Back and coming back to the home from #6; the home menu from #7; edge to edge, screen sizes and navigation modes from #8; the Applications grid and the app catalogue from #9; one icon shape and each app's accent from #10; the layout kept in step with the installed apps from #11; the app long-press menu from #12; edit mode from #13; folders from #14; app search from #15; hiding apps from #16; backup and restore from #17; the Events header from #18; Events' notifications from #19; opening, clearing and dismissing them from #20; the image-of-the-day card from #21; Recent's cards from #22; Recent's density and its pinch from #23; Recent's close mode and Clear all from #24; Recent's time window from #25; the image feed, the network adapter and the region from #26; downloading, checking, cropping and caching the daily image from #27; the daily image check, its retries and back-off from #28; the daily image as the lock-screen wallpaper, "Update now", the pause and the reset from #29; the image details screen, opening links and the update status from #30; browsing the past week and pinning an image from #31; System, Light and Dark themes and the theme cross-fade from #32; the shared motion system and the system animation speed from #33; the Settings screen and Reset launcher from #34; first-run setup and the home-app banner from #35; the product's name, the asset inventory, the store listing and their checks from #36; names, targets, contrast, large text, announcements and the accessibility audit from #37. The following arrive with later requirements:
 
 - **Android adapters.**
   - Built:
@@ -446,7 +458,7 @@ These are the commands CI runs (`.github/workflows/ci.yml`):
 
 ```sh
 cargo fmt --all --check
-cargo test -p arch-check                       # architecture and legal rules
+cargo test -p arch-check                       # architecture, legal and accessibility rules
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo coverage                                 # core-logic line coverage, fails below 80 %
@@ -464,3 +476,5 @@ cargo install cargo-llvm-cov --locked
 ```
 
 The acceptance scenarios of SRS section 9 run in `tests/acceptance.rs`, one test per scenario, on the whole app with fakes (MAINT-03). A feature adds its scenarios there.
+
+The accessibility audit runs on a device, not in CI (ADR 0038). With the debug build installed (`(cd android && ./gradlew installDebug)`), `tools/a11y-audit.sh` checks every screen in both themes at font scale 1.0 and 2.0, and fails on any problem it finds. `--first-run` clears MeeGone's data first, so setup is checked too; use it only on a test device.

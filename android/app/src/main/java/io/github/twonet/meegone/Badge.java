@@ -2,13 +2,14 @@ package io.github.twonet.meegone;
 
 import android.graphics.Canvas;
 import android.graphics.Paint;
+import android.graphics.Rect;
 
 /**
  * The ✕ that edit mode puts on an app's icon (ADR 0014) and close mode on a Recent card (ADR
  * 0025): a disc in the surface colour with a faint ring and a cross in the text colour, at its
  * pop-in scale (ANIM-12). Each view puts it at the top-start corner of what it marks, mirrored
  * right to left. A tap within the 48 dp square at the top-start corner of the view it is on taps
- * it (A11Y-02).
+ * it, 48 dp on screen whatever the view's scale (A11Y-02).
  */
 final class Badge {
     /** A disc this wide. */
@@ -16,8 +17,6 @@ final class Badge {
     /** Half the length of each stroke of the ✕, and its width. */
     private static final float ARM_DP = 4.5f;
     private static final float STROKE_DP = 2f;
-    /** A tap within this square at the view's top-start corner taps the ✕ (A11Y-02). */
-    private static final float TARGET_DP = 48f;
 
     private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint ring = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -29,7 +28,8 @@ final class Badge {
     Badge(float density) {
         sizePx = Math.round(SIZE_DP * density);
         armPx = Math.round(ARM_DP * density);
-        targetPx = Math.round(TARGET_DP * density);
+        // A tap within this square at the view's top-start corner taps the ✕ (A11Y-02).
+        targetPx = Math.round(A11y.TARGET_DP * density);
         ring.setStyle(Paint.Style.STROKE);
         ring.setStrokeWidth(Math.max(1f, density));
         cross.setStyle(Paint.Style.STROKE);
@@ -60,11 +60,19 @@ final class Badge {
     }
 
     /**
-     * Whether ({@code x}, {@code y}), in a view {@code width} px wide, is in the ✕'s target: the
-     * view's top-start square.
+     * Whether ({@code x}, {@code y}), in a view {@code width} px wide drawn at {@code scale}, is
+     * in the ✕'s target: the view's top-start square.
      */
-    boolean hit(float x, float y, int width, boolean rtl) {
-        boolean across = rtl ? x >= width - targetPx && x <= width : x >= 0 && x < targetPx;
-        return across && y >= 0 && y < targetPx;
+    boolean hit(float x, float y, int width, boolean rtl, float scale) {
+        return target(width, rtl, scale).contains(Math.round(x), Math.round(y));
+    }
+
+    /**
+     * The ✕'s target in a view {@code width} px wide drawn at {@code scale}: the view's top-start
+     * square, in its own coordinates, as big as {@link A11y#TARGET_DP} on screen.
+     */
+    Rect target(int width, boolean rtl, float scale) {
+        int size = Math.round(targetPx / Math.max(scale, 0.01f));
+        return rtl ? new Rect(width - size, 0, width, size) : new Rect(0, 0, size, size);
     }
 }

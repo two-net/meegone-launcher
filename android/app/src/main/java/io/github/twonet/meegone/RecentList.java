@@ -1,7 +1,6 @@
 package io.github.twonet.meegone;
 
 import android.content.Context;
-import android.content.res.ColorStateList;
 import android.content.res.Resources;
 import android.graphics.Canvas;
 import android.graphics.Color;
@@ -10,7 +9,6 @@ import android.graphics.ColorMatrixColorFilter;
 import android.graphics.Rect;
 import android.graphics.RectF;
 import android.graphics.Typeface;
-import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
@@ -104,11 +102,12 @@ final class RecentList extends LinearLayout {
     private static final float MAX_RATIO = 2.2f;
     /** A phone's, until the window's size is known. */
     private static final float PHONE_RATIO = 2400f / 1080f;
-    /** The smallest a touch target gets (A11Y-02). */
-    private static final float TARGET_DP = 48f;
     /** The ✕'s centre is this far inside the plate's top-start corner, so it stays on the plate. */
     private static final float BADGE_INSET_DP = 16f;
-    /** An unavailable app, greyed and at half opacity as in the grid (APPS-09). */
+    /**
+     * An unavailable app's icon, greyed and at half opacity as in the grid; its plate and label
+     * are in the secondary text colour, which keeps their contrast (APPS-09, A11Y-03).
+     */
     private static final float DIMMED_ALPHA = 0.5f;
     private static final ColorMatrixColorFilter GREYED;
 
@@ -203,8 +202,8 @@ final class RecentList extends LinearLayout {
         clearAll.setTextSize(TypedValue.COMPLEX_UNIT_SP, BODY_SP);
         clearAll.setTypeface(Typeface.create(Typeface.DEFAULT, MEDIUM, false));
         clearAll.setGravity(Gravity.CENTER);
-        clearAll.setMinHeight(dp(TARGET_DP));
-        clearAll.setMinWidth(dp(TARGET_DP));
+        clearAll.setMinHeight(dp(A11y.TARGET_DP));
+        clearAll.setMinWidth(dp(A11y.TARGET_DP));
         clearAll.setPadding(dp(GAP_DP), 0, dp(GAP_DP), 0);
         clearAll.setOnClickListener(view -> {
             if (closing) {
@@ -228,7 +227,7 @@ final class RecentList extends LinearLayout {
         empty.setText(R.string.recent_empty);
         empty.setTextSize(TypedValue.COMPLEX_UNIT_SP, BODY_SP);
         empty.setGravity(Gravity.CENTER);
-        empty.setMinHeight(dp(TARGET_DP));
+        empty.setMinHeight(dp(A11y.TARGET_DP));
         // A11Y-08: read when it appears, such as after Clear all.
         empty.setAccessibilityLiveRegion(ACCESSIBILITY_LIVE_REGION_POLITE);
         LayoutParams emptyParams = matchWidth();
@@ -443,8 +442,9 @@ final class RecentList extends LinearLayout {
     }
 
     /**
-     * The label of the card that went with the cards last read, if exactly one did, so screen
-     * readers hear "Mail removed from Recent" (A11Y-08); otherwise null.
+     * The name of the card that went with the cards last read, if exactly one did, so screen
+     * readers hear "Mail removed from Recent", with "work" for a work-profile app (A11Y-08);
+     * otherwise null.
      */
     String left() {
         return left;
@@ -474,7 +474,7 @@ final class RecentList extends LinearLayout {
                 Card card = shown.get(i);
                 card.startLeaving(i / columnsRead);
                 leaving.add(card);
-                left = card.name;
+                left = card.spoken;
                 went++;
             }
         }
@@ -519,10 +519,8 @@ final class RecentList extends LinearLayout {
         this.accent = accent;
         this.divider = divider;
         title.colour(dim, divider);
-        ColorStateList pressed = ColorStateList.valueOf((foreground & 0x00FFFFFF) | 0x1F000000);
         clearAll.setTextColor(accent);
-        clearAll.setBackground(
-                new RippleDrawable(pressed, null, new ColorDrawable(Color.WHITE)));
+        clearAll.setBackground(SettingsRows.ripple(foreground));
         explainer.colour(foreground, surface, accent);
         empty.setTextColor(dim);
         for (Card card : shown) {
@@ -675,7 +673,7 @@ final class RecentList extends LinearLayout {
      * mode's scale and shrinks and fades as it leaves (ANIM-12, ANIM-18), so neither undoes the
      * other.
      */
-    private final class Card extends FrameLayout {
+    private final class Card extends FrameLayout implements Audited {
         private final GradientDrawable fill = new GradientDrawable();
         private final GradientDrawable mask = new GradientDrawable();
         private final Body body;
@@ -686,6 +684,13 @@ final class RecentList extends LinearLayout {
         private final Badge badge;
         private final int badgeInsetPx;
         private String name = "";
+        /** Its name as screen readers read it, with "work" for a work-profile app (A11Y-01). */
+        private String spoken = "";
+        /** Its fill: the app's accent, and whether the cards read gave one. */
+        private int accentFill;
+        private boolean filled;
+        private int foreground;
+        private int dim;
         private String packageName = "";
         private String activity = "";
         private long profile;
@@ -747,11 +752,21 @@ final class RecentList extends LinearLayout {
         void size(int plateHeight, int iconSize) {
             LinearLayout.LayoutParams plateParams =
                     (LinearLayout.LayoutParams) plate.getLayoutParams();
-            plateParams.height = plateHeight;
             FrameLayout.LayoutParams iconParams =
                     (FrameLayout.LayoutParams) image.getLayoutParams();
+            if (plateParams.height == plateHeight && iconParams.width == iconSize) {
+                return;
+            }
+            plateParams.height = plateHeight;
             iconParams.width = iconSize;
             iconParams.height = iconSize;
+            // Measured again at the next measure, even with the same measure specs: the grid
+            // measures the first card with no plate to find its caption's height first, and the
+            // card must not keep that height, which would leave its plate outside its touch
+            // target (A11Y-02).
+            forceLayout();
+            body.forceLayout();
+            plate.forceLayout();
         }
 
         void bind(String[] fields, int at) {
@@ -761,21 +776,27 @@ final class RecentList extends LinearLayout {
             packageName = field(fields, at + 2);
             activity = field(fields, at + 3);
             profile = parseLong(field(fields, at + 4));
-            fill.setColor(parseInt(field(fields, at + 5), Color.GRAY));
+            try {
+                accentFill = Integer.parseInt(field(fields, at + 5));
+                filled = true;
+            } catch (NumberFormatException e) {
+                filled = false;
+            }
             int unit = parseInt(field(fields, at + 6), 0);
             int count = parseInt(field(fields, at + 7), 0);
             available = (flags & UNAVAILABLE) == 0;
 
             label.setText(name);
             age.setText(ago(res, unit, count, false));
-            String named = (flags & WORK) != 0 ? res.getString(R.string.app_work, name) : name;
-            String spoken = res.getString(R.string.recent_card_description, named,
+            spoken = A11y.appName(res, name, (flags & WORK) != 0);
+            String described = res.getString(R.string.recent_card_description, spoken,
                     ago(res, unit, count, true));
             setContentDescription(available
-                    ? spoken
-                    : res.getString(R.string.recent_card_description, spoken,
+                    ? described
+                    : res.getString(R.string.recent_card_description, described,
                             res.getString(R.string.app_state_unavailable)));
-            plate.setAlpha(available ? 1f : DIMMED_ALPHA);
+            image.setAlpha(available ? 1f : DIMMED_ALPHA);
+            paint();
         }
 
         void icon(AppIcons icons) {
@@ -783,14 +804,20 @@ final class RecentList extends LinearLayout {
         }
 
         void colour(int foreground, int dim, int surface) {
-            label.setTextColor(foreground);
+            this.foreground = foreground;
+            this.dim = dim;
             age.setTextColor(dim);
             badge.colour(foreground, dim, surface);
             // The card's press shows on its plate, which takes it and its hotspot as a child.
-            ColorStateList pressed =
-                    ColorStateList.valueOf((foreground & 0x00FFFFFF) | 0x1F000000);
-            plate.setForeground(new RippleDrawable(pressed, null, mask));
+            plate.setForeground(new RippleDrawable(SettingsRows.pressed(foreground), null, mask));
+            paint();
             body.invalidate();
+        }
+
+        /** The plate and the label, dimmed while the app is unavailable (APPS-09, A11Y-03). */
+        private void paint() {
+            fill.setColor(available && filled ? accentFill : dim);
+            label.setTextColor(available ? foreground : dim);
         }
 
         /** Close mode as the frame says: whether it is on, the card's scale and its ✕'s. */
@@ -846,7 +873,20 @@ final class RecentList extends LinearLayout {
         }
 
         private boolean onBadge(float x, float y) {
-            return badge.hit(x, y, getWidth(), getLayoutDirection() == LAYOUT_DIRECTION_RTL);
+            // Only the body takes close mode's scale, so the target is 48 dp as it is.
+            return badge.hit(x, y, getWidth(), getLayoutDirection() == LAYOUT_DIRECTION_RTL, 1f);
+        }
+
+        // The ✕'s target, for the debug build's audit (ADR 0038). Its texts are views.
+        @Override
+        public void auditTexts(List<Rect> out) {}
+
+        @Override
+        public void auditTargets(List<Rect> out) {
+            if (closing) {
+                out.add(badge.target(getWidth(), getLayoutDirection() == LAYOUT_DIRECTION_RTL,
+                        1f));
+            }
         }
 
         // In close mode only the ✕ acts on a card: a tap on it removes the card from Recent
@@ -896,7 +936,7 @@ final class RecentList extends LinearLayout {
             info.setClickable(false);
             info.removeAction(AccessibilityAction.ACTION_CLICK);
             info.addAction(new AccessibilityAction(R.id.action_remove_from_recent,
-                    getResources().getString(R.string.action_remove_from_recent, name)));
+                    getResources().getString(R.string.action_remove_from_recent, spoken)));
         }
 
         @Override

@@ -1,15 +1,10 @@
 package io.github.twonet.meegone;
 
 import android.content.Context;
-import android.content.res.ColorStateList;
-import android.graphics.Color;
 import android.graphics.Rect;
 import android.graphics.Typeface;
-import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
-import android.graphics.drawable.RippleDrawable;
-import android.os.Build;
 import android.os.Bundle;
 import android.text.TextUtils;
 import android.util.TypedValue;
@@ -67,8 +62,6 @@ final class EventsList extends LinearLayout {
     private static final float ICON_DP = 40f;
     private static final float MARKER_DP = 4f;
     private static final float GAP_DP = 12f;
-    /** The smallest a touch target gets (A11Y-02). */
-    private static final float TARGET_DP = 48f;
 
     /** What the user does with the list. */
     interface Listener {
@@ -126,8 +119,8 @@ final class EventsList extends LinearLayout {
         clear.setTextSize(TypedValue.COMPLEX_UNIT_SP, BODY_SP);
         clear.setTypeface(Typeface.create(Typeface.DEFAULT, MEDIUM, false));
         clear.setGravity(Gravity.CENTER);
-        clear.setMinHeight(dp(TARGET_DP));
-        clear.setMinWidth(dp(TARGET_DP));
+        clear.setMinHeight(dp(A11y.TARGET_DP));
+        clear.setMinWidth(dp(A11y.TARGET_DP));
         clear.setPadding(dp(GAP_DP), 0, dp(GAP_DP), 0);
         clear.setOnClickListener(view -> listener.clear());
         clear.setVisibility(GONE);
@@ -144,7 +137,7 @@ final class EventsList extends LinearLayout {
         empty.setText(R.string.events_empty);
         empty.setTextSize(TypedValue.COMPLEX_UNIT_SP, BODY_SP);
         empty.setGravity(Gravity.CENTER);
-        empty.setMinHeight(dp(TARGET_DP));
+        empty.setMinHeight(dp(A11y.TARGET_DP));
         // A11Y-08: read when it appears, such as after Clear.
         empty.setAccessibilityLiveRegion(ACCESSIBILITY_LIVE_REGION_POLITE);
         LayoutParams emptyParams = matchWidth();
@@ -174,9 +167,12 @@ final class EventsList extends LinearLayout {
         return index >= 0 && index < shown.size() ? shown.get(index) : null;
     }
 
-    /** The app's name on row {@code index} of the rows last read, or null. */
+    /**
+     * The app's name on row {@code index} of the rows last read, as screen readers read it, with
+     * "work" for a work-profile app (A11Y-01), or null.
+     */
     String label(int index) {
-        return index >= 0 && index < shown.size() ? shown.get(index).label : null;
+        return index >= 0 && index < shown.size() ? shown.get(index).spoken : null;
     }
 
     /** Where {@code view} is in the rows last read, if it is one of them; otherwise -1. */
@@ -322,10 +318,9 @@ final class EventsList extends LinearLayout {
 
     private void paint() {
         explainer.colour(foreground, surface, accent);
-        ColorStateList pressed = ColorStateList.valueOf((foreground & 0x00FFFFFF) | 0x1F000000);
         section.colour(dim, divider);
         clear.setTextColor(accent);
-        clear.setBackground(new RippleDrawable(pressed, null, new ColorDrawable(Color.WHITE)));
+        clear.setBackground(SettingsRows.ripple(foreground));
         empty.setTextColor(dim);
         for (int i = 0; i < rows.getChildCount(); i++) {
             ((Row) rows.getChildAt(i)).colour(foreground, dim);
@@ -438,6 +433,8 @@ final class EventsList extends LinearLayout {
         /** How much of its height it takes, from 0 to 1 (ANIM-20). */
         float share = 1f;
         String label = "";
+        /** The app's name as screen readers read it (A11Y-01). */
+        String spoken = "";
         private long profile;
         private String packageName = "";
         private String activity = "";
@@ -451,7 +448,7 @@ final class EventsList extends LinearLayout {
             super(context);
             setOrientation(HORIZONTAL);
             setPadding(0, dp(GAP_DP), 0, dp(GAP_DP));
-            setMinimumHeight(dp(TARGET_DP));
+            setMinimumHeight(dp(A11y.TARGET_DP));
             setScreenReaderFocusable(true);
             // Not long-clickable: HomeViews times the long-press, so Android starts no second
             // timer (ADR 0013).
@@ -511,7 +508,8 @@ final class EventsList extends LinearLayout {
             packageName = field(fields, at + 3);
             activity = field(fields, at + 4);
             profile = parseLong(field(fields, at + 5));
-            marker.setColor(parseInt(field(fields, at + 6), Color.GRAY));
+            // The Rust app always sends the marker's colour; without one, there is no marker.
+            marker.setColor(parseInt(field(fields, at + 6), 0));
             notifications = Math.max(1, parseInt(field(fields, at + 7), 1));
             title = field(fields, at + 8);
             text = field(fields, at + 9);
@@ -526,24 +524,24 @@ final class EventsList extends LinearLayout {
             String said = said();
             message.setText(said);
             message.setVisibility(said.isEmpty() ? GONE : VISIBLE);
-            String app = work ? getResources().getString(R.string.app_work, label) : label;
+            String app = A11y.appName(getResources(), label, work);
+            spoken = app;
+            String description;
             if (notification) {
-                setContentDescription(said.isEmpty() ? app : said);
+                description = said.isEmpty() ? app : said;
             } else if (expanded) {
-                setContentDescription(getResources().getQuantityString(
+                description = getResources().getQuantityString(
                         R.plurals.events_group_expanded_description, notifications, app,
-                        notifications));
+                        notifications);
             } else {
-                setContentDescription(getResources().getQuantityString(
+                description = getResources().getQuantityString(
                         R.plurals.events_group_description, notifications, app, notifications,
-                        said));
+                        said);
             }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                setStateDescription(expandable()
-                        ? getResources().getString(
-                                expanded ? R.string.events_expanded : R.string.events_collapsed)
-                        : null);
-            }
+            A11y.describe(this, description, expandable()
+                    ? getResources().getString(
+                            expanded ? R.string.events_expanded : R.string.events_collapsed)
+                    : null);
             setClickable(role != GOING);
         }
 
@@ -581,9 +579,7 @@ final class EventsList extends LinearLayout {
             count.setTextColor(dim);
             // A notification's own row reads as the group's newest does.
             message.setTextColor(notification ? foreground : dim);
-            ColorStateList pressed =
-                    ColorStateList.valueOf((foreground & 0x00FFFFFF) | 0x1F000000);
-            setBackground(new RippleDrawable(pressed, null, new ColorDrawable(Color.WHITE)));
+            setBackground(SettingsRows.ripple(foreground));
         }
 
         // A tap opens or expands, and the long-press's menu is an action (A11Y-05).

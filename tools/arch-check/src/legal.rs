@@ -321,7 +321,7 @@ pub fn listing_files(root: &Path) -> Result<BTreeSet<String>, String> {
 }
 
 /// The directories directly in `dir`, or none if it doesn't exist.
-fn directories(dir: &Path) -> Result<Vec<PathBuf>, String> {
+pub(crate) fn directories(dir: &Path) -> Result<Vec<PathBuf>, String> {
     if !dir.is_dir() {
         return Ok(Vec::new());
     }

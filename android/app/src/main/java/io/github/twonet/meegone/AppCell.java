@@ -8,7 +8,6 @@ import android.graphics.Paint;
 import android.graphics.Rect;
 import android.graphics.RectF;
 import android.graphics.drawable.Drawable;
-import android.os.Build;
 import android.os.Bundle;
 import android.text.Layout;
 import android.text.StaticLayout;
@@ -20,6 +19,7 @@ import android.view.View;
 import android.view.accessibility.AccessibilityNodeInfo;
 import android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Objects;
 
 /**
@@ -31,7 +31,8 @@ import java.util.Objects;
  * The label sits 4 dp below it, at 12 sp in the theme's text colour, on one line and ellipsised
  * (APPS-16). The cell's height follows the font, so it grows with the system font size instead
  * of overlapping, and its 8 dp above and below leave 16 dp between rows. A pressed icon shrinks
- * (ANIM-10). An unavailable app is drawn greyed and at half opacity (APPS-09). A new app has a
+ * (ANIM-10). An unavailable app's icon is drawn greyed and at half opacity, and its label and dot
+ * in the secondary text colour, which keeps its contrast (APPS-09, A11Y-03). A new app has a
  * small dot in the accent colour before its label (APPS-07). As apps come and go, the grid
  * scales, fades and slides the whole cell (ANIM-21). While its icon is dragged, {@link
  * DragShadow} draws it, and the cell is a gap (APPS-11).
@@ -44,18 +45,19 @@ import java.util.Objects;
  *
  * <p>In edit mode (APPS-12, ADR 0014) the whole cell is drawn at 92 %, and an app the user can
  * uninstall has a ✕ over its icon's top-start corner, which pops in and out as the frame says
- * (ANIM-12). A tap within the cell's top-start 48 dp square taps the ✕ (A11Y-02, APPS-13); any
- * other tap on an app does nothing, and one on a folder opens it (FOLD-04).
+ * (ANIM-12). A tap within the cell's top-start square, 48 dp on screen at the cell's scale, taps
+ * the ✕ (A11Y-02, APPS-13); any other tap on an app does nothing, and one on a folder opens it
+ * (FOLD-04).
  *
  * <p>Screen readers read its label, "work" for a work-profile app (A11Y-01), and "new" for a
  * new one; a folder is "Folder: ‹name›, N apps". Each cell offers "Open menu", which opens its
- * long-press menu (A11Y-05). In edit mode it also offers "Uninstall ‹label›" for an app's ✕
- * (A11Y-01), and "Move to start", "Move earlier", "Move later" and "Move to end" instead of
- * dragging (A11Y-05). An app in the grid offers "Make folder with ‹next›", or "Move into
+ * long-press menu (A11Y-05). In edit mode an app offers no tap, which does nothing there, but
+ * "Uninstall ‹name›" for its ✕ (A11Y-01), and "Move to start", "Move earlier", "Move later" and
+ * "Move to end" instead of dragging (A11Y-05). An app in the grid offers "Make folder with ‹next›", or "Move into
  * ‹folder›" when the next cell is a folder, and an app in an open folder "Move out of folder".
  * The view itself isn't long-clickable: {@link HomeViews} times long-presses.
  */
-final class AppCell extends View {
+final class AppCell extends View implements Audited {
     private static final float ICON_DP = 56f;
     private static final float LABEL_GAP_DP = 4f;
     private static final float LABEL_SP = 12f;
@@ -64,7 +66,8 @@ final class AppCell extends View {
     private static final float SIDE_PADDING_DP = 4f;
     private static final float DOT_DP = 6f;
     private static final float DOT_GAP_DP = 4f;
-    private static final float DIMMED_ALPHA = 0.5f;
+    /** An unavailable app's icon (APPS-09), as 0 to 255. */
+    private static final int DIMMED_ICON_ALPHA = 128;
     /** A folder's preview, as {@code PREVIEW_INSET} and {@code PREVIEW_GAP} in the Rust app. */
     private static final int PREVIEW_APPS = 4;
     private static final float PREVIEW_INSET = 0.14f;
@@ -87,6 +90,10 @@ final class AppCell extends View {
     private final Paint folderFill = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint folderRing = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint dot = new Paint(Paint.ANTI_ALIAS_FLAG);
+    /** The label's and the dot's colours, and an unavailable app's for both (APPS-09). */
+    private int labelColour;
+    private int dotColour;
+    private int dimColour;
     /** The ✕ over the icon in edit mode (ANIM-12). */
     private final Badge badge;
     private final int badgeInsetPx;
@@ -107,6 +114,7 @@ final class AppCell extends View {
     private String packageName;
     private String activity;
     private long profile;
+    private boolean work;
     private boolean available = true;
     /** Installed since the grid was set up and not opened yet: it has a dot (APPS-07). */
     private boolean isNew;
@@ -136,7 +144,7 @@ final class AppCell extends View {
     private boolean badgeDown;
     /** Its cell left the grid: it only shrinks away, and can't be tapped (ANIM-21). */
     private boolean leaving;
-    /** Its opacity as the grid changes, on top of the dimming of an unavailable app. */
+    /** Its opacity as the grid changes (ANIM-21). */
     private float motionAlpha = 1f;
     /** Its scale and distance from its place as the grid changes (ANIM-21). */
     private float motionScale = 1f;
@@ -222,6 +230,7 @@ final class AppCell extends View {
         this.packageName = packageName;
         this.activity = activity;
         this.profile = profile;
+        this.work = work;
         this.available = available;
         this.isNew = isNew;
         if (uninstallable != this.uninstallable) {
@@ -231,19 +240,14 @@ final class AppCell extends View {
         setClickable(true);
         setImportantForAccessibility(IMPORTANT_FOR_ACCESSIBILITY_YES);
         if (isFolder()) {
-            setContentDescription(getResources().getQuantityString(
-                    R.plurals.folder_description, count, name(), count));
+            A11y.describe(this, getResources().getQuantityString(
+                    R.plurals.folder_description, count, name(), count), null);
         } else {
-            String description =
-                    work ? getResources().getString(R.string.app_work, label) : label;
-            setContentDescription(isNew
-                    ? getResources().getString(R.string.app_new, description)
-                    : description);
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            setStateDescription(available
-                    ? null
-                    : getResources().getString(R.string.app_state_unavailable));
+            String description = spokenName();
+            A11y.describe(this, isNew
+                            ? getResources().getString(R.string.app_new, description)
+                            : description,
+                    available ? null : getResources().getString(R.string.app_state_unavailable));
         }
         applyAlpha();
         if (labelChanged) {
@@ -292,6 +296,14 @@ final class AppCell extends View {
         return isFolder() && label.isEmpty() ? getResources().getString(R.string.folder) : label;
     }
 
+    /**
+     * Its name as screen readers read it in actions and announcements: an app's label with
+     * "work" for a work-profile app, or a folder's name (A11Y-01).
+     */
+    String spokenName() {
+        return isFolder() ? name() : A11y.appName(getResources(), label, work);
+    }
+
     boolean isFolder() {
         return packageName == null;
     }
@@ -301,12 +313,13 @@ final class AppCell extends View {
      * a surface disc with a faint ring and a cross in the text colour.
      */
     void setColours(int foreground, int dim, int accent, int surface) {
-        text.setColor(foreground);
+        labelColour = foreground;
+        dotColour = accent;
+        dimColour = dim;
         folderFill.setColor(surface);
         folderRing.setColor((dim & 0x00FFFFFF) | 0x40000000);
         // A faint plate in the secondary text colour.
         plate.setColor((dim & 0x00FFFFFF) | 0x33000000);
-        dot.setColor(accent);
         badge.colour(foreground, dim, surface);
         invalidate();
     }
@@ -402,7 +415,7 @@ final class AppCell extends View {
     }
 
     private void applyAlpha() {
-        setAlpha((available ? 1f : DIMMED_ALPHA) * motionAlpha);
+        setAlpha(motionAlpha);
     }
 
     /** The icon's scale while it is pressed (ANIM-10). */
@@ -435,9 +448,13 @@ final class AppCell extends View {
         return hasMenu() && !isFolder() && uninstallable;
     }
 
-    /** Whether ({@code x}, {@code y}) is in the ✕'s target: the cell's top-start square. */
+    /**
+     * Whether ({@code x}, {@code y}) is in the ✕'s target: the cell's top-start square, as big
+     * on screen at edit mode's scale as anywhere else (A11Y-02).
+     */
     private boolean onBadge(float x, float y) {
-        return badge.hit(x, y, getWidth(), getLayoutDirection() == LAYOUT_DIRECTION_RTL);
+        return badge.hit(x, y, getWidth(), getLayoutDirection() == LAYOUT_DIRECTION_RTL,
+                editScale);
     }
 
     // In edit mode only the ✕ acts on an app: a tap on it asks the system to uninstall the app
@@ -486,9 +503,14 @@ final class AppCell extends View {
         if (!editing) {
             return;
         }
+        if (!isFolder()) {
+            // A tap on an app does nothing in edit mode (APPS-12), so it isn't offered.
+            info.setClickable(false);
+            info.removeAction(AccessibilityAction.ACTION_CLICK);
+        }
         if (hasBadge()) {
             info.addAction(new AccessibilityAction(R.id.action_uninstall,
-                    getResources().getString(R.string.action_uninstall, label)));
+                    getResources().getString(R.string.action_uninstall, spokenName())));
         }
         if (index > 0) {
             addAction(info, R.id.action_move_first, R.string.action_move_first);
@@ -505,7 +527,7 @@ final class AppCell extends View {
         if (grid.surface() == AppsGrid.GRID && next != null) {
             int text = next.isFolder() ? R.string.action_move_into : R.string.action_make_folder;
             info.addAction(new AccessibilityAction(
-                    R.id.action_group, getResources().getString(text, next.name())));
+                    R.id.action_group, getResources().getString(text, next.spokenName())));
         } else if (grid.surface() == AppsGrid.FOLDER) {
             addAction(info, R.id.action_move_out, R.string.action_move_out);
         }
@@ -521,6 +543,9 @@ final class AppCell extends View {
             return grid.menuRequested(this);
         }
         if (editing && hasMenu()) {
+            if (action == AccessibilityNodeInfo.ACTION_CLICK && !isFolder()) {
+                return false;
+            }
             if (action == R.id.action_uninstall && hasBadge()) {
                 grid.badgeTapped(this);
                 return true;
@@ -564,8 +589,29 @@ final class AppCell extends View {
 
     @Override
     public boolean hasOverlappingRendering() {
-        // The icon and label never overlap, so dimming needs no offscreen layer.
+        // The icon and label never overlap, so fading needs no offscreen layer.
         return false;
+    }
+
+    // The label it draws itself, and the ✕'s target, for the debug build's audit (ADR 0038).
+    @Override
+    public void auditTexts(List<Rect> out) {
+        StaticLayout layout = labelLayout();
+        if (layout == null || hidden) {
+            return;
+        }
+        int left = sidePaddingPx + dotRoom();
+        int top = verticalPaddingPx + iconPx + labelGapPx;
+        out.add(new Rect(left + Math.round(layout.getLineLeft(0)), top + layout.getLineTop(0),
+                left + Math.round(layout.getLineRight(0)), top + layout.getLineBottom(0)));
+    }
+
+    @Override
+    public void auditTargets(List<Rect> out) {
+        if (editing && hasBadge()) {
+            out.add(badge.target(getWidth(), getLayoutDirection() == LAYOUT_DIRECTION_RTL,
+                    editScale));
+        }
     }
 
     @Override
@@ -597,6 +643,8 @@ final class AppCell extends View {
         if (layout != null) {
             canvas.save();
             canvas.translate(sidePaddingPx + dotRoom(), iconTop + iconPx + labelGapPx);
+            text.setColor(available ? labelColour : dimColour);
+            dot.setColor(available ? dotColour : dimColour);
             layout.draw(canvas);
             if (isNew) {
                 drawDot(canvas, layout);
@@ -622,7 +670,14 @@ final class AppCell extends View {
             icon.setBounds(Math.round(left), Math.round(top), Math.round(left + size),
                     Math.round(top + size));
             icon.setColorFilter(available ? null : GREYED);
-            icon.draw(canvas);
+            if (available) {
+                icon.draw(canvas);
+            } else {
+                // Dimmed in a layer of its own: every view shares the drawable (APPS-09).
+                int layer = canvas.saveLayerAlpha(plateBounds, DIMMED_ICON_ALPHA);
+                icon.draw(canvas);
+                canvas.restoreToCount(layer);
+            }
         } else {
             canvas.drawRoundRect(plateBounds, corner, corner, plate);
         }

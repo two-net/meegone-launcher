@@ -31,7 +31,8 @@ jobs:
       # adapter, and on fakes turned on outside tests. See ARCHITECTURE.md. Also fails on a
       # bundled asset missing from ASSETS.md, a licence text About doesn't show, a third-party
       # name in the app's text or store listing, and a listing without the privacy notice or
-      # the non-affiliation statement (ADR 0037).
+      # the non-affiliation statement (ADR 0037). And fails on a colour the Java host draws that
+      # isn't one of the theme's tokens, or a text size that isn't in sp (ADR 0038).
       - name: Architecture rules
         run: cargo test -p arch-check
 

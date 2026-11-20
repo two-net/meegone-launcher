@@ -1,11 +1,7 @@
 package io.github.twonet.meegone;
 
 import android.content.Context;
-import android.content.res.ColorStateList;
-import android.graphics.Color;
-import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
-import android.graphics.drawable.RippleDrawable;
 import android.text.TextUtils;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -39,10 +35,11 @@ final class HiddenAppsList extends LinearLayout {
     private static final float TEXT_SP = 16f;
     private static final float ICON_DP = 40f;
     private static final float ROW_DP = 56f;
-    /** The smallest a touch target gets (A11Y-02). */
-    private static final float TARGET_DP = 48f;
     private static final float GAP_DP = 16f;
-    /** How faint an unavailable app's label is, as its icon in the grid (APPS-09). */
+    /**
+     * How faint an unavailable app's icon is, as in the grid; its label is in the secondary
+     * text colour, which keeps its contrast (APPS-09, A11Y-03).
+     */
     private static final float UNAVAILABLE_ALPHA = 0.5f;
 
     private final AppIcons icons;
@@ -71,7 +68,7 @@ final class HiddenAppsList extends LinearLayout {
         float density = getResources().getDisplayMetrics().density;
         iconSize = Math.round(ICON_DP * density);
         rowHeight = Math.round(ROW_DP * density);
-        target = Math.round(TARGET_DP * density);
+        target = Math.round(A11y.TARGET_DP * density);
         gap = Math.round(GAP_DP * density);
         setOrientation(VERTICAL);
 
@@ -135,7 +132,7 @@ final class HiddenAppsList extends LinearLayout {
         int flags = parseInt(field(index, 4));
         boolean work = (flags & WORK) != 0;
         boolean available = (flags & AVAILABLE) != 0;
-        String name = work ? getResources().getString(R.string.app_work, label) : label;
+        String name = A11y.appName(getResources(), label, work);
 
         LinearLayout row = new LinearLayout(context);
         row.setOrientation(HORIZONTAL);
@@ -155,7 +152,6 @@ final class HiddenAppsList extends LinearLayout {
         text.setTextSize(TypedValue.COMPLEX_UNIT_SP, TEXT_SP);
         text.setSingleLine(true);
         text.setEllipsize(TextUtils.TruncateAt.END);
-        text.setAlpha(available ? 1f : UNAVAILABLE_ALPHA);
         LayoutParams textParams = new LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f);
         textParams.setMarginStart(gap);
         textParams.setMarginEnd(gap);
@@ -211,14 +207,14 @@ final class HiddenAppsList extends LinearLayout {
         group.setTextColor(dim);
         title.setTextColor(foreground);
         none.setTextColor(dim);
-        ColorStateList pressed = ColorStateList.valueOf((foreground & 0x00FFFFFF) | 0x1F000000);
         for (int i = 0; i < rows.getChildCount(); i++) {
             LinearLayout row = (LinearLayout) rows.getChildAt(i);
-            ((TextView) row.getChildAt(1)).setTextColor(foreground);
+            boolean available = (parseInt(field(i, 4)) & AVAILABLE) != 0;
+            ((TextView) row.getChildAt(1)).setTextColor(available ? foreground : dim);
             TextView button = (TextView) row.getChildAt(2);
             button.setTextColor(accent);
             button.setBackground(
-                    new RippleDrawable(pressed, null, new ColorDrawable(Color.WHITE)));
+                    SettingsRows.ripple(foreground));
         }
     }
 

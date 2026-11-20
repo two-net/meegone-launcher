@@ -5,15 +5,19 @@
 //! - only platform adapters reach the operating system (ARCH-04);
 //! - every third-party crate is listed with a reason in DEPENDENCIES.md (ARCH-08);
 //! - test fakes are enabled only in dev-dependencies (SEC-06);
-//! - and, in [`legal`], the legal and branding rules of ADR 0037: the product's name, no
+//! - in [`legal`], the legal and branding rules of ADR 0037: the product's name, no
 //!   third-party names, every bundled asset in ASSETS.md, every licence in About, and the store
-//!   listing (LEGAL-01 to LEGAL-06, PRIV-04).
+//!   listing (LEGAL-01 to LEGAL-06, PRIV-04);
+//! - and, in [`a11y`], the accessibility rules of ADR 0038: every colour the Java host draws
+//!   comes from the theme's tokens, and every text size follows the system font size (A11Y-03,
+//!   A11Y-04).
 //!
 //! The rules are pure functions over a [`Graph`] and over source text; [`load`] reads the graph
 //! with `cargo metadata`, and [`os_access_violations`] reads the app's sources.
-//! `tests/workspace.rs` and `tests/legal.rs` run them on this repository, so CI fails on any
-//! violation.
+//! `tests/workspace.rs`, `tests/legal.rs` and `tests/a11y.rs` run them on this repository, so
+//! CI fails on any violation.
 
+pub mod a11y;
 pub mod legal;
 
 use std::collections::BTreeSet;

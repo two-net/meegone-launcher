@@ -23,8 +23,6 @@ final class SettingsRows {
     static final float NOTE_SP = 14f;
     static final float ROW_DP = 56f;
     static final float GAP_DP = 16f;
-    /** The smallest a touch target gets (A11Y-02). */
-    static final float TARGET_DP = 48f;
     static final int MEDIUM = 500;
     /** How faint a control that takes no input is drawn. */
     static final float DISABLED_ALPHA = 0.38f;
@@ -118,7 +116,7 @@ final class SettingsRows {
         button.setTextSize(TypedValue.COMPLEX_UNIT_SP, TEXT_SP);
         button.setTypeface(Typeface.create(Typeface.DEFAULT, MEDIUM, false));
         button.setGravity(Gravity.CENTER);
-        int target = px(button, TARGET_DP);
+        int target = A11y.targetPx(button);
         button.setMinHeight(target);
         button.setMinWidth(target);
         int gap = px(button, GAP_DP);
@@ -153,8 +151,16 @@ final class SettingsRows {
 
     /** The press ripple in the theme's foreground, not the device theme's (THEME-03). */
     static RippleDrawable ripple(int foreground) {
-        ColorStateList pressed = ColorStateList.valueOf((foreground & 0x00FFFFFF) | 0x1F000000);
-        return new RippleDrawable(pressed, null, new ColorDrawable(Color.WHITE));
+        return new RippleDrawable(pressed(foreground), null, new ColorDrawable(Color.WHITE));
+    }
+
+    /**
+     * The colour of every press: the theme's foreground at 12 %, {@code PRESSED_PERCENT} in the
+     * Rust app's tokens. It shows only under the finger, so it isn't held to a contrast ratio
+     * (A11Y-03, ADR 0038).
+     */
+    static ColorStateList pressed(int foreground) {
+        return ColorStateList.valueOf((foreground & 0x00FFFFFF) | 0x1F000000);
     }
 
     /** A switch row in the theme's colours (THEME-03). */

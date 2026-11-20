@@ -94,6 +94,7 @@ public final class HomeActivity extends Activity {
         if (opensSettings(getIntent())) {
             nativeOpenSettings();
         }
+        DebugHooks.readAuditExtras(this, views, getIntent());
     }
 
     @Override
@@ -113,6 +114,7 @@ public final class HomeActivity extends Activity {
             nativeOpenSettings();
             views.refresh();
         }
+        DebugHooks.readAuditExtras(this, views, intent);
     }
 
     @Override

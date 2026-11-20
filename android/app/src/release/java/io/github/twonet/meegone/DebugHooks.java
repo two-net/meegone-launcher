@@ -8,6 +8,8 @@ final class DebugHooks {
 
     static void readIconExtras(Intent intent) {}
 
+    static void readAuditExtras(HomeActivity activity, HomeViews views, Intent intent) {}
+
     static boolean legacyIcons() {
         return false;
     }

@@ -16,6 +16,14 @@ final class DebugHooks {
      */
     static final String EXTRA_LEGACY_ICONS = "io.github.twonet.meegone.debug.LEGACY_ICONS";
 
+    /**
+     * Goes through every screen in both themes and checks each against #37's accessibility rules,
+     * logging what fails under {@code MeeGoneA11y} (ADR 0038): {@code adb shell am start -n
+     * io.github.twonet.meegone/.HomeActivity --ez <this> true}, or {@code tools/a11y-audit.sh},
+     * which runs it at the normal and the largest font size.
+     */
+    static final String EXTRA_A11Y_AUDIT = "io.github.twonet.meegone.debug.A11Y_AUDIT";
+
     /** Read on the icon threads. */
     private static volatile boolean legacyIcons;
 
@@ -25,6 +33,17 @@ final class DebugHooks {
     static void readIconExtras(Intent intent) {
         if (intent != null && intent.getBooleanExtra(EXTRA_LEGACY_ICONS, false)) {
             legacyIcons = true;
+        }
+    }
+
+    /**
+     * Starts the accessibility tour if {@code intent} asks for it. The extra is taken off, so the
+     * activity made again after a configuration change doesn't start it again.
+     */
+    static void readAuditExtras(HomeActivity activity, HomeViews views, Intent intent) {
+        if (intent != null && intent.getBooleanExtra(EXTRA_A11Y_AUDIT, false)) {
+            intent.removeExtra(EXTRA_A11Y_AUDIT);
+            A11yTour.start(activity, views);
         }
     }
 

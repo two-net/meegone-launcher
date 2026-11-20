@@ -215,7 +215,7 @@ final class ImageCard extends LinearLayout {
         plate.setColor(surface);
         title.setTextColor(foreground);
         attribution.setTextColor(dim);
-        ColorStateList pressed = ColorStateList.valueOf((foreground & 0x00FFFFFF) | 0x1F000000);
+        ColorStateList pressed = SettingsRows.pressed(foreground);
         card.setForeground(new RippleDrawable(pressed, null, mask));
     }
 

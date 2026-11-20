@@ -2,9 +2,6 @@ package io.github.twonet.meegone;
 
 import android.content.Context;
 import android.content.res.ColorStateList;
-import android.graphics.Color;
-import android.graphics.drawable.ColorDrawable;
-import android.graphics.drawable.RippleDrawable;
 import android.util.TypedValue;
 import android.widget.LinearLayout;
 import android.widget.RadioButton;
@@ -136,12 +133,11 @@ final class ChoiceSettings extends LinearLayout {
         title.setTextColor(foreground);
         int[][] states = {{android.R.attr.state_checked}, {}};
         ColorStateList tint = new ColorStateList(states, new int[] {accent, dim});
-        ColorStateList pressed = ColorStateList.valueOf((foreground & 0x00FFFFFF) | 0x1F000000);
         for (RadioButton button : buttons) {
             button.setTextColor(foreground);
             button.setButtonTintList(tint);
             button.setBackground(
-                    new RippleDrawable(pressed, null, new ColorDrawable(Color.WHITE)));
+                    SettingsRows.ripple(foreground));
         }
     }
 }

@@ -3,13 +3,11 @@ package io.github.twonet.meegone;
 import android.annotation.TargetApi;
 import android.app.AlertDialog;
 import android.content.Context;
-import android.content.res.ColorStateList;
 import android.content.res.Resources;
 import android.graphics.Color;
 import android.graphics.Insets;
 import android.graphics.Matrix;
 import android.graphics.Rect;
-import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
 import android.os.Build;
@@ -33,7 +31,6 @@ import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityManager;
 import android.view.accessibility.AccessibilityNodeInfo;
 import android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction;
-import android.widget.Button;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
@@ -263,6 +260,8 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private static final int SEARCH_OFFERED = 32; // screen readers can open search
     /** An open folder's columns, as {@code FOLDER_COLUMNS} in the Rust app. */
     private static final int FOLDER_COLUMNS = 4;
+    /** A zero-width space: added to an announcement that repeats the last, so it is read. */
+    private static final String UNSPOKEN = "\u200B";
     /** The longest name a folder takes, as {@code MAX_FOLDER_NAME} in the Rust app. */
     private static final int MAX_FOLDER_NAME = 64;
 
@@ -380,6 +379,11 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
      * icon: over the home views. Its items are made for the menu that opens.
      */
     private final LinearLayout menu;
+    /** The menu's items, which scroll inside the card when they don't all fit (A11Y-04). */
+    private final LinearLayout menuList;
+    private final ScrollView menuScroll;
+    /** The cell or Events row whose menu is open, which takes screen readers' focus back. */
+    private View menuOpener;
     private final GradientDrawable menuCard;
     private final List<TextView> menuItems = new ArrayList<>();
     private final List<View> menuDividers = new ArrayList<>();
@@ -429,6 +433,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     /** Done's colours as drawn: the accent behind, and the background's for its text. */
     private int doneAccent;
     private int doneText;
+    private int donePress;
     private int selected = -1;
     private int background;
     private int surface;
@@ -484,6 +489,8 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private boolean searchOpen;
     /** Whether the open folder covers the grid for screen readers, or -1 before the first frame. */
     private int folderCovering = -1;
+    /** The open folder's cell in the grid, which screen readers' focus goes back to. */
+    private int folderCellShown = -1;
     /** The folder the rename dialog is for, or -1, and the dialog while it shows (FOLD-03). */
     private int renameShown = -1;
     private AlertDialog renameDialog;
@@ -592,7 +599,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         done.setText(R.string.edit_done);
         done.setTextSize(TypedValue.COMPLEX_UNIT_SP, 16);
         done.setGravity(Gravity.CENTER);
-        done.setMinHeight(dp(48));
+        done.setMinHeight(A11y.targetPx(this));
         done.setMinWidth(dp(120));
         done.setPadding(dp(24), 0, dp(24), 0);
         doneShape = new GradientDrawable();
@@ -745,11 +752,13 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         settings.setGravity(Gravity.TOP | Gravity.CENTER_HORIZONTAL);
         // Touches on Settings stay there.
         settings.setClickable(true);
+        A11y.notAButton(settings);
         settings.setVisibility(GONE);
         settings.setAccessibilityPaneTitle(getResources().getString(R.string.settings_title));
         settingsTitle = new TextView(context);
         settingsTitle.setText(R.string.settings_title);
         settingsTitle.setTextSize(TypedValue.COMPLEX_UNIT_SP, 28);
+        settingsTitle.setAccessibilityHeading(true);
         settings.addView(settingsTitle, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
         // Settings → Applications → Hidden apps (APPS-19).
@@ -995,7 +1004,6 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
 
         menu = new LinearLayout(context);
         menu.setOrientation(LinearLayout.VERTICAL);
-        menu.setPadding(0, dp(8), 0, dp(8));
         menuCard = new GradientDrawable();
         menuCard.setCornerRadius(dp(16));
         menu.setBackground(menuCard);
@@ -1004,6 +1012,18 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         menu.setVisibility(GONE);
         // Touches on the card, between its items, stay there: none reaches an icon behind it.
         menu.setClickable(true);
+        A11y.notAButton(menu);
+        // A long app menu in a short window, or at a large font size, scrolls (A11Y-04).
+        menuList = new LinearLayout(context);
+        menuList.setOrientation(LinearLayout.VERTICAL);
+        menuList.setPadding(0, dp(8), 0, dp(8));
+        menuScroll = new ScrollView(context);
+        menuScroll.setOverScrollMode(OVER_SCROLL_IF_CONTENT_SCROLLS);
+        menuScroll.addView(menuList, new ScrollView.LayoutParams(
+                LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT));
+        scrolls.add(menuScroll);
+        menu.addView(menuScroll, new LinearLayout.LayoutParams(
+                LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT));
         // Placed from the left whatever the layout direction; placeMenu mirrors it.
         addView(menu, new LayoutParams(
                 LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT, Gravity.TOP | Gravity.LEFT));
@@ -1562,22 +1582,21 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         applyDone();
         if (current != announced) {
             announced = current;
-            status.setText(viewPosition(current));
+            announce(viewPosition(current));
         }
         if (frame[EDITING] != editingShown) {
-            // A11Y-08: "Edit mode". Leaving it sets the view's position again, so the next time
-            // edit mode starts, the text changes and is read.
+            // A11Y-08: "Edit mode", and the view's position again when it ends.
             if (editingShown >= 0) {
-                status.setText(frame[EDITING] != 0
+                announce(frame[EDITING] != 0
                         ? getResources().getString(R.string.edit_mode)
                         : viewPosition(current));
             }
             editingShown = frame[EDITING];
         }
         if (frame[RECENT_CLOSE] != closingShown) {
-            // A11Y-08: "Editing Recent", read again each time close mode starts, as edit mode.
+            // A11Y-08: "Editing Recent", as edit mode.
             if (closingShown >= 0) {
-                status.setText(frame[RECENT_CLOSE] != 0
+                announce(frame[RECENT_CLOSE] != 0
                         ? getResources().getString(R.string.recent_close_mode)
                         : viewPosition(current));
             }
@@ -1649,11 +1668,18 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         folderPanel.apply(folder, frame[FOLDER_OPEN] != 0, frame[FOLDER_PROGRESS], folderIcon,
                 cell == null ? null : cell.name(), frame[SCRIM], foreground, surface);
         int covering = folder >= 0 && frame[FOLDER_OPEN] != 0 ? 1 : 0;
+        if (covering != 0) {
+            folderCellShown = frame[FOLDER_CELL];
+        }
         if (covering != folderCovering) {
+            boolean closed = folderCovering == 1;
             folderCovering = covering;
             apps.setImportantForAccessibility(covering != 0
                     ? IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
                     : IMPORTANT_FOR_ACCESSIBILITY_AUTO);
+            if (closed && frame[CURRENT] == APPLICATIONS) {
+                focusBack(apps.cellAt(folderCellShown));
+            }
         }
     }
 
@@ -1687,6 +1713,10 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
                 searchPanel.focus(nativeSearchQuery());
             } else {
                 searchPanel.dismiss();
+                // A screen reader goes back to the grid, where search was pulled from (A11Y-08).
+                if (applications) {
+                    focusBack(apps.firstVisibleCell());
+                }
             }
         }
     }
@@ -1756,9 +1786,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         FrameLayout box = new FrameLayout(getContext());
         box.setPaddingRelative(dp(24), dp(8), dp(24), 0);
         box.addView(field);
-        AlertDialog dialog = new AlertDialog.Builder(getContext(), light
-                        ? android.R.style.Theme_DeviceDefault_Light_Dialog_Alert
-                        : android.R.style.Theme_DeviceDefault_Dialog_Alert)
+        AlertDialog dialog = Dialogs.builder(getContext(), light)
                 .setTitle(R.string.menu_rename_folder)
                 .setView(box)
                 .setPositiveButton(android.R.string.ok, (shown, which) -> {
@@ -1782,13 +1810,10 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         dialog.getWindow().setSoftInputMode(
                 WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE);
         dialog.show();
-        // The dialog's theme is the device's light or dark one, matched to MeeGone's; its
-        // buttons and field take MeeGone's accent too (THEME-03).
-        int accent = frame[ACCENT];
-        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setTextColor(accent);
-        dialog.getButton(AlertDialog.BUTTON_NEGATIVE).setTextColor(accent);
-        field.setBackgroundTintList(ColorStateList.valueOf(accent));
-        Themed.textField(field, accent);
+        // Laid out as the device's light or dark dialogs, matched to MeeGone's theme, and drawn
+        // in MeeGone's colours (THEME-03, A11Y-03).
+        Dialogs.colour(dialog, surface, foreground, dim, frame[ACCENT], frame[SCRIM]);
+        Dialogs.colourField(field, foreground, dim, frame[ACCENT]);
         field.requestFocus();
     }
 
@@ -1809,9 +1834,15 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
                 getResources().getString(NAMES[view]), view + 1, VIEWS);
     }
 
-    /** Tells screen readers of a change, through the polite live region (A11Y-08). */
+    /**
+     * Tells screen readers of a change, through the polite live region (A11Y-08). Only a change
+     * of its text is read, so the same words twice in a row, such as two "Removed from Recent",
+     * differ by a character that isn't spoken.
+     */
     private void announce(String text) {
-        status.setText(text);
+        String shown = status.getText().toString();
+        boolean again = shown.replace(UNSPOKEN, "").equals(text) && !shown.endsWith(UNSPOKEN);
+        status.setText(again ? text + UNSPOKEN : text);
     }
 
     /**
@@ -1830,13 +1861,15 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         done.setImportantForAccessibility(on && !covered
                 ? IMPORTANT_FOR_ACCESSIBILITY_YES
                 : IMPORTANT_FOR_ACCESSIBILITY_NO);
-        if (frame[ACCENT] != doneAccent || background != doneText) {
+        if (frame[ACCENT] != doneAccent || background != doneText || foreground != donePress) {
             doneAccent = frame[ACCENT];
             doneText = background;
+            donePress = foreground;
             doneShape.setColor(doneAccent);
-            ColorStateList pressed =
-                    ColorStateList.valueOf((background & 0x00FFFFFF) | 0x3D000000);
-            done.setBackground(new RippleDrawable(pressed, doneShape, null));
+            // The theme's press, as everywhere else: it darkens the accent in Light and
+            // lightens it in Dark, so Done's text keeps its contrast (A11Y-03).
+            done.setBackground(new RippleDrawable(SettingsRows.pressed(foreground), doneShape,
+                    null));
             done.setTextColor(background);
         }
     }
@@ -2078,7 +2111,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private void confirmRemoval(String label) {
         AccessibilityManager access = getContext().getSystemService(AccessibilityManager.class);
         if (access != null && access.isTouchExplorationEnabled()) {
-            status.setText(label != null
+            announce(label != null
                     ? getResources().getString(R.string.recent_removed_app, label)
                     : getResources().getString(R.string.recent_removed));
             return;
@@ -2120,7 +2153,8 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         if (frame[RECENT_ROWS] != rows) {
             return false;
         }
-        status.setText(rows == 2 ? R.string.action_bigger_cards : R.string.action_more_cards);
+        announce(getResources().getString(
+                rows == 2 ? R.string.action_bigger_cards : R.string.action_more_cards));
         return true;
     }
 
@@ -2281,15 +2315,12 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
                 : name;
     }
 
-    /** A dialog over Settings, in MeeGone's theme as the device draws dialogs (THEME-03). */
+    /** A dialog over Settings, laid out as the device's in MeeGone's theme (THEME-03). */
     private AlertDialog.Builder dialogOverSettings() {
-        boolean light = Color.luminance(background) > 0.5f;
-        return new AlertDialog.Builder(getContext(), light
-                ? android.R.style.Theme_DeviceDefault_Light_Dialog_Alert
-                : android.R.style.Theme_DeviceDefault_Dialog_Alert);
+        return Dialogs.builder(getContext(), Color.luminance(background) > 0.5f);
     }
 
-    /** Shows {@code dialog} over Settings, with MeeGone's accent, closing any other. */
+    /** Shows {@code dialog} over Settings, in MeeGone's colours, closing any other. */
     private void showSettingsDialog(AlertDialog dialog) {
         closeSettingsDialog();
         settingsDialog = dialog;
@@ -2299,12 +2330,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             }
         });
         dialog.show();
-        for (int which : new int[] {AlertDialog.BUTTON_POSITIVE, AlertDialog.BUTTON_NEGATIVE}) {
-            Button button = dialog.getButton(which);
-            if (button != null) {
-                button.setTextColor(frame[ACCENT]);
-            }
-        }
+        Dialogs.colour(dialog, surface, foreground, dim, frame[ACCENT], frame[SCRIM]);
     }
 
     /** Closes the dialog over Settings, as when Settings closes. */
@@ -2354,7 +2380,9 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         body.setText(text);
         body.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
         body.setPaddingRelative(dp(24), dp(8), dp(24), dp(8));
+        Dialogs.colourText(body, foreground);
         ScrollView scroll = new ScrollView(builder.getContext());
+        Themed.scrolling(scroll, dim);
         scroll.addView(body);
         showSettingsDialog(builder
                 .setTitle(R.string.about_licences)
@@ -2490,10 +2518,13 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             eventsMenuRowShown = eventsRow;
             if (homeItems != 0) {
                 fillHomeMenu(homeItems);
+                menuOpener = null;
             } else if (appMenu >= 0) {
                 fillAppMenu(frame[APP_MENU_REVISION]);
+                menuOpener = menuGrid().cellAt(frame[APP_MENU]);
             } else if (eventsItems != 0) {
                 fillEventsMenu(eventsItems, eventsRow);
+                menuOpener = eventsList.rowAt(eventsRow);
             }
             hidePagesFromScreenReaders();
             if (!wasOpen && menuOpen() && !menuItems.isEmpty()) {
@@ -2501,6 +2532,11 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
                 TextView first = menuItems.get(0);
                 menu.post(() -> first.performAccessibilityAction(
                         AccessibilityNodeInfo.ACTION_ACCESSIBILITY_FOCUS, null));
+            }
+            if (wasOpen && !menuOpen()) {
+                // A screen reader goes back to the cell or row the menu was for (A11Y-08).
+                focusBack(menuOpener);
+                menuOpener = null;
             }
         }
         if (menuOpen()) {
@@ -2605,7 +2641,8 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     }
 
     private void clearMenu() {
-        menu.removeAllViews();
+        menuList.removeAllViews();
+        menuScroll.scrollTo(0, 0);
         menuItems.clear();
         menuDividers.clear();
     }
@@ -2618,11 +2655,11 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         item.setSingleLine(true);
         item.setEllipsize(TextUtils.TruncateAt.END);
         item.setGravity(Gravity.CENTER_VERTICAL | Gravity.START);
-        item.setMinHeight(dp(48));
+        item.setMinHeight(A11y.targetPx(this));
         item.setMinWidth(dp(200));
         item.setPaddingRelative(dp(24), 0, dp(24), 0);
         item.setOnClickListener(chosen);
-        menu.addView(item, new LinearLayout.LayoutParams(
+        menuList.addView(item, new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
         menuItems.add(item);
     }
@@ -2635,19 +2672,18 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
                 LinearLayout.LayoutParams.MATCH_PARENT, Math.max(1, dp(1)));
         params.topMargin = dp(8);
         params.bottomMargin = dp(8);
-        menu.addView(divider, params);
+        menuList.addView(divider, params);
         menuDividers.add(divider);
     }
 
     /** The menu's items in the theme's text colour, with a light wash when pressed. */
     private void colourMenu() {
-        ColorStateList pressed = ColorStateList.valueOf((foreground & 0x00FFFFFF) | 0x1F000000);
         for (TextView item : menuItems) {
             item.setTextColor(foreground);
-            item.setBackground(new RippleDrawable(pressed, null, new ColorDrawable(Color.WHITE)));
+            item.setBackground(SettingsRows.ripple(foreground));
         }
         for (View divider : menuDividers) {
-            divider.setBackgroundColor((dim & 0x00FFFFFF) | 0x66000000);
+            divider.setBackgroundColor(frame[DIVIDER]);
         }
     }
 
@@ -2725,6 +2761,25 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
 
     private static float within(float value, float low, float high) {
         return Math.max(low, Math.min(value, high));
+    }
+
+    /**
+     * Screen readers' focus goes back to {@code view}, such as the cell whose menu or folder
+     * just closed, which they then read: "Folder: Games, 3 apps" (A11Y-08). Not while another
+     * screen covers the home views, nor for a view that has gone.
+     */
+    private void focusBack(View view) {
+        if (view == null) {
+            return;
+        }
+        post(() -> {
+            if (view.isAttachedToWindow() && view.isShown() && !menuOpen()
+                    && frame[SETTINGS] == 0 && frame[SETUP_STEP] < 0 && imageDetailsShown == 0
+                    && pastImagesShown == 0) {
+                view.performAccessibilityAction(
+                        AccessibilityNodeInfo.ACTION_ACCESSIBILITY_FOCUS, null);
+            }
+        });
     }
 
     /** While a menu or Settings covers the home views, screen readers skip them. */
@@ -2836,6 +2891,104 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         boolean moved = nativeShow(next);
         apply();
         return moved;
+    }
+
+    // The debug build's accessibility audit drives and reads the home views through what
+    // follows, as a screen reader would (ADR 0038). Release builds never call it.
+
+    /** Whether nothing moves, as of the last frame. */
+    boolean auditSettled() {
+        return frame[ANIMATING] == 0;
+    }
+
+    /** The home view shown, 0 to 2. */
+    int auditView() {
+        return frame[CURRENT];
+    }
+
+    /** The theme chosen in Settings, a value of {@link #THEMES}, or -1 while not offered. */
+    int auditTheme() {
+        return frame[THEME];
+    }
+
+    /** Chooses theme {@code theme}, a value of {@link #THEMES}, as Settings does. */
+    void auditSetTheme(int theme) {
+        nativeTheme(theme);
+        apply();
+    }
+
+    /** Recent's rows on one screen: 3 for more cards, 2 for bigger ones. */
+    int auditRecentRows() {
+        return frame[RECENT_ROWS];
+    }
+
+    /** The setup step shown, or -1. */
+    int auditSetupStep() {
+        return frame[SETUP_STEP];
+    }
+
+    /** Whether the image details screen or the past week's images show. */
+    boolean auditImageDetails() {
+        return frame[IMAGE_DETAILS] != 0;
+    }
+
+    boolean auditPastImages() {
+        return frame[PAST_IMAGES] != 0;
+    }
+
+    /**
+     * Whether anything is open over the home views or in them that Back closes: a menu,
+     * Settings, a screen over them, a folder, search, edit mode or close mode.
+     */
+    boolean auditOpen() {
+        return menuOpen() || frame[SETTINGS] != 0 || frame[IMAGE_DETAILS] != 0
+                || frame[PAST_IMAGES] != 0 || frame[FOLDER] >= 0
+                || (frame[SEARCH] & SEARCH_OPEN) != 0 || frame[EDITING] != 0
+                || frame[RECENT_CLOSE] != 0 || frame[RENAMING] >= 0;
+    }
+
+    /** The dialog showing over the home views, or null. */
+    AlertDialog auditDialog() {
+        return settingsDialog != null ? settingsDialog : renameDialog;
+    }
+
+    /** The scrolling view that shows the most of what is on top, or null. */
+    ScrollView auditScroll() {
+        if (frame[PAST_IMAGES] != 0) {
+            return pastImages;
+        } else if (frame[SETTINGS] != 0) {
+            return settingsScroll;
+        } else if (frame[IMAGE_DETAILS] != 0) {
+            return imageDetails;
+        } else if (frame[SETUP_STEP] >= 0) {
+            return setup;
+        } else if (menuOpen()) {
+            return menuScroll;
+        } else if (frame[FOLDER] >= 0) {
+            return folderApps;
+        } else if ((frame[SEARCH] & SEARCH_RESULTS) != 0) {
+            return results;
+        }
+        int current = frame[CURRENT];
+        return current == APPLICATIONS ? apps : scrolls.get(current == EVENTS ? 0 : 1);
+    }
+
+    AppsGrid auditApps() {
+        return apps;
+    }
+
+    EventsList auditEvents() {
+        return eventsList;
+    }
+
+    /** The search field, which the audit types into as a user would. */
+    EditText auditSearchField() {
+        return searchPanel.auditField();
+    }
+
+    /** The open folder's name, which renames it when tapped. */
+    TextView auditFolderName() {
+        return folderPanel.auditName();
     }
 
     private int dp(int value) {

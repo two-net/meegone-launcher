@@ -1,13 +1,9 @@
 package io.github.twonet.meegone;
 
 import android.content.Context;
-import android.content.res.ColorStateList;
-import android.graphics.Color;
 import android.graphics.Insets;
 import android.graphics.Rect;
-import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.GradientDrawable;
-import android.graphics.drawable.RippleDrawable;
 import android.os.Build;
 import android.text.Editable;
 import android.text.InputType;
@@ -96,7 +92,6 @@ final class SearchPanel extends FrameLayout {
         noneTop = Math.round(NONE_TOP_DP * density);
         setVisibility(INVISIBLE);
         setClipToPadding(false);
-        setAccessibilityPaneTitle(getResources().getString(R.string.search_action));
 
         addView(results, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
         results.setVisibility(INVISIBLE);
@@ -236,6 +231,12 @@ final class SearchPanel extends FrameLayout {
     void apply(boolean open, int reveal, boolean resultsShown, boolean nothingFound,
             boolean webOffered, int foreground, int dim, int surface, int accent) {
         colour(foreground, dim, surface, accent);
+        // Screen readers announce search once it is open, not while it is being pulled
+        // (A11Y-08).
+        CharSequence pane = open ? getResources().getString(R.string.search_action) : null;
+        if (!TextUtils.equals(pane, getAccessibilityPaneTitle())) {
+            setAccessibilityPaneTitle(pane);
+        }
         boolean shown = open || reveal > 0;
         setVisibility(shown ? VISIBLE : INVISIBLE);
         field.setVisibility(shown ? VISIBLE : INVISIBLE);
@@ -269,8 +270,7 @@ final class SearchPanel extends FrameLayout {
         Themed.textField(field, accent);
         none.setTextColor(dim);
         web.setTextColor(accent);
-        ColorStateList pressed = ColorStateList.valueOf((foreground & 0x00FFFFFF) | 0x1F000000);
-        web.setBackground(new RippleDrawable(pressed, null, new ColorDrawable(Color.WHITE)));
+        web.setBackground(SettingsRows.ripple(foreground));
     }
 
     /**
@@ -322,5 +322,10 @@ final class SearchPanel extends FrameLayout {
     Rect firstIcon() {
         AppCell first = results.cellAt(0);
         return first != null && first.isShown() ? first.iconOnScreen() : new Rect();
+    }
+
+    /** The field, for the debug build's accessibility audit (ADR 0038). */
+    EditText auditField() {
+        return field;
     }
 }

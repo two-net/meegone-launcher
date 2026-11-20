@@ -3,7 +3,6 @@ package io.github.twonet.meegone;
 import android.content.Context;
 import android.graphics.drawable.GradientDrawable;
 import android.util.TypedValue;
-import android.view.Gravity;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
@@ -40,23 +39,21 @@ final class HomeBannerView extends LinearLayout {
         setBackground(card);
         // Touches on the card stay there: none reaches the views behind it.
         setClickable(true);
+        A11y.notAButton(this);
         text = new TextView(context);
         text.setText(R.string.home_banner_text);
         text.setTextSize(TypedValue.COMPLEX_UNIT_SP, SettingsRows.TEXT_SP);
         addView(text, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
-        LinearLayout buttons = new LinearLayout(context);
-        buttons.setOrientation(HORIZONTAL);
-        buttons.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+        // Side by side at the end, or one above the other at a large font size (A11Y-04).
+        ButtonRow buttons = new ButtonRow(context);
         dismiss = new TextView(context);
         SettingsRows.button(dismiss, R.string.home_banner_dismiss);
         dismiss.setOnClickListener(view -> listener.dismiss());
         makeDefault = new TextView(context);
         SettingsRows.button(makeDefault, R.string.access_make_default);
         makeDefault.setOnClickListener(view -> listener.makeDefault());
-        buttons.addView(dismiss, new LayoutParams(
-                LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT));
-        buttons.addView(makeDefault, new LayoutParams(
-                LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT));
+        buttons.addView(dismiss);
+        buttons.addView(makeDefault);
         addView(buttons, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
     }
 

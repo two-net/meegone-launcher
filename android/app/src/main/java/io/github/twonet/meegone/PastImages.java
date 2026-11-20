@@ -1,12 +1,9 @@
 package io.github.twonet.meegone;
 
 import android.content.Context;
-import android.content.res.ColorStateList;
 import android.content.res.Resources;
 import android.graphics.Bitmap;
-import android.graphics.Color;
 import android.graphics.Typeface;
-import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.RippleDrawable;
 import android.os.Handler;
 import android.os.Looper;
@@ -65,8 +62,6 @@ final class PastImages extends ScrollView {
     /** Body text (SRS 5.2). */
     private static final float BODY_SP = 15f;
     private static final float ROW_DP = 56f;
-    /** The smallest a touch target gets (A11Y-02). */
-    private static final float TARGET_DP = 48f;
     /** The side margins (SRS 5.2). */
     private static final float MARGIN_DP = 16f;
     private static final float GAP_DP = 8f;
@@ -116,6 +111,7 @@ final class PastImages extends ScrollView {
         density = getResources().getDisplayMetrics().density;
         // Touches on it stay there.
         setClickable(true);
+        A11y.notAButton(this);
         setFillViewport(true);
         setAccessibilityPaneTitle(getResources().getString(R.string.image_past_week));
 
@@ -256,8 +252,7 @@ final class PastImages extends ScrollView {
     }
 
     private RippleDrawable ripple() {
-        ColorStateList pressed = ColorStateList.valueOf((foreground & 0x00FFFFFF) | 0x1F000000);
-        return new RippleDrawable(pressed, null, new ColorDrawable(Color.WHITE));
+        return SettingsRows.ripple(foreground);
     }
 
     /** A preview's height for {@code width}: 5:3, and at most {@link #MAX_PREVIEW_DP}. */
@@ -290,8 +285,8 @@ final class PastImages extends ScrollView {
         button.setTextSize(TypedValue.COMPLEX_UNIT_SP, BODY_SP + 1);
         button.setTypeface(Typeface.create(Typeface.DEFAULT, MEDIUM, false));
         button.setGravity(Gravity.CENTER);
-        button.setMinHeight(dp(TARGET_DP));
-        button.setMinWidth(dp(TARGET_DP));
+        button.setMinHeight(dp(A11y.TARGET_DP));
+        button.setMinWidth(dp(A11y.TARGET_DP));
         button.setPadding(margin, 0, margin, 0);
         row.addView(button, new LinearLayout.LayoutParams(
                 LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT));

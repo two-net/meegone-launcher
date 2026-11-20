@@ -2,6 +2,8 @@ package io.github.twonet.meegone;
 
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
+import android.view.View;
+import android.widget.AbsListView;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
@@ -60,11 +62,21 @@ final class Themed {
      */
     static void scrolling(ScrollView scroll, int dim) {
         scroll.setEdgeEffectColor(dim);
-        float density = scroll.getResources().getDisplayMetrics().density;
+        scroll.setVerticalScrollbarThumbDrawable(thumb(scroll, dim));
+    }
+
+    /** The same for a list, such as the region dialog's (ADR 0038). */
+    static void scrolling(AbsListView list, int dim) {
+        list.setEdgeEffectColor(dim);
+        list.setVerticalScrollbarThumbDrawable(thumb(list, dim));
+    }
+
+    private static Drawable thumb(View view, int dim) {
+        float density = view.getResources().getDisplayMetrics().density;
         GradientDrawable thumb = new GradientDrawable();
         thumb.setColor(dim);
         thumb.setCornerRadius(THUMB_DP * density / 2);
         thumb.setSize(Math.round(THUMB_DP * density), 0);
-        scroll.setVerticalScrollbarThumbDrawable(thumb);
+        return thumb;
     }
 }

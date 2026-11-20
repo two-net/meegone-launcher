@@ -10,16 +10,16 @@ import android.widget.TextView;
 /**
  * A section header (SRS 5.2): its title in 13 sp capitals, letter-spaced, in the secondary
  * colour, then a hairline to the end. Screen readers hear the title as a heading. Events'
- * "Notifications" adds Clear after the hairline (EVT-07); "Image of the day" has nothing more
- * (EVT-12).
+ * "Notifications" adds Clear after the hairline (EVT-07), and Recent Clear all (REC-07); "Image
+ * of the day" has nothing more (EVT-12). A button at the end keeps its width, and the title
+ * wraps into what is left, so a large font size never pushes the button off the screen
+ * (A11Y-04).
  */
 final class SectionHeader extends LinearLayout {
     /** Section headers: 13 sp, in capitals and letter-spaced (SRS 5.2). */
     private static final float TITLE_SP = 13f;
     private static final float SPACING = 0.1f;
     private static final float GAP_DP = 12f;
-    /** The smallest a touch target gets (A11Y-02), so a button at its end fits. */
-    private static final float TARGET_DP = 48f;
 
     private final TextView title;
     private final View hairline;
@@ -29,7 +29,7 @@ final class SectionHeader extends LinearLayout {
         float density = getResources().getDisplayMetrics().density;
         setOrientation(HORIZONTAL);
         setGravity(Gravity.CENTER_VERTICAL);
-        setMinimumHeight(Math.round(TARGET_DP * density));
+        setMinimumHeight(Math.round(A11y.TARGET_DP * density));
         title = new TextView(context);
         title.setText(text);
         title.setAllCaps(true);
@@ -43,6 +43,31 @@ final class SectionHeader extends LinearLayout {
                 new LayoutParams(0, Math.max(1, Math.round(density)), 1f);
         hairlineParams.setMarginStart(Math.round(GAP_DP * density));
         addView(hairline, hairlineParams);
+    }
+
+    @Override
+    protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
+        if (MeasureSpec.getMode(widthMeasureSpec) != MeasureSpec.UNSPECIFIED) {
+            int room = MeasureSpec.getSize(widthMeasureSpec) - getPaddingLeft()
+                    - getPaddingRight();
+            int taken = 0;
+            for (int i = 0; i < getChildCount(); i++) {
+                View child = getChildAt(i);
+                if (child == title || child == hairline || child.getVisibility() == GONE) {
+                    continue;
+                }
+                LayoutParams params = (LayoutParams) child.getLayoutParams();
+                child.measure(MeasureSpec.makeMeasureSpec(room, MeasureSpec.AT_MOST),
+                        MeasureSpec.makeMeasureSpec(0, MeasureSpec.UNSPECIFIED));
+                taken += child.getMeasuredWidth() + params.getMarginStart()
+                        + params.getMarginEnd();
+            }
+            int most = Math.max(0, room - taken);
+            if (title.getMaxWidth() != most) {
+                title.setMaxWidth(most);
+            }
+        }
+        super.onMeasure(widthMeasureSpec, heightMeasureSpec);
     }
 
     /** The theme's colours (THEME-03): the title's, and the hairline's. */

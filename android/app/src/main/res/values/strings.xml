@@ -34,6 +34,10 @@
     <!-- Read by screen readers after the name of an app that can't open now: its work profile
          is paused, it is suspended or its storage is missing (APPS-09). -->
     <string name="app_state_unavailable">Unavailable</string>
+    <!-- What screen readers read on Android 10, which has no separate state: an element's name,
+         then its state, e.g. "Mail, Unavailable" or "Messages, 3 notifications, Expanded"
+         (A11Y-01). %1$s is the name, %2$s the state. -->
+    <string name="described_state">%1$s, %2$s</string>
     <!-- Shown briefly when a tapped app couldn't open and the system said nothing itself
          (APPS-09). -->
     <string name="app_unavailable">This app can\'t open right now</string>

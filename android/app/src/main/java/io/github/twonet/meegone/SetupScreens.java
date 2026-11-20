@@ -7,7 +7,6 @@ import android.graphics.Typeface;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.TypedValue;
-import android.view.Gravity;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
@@ -122,7 +121,7 @@ final class SetupScreens extends ScrollView {
     private final TextView[] accessTitles = new TextView[ACCESS_ITEMS.length];
     private final TextView[] accessWhy = new TextView[ACCESS_ITEMS.length];
     private final TextView[] accessStatus = new TextView[ACCESS_ITEMS.length];
-    private final LinearLayout[] accessButtons = new LinearLayout[ACCESS_ITEMS.length];
+    private final ButtonRow[] accessButtons = new ButtonRow[ACCESS_ITEMS.length];
     private final TextView[] accessNotNow = new TextView[ACCESS_ITEMS.length];
     private final TextView[] accessAllow = new TextView[ACCESS_ITEMS.length];
     private final TextView[] accessInstructions = new TextView[ACCESS_ITEMS.length];
@@ -141,6 +140,7 @@ final class SetupScreens extends ScrollView {
         density = getResources().getDisplayMetrics().density;
         // Touches on it stay there.
         setClickable(true);
+        A11y.notAButton(this);
         setFillViewport(true);
         FrameLayout content = new FrameLayout(context);
         int margin = dp(MARGIN_DP);
@@ -239,7 +239,7 @@ final class SetupScreens extends ScrollView {
             accessStatus[at].setVisibility(GONE);
             accessInstructions[at] = SettingsRows.note(access);
             TextView[] answers = buttons(access, R.string.setup_not_now, R.string.access_allow);
-            accessButtons[at] = (LinearLayout) answers[1].getParent();
+            accessButtons[at] = (ButtonRow) answers[1].getParent();
             accessNotNow[at] = answers[0];
             accessAllow[at] = answers[1];
             String title = res.getString(ACCESS_TITLES[at]);
@@ -439,12 +439,11 @@ final class SetupScreens extends ScrollView {
 
     /**
      * A row of buttons at the screen's end edge: {@code second}, the step forward, last, after
-     * {@code first} if there is one. Returns both, the first null if there is none.
+     * {@code first} if there is one, or one above the other at a large font size (A11Y-04).
+     * Returns both, the first null if there is none.
      */
     private TextView[] buttons(LinearLayout parent, Integer first, int second) {
-        LinearLayout row = new LinearLayout(parent.getContext());
-        row.setOrientation(LinearLayout.HORIZONTAL);
-        row.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+        ButtonRow row = new ButtonRow(parent.getContext());
         LinearLayout.LayoutParams params = matchWidth();
         params.topMargin = dp(GAP_DP);
         parent.addView(row, params);
@@ -452,11 +451,11 @@ final class SetupScreens extends ScrollView {
         if (first != null) {
             made[0] = new TextView(parent.getContext());
             SettingsRows.button(made[0], first);
-            row.addView(made[0], wrap());
+            row.addView(made[0]);
         }
         made[1] = new TextView(parent.getContext());
         SettingsRows.button(made[1], second);
-        row.addView(made[1], wrap());
+        row.addView(made[1]);
         return made;
     }
 
@@ -467,10 +466,5 @@ final class SetupScreens extends ScrollView {
     private static LinearLayout.LayoutParams matchWidth() {
         return new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
-    }
-
-    private static LinearLayout.LayoutParams wrap() {
-        return new LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
     }
 }

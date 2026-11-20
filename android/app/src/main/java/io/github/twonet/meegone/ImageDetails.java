@@ -1,12 +1,8 @@
 package io.github.twonet.meegone;
 
 import android.content.Context;
-import android.content.res.ColorStateList;
 import android.content.res.Resources;
 import android.graphics.Bitmap;
-import android.graphics.Color;
-import android.graphics.drawable.ColorDrawable;
-import android.graphics.drawable.RippleDrawable;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.TypedValue;
@@ -105,6 +101,7 @@ final class ImageDetails extends ScrollView {
         density = getResources().getDisplayMetrics().density;
         // Touches on it stay there.
         setClickable(true);
+        A11y.notAButton(this);
         setFillViewport(true);
         setAccessibilityPaneTitle(getResources().getString(R.string.image_of_the_day));
 
@@ -252,10 +249,9 @@ final class ImageDetails extends ScrollView {
         dateRegion.setTextColor(dim);
         updated.setTextColor(dim);
         problem.setTextColor(foreground);
-        ColorStateList pressed = ColorStateList.valueOf((foreground & 0x00FFFFFF) | 0x1F000000);
         for (TextView row : new TextView[] {moreInfo, unpin, updateNow, pastImages, settings}) {
             row.setTextColor(row.isEnabled() ? accent : dim);
-            row.setBackground(new RippleDrawable(pressed, null, new ColorDrawable(Color.WHITE)));
+            row.setBackground(SettingsRows.ripple(foreground));
         }
     }
 

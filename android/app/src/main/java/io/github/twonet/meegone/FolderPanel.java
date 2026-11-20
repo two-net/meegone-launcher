@@ -1,19 +1,18 @@
 package io.github.twonet.meegone;
 
 import android.content.Context;
-import android.content.res.ColorStateList;
 import android.graphics.Color;
 import android.graphics.Insets;
 import android.graphics.Rect;
-import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.GradientDrawable;
-import android.graphics.drawable.RippleDrawable;
 import android.text.TextUtils;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewConfiguration;
+import android.view.accessibility.AccessibilityNodeInfo;
+import android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.TextView;
@@ -24,7 +23,8 @@ import java.util.function.IntConsumer;
  * the surface colour with 12 dp corners and no shadow, centred in the safe area. The panel is
  * four of the grid's cells wide, with the folder's name above its own {@link AppsGrid}, and as
  * tall as its rows, up to what fits; then its grid scrolls. A tap on the name asks to rename the
- * folder (FOLD-03).
+ * folder (FOLD-03). Screen readers hear the name as a heading, offering "Rename folder"
+ * (A11Y-01).
  *
  * <p>It is inside the Applications page, so it moves with it, and the home views find what is
  * under a finger in it as for the grid. It grows from the folder's icon as it opens and shrinks
@@ -37,7 +37,6 @@ final class FolderPanel extends FrameLayout {
     private static final float SIDE_DP = 8f;
     private static final float BOTTOM_DP = 12f;
     private static final float NAME_SP = 18f;
-    private static final float MIN_TARGET_DP = 48f;
     /** How far the panel stays from the safe area's edges. */
     private static final float MARGIN_DP = 16f;
     private static final float WHOLE = 10_000f;
@@ -113,11 +112,20 @@ final class FolderPanel extends FrameLayout {
         name.setGravity(Gravity.CENTER);
         name.setSingleLine(true);
         name.setEllipsize(TextUtils.TruncateAt.END);
-        name.setMinHeight(Math.round(MIN_TARGET_DP * density));
+        name.setMinHeight(Math.round(A11y.TARGET_DP * density));
         name.setPadding(sides, 0, sides, 0);
         name.setOnClickListener(view -> {
             if (folder >= 0) {
                 renameRequested.accept(folder);
+            }
+        });
+        name.setAccessibilityHeading(true);
+        name.setAccessibilityDelegate(new AccessibilityDelegate() {
+            @Override
+            public void onInitializeAccessibilityNodeInfo(View host, AccessibilityNodeInfo info) {
+                super.onInitializeAccessibilityNodeInfo(host, info);
+                info.addAction(new AccessibilityAction(AccessibilityNodeInfo.ACTION_CLICK,
+                        getResources().getString(R.string.menu_rename_folder)));
             }
         });
         panel.addView(name, new LinearLayout.LayoutParams(
@@ -149,9 +157,7 @@ final class FolderPanel extends FrameLayout {
             this.surface = surface;
             card.setColor(surface);
             name.setTextColor(foreground);
-            ColorStateList pressed =
-                    ColorStateList.valueOf((foreground & 0x00FFFFFF) | 0x1F000000);
-            name.setBackground(new RippleDrawable(pressed, null, new ColorDrawable(Color.WHITE)));
+            name.setBackground(SettingsRows.ripple(foreground));
         }
         if (folder < 0) {
             this.folder = -1;
@@ -268,5 +274,10 @@ final class FolderPanel extends FrameLayout {
                 tapping = false;
         }
         return true;
+    }
+
+    /** The folder's name, for the debug build's accessibility audit (ADR 0038). */
+    TextView auditName() {
+        return name;
     }
 }
