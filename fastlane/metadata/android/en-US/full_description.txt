@@ -1,0 +1,24 @@
+MeeGone Launcher is a calm home screen of three full-screen views, side by side: Events, Applications and Recent. Swipe between them, and press Home to come back.
+
+EVENTS
+Your notifications, grouped by app, under today's date and your next alarm. Open, clear or dismiss them right there.
+
+APPLICATIONS
+All your apps in one grid, every icon in the same rounded shape. Arrange them, gather them into folders, hide the ones you never use, and search by name.
+
+RECENT
+The apps you used lately, as large colour cards. Pinch to switch between nine and four cards a screen, and close the ones you are done with.
+
+A NEW LOCK-SCREEN IMAGE EACH DAY
+Each day, MeeGone can put Bing's image of the day on your lock screen, with the image's credit line as the source gives it. Your home screen stays as it is. Choose the region, whether to use mobile data, or pin a favourite from the past week.
+
+LIGHT, DARK OR SYSTEM
+MeeGone follows your device's theme, or stays light or dark.
+
+ACCESS
+Events needs notification access, and Recent needs usage access. Both are optional, and MeeGone says what each one reads before you allow it.
+
+PRIVACY
+MeeGone has no accounts, analytics, advertising or tracking, and collects nothing about you. Its only connection is to Bing's image feed, for the daily image, and those requests carry only the region and image size, never anything that identifies you or your device. Your notifications and app-usage history are read on this device, in memory only; the only usage data kept is which apps you removed from Recent, and when. Your layout and settings are included in the system's backup. Uninstalling MeeGone or clearing its data removes everything it stored.
+
+MeeGone Launcher is an independent project and is not affiliated with or endorsed by Nokia or Microsoft.

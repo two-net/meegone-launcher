@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name" translatable="false">MeeGone</string>
+    <!-- The product's name, as the system shows it under the icon, in the home-app choice and in
+         App info (LEGAL-01, ADR 0037). The text below calls it MeeGone for short. -->
+    <string name="app_name" translatable="false">MeeGone Launcher</string>
 
     <!-- The three home views (HOME-02). -->
     <string name="view_events">Events</string>

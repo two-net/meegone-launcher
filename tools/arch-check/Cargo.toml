@@ -1,6 +1,6 @@
 [package]
 name = "arch-check"
-description = "Checks the workspace dependency graph against the rules in ARCHITECTURE.md. A development tool, never part of the app."
+description = "Checks the workspace dependency graph against the rules in ARCHITECTURE.md, and the app's assets, text and store listing against the legal rules of ADR 0037. A development tool, never part of the app."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

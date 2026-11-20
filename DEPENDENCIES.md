@@ -4,7 +4,7 @@ Every third-party crate that a workspace crate depends on directly is listed her
 
 `tools/arch-check` enforces this list in CI. It fails if a crate is used but not listed here, and also if a listed crate is no longer used.
 
-The app's own crates (`crates/` and the root package) use only the Rust standard library.
+The app's own crates (`crates/` and the root package) use only the Rust standard library. A third-party crate added to the app also needs its licence shown in About and recorded in [ASSETS.md](ASSETS.md) (LEGAL-06).
 
 | Crate | Used by | Reason | Collects or transmits data |
 |---|---|---|---|

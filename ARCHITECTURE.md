@@ -48,6 +48,15 @@ The root package `meegone-launcher` is the app. `Launcher::start(platform)` hand
 | OS access (ARCH-04) | No file in `crates/` or `src/` may use `std::{env, fs, net, os, process}`, read the clock (`Instant`, `SystemTime`) or contain `unsafe`, which foreign code such as JNI needs. Only the files listed in `OS_ACCESS_ALLOWED` in arch-check may: `FileStorage` (`storage/files.rs`), the JNI binding and the Android `SystemConfigAdapter` (`android/jni.rs`, `android/system.rs` in core data), and the app's Android entry points (`src/android.rs`). Comments and strings are ignored. The scan catches accidents, not determined workarounds. |
 | Fakes (SEC-06) | A crate's `fakes` feature may be turned on only in `[dev-dependencies]`, so fakes never reach the app. |
 
+It also checks the legal rules ([ADR 0037](docs/adr/0037-branding-assets-and-the-store-listing.md)):
+- The app's label and the store listing's title are "MeeGone Launcher" (LEGAL-01).
+- No text resource and no listing file names Nokia, Microsoft, MeeGo, Harmattan or the N9, except in the non-affiliation statement (LEGAL-01, LEGAL-05).
+- Every file under `android/app/src/*/res` and `assets`, apart from `values*` and `xml`, is listed with its source and licence in [ASSETS.md](ASSETS.md) (LEGAL-02).
+- Every licence text is shown in About (LEGAL-06).
+- The listing in `fastlane/metadata/android/` carries About's privacy notice and the LEGAL-05 statement word for word (PRIV-04).
+
+What a check can't decide, such as the image source's terms (LEGAL-04) and the store graphics, is in [RELEASING.md](RELEASING.md).
+
 ## How a feature works
 
 The example below follows a tap on the Mail icon (ARCH-05):
@@ -400,7 +409,7 @@ MeeGone keeps three persistent stores, each in its own file under one private fo
 
 ## Not built yet
 
-The skeleton is from issue #1; the Android host and the home-app role from #4; the carousel of home views from #5; Home, Back and coming back to the home from #6; the home menu from #7; edge to edge, screen sizes and navigation modes from #8; the Applications grid and the app catalogue from #9; one icon shape and each app's accent from #10; the layout kept in step with the installed apps from #11; the app long-press menu from #12; edit mode from #13; folders from #14; app search from #15; hiding apps from #16; backup and restore from #17; the Events header from #18; Events' notifications from #19; opening, clearing and dismissing them from #20; the image-of-the-day card from #21; Recent's cards from #22; Recent's density and its pinch from #23; Recent's close mode and Clear all from #24; Recent's time window from #25; the image feed, the network adapter and the region from #26; downloading, checking, cropping and caching the daily image from #27; the daily image check, its retries and back-off from #28; the daily image as the lock-screen wallpaper, "Update now", the pause and the reset from #29; the image details screen, opening links and the update status from #30; browsing the past week and pinning an image from #31; System, Light and Dark themes and the theme cross-fade from #32; the shared motion system and the system animation speed from #33; the Settings screen and Reset launcher from #34; first-run setup and the home-app banner from #35. The following arrive with later requirements:
+The skeleton is from issue #1; the Android host and the home-app role from #4; the carousel of home views from #5; Home, Back and coming back to the home from #6; the home menu from #7; edge to edge, screen sizes and navigation modes from #8; the Applications grid and the app catalogue from #9; one icon shape and each app's accent from #10; the layout kept in step with the installed apps from #11; the app long-press menu from #12; edit mode from #13; folders from #14; app search from #15; hiding apps from #16; backup and restore from #17; the Events header from #18; Events' notifications from #19; opening, clearing and dismissing them from #20; the image-of-the-day card from #21; Recent's cards from #22; Recent's density and its pinch from #23; Recent's close mode and Clear all from #24; Recent's time window from #25; the image feed, the network adapter and the region from #26; downloading, checking, cropping and caching the daily image from #27; the daily image check, its retries and back-off from #28; the daily image as the lock-screen wallpaper, "Update now", the pause and the reset from #29; the image details screen, opening links and the update status from #30; browsing the past week and pinning an image from #31; System, Light and Dark themes and the theme cross-fade from #32; the shared motion system and the system animation speed from #33; the Settings screen and Reset launcher from #34; first-run setup and the home-app banner from #35; the product's name, the asset inventory, the store listing and their checks from #36. The following arrive with later requirements:
 
 - **Android adapters.**
   - Built:
@@ -422,6 +431,7 @@ The skeleton is from issue #1; the Android host and the home-app role from #4; t
 - **Drawing.** The home views, their carousel, the view indicator, the return-home motion, the home menu, the Applications grid, its edit mode, its folders, search, Settings' Hidden apps, Recent's time window, the daily image's switch, "Update now", the pause, "Show card in Events", "Use mobile data", "Daily image unavailable", the status line and the reset, the pin and "Choose from the past week", the Events header and notifications, the image-of-the-day card, the image details screen, the past week's images, Recent's cards, their pinch and close mode, the theme cross-fade, the whole of Settings, first-run setup and the home-app banner are drawn (ADR 0006 to ADR 0008, ADR 0010, ADR 0014 to ADR 0017, ADR 0019 to ADR 0026, ADR 0029 to ADR 0033, ADR 0035, ADR 0036). Expanded groups' action buttons (EVT-14, Could) come with a later issue.
   - The pages, the carousel, the safe area, the menu, Settings, the Applications columns and Recent's columns adapt (HOME-12, APPS-02, REC-05).
   - Edit mode's "Sort A–Z" (APPS-14, Could) and folders' category names (FOLD-07, Could) come with later issues.
+- **The launcher icon.** There isn't one yet, so Android shows its default. An original icon, recorded in `ASSETS.md`, is needed before release (ADR 0037, `RELEASING.md`).
 
 ## Adding a crate
 
@@ -436,7 +446,7 @@ These are the commands CI runs (`.github/workflows/ci.yml`):
 
 ```sh
 cargo fmt --all --check
-cargo test -p arch-check                       # architecture rules
+cargo test -p arch-check                       # architecture and legal rules
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo coverage                                 # core-logic line coverage, fails below 80 %

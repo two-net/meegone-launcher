@@ -4,11 +4,17 @@
 //! - features depend only on core, and only the shell puts features together (ARCH-03);
 //! - only platform adapters reach the operating system (ARCH-04);
 //! - every third-party crate is listed with a reason in DEPENDENCIES.md (ARCH-08);
-//! - test fakes are enabled only in dev-dependencies (SEC-06).
+//! - test fakes are enabled only in dev-dependencies (SEC-06);
+//! - and, in [`legal`], the legal and branding rules of ADR 0037: the product's name, no
+//!   third-party names, every bundled asset in ASSETS.md, every licence in About, and the store
+//!   listing (LEGAL-01 to LEGAL-06, PRIV-04).
 //!
 //! The rules are pure functions over a [`Graph`] and over source text; [`load`] reads the graph
 //! with `cargo metadata`, and [`os_access_violations`] reads the app's sources.
-//! `tests/workspace.rs` runs them on this workspace, so CI fails on any violation.
+//! `tests/workspace.rs` and `tests/legal.rs` run them on this repository, so CI fails on any
+//! violation.
+
+pub mod legal;
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -245,11 +251,7 @@ pub fn os_access_violations(root: &Path) -> Result<Vec<Violation>, String> {
 
     let mut violations = Vec::new();
     for file in files {
-        let relative = file
-            .strip_prefix(root)
-            .unwrap_or(&file)
-            .to_string_lossy()
-            .replace('\\', "/");
+        let relative = relative(root, &file);
         if OS_ACCESS_ALLOWED.contains(&relative.as_str()) {
             continue;
         }
@@ -266,6 +268,17 @@ pub fn os_access_violations(root: &Path) -> Result<Vec<Violation>, String> {
 }
 
 fn rust_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
+    let mut all = Vec::new();
+    files_under(dir, &mut all)?;
+    files.extend(
+        all.into_iter()
+            .filter(|path| path.extension().is_some_and(|extension| extension == "rs")),
+    );
+    Ok(())
+}
+
+/// Adds every file in `dir` and its subdirectories to `files`. A missing `dir` adds nothing.
+fn files_under(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
     if !dir.is_dir() {
         return Ok(());
     }
@@ -276,12 +289,20 @@ fn rust_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
             .map_err(|error| format!("couldn't list {}: {error}", dir.display()))?
             .path();
         if path.is_dir() {
-            rust_files(&path, files)?;
-        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            files_under(&path, files)?;
+        } else {
             files.push(path);
         }
     }
     Ok(())
+}
+
+/// `file`'s path from `root`, with `/` between its parts on every platform.
+fn relative(root: &Path, file: &Path) -> String {
+    file.strip_prefix(root)
+        .unwrap_or(file)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 /// The paths in `source` that reach the operating system: any path into one of
@@ -462,11 +483,27 @@ fn raw_string_end(chars: &[char], start: usize) -> Option<usize> {
 
 /// The crate names in the first column of DEPENDENCIES.md's tables, written as `` `name` ``.
 pub fn listed_crates(markdown: &str) -> BTreeSet<String> {
+    code_rows(markdown)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// The rows of `markdown`'s tables whose first cell is code, written as `` `code` ``: that
+/// code, then the row's other cells, trimmed.
+fn code_rows(markdown: &str) -> Vec<(String, Vec<String>)> {
     markdown
         .lines()
-        .filter_map(|line| line.trim().strip_prefix('|')?.split('|').next())
-        .filter_map(|cell| cell.trim().strip_prefix('`')?.strip_suffix('`'))
-        .map(str::to_owned)
+        .filter_map(|line| {
+            let row = line.trim().strip_prefix('|')?;
+            let mut cells = row
+                .strip_suffix('|')
+                .unwrap_or(row)
+                .split('|')
+                .map(str::trim);
+            let code = cells.next()?.strip_prefix('`')?.strip_suffix('`')?;
+            Some((code.to_owned(), cells.map(str::to_owned).collect()))
+        })
         .collect()
 }
 
