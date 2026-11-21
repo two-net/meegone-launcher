@@ -224,6 +224,13 @@ pub const PAIRINGS: &[Pairing] = &[
         need: Need::Graphic,
     },
     Pairing {
+        what: "The focus ring around what a keyboard or a switch has focused (A11Y-06), against what is around it; a halo in the background colour lines it",
+        drawn_by: "FocusRing",
+        foreground: Ink::Accent,
+        on: BACKGROUNDS,
+        need: Need::Graphic,
+    },
+    Pairing {
         what: "The dot on a newly installed app (APPS-07)",
         drawn_by: "AppCell",
         foreground: Ink::Accent,

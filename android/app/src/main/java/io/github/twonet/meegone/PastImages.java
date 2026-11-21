@@ -12,7 +12,6 @@ import android.view.Gravity;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
-import android.widget.ScrollView;
 import android.widget.TextView;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -34,7 +33,7 @@ import java.util.Set;
  * (SEC-02). Each preview is a JPEG the Rust app checked, decoded on {@link ImageCard}'s thread no
  * larger than it shows, and kept by its image's id until the screen hides.
  */
-final class PastImages extends ScrollView {
+final class PastImages extends Scroll {
     // The fields of nativePastImages, mirrored in src/android.rs: two for the screen, "1" while
     // the week is being read and the last problem, then IMAGE_FIELDS for each image.
     private static final int HEADER_FIELDS = 2;

@@ -13,9 +13,10 @@ The store listing is in `fastlane/metadata/android/`, in the layout F-Droid read
   - every bundled licence text is shown in About (LEGAL-06);
   - About and the listing's full description carry the non-affiliation statement (LEGAL-05) and the privacy notice (PRIV-04) word for word;
   - the listing's fields fit the stores' length limits.
-- [ ] `cargo test -p arch-check` and `cargo test --workspace` also check the accessibility rules CI can (ADR 0038):
-  - every colour the host draws is one of the theme's tokens, and every pairing of them meets its contrast in both themes (A11Y-03);
-  - every text size is in sp (A11Y-04).
+- [ ] `cargo test -p arch-check` and `cargo test --workspace` also check the accessibility rules CI can (ADR 0038, ADR 0039):
+  - every colour the host draws is one of the theme's tokens, and every pairing of them meets its contrast in both themes, the focus ring's included (A11Y-03, A11Y-06);
+  - every text size is in sp (A11Y-04);
+  - AC-19's tasks can be done with no gesture, and with animations removed every flow is over as it happens (A11Y-05, AC-18).
 
 ## Open questions that block a release
 
@@ -39,5 +40,17 @@ The store listing is in `fastlane/metadata/android/`, in the layout F-Droid read
 - [ ] The launcher icon is MeeGone's own original icon, recorded in `ASSETS.md`, not Android's default.
 - [ ] Settings → About shows the version, the privacy notice, the non-affiliation statement and "Open-source licences", whose texts open in full (SET-05, LEGAL-05, LEGAL-06).
 - [ ] The image-of-the-day card, the image details screen, the past week and setup each show the image's attribution in full (LEGAL-03).
-- [ ] `tools/a11y-audit.sh` passes with the debug build of the release's commit, on a test device with a folder, notifications and a work profile, and again with `--first-run` for setup's screens. It checks every screen in both themes at font scale 1.0 and 2.0: names, 48 dp targets, contrast, and text cut off or overlapping (A11Y-01 to A11Y-04, ADR 0038).
+- [ ] `tools/a11y-audit.sh` passes with the debug build of the release's commit, on a test device with a folder, notifications and a work profile, and again with `--first-run` for setup's screens. It checks every screen in both themes at font scale 1.0, at 2.0, and with animations removed: names, 48 dp targets, contrast, text cut off or overlapping, what screen readers and Tab reach, and the focus ring (A11Y-01 to A11Y-07, ADR 0038, ADR 0039).
 - [ ] With TalkBack on, the home views, a folder, edit mode, Recent's close mode and Settings read as ADR 0038 says: apps by name with "work" for a work app, "Folder: ‹name›, N apps", "Uninstall ‹app›" and "Remove ‹app› from Recent", and "Applications, 2 of 3", "Edit mode" and "‹app› removed from Recent" as they happen (A11Y-01, A11Y-08).
+- [ ] AC-19's six tasks, done three ways with no gesture: switch views, launch an app, move an icon, make a folder, clear Recent and open Settings (A11Y-05, A11Y-06, ADR 0039).
+  - **With TalkBack:**
+    - Touching empty space reads the view, such as "Applications, 2 of 3".
+    - Its actions menu offers Next view, Previous view, Search apps and Bigger or More cards.
+    - A double-tap there opens the home menu, or Edit Recent on Recent.
+  - **With only a hardware keyboard:**
+    - Tab, the arrows and Enter reach everything, and ← or → past a view's edge goes to the next view.
+    - Menu or Shift+F10 opens a menu, and Esc is Back.
+    - In edit mode, Ctrl with the arrows moves an app, and the app's menu makes a folder.
+    - The ring shows wherever the focus is, and Meta+/ lists the keys.
+  - **With Switch Access** (Universal Switch on Samsung): every element and each view's element can be reached and acted on.
+- [ ] With Accessibility → Remove animations on, the same tasks and every screen are instant, or fades of 100 ms or less, and nothing is missing (AC-18, A11Y-07).

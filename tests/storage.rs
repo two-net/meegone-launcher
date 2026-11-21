@@ -124,6 +124,15 @@ fn failing_storage_never_stops_the_app() {
     let full = DataError::Failed("Not enough storage space".into());
     *fakes.storage.error.lock().unwrap() = Some(full);
     let mut launcher = Launcher::start(fakes.platform());
+    // Setup's end can't be saved, so it shows again; it still goes to the home.
+    for _ in 0..10 {
+        if !launcher.shell().setup_shown() {
+            break;
+        }
+        launcher.view().setup().continue_tapped();
+        launcher.frame();
+    }
+    assert!(!launcher.shell().setup_shown());
 
     launcher.view().apps().icon_tapped(app_id("mail"), None);
     launcher.frame();

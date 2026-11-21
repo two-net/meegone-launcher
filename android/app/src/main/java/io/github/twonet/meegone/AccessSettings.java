@@ -67,8 +67,9 @@ final class AccessSettings extends LinearLayout {
             row.setPadding(0, gap / 2, 0, gap / 2);
             LinearLayout text = new LinearLayout(context);
             text.setOrientation(VERTICAL);
-            // Read as one: "Notification access, Not allowed. Events can't list…" (A11Y-01).
-            text.setFocusable(true);
+            // Read as one: "Notification access, Not allowed. Events can't list…" (A11Y-01). Not
+            // a keyboard's stop, where it would do nothing (A11Y-06).
+            text.setScreenReaderFocusable(true);
             titles[item] = new TextView(context);
             titles[item].setText(TITLES[item]);
             titles[item].setTextSize(TypedValue.COMPLEX_UNIT_SP, SettingsRows.TEXT_SP);

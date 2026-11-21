@@ -799,6 +799,19 @@ impl HomeShell {
             }
             ShellIntent::ImageChecked => self.lockimage.dispatch(LockImageIntent::Checked),
             ShellIntent::Apps(AppsIntent::OpenSearch) => self.open_search(),
+            // A tap on a cell counts only where a finger could reach it: not under a menu or a
+            // screen, nor on a surface something covers, such as the grid under an open folder.
+            // A keyboard or switch can't reach those either (A11Y-06, ADR 0039).
+            ShellIntent::Apps(AppsIntent::Launch { app, from }) => {
+                if self.reachable(&CellKey::App(app.clone())) {
+                    self.apps.dispatch(AppsIntent::Launch { app, from });
+                }
+            }
+            ShellIntent::Apps(AppsIntent::OpenFolder(folder)) => {
+                if self.reachable(&CellKey::Folder(folder)) {
+                    self.apps.dispatch(AppsIntent::OpenFolder(folder));
+                }
+            }
             ShellIntent::Apps(intent) => self.apps.dispatch(intent),
             ShellIntent::Events(intent) => self.events.dispatch(intent),
             ShellIntent::Recent(intent) => self.recent.dispatch(intent),
@@ -1449,8 +1462,16 @@ impl HomeShell {
         self.search.finish();
     }
 
+    /// A screen reader's or a keyboard's "Next view" or "Previous view" (A11Y-05, A11Y-06). A
+    /// menu, a folder or search open on the view closes, as when the view changes any other
+    /// way. Not while setup, Settings, the image details or the past week covers the views,
+    /// where it would change a view no one can see.
     fn swipe(&mut self, direction: Direction) {
-        if self.setup_shown() {
+        if self.setup_shown()
+            || self.state.settings_open
+            || self.state.image_details_open
+            || self.state.past_images_open
+        {
             return;
         }
         let wrap = self.state.carousel.wrap;
@@ -1476,6 +1497,16 @@ impl HomeShell {
 
     /// Whether `surface` takes touches: the open folder's panel while it is open (FOLD-04);
     /// while search is open, its results, or the grid below an empty field; otherwise the grid.
+    /// Whether `key`'s cell is on a surface a tap reaches now, with nothing covering the views.
+    fn reachable(&self, key: &CellKey) -> bool {
+        !self.covered()
+            && [Surface::Grid, Surface::Folder, Surface::Search]
+                .into_iter()
+                .any(|surface| {
+                    self.touchable(surface) && self.apps.state().place_of(surface, key).is_some()
+                })
+    }
+
     fn touchable(&self, surface: Surface) -> bool {
         if self.folder_shown() {
             surface == Surface::Folder
@@ -4075,6 +4106,78 @@ mod tests {
     }
 
     #[test]
+    fn next_view_does_nothing_under_setup_settings_or_the_image_screens() {
+        // A11Y-05, A11Y-06, ADR 0039: it would change a view no one can see.
+        let mut shell = laid_out(&Fakes::after_setup());
+        shell.dispatch(ShellIntent::OpenSettings);
+        shell.dispatch(ShellIntent::Swipe(Direction::Next));
+        assert_eq!(shell.state().current, HomeView::Applications);
+        assert!(shell.state().settings_open);
+
+        shell.dispatch(ShellIntent::Back);
+        shell.dispatch(ShellIntent::Swipe(Direction::Next));
+        assert_eq!(shell.state().current, HomeView::Recent);
+
+        let mut shell = laid_out(&Fakes::default());
+        assert!(shell.setup_shown());
+        shell.dispatch(ShellIntent::Swipe(Direction::Next));
+        assert_eq!(shell.state().current, HomeView::Applications);
+    }
+
+    #[test]
+    fn a_cell_tapped_where_no_finger_could_reach_it_does_nothing() {
+        // A11Y-06, ADR 0039: under a menu or Settings, or the grid under an open folder, as a
+        // keyboard can't reach them either.
+        let fakes = Fakes::after_setup();
+        *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail")];
+        let mut shell = HomeShell::compose(fakes.platform());
+        let launch = |shell: &mut HomeShell| {
+            shell.dispatch(ShellIntent::Apps(AppsIntent::Launch {
+                app: app_id("mail"),
+                from: None,
+            }));
+        };
+
+        shell.dispatch(ShellIntent::OpenMenu);
+        launch(&mut shell);
+        shell.dispatch(ShellIntent::CloseMenu);
+        shell.dispatch(ShellIntent::OpenSettings);
+        launch(&mut shell);
+        assert!(fakes.apps.launched.lock().unwrap().is_empty());
+
+        shell.dispatch(ShellIntent::Back);
+        launch(&mut shell);
+        assert_eq!(*fakes.apps.launched.lock().unwrap(), [app_id("mail")]);
+
+        // An open folder takes taps, and the grid under it gets none.
+        let (fakes, mut shell) = with_a_folder();
+        *fakes.apps.apps.lock().unwrap() = vec![
+            app("maps", "Maps"),
+            app("mail", "Mail"),
+            app("phone", "Phone"),
+        ];
+        shell.dispatch(ShellIntent::AppsChanged);
+        shell.dispatch(ShellIntent::Apps(AppsIntent::OpenFolder(FolderId(1))));
+        assert!(shell.state().folder_open);
+        shell.dispatch(ShellIntent::Apps(AppsIntent::Launch {
+            app: app_id("phone"),
+            from: None,
+        }));
+        assert!(fakes.apps.launched.lock().unwrap().is_empty());
+        shell.dispatch(ShellIntent::Apps(AppsIntent::Launch {
+            app: app_id("maps"),
+            from: None,
+        }));
+        assert_eq!(*fakes.apps.launched.lock().unwrap(), [app_id("maps")]);
+
+        // A folder doesn't open under a menu.
+        shell.dispatch(ShellIntent::Back);
+        shell.dispatch(ShellIntent::OpenMenu);
+        shell.dispatch(ShellIntent::Apps(AppsIntent::OpenFolder(FolderId(1))));
+        assert!(!shell.state().folder_open);
+    }
+
+    #[test]
     fn the_menu_closes_when_the_view_changes() {
         let mut shell = laid_out(&Fakes::after_setup());
         shell.dispatch(ShellIntent::OpenMenu);
@@ -4587,10 +4690,10 @@ mod tests {
         shell.dispatch(ShellIntent::OpenCellMenu(CellKey::App(app_id("mail"))));
         assert!(shell.state().app_menu_open);
 
-        shell.dispatch(ShellIntent::Apps(AppsIntent::Launch {
-            app: app_id("mail"),
-            from: None,
-        }));
+        // Its Uninstall fails Applications part-way, with the menu still in its last state.
+        shell.dispatch(ShellIntent::Apps(AppsIntent::ChooseMenuItem(
+            AppMenuItem::Uninstall,
+        )));
 
         assert!(matches!(shell.apps().health(), Health::Failed(_)));
         assert!(!shell.state().app_menu_open);

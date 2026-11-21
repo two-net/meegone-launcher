@@ -17,8 +17,10 @@ import java.util.List;
 /**
  * Debug builds only: goes through every screen of MeeGone in the Light theme, then the Dark one,
  * and has {@link A11yAudit} check each as it is drawn (#37, ADR 0038). It gets there as a screen
- * reader would, through the home views' and the elements' own actions (A11Y-05), and waits for
- * everything to come to rest before each check.
+ * reader would, through each view's own element and the elements' own actions (A11Y-05,
+ * ADR 0039), and waits for everything to come to rest before each check. Last, in each theme,
+ * it leaves touch mode as a keyboard does and checks the focus ring on an app and in a menu
+ * (A11Y-06). The home stays out of touch mode until the next touch.
  *
  * <p>Every scrolling screen is checked a page at a time to its end. Each dialog is cancelled,
  * Reset launcher's included. The theme and Recent's density are put back as they were found, so
@@ -75,7 +77,8 @@ final class A11yTour {
 
     private void begin() {
         float scale = activity.getResources().getConfiguration().fontScale;
-        Log.i(A11yAudit.TAG, "START font scale " + scale + ", Android " + Build.VERSION.SDK_INT);
+        Log.i(A11yAudit.TAG, "START font scale " + scale + ", animations "
+                + (Scroll.animating() ? "on" : "removed") + ", Android " + Build.VERSION.SDK_INT);
         int themeFound = views.auditTheme();
         int rowsFound = views.auditRecentRows();
         if (views.auditSetupStep() >= 0) {
@@ -83,6 +86,9 @@ final class A11yTour {
         }
         for (int each : new int[] {LIGHT, DARK}) {
             queueTheme(each);
+        }
+        for (int each : new int[] {LIGHT, DARK}) {
+            queueKeyboard(each);
         }
         steps.add(act(() -> {
             if (themeFound >= 0) {
@@ -93,8 +99,8 @@ final class A11yTour {
         steps.add(next -> {
             if (views.auditRecentRows() != rowsFound) {
                 goTo(RECENT, () -> {
-                    views.performAccessibilityAction(rowsFound == 2
-                            ? R.id.action_bigger_cards : R.id.action_more_cards, null);
+                    viewAction(rowsFound == 2
+                            ? R.id.action_bigger_cards : R.id.action_more_cards);
                     settle(next);
                 });
             } else {
@@ -137,7 +143,7 @@ final class A11yTour {
         steps.add(next -> goTo(APPLICATIONS, next));
         steps.add(pages("Applications", MAX_GRID_PAGES));
         steps.add(next -> {
-            views.performAccessibilityAction(R.id.action_home_menu, null);
+            viewAction(AccessibilityNodeInfo.ACTION_CLICK);
             settle(() -> check("Home menu", () -> closeAll(next)));
         });
         steps.add(next -> {
@@ -151,7 +157,7 @@ final class A11yTour {
             settle(() -> check("App menu", () -> closeAll(next)));
         });
         steps.add(next -> {
-            views.performAccessibilityAction(R.id.action_home_menu, null);
+            viewAction(AccessibilityNodeInfo.ACTION_CLICK);
             settle(() -> {
                 click(R.string.menu_edit_applications);
                 settle(() -> check("Edit mode", () -> {
@@ -180,7 +186,7 @@ final class A11yTour {
             }));
         });
         steps.add(next -> {
-            views.performAccessibilityAction(R.id.action_search, null);
+            viewAction(R.id.action_search);
             settle(() -> {
                 type("a");
                 settle(() -> check("Search results", () -> {
@@ -195,20 +201,19 @@ final class A11yTour {
         steps.add(pages("Recent", MAX_PAGES));
         steps.add(next -> {
             boolean bigger = views.auditRecentRows() != 2;
-            if (!views.performAccessibilityAction(
-                    bigger ? R.id.action_bigger_cards : R.id.action_more_cards, null)) {
+            if (!viewAction(bigger ? R.id.action_bigger_cards : R.id.action_more_cards)) {
                 skip("Recent, other density", "not offered");
                 next.run();
                 return;
             }
             settle(() -> check(bigger ? "Recent, bigger cards" : "Recent, more cards", () -> {
-                views.performAccessibilityAction(
-                        bigger ? R.id.action_more_cards : R.id.action_bigger_cards, null);
+                viewAction(bigger ? R.id.action_more_cards : R.id.action_bigger_cards);
                 settle(next);
             }));
         });
         steps.add(next -> {
-            if (!views.performAccessibilityAction(R.id.action_edit_recent, null)) {
+            // Recent's element: its press is Edit Recent.
+            if (!viewAction(AccessibilityNodeInfo.ACTION_CLICK)) {
                 skip("Recent close mode", "not offered");
                 next.run();
                 return;
@@ -219,7 +224,7 @@ final class A11yTour {
         // Settings and its dialogs, never confirming Reset launcher.
         steps.add(next -> goTo(APPLICATIONS, next));
         steps.add(next -> {
-            views.performAccessibilityAction(R.id.action_home_menu, null);
+            viewAction(AccessibilityNodeInfo.ACTION_CLICK);
             settle(() -> {
                 click(R.string.menu_launcher_settings);
                 settle(next);
@@ -233,7 +238,7 @@ final class A11yTour {
 
         // The image details screen and the past week, once there is an image.
         steps.add(next -> {
-            views.performAccessibilityAction(R.id.action_home_menu, null);
+            viewAction(AccessibilityNodeInfo.ACTION_CLICK);
             settle(() -> {
                 click(R.string.menu_lock_screen_image);
                 settle(() -> {
@@ -257,6 +262,45 @@ final class A11yTour {
                 });
             });
         });
+    }
+
+    /**
+     * In theme {@code chosen}, a keyboard's focus on an app of the grid, or on Applications' own
+     * element, then in the home menu, where it goes to the first item; the ring is checked each
+     * time (A11Y-06, ADR 0039).
+     */
+    private void queueKeyboard(int chosen) {
+        String name = chosen == LIGHT ? "Light" : "Dark";
+        steps.add(act(() -> {
+            theme = name;
+            views.auditSetTheme(chosen);
+        }));
+        steps.add(this::closeAll);
+        steps.add(next -> goTo(APPLICATIONS, next));
+        steps.add(next -> {
+            AppCell app = cell(false);
+            View focused = app != null ? app : views.auditNode();
+            focused.requestFocusFromTouch();
+            settle(() -> ring("Focus ring", () -> {
+                viewAction(AccessibilityNodeInfo.ACTION_CLICK);
+                settle(() -> ring("Focus ring in the home menu", () -> closeAll(next)));
+            }));
+        });
+    }
+
+    /** Checks the focus ring where it is drawn. */
+    private void ring(String screen, Runnable next) {
+        screens++;
+        audit.checkRing(activity.getWindow(), activity.getWindow().getDecorView(),
+                views.auditRing(), screen, theme, next);
+    }
+
+    /**
+     * Does {@code action} on the shown view's own element, as a screen reader does from its
+     * actions menu. Returns whether it did anything.
+     */
+    private boolean viewAction(int action) {
+        return views.auditNode().performAccessibilityAction(action, null);
     }
 
     /**
@@ -351,7 +395,7 @@ final class A11yTour {
                     theme, next);
         } else {
             audit.check(activity.getWindow(), activity.getWindow().getDecorView(), false,
-                    screen, theme, next);
+                    views.auditFocusLayers(), screen, theme, next);
         }
     }
 
@@ -384,8 +428,7 @@ final class A11yTour {
             next.run();
             return;
         }
-        views.performAccessibilityAction(view > current
-                ? R.id.action_next_view : R.id.action_previous_view, null);
+        viewAction(view > current ? R.id.action_next_view : R.id.action_previous_view);
         settle(() -> goTo(view, next, tries + 1));
     }
 

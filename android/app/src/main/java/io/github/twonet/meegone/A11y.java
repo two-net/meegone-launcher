@@ -49,9 +49,11 @@ final class A11y {
     /**
      * {@code view} is clickable only so that touches on it stay there, and the home views don't
      * take its empty space for theirs (ADR 0008). Screen readers don't offer it as a button,
-     * which would say "double-tap to activate" over a whole screen (A11Y-01).
+     * which would say "double-tap to activate" over a whole screen (A11Y-01). Nor is it a
+     * keyboard's stop, where it would do nothing (A11Y-06).
      */
     static void notAButton(View view) {
+        view.setFocusable(false);
         view.setAccessibilityDelegate(new View.AccessibilityDelegate() {
             @Override
             public void onInitializeAccessibilityNodeInfo(View host,

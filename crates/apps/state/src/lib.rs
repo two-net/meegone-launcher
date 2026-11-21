@@ -114,6 +114,30 @@ pub enum AppMenuItem {
     Shortcut(Shortcut),
     /// Asks the user for a folder's new name (FOLD-03). A folder's menu only.
     RenameFolder,
+    /// In edit mode, moves the cell to the first place of the grid, or of its open folder, and
+    /// saves it, as dragging it there does (APPS-12, FOLD-05, A11Y-05). Offered only where it
+    /// moves something, as are the next three.
+    MoveToStart,
+    /// In edit mode, moves the cell one place earlier.
+    MoveEarlier,
+    /// In edit mode, moves the cell one place later.
+    MoveLater,
+    /// In edit mode, moves the cell to the last place.
+    MoveToEnd,
+    /// In edit mode, makes a folder of the app and `app`, the next cell in the grid, as
+    /// dropping it onto that app does (FOLD-01, A11Y-05). `name` and `work` name that app.
+    MakeFolderWith {
+        app: AppId,
+        name: String,
+        work: bool,
+    },
+    /// In edit mode, puts the app into `folder`, the next cell in the grid, as dropping it onto
+    /// that folder does (FOLD-05, A11Y-05). `name` is the folder's, `""` until the user names
+    /// it.
+    MoveInto { folder: FolderId, name: String },
+    /// In edit mode, takes an app in the open folder out of it, just after it in the grid, as
+    /// dragging it out does (FOLD-05, A11Y-05).
+    MoveOutOfFolder,
 }
 
 /// A cell's long-press menu: an app's (APPS-11) or a folder's (ADR 0015). It covers the home
@@ -123,7 +147,9 @@ pub struct AppMenu {
     /// The app or folder it is for. The host opens it at that cell.
     pub item: CellKey,
     /// What it offers, in order. An app's: App info, Uninstall, Hide, Edit applications, then
-    /// the shortcuts. A folder's: Rename folder, then Edit applications.
+    /// the shortcuts. A folder's: Rename folder, then Edit applications. In edit mode, the
+    /// moves take Edit applications' place, so a cell can be arranged without a drag
+    /// (A11Y-05, ADR 0039).
     pub items: Vec<AppMenuItem>,
 }
 
@@ -1071,7 +1097,7 @@ impl AppsHolder {
     /// (APPS-19), Edit applications unless edit mode is on, then the app's first shortcuts. The
     /// system offers shortcuts only while MeeGone is the default home app; otherwise, or if it
     /// can't say, the menu has none. A folder's menu offers Rename folder, then Edit
-    /// applications.
+    /// applications. In edit mode, the moves take Edit applications' place ([`Self::moves`]).
     fn open_menu(&mut self, key: CellKey) {
         let mut items = Vec::new();
         match &key {
@@ -1088,7 +1114,9 @@ impl AppsHolder {
             CellKey::Folder(_) if self.has(&key) => items.push(AppMenuItem::RenameFolder),
             CellKey::Folder(_) => return,
         }
-        if !self.state.edit_mode {
+        if self.state.edit_mode {
+            items.extend(self.moves(&key));
+        } else {
             items.push(AppMenuItem::EditApplications);
         }
         if let CellKey::App(id) = &key {
@@ -1126,9 +1154,113 @@ impl AppsHolder {
                 self.state.renaming = Some(*folder);
                 Ok(())
             }
+            (
+                moved @ (AppMenuItem::MoveToStart
+                | AppMenuItem::MoveEarlier
+                | AppMenuItem::MoveLater
+                | AppMenuItem::MoveToEnd),
+                key,
+            ) => {
+                self.move_from_menu(key, &moved);
+                Ok(())
+            }
+            (AppMenuItem::MakeFolderWith { app: with, .. }, CellKey::App(app)) => {
+                let with = CellKey::App(with);
+                if self.edit(|layout, _| folders::combine(layout, app, &with)) {
+                    self.commit();
+                }
+                Ok(())
+            }
+            (AppMenuItem::MoveInto { folder, .. }, CellKey::App(app)) => {
+                let with = CellKey::Folder(folder);
+                if self.edit(|layout, _| folders::combine(layout, app, &with)) {
+                    self.commit();
+                }
+                Ok(())
+            }
+            (AppMenuItem::MoveOutOfFolder, CellKey::App(app)) => {
+                if self.edit(|layout, shown| folders::move_out(layout, shown, app)) {
+                    self.commit();
+                }
+                Ok(())
+            }
             _ => Ok(()),
         };
         self.state.problem = done.err().map(|error| error.to_string());
+    }
+
+    /// Where `key`'s cell is for its menu: in the open folder, or else in the grid, with its
+    /// place there and how many cells that surface shows.
+    fn menu_place(&self, key: &CellKey) -> Option<(Surface, usize, usize)> {
+        [Surface::Folder, Surface::Grid]
+            .into_iter()
+            .find_map(|surface| {
+                let place = self.state.place_of(surface, key)?;
+                Some((surface, place, self.state.cells(surface).len()))
+            })
+    }
+
+    /// The moves `key`'s menu offers in edit mode, in order (A11Y-05, ADR 0039): to the start
+    /// and one place earlier unless it is first, one place later and to the end unless it is
+    /// last; for an app in the grid, into a folder with the next cell; for an app in the open
+    /// folder, out of it. The same as a screen reader's actions on the cell.
+    fn moves(&self, key: &CellKey) -> Vec<AppMenuItem> {
+        let mut items = Vec::new();
+        let Some((surface, place, count)) = self.menu_place(key) else {
+            return items;
+        };
+        if place > 0 {
+            items.extend([AppMenuItem::MoveToStart, AppMenuItem::MoveEarlier]);
+        }
+        if place + 1 < count {
+            items.extend([AppMenuItem::MoveLater, AppMenuItem::MoveToEnd]);
+        }
+        let CellKey::App(_) = key else {
+            return items;
+        };
+        match surface {
+            Surface::Grid => match self.state.items.get(place + 1) {
+                Some(GridItem::App { app, .. }) => items.push(AppMenuItem::MakeFolderWith {
+                    app: app.id.clone(),
+                    name: app.label.clone(),
+                    work: app.work,
+                }),
+                Some(GridItem::Folder { id, name, .. }) => items.push(AppMenuItem::MoveInto {
+                    folder: *id,
+                    name: name.clone(),
+                }),
+                None => {}
+            },
+            Surface::Folder => items.push(AppMenuItem::MoveOutOfFolder),
+            Surface::Search => {}
+        }
+        items
+    }
+
+    /// Moves `key`'s cell where `item` says, in the grid or the open folder, and saves it.
+    fn move_from_menu(&mut self, key: &CellKey, item: &AppMenuItem) {
+        let Some((surface, place, count)) = self.menu_place(key) else {
+            return;
+        };
+        let to = match item {
+            AppMenuItem::MoveToStart => 0,
+            AppMenuItem::MoveEarlier => place.saturating_sub(1),
+            AppMenuItem::MoveLater => place + 1,
+            AppMenuItem::MoveToEnd => count.saturating_sub(1),
+            _ => return,
+        };
+        let moved = match (surface, key) {
+            (Surface::Folder, CellKey::App(app)) => {
+                self.edit(|layout, shown| folders::arrange_in_folder(layout, shown, app, to))
+            }
+            (Surface::Grid, _) => {
+                self.edit(|layout, shown| folders::arrange(layout, shown, key, to))
+            }
+            _ => false,
+        };
+        if moved {
+            self.commit();
+        }
     }
 
     /// Leaves edit mode, undoing a drag's draft that wasn't dropped. Returns whether it was on.
@@ -3206,6 +3338,183 @@ mod tests {
         holder.handle(AppsIntent::MoveOutOfFolder(app_id("maps")));
         assert_eq!(labels(holder.state()), ["Camera", "Mail", "Maps", "Phone"]);
         assert_eq!(saved_order(&layout), ["camera", "mail", "maps", "phone"]);
+    }
+
+    /// The items of `key`'s menu after its own: in edit mode, its moves (ADR 0039).
+    fn moves_of(holder: &mut AppsHolder, key: CellKey) -> Vec<AppMenuItem> {
+        holder.handle(AppsIntent::OpenMenu(key));
+        let items = menu(holder).expect("a menu");
+        holder.handle(AppsIntent::CloseMenu);
+        items
+            .into_iter()
+            .filter(|item| {
+                !matches!(
+                    item,
+                    AppMenuItem::AppInfo | AppMenuItem::Uninstall | AppMenuItem::Hide
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn in_edit_mode_a_cells_menu_offers_the_moves_a_drag_makes() {
+        // A11Y-05, ADR 0039: the moves take Edit applications' place, each only where it moves
+        // something, and an app can go into a folder with the next cell.
+        let fakes = Fakes::default();
+        let (_, _, mut holder) = folder_of_two(&fakes);
+        let folder = folder_id(holder.state());
+        // Camera, the folder of Mail and Maps, Phone.
+        assert_eq!(
+            moves_of(&mut holder, CellKey::App(app_id("camera"))),
+            [
+                AppMenuItem::MoveLater,
+                AppMenuItem::MoveToEnd,
+                AppMenuItem::MoveInto {
+                    folder,
+                    name: String::new()
+                },
+            ]
+        );
+        assert_eq!(
+            moves_of(&mut holder, CellKey::Folder(folder)),
+            [
+                AppMenuItem::RenameFolder,
+                AppMenuItem::MoveToStart,
+                AppMenuItem::MoveEarlier,
+                AppMenuItem::MoveLater,
+                AppMenuItem::MoveToEnd,
+            ]
+        );
+        assert_eq!(
+            moves_of(&mut holder, CellKey::App(app_id("phone"))),
+            [AppMenuItem::MoveToStart, AppMenuItem::MoveEarlier]
+        );
+
+        // In the open folder, an app moves among its apps, and out.
+        holder.handle(AppsIntent::OpenFolder(folder));
+        assert_eq!(
+            moves_of(&mut holder, CellKey::App(app_id("mail"))),
+            [
+                AppMenuItem::MoveLater,
+                AppMenuItem::MoveToEnd,
+                AppMenuItem::MoveOutOfFolder,
+            ]
+        );
+
+        // Next to another app, it makes a folder with it.
+        let (_, _, mut holder) = editing(&Fakes::default());
+        assert_eq!(
+            moves_of(&mut holder, CellKey::App(app_id("mail"))),
+            [
+                AppMenuItem::MoveToStart,
+                AppMenuItem::MoveEarlier,
+                AppMenuItem::MoveLater,
+                AppMenuItem::MoveToEnd,
+                AppMenuItem::MakeFolderWith {
+                    app: app_id("maps"),
+                    name: "Maps".into(),
+                    work: false,
+                },
+            ]
+        );
+
+        // Outside edit mode, the menu offers Edit applications instead.
+        holder.handle(AppsIntent::ExitEditMode);
+        assert_eq!(
+            moves_of(&mut holder, CellKey::App(app_id("mail"))),
+            [AppMenuItem::EditApplications]
+        );
+    }
+
+    #[test]
+    fn a_move_chosen_from_the_menu_arranges_the_grid_and_saves_it() {
+        // APPS-12, APPS-18, A11Y-05: as a drag and a drop would, at once.
+        let fakes = Fakes::default();
+        let (storage, layout, mut holder) = editing(&fakes);
+        let choose = |holder: &mut AppsHolder, app: &str, item: AppMenuItem| {
+            holder.handle(AppsIntent::OpenMenu(CellKey::App(app_id(app))));
+            holder.handle(AppsIntent::ChooseMenuItem(item));
+        };
+
+        choose(&mut holder, "camera", AppMenuItem::MoveToEnd);
+        assert_eq!(holder.state().menu, None);
+        assert_eq!(labels(holder.state()), ["Mail", "Maps", "Phone", "Camera"]);
+        assert_eq!(saved_order(&layout), ["mail", "maps", "phone", "camera"]);
+        assert_eq!(storage.writes.lock().unwrap().len(), 1);
+        choose(&mut holder, "camera", AppMenuItem::MoveEarlier);
+        assert_eq!(labels(holder.state()), ["Mail", "Maps", "Camera", "Phone"]);
+        choose(&mut holder, "camera", AppMenuItem::MoveToStart);
+        assert_eq!(labels(holder.state()), ["Camera", "Mail", "Maps", "Phone"]);
+        choose(&mut holder, "camera", AppMenuItem::MoveLater);
+        assert_eq!(labels(holder.state()), ["Mail", "Camera", "Maps", "Phone"]);
+        assert_eq!(saved_order(&layout), ["mail", "camera", "maps", "phone"]);
+
+        // A move the menu doesn't offer, such as the first cell's earlier, does nothing, and
+        // the menu stays open.
+        storage.writes.lock().unwrap().clear();
+        choose(&mut holder, "mail", AppMenuItem::MoveEarlier);
+        assert!(holder.state().menu.is_some());
+        assert_eq!(labels(holder.state()), ["Mail", "Camera", "Maps", "Phone"]);
+        assert!(storage.writes.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn folders_are_made_joined_and_left_from_the_menu() {
+        // FOLD-01, FOLD-05, FOLD-06, A11Y-05: each saved, as a drop is.
+        let fakes = Fakes::default();
+        let (_, layout, mut holder) = editing(&fakes);
+        let choose = |holder: &mut AppsHolder, key: CellKey, item: AppMenuItem| {
+            holder.handle(AppsIntent::OpenMenu(key));
+            holder.handle(AppsIntent::ChooseMenuItem(item));
+        };
+
+        choose(
+            &mut holder,
+            CellKey::App(app_id("mail")),
+            AppMenuItem::MakeFolderWith {
+                app: app_id("maps"),
+                name: "Maps".into(),
+                work: false,
+            },
+        );
+        assert_eq!(labels(holder.state()), ["Camera", "[]", "Phone"]);
+        assert_eq!(saved_order(&layout), ["camera", "[]", "phone"]);
+        assert_eq!(holder.state().folders_made, 1);
+        let folder = folder_id(holder.state());
+
+        choose(
+            &mut holder,
+            CellKey::App(app_id("camera")),
+            AppMenuItem::MoveInto {
+                folder,
+                name: String::new(),
+            },
+        );
+        assert_eq!(labels(holder.state()), ["[]", "Phone"]);
+        assert_eq!(saved_order(&layout), ["[]", "phone"]);
+        assert_eq!(holder.state().folders_made, 1);
+
+        // In the open folder: Maps, Mail, Camera.
+        holder.handle(AppsIntent::OpenFolder(folder));
+        choose(
+            &mut holder,
+            CellKey::App(app_id("camera")),
+            AppMenuItem::MoveToStart,
+        );
+        let shown: Vec<&str> = holder
+            .state()
+            .folder_items
+            .iter()
+            .map(GridItem::label)
+            .collect();
+        assert_eq!(shown, ["Camera", "Maps", "Mail"]);
+        choose(
+            &mut holder,
+            CellKey::App(app_id("camera")),
+            AppMenuItem::MoveOutOfFolder,
+        );
+        assert_eq!(labels(holder.state()), ["[]", "Camera", "Phone"]);
+        assert_eq!(saved_order(&layout), ["[]", "camera", "phone"]);
     }
 
     #[test]

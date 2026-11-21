@@ -695,19 +695,34 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeAppM
 }
 
 /// The fields of one item of a cell's menu in `nativeAppMenu`, mirrored in `HomeViews.java`:
-/// its kind, 0 App info, 1 Uninstall, 2 Edit applications, 3 a shortcut, 4 Rename folder or
-/// 5 Hide (APPS-19), then the shortcut's label, or nothing for the others, whose text is in
-/// Android's string resources (L10N-01).
-fn menu_item_fields(item: &AppMenuItem) -> [String; 2] {
-    let (kind, label) = match item {
-        AppMenuItem::AppInfo => (0, ""),
-        AppMenuItem::Uninstall => (1, ""),
-        AppMenuItem::EditApplications => (2, ""),
-        AppMenuItem::Shortcut(shortcut) => (3, shortcut.label.as_str()),
-        AppMenuItem::RenameFolder => (4, ""),
-        AppMenuItem::Hide => (5, ""),
+/// - its kind: 0 App info, 1 Uninstall, 2 Edit applications, 3 a shortcut, 4 Rename folder,
+///   5 Hide (APPS-19), and in edit mode 6 Move to start, 7 Move earlier, 8 Move later, 9 Move
+///   to end, 10 Make folder with an app, 11 Move into a folder and 12 Move out of folder
+///   (A11Y-05, ADR 0039);
+/// - a name: the shortcut's label, the app's or the folder's to group with, or nothing for the
+///   others, whose text is in Android's string resources (L10N-01);
+/// - `1` when that app is a work app, so its name says so (A11Y-01), or `0`.
+fn menu_item_fields(item: &AppMenuItem) -> [String; 3] {
+    let (kind, label, work) = match item {
+        AppMenuItem::AppInfo => (0, "", false),
+        AppMenuItem::Uninstall => (1, "", false),
+        AppMenuItem::EditApplications => (2, "", false),
+        AppMenuItem::Shortcut(shortcut) => (3, shortcut.label.as_str(), false),
+        AppMenuItem::RenameFolder => (4, "", false),
+        AppMenuItem::Hide => (5, "", false),
+        AppMenuItem::MoveToStart => (6, "", false),
+        AppMenuItem::MoveEarlier => (7, "", false),
+        AppMenuItem::MoveLater => (8, "", false),
+        AppMenuItem::MoveToEnd => (9, "", false),
+        AppMenuItem::MakeFolderWith { name, work, .. } => (10, name.as_str(), *work),
+        AppMenuItem::MoveInto { name, .. } => (11, name.as_str(), false),
+        AppMenuItem::MoveOutOfFolder => (12, "", false),
     };
-    [kind.to_string(), label.to_owned()]
+    [
+        kind.to_string(),
+        label.to_owned(),
+        u8::from(work).to_string(),
+    ]
 }
 
 /// `String nativeAppMenuChosen(int revision, int item)`: item `item` of the app menu at

@@ -10,7 +10,6 @@ import android.util.TypedValue;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
-import android.widget.ScrollView;
 import android.widget.Switch;
 import android.widget.TextView;
 
@@ -34,7 +33,7 @@ import android.widget.TextView;
  * with its own title, so screen readers announce it. It scrolls, so nothing overlaps at large
  * text sizes (A11Y-04). Every text the feed sent is set as plain text (SEC-02).
  */
-final class SetupScreens extends ScrollView {
+final class SetupScreens extends Scroll {
     // The screens, as setup_step_code in src/android.rs numbers them; -1 while none shows.
     static final int WELCOME = 0;
     static final int DEFAULT_HOME = 1;

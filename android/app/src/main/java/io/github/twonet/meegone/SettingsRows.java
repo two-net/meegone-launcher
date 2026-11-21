@@ -143,7 +143,9 @@ final class SettingsRows {
         if (tapped != null) {
             row.setOnClickListener(view -> tapped.run());
         } else {
-            row.setFocusable(true);
+            // Read as one by screen readers, but no stop for a keyboard, where it does nothing
+            // (A11Y-06).
+            row.setScreenReaderFocusable(true);
         }
         group.addView(row, fill());
         return row;
@@ -157,10 +159,15 @@ final class SettingsRows {
     /**
      * The colour of every press: the theme's foreground at 12 %, {@code PRESSED_PERCENT} in the
      * Rust app's tokens. It shows only under the finger, so it isn't held to a contrast ratio
-     * (A11Y-03, ADR 0038).
+     * (A11Y-03, ADR 0038). Focus alone draws no wash, which would stay under a keyboard's focus
+     * for as long as it rests there: the focus ring shows it instead (A11Y-06, ADR 0039).
      */
     static ColorStateList pressed(int foreground) {
-        return ColorStateList.valueOf((foreground & 0x00FFFFFF) | 0x1F000000);
+        int press = (foreground & 0x00FFFFFF) | 0x1F000000;
+        int[][] states = {
+            {android.R.attr.state_pressed}, {android.R.attr.state_focused}, {},
+        };
+        return new ColorStateList(states, new int[] {press, foreground & 0x00FFFFFF, press});
     }
 
     /** A switch row in the theme's colours (THEME-03). */

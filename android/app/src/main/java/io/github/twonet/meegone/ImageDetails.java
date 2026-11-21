@@ -10,7 +10,6 @@ import android.view.Gravity;
 import android.widget.FrameLayout;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
-import android.widget.ScrollView;
 import android.widget.TextView;
 import java.io.File;
 import java.util.Locale;
@@ -26,7 +25,7 @@ import java.util.Locale;
  * changes. Every text is set as plain text: never as HTML, and with no links made clickable
  * (SEC-02). More info shows only while the image has a link and a browser can open it.
  */
-final class ImageDetails extends ScrollView {
+final class ImageDetails extends Scroll {
     // The fields of nativeImageDetails, mirrored in src/android.rs: the title, the attribution,
     // the date, the region's tag, the image's file relative to the app's files folder, the
     // image's key, "1" while More info is offered, and "1" while the image is pinned.

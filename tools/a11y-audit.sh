@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
-# Runs the debug build's accessibility tour (ADR 0038) on the device adb is connected to: every
-# screen, in the Light and the Dark theme, at the normal font size and at 200 %. Prints what
-# fails and exits non-zero if anything does. See RELEASING.md.
+# Runs the debug build's accessibility tour (ADR 0038, ADR 0039) on the device adb is connected
+# to: every screen, in the Light and the Dark theme, at the normal font size, at 200 %, and with
+# animations removed, as Accessibility's "Remove animations" does, so every screen must still be
+# reached and pass (AC-18). Prints what fails and exits non-zero if anything does. See
+# RELEASING.md.
 #
 #   tools/a11y-audit.sh               the screens of an installed, set-up MeeGone
 #   tools/a11y-audit.sh --first-run   clears MeeGone's data first, so setup's screens are
@@ -9,13 +11,16 @@
 #                                     and settings
 #
 # Install the debug build first: (cd android && ./gradlew installDebug). The script puts the
-# device's font size back as it found it; the tour puts back the theme and Recent's density.
+# device's font size and animation scales back as it found them; the tour puts back the theme
+# and Recent's density. It ends out of touch mode, as a keyboard leaves it, until the next touch.
 set -euo pipefail
 
 PACKAGE=io.github.twonet.meegone
 EXTRA=io.github.twonet.meegone.debug.A11Y_AUDIT
 TAG=MeeGoneA11y
-SCALES=(1.0 2.0)
+# Each pass: a font scale, and whether animations are removed.
+PASSES=("1.0 on" "2.0 on" "1.0 off")
+ANIMATIONS=(animator_duration_scale transition_animation_scale window_animation_scale)
 # The longest one tour may take, in seconds.
 PATIENCE=900
 
@@ -45,19 +50,39 @@ if $first_run; then
   adb shell pm clear "$PACKAGE" >/dev/null
 fi
 
-found=$(adb shell settings get system font_scale | tr -d '\r')
-restore() {
-  if [[ "$found" == "null" || -z "$found" ]]; then
-    adb shell settings delete system font_scale >/dev/null
+# Puts back setting $2 in namespace $1 as $3 says: deleted if it had no value.
+put_back() {
+  if [[ "$3" == "null" || -z "$3" ]]; then
+    adb shell settings delete "$1" "$2" >/dev/null
   else
-    adb shell settings put system font_scale "$found"
+    adb shell settings put "$1" "$2" "$3"
   fi
+}
+found=$(adb shell settings get system font_scale | tr -d '\r')
+declare -a animations_found
+for i in "${!ANIMATIONS[@]}"; do
+  animations_found[$i]=$(adb shell settings get global "${ANIMATIONS[$i]}" | tr -d '\r')
+done
+restore() {
+  put_back system font_scale "$found"
+  for i in "${!ANIMATIONS[@]}"; do
+    put_back global "${ANIMATIONS[$i]}" "${animations_found[$i]}"
+  done
 }
 trap restore EXIT
 
 failures=0
-for scale in "${SCALES[@]}"; do
-  echo "== Font scale $scale"
+for pass in "${PASSES[@]}"; do
+  read -r scale animations <<<"$pass"
+  if [[ "$animations" == off ]]; then
+    echo "== Font scale $scale, animations removed"
+    for setting in "${ANIMATIONS[@]}"; do
+      adb shell settings put global "$setting" 0
+    done
+  else
+    echo "== Font scale $scale"
+    restore
+  fi
   adb shell settings put system font_scale "$scale"
   # The activity is made again for the new size.
   sleep 3

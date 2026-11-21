@@ -8,8 +8,14 @@ import android.graphics.Point;
 import android.graphics.Rect;
 import android.os.Build;
 import android.os.Bundle;
+import android.view.KeyEvent;
+import android.view.KeyboardShortcutGroup;
+import android.view.KeyboardShortcutInfo;
+import android.view.Menu;
 import android.view.View;
 import android.window.OnBackInvokedDispatcher;
+import java.util.Arrays;
+import java.util.List;
 
 /**
  * MeeGone's one activity: the home screen (HOME-01), which also opens from the app drawer as a
@@ -89,6 +95,7 @@ public final class HomeActivity extends Activity {
         drawEdgeToEdge();
         followScreenSize();
         views = new HomeViews(this);
+        views.setBack(this::back);
         setContentView(views);
         listenForBack();
         if (opensSettings(getIntent())) {
@@ -194,6 +201,57 @@ public final class HomeActivity extends Activity {
     private void back() {
         nativeBack();
         views.refresh();
+    }
+
+    /**
+     * Esc is Back, as on a desktop: it closes the topmost open element (HOME-08, A11Y-06). The
+     * home views take it while they have the focus; this, while nothing does. Android's own
+     * fallback from Esc to Back isn't on every keyboard.
+     */
+    @Override
+    public boolean onKeyDown(int keyCode, KeyEvent event) {
+        if (keyCode == KeyEvent.KEYCODE_ESCAPE && event.hasNoModifiers()) {
+            if (event.getRepeatCount() == 0) {
+                back();
+            }
+            return true;
+        }
+        return super.onKeyDown(keyCode, event);
+    }
+
+    /**
+     * The home views' keys, beyond Tab, the arrows, Enter and Esc for Back, in Android's list of
+     * keyboard shortcuts, Meta+/ (A11Y-06, ADR 0039). The arrows that go to the next view are
+     * mirrored right to left, as the views are.
+     */
+    @Override
+    public void onProvideKeyboardShortcuts(List<KeyboardShortcutGroup> data, Menu menu,
+            int deviceId) {
+        super.onProvideKeyboardShortcuts(data, menu, deviceId);
+        boolean rtl = getResources().getConfiguration().getLayoutDirection()
+                == View.LAYOUT_DIRECTION_RTL;
+        int forward = rtl ? KeyEvent.KEYCODE_DPAD_LEFT : KeyEvent.KEYCODE_DPAD_RIGHT;
+        int back = rtl ? KeyEvent.KEYCODE_DPAD_RIGHT : KeyEvent.KEYCODE_DPAD_LEFT;
+        int ctrl = KeyEvent.META_CTRL_ON;
+        data.add(new KeyboardShortcutGroup(getString(R.string.shortcuts_home), Arrays.asList(
+                shortcut(R.string.shortcut_menu, KeyEvent.KEYCODE_MENU, 0),
+                shortcut(R.string.shortcut_menu, KeyEvent.KEYCODE_F10, KeyEvent.META_SHIFT_ON),
+                shortcut(R.string.shortcut_next_view, forward, 0),
+                shortcut(R.string.shortcut_previous_view, back, 0),
+                shortcut(R.string.shortcut_search, KeyEvent.KEYCODE_F, ctrl),
+                shortcut(R.string.shortcut_bigger_cards, KeyEvent.KEYCODE_EQUALS, ctrl),
+                shortcut(R.string.shortcut_more_cards, KeyEvent.KEYCODE_MINUS, ctrl),
+                shortcut(R.string.shortcut_remove, KeyEvent.KEYCODE_DEL, 0),
+                shortcut(R.string.shortcut_move_earlier, back, ctrl),
+                shortcut(R.string.shortcut_move_later, forward, ctrl),
+                shortcut(R.string.shortcut_move_up, KeyEvent.KEYCODE_DPAD_UP, ctrl),
+                shortcut(R.string.shortcut_move_down, KeyEvent.KEYCODE_DPAD_DOWN, ctrl),
+                shortcut(R.string.shortcut_move_first, KeyEvent.KEYCODE_MOVE_HOME, ctrl),
+                shortcut(R.string.shortcut_move_last, KeyEvent.KEYCODE_MOVE_END, ctrl))));
+    }
+
+    private KeyboardShortcutInfo shortcut(int label, int key, int modifiers) {
+        return new KeyboardShortcutInfo(getString(label), key, modifiers);
     }
 
     /**

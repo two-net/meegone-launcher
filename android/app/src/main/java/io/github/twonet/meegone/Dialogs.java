@@ -38,8 +38,20 @@ final class Dialogs {
     }
 
     /**
+     * Shows {@code dialog}. With animations removed it appears and goes at once, as the rest of
+     * MeeGone does, even where the system's window animations are still on (A11Y-07, ADR 0039).
+     */
+    static void show(AlertDialog dialog) {
+        Window window = dialog.getWindow();
+        if (window != null && !Scroll.animating()) {
+            window.setWindowAnimations(0);
+        }
+        dialog.show();
+    }
+
+    /**
      * Draws {@code dialog}, already shown, in the theme's colours, with the scrim behind it at
-     * {@code scrim}, 0 to 255.
+     * {@code scrim}, 0 to 255, and the focus ring in the accent (A11Y-06).
      */
     static void colour(AlertDialog dialog, int surface, int foreground, int dim, int accent,
             int scrim) {
@@ -53,6 +65,10 @@ final class Dialogs {
         card.setCornerRadius(CORNER_DP * density);
         window.setBackgroundDrawable(new InsetDrawable(card, Math.round(INSET_DP * density)));
         window.setDimAmount(scrim / 255f);
+        View decor = window.getDecorView();
+        if (decor instanceof ViewGroup) {
+            FocusRing.attach((ViewGroup) decor).colour(accent, surface);
+        }
         int titleId = dialog.getContext().getResources()
                 .getIdentifier("alertTitle", "id", "android");
         if (titleId != 0) {

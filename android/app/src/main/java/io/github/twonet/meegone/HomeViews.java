@@ -17,7 +17,10 @@ import android.text.TextUtils;
 import android.util.TypedValue;
 import android.view.Choreographer;
 import android.view.DisplayCutout;
+import android.view.FocusFinder;
 import android.view.Gravity;
+import android.view.KeyCharacterMap;
+import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.RoundedCorner;
 import android.view.View;
@@ -288,16 +291,26 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     /** The app menu's slot while it is closed. */
     private static final int APP_MENU_CLOSED = -2;
     // The fields of one item in nativeAppMenu, mirrored in menu_item_fields in src/android.rs:
-    // its kind, then a shortcut's label.
-    private static final int APP_MENU_FIELDS = 2;
+    // its kind, then a name, then whether that is a work app's.
+    private static final int APP_MENU_FIELDS = 3;
     private static final int APP_MENU_SHORTCUT = 3;
+    // Edit mode's moves (ADR 0039): to the start, earlier, later and to the end, then into a
+    // folder with the next app, into the next folder, and out of the open folder.
+    private static final int APP_MENU_MOVE_FIRST = 6;
+    private static final int APP_MENU_MOVE_LAST = 9;
+    private static final int APP_MENU_MAKE_FOLDER = 10;
+    private static final int APP_MENU_MOVE_INTO = 11;
+    private static final int APP_MENU_MOVE_OUT = 12;
     /**
      * The text of each kind of item of a cell's menu: App info, Uninstall, Edit applications, a
-     * shortcut's own, Rename folder and Hide.
+     * shortcut's own, Rename folder, Hide, then edit mode's moves, the same as screen readers'
+     * actions. The two that name the next cell are made from its name.
      */
     private static final int[] APP_MENU_ITEMS = {
         R.string.menu_app_info, R.string.menu_uninstall, R.string.menu_edit_applications, 0,
-        R.string.menu_rename_folder, R.string.menu_hide
+        R.string.menu_rename_folder, R.string.menu_hide, R.string.action_move_first,
+        R.string.action_move_earlier, R.string.action_move_later, R.string.action_move_last,
+        R.string.action_make_folder, R.string.action_move_into, R.string.action_move_out
     };
     /**
      * The text of each item of a notification's menu, by its code in notification_menu_bit in
@@ -310,6 +323,10 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
 
     private final int[] frame = new int[FRAME_SIZE];
     private final FrameLayout[] pages = new FrameLayout[VIEWS];
+    /** Each view's own element, first in its page (A11Y-05, A11Y-06, ADR 0039). */
+    private final ViewNode[] nodes = new ViewNode[VIEWS];
+    /** The focus indicator over everything here (A11Y-06). */
+    private final FocusRing ring;
     /** The date and the next alarm at the top of Events (EVT-01, EVT-02). */
     private final EventsHeader eventsHeader;
     /** Below the header: notification access, or the notifications (EVT-03, EVT-04). */
@@ -420,6 +437,12 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private boolean tapping;
     private boolean framePosted;
     private int announced = -1;
+    /** The view is changing at a view element's or a key's request, which reads it itself. */
+    private boolean quietSwitch;
+    /** What Back does: the activity's, which tells the Rust app (HOME-08). */
+    private Runnable back = () -> {};
+    /** The topmost of what covers the home views, as in {@link #topLayer}, as last drawn. */
+    private int layerShown = -1;
     /** Edit mode as last drawn, or -1 before the first frame. */
     private int editingShown = -1;
     /** Recent's close mode as last drawn, or -1 before the first frame. */
@@ -593,6 +616,14 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             public void clearAll() {
                 clearRecent();
             }
+
+            @Override
+            public boolean editRequested() {
+                // A long-press on a card, without a finger (A11Y-05).
+                nativeRecentEditRequested();
+                apply();
+                return frame[RECENT_CLOSE] != 0;
+            }
         });
         doneMargin = dp(16);
         done = new TextView(context);
@@ -608,6 +639,11 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         done.setVisibility(GONE);
         for (int i = 0; i < VIEWS; i++) {
             FrameLayout page = new FrameLayout(context);
+            // The view's own element, under its content and first in its order (ADR 0039).
+            nodes[i] = new ViewNode(context, i, viewNodes);
+            nodes[i].setContentDescription(viewPosition(i));
+            page.addView(nodes[i], new LayoutParams(
+                    LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
             if (i == APPLICATIONS) {
                 page.addView(apps, new LayoutParams(
                         LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
@@ -631,7 +667,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
                         LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
                 content.addView(imageCard, new LinearLayout.LayoutParams(
                         LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
-                ScrollView scroll = new ScrollView(context);
+                ScrollView scroll = new Scroll(context);
                 scroll.setVerticalScrollBarEnabled(false);
                 scroll.setOverScrollMode(OVER_SCROLL_IF_CONTENT_SCROLLS);
                 scroll.addView(content, new LayoutParams(
@@ -641,7 +677,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
                         LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
             } else {
                 // Recent's title, then its cards, scrolling together (ADR 0023).
-                ScrollView scroll = new ScrollView(context);
+                ScrollView scroll = new Scroll(context);
                 scroll.setVerticalScrollBarEnabled(false);
                 scroll.setOverScrollMode(OVER_SCROLL_IF_CONTENT_SCROLLS);
                 scroll.addView(recentList, new LayoutParams(
@@ -906,7 +942,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             groups.addView(group, new LinearLayout.LayoutParams(
                     LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
         }
-        settingsScroll = new ScrollView(context);
+        settingsScroll = new Scroll(context);
         settingsScroll.addView(groups, new ScrollView.LayoutParams(
                 LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
         scrolls.add(settingsScroll);
@@ -1017,7 +1053,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         menuList = new LinearLayout(context);
         menuList.setOrientation(LinearLayout.VERTICAL);
         menuList.setPadding(0, dp(8), 0, dp(8));
-        menuScroll = new ScrollView(context);
+        menuScroll = new Scroll(context);
         menuScroll.setOverScrollMode(OVER_SCROLL_IF_CONTENT_SCROLLS);
         menuScroll.addView(menuList, new ScrollView.LayoutParams(
                 LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT));
@@ -1027,6 +1063,9 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         // Placed from the left whatever the layout direction; placeMenu mirrors it.
         addView(menu, new LayoutParams(
                 LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT, Gravity.TOP | Gravity.LEFT));
+
+        // Over everything, in the theme's accent once the first frame says it (A11Y-06).
+        ring = FocusRing.attach(this);
     }
 
     /** MeeGone came to the foreground; another activity may have moved the carousel. */
@@ -1582,7 +1621,10 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         applyDone();
         if (current != announced) {
             announced = current;
-            announce(viewPosition(current));
+            // A view's element or a key that switched reads the new view's element instead.
+            if (!quietSwitch) {
+                announce(viewPosition(current));
+            }
         }
         if (frame[EDITING] != editingShown) {
             // A11Y-08: "Edit mode", and the view's position again when it ends.
@@ -1617,13 +1659,15 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         int density = frame[RECENT_DENSITY_OFFERED] != 0 ? frame[RECENT_ROWS] : 0;
         if (frame[MENU_OFFERED] != menuOffered || offered != searchOffered
                 || density != densityOffered || frame[RECENT_EDIT_OFFERED] != editRecentOffered) {
-            // Screen readers ask again which actions the home views offer.
+            // Screen readers ask again which actions the view's element offers.
             menuOffered = frame[MENU_OFFERED];
             searchOffered = offered;
             densityOffered = density;
             editRecentOffered = frame[RECENT_EDIT_OFFERED];
-            sendAccessibilityEvent(AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED);
+            nodes[current].sendAccessibilityEvent(AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED);
         }
+        ring.colour(frame[ACCENT], background);
+        followLayers();
         if (frame[ANIMATING] != 0 && !framePosted && isAttachedToWindow()) {
             framePosted = true;
             Choreographer.getInstance().postFrameCallback(this);
@@ -1677,6 +1721,15 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             apps.setImportantForAccessibility(covering != 0
                     ? IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
                     : IMPORTANT_FOR_ACCESSIBILITY_AUTO);
+            // A keyboard stays in the open folder too: the grid and Applications' own element
+            // under it are no stops (A11Y-06).
+            apps.setDescendantFocusability(covering != 0
+                    ? FOCUS_BLOCK_DESCENDANTS
+                    : FOCUS_AFTER_DESCENDANTS);
+            nodes[APPLICATIONS].setFocusable(covering == 0);
+            if (covering != 0 && !isInTouchMode()) {
+                focusOnceLaidOut(folderPanel, folderPanel);
+            }
             if (closed && frame[CURRENT] == APPLICATIONS) {
                 focusBack(apps.cellAt(folderCellShown));
             }
@@ -1809,7 +1862,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         renameLight = light;
         dialog.getWindow().setSoftInputMode(
                 WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE);
-        dialog.show();
+        Dialogs.show(dialog);
         // Laid out as the device's light or dark dialogs, matched to MeeGone's theme, and drawn
         // in MeeGone's colours (THEME-03, A11Y-03).
         Dialogs.colour(dialog, surface, foreground, dim, frame[ACCENT], frame[SCRIM]);
@@ -1861,6 +1914,8 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         done.setImportantForAccessibility(on && !covered
                 ? IMPORTANT_FOR_ACCESSIBILITY_YES
                 : IMPORTANT_FOR_ACCESSIBILITY_NO);
+        // Nor is it a keyboard's stop there (A11Y-06).
+        done.setFocusable(on && !covered);
         if (frame[ACCENT] != doneAccent || background != doneText || foreground != donePress) {
             doneAccent = frame[ACCENT];
             doneText = background;
@@ -1943,7 +1998,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             if (imageDetailsShown != 0) {
                 imageDetails.opened();
             }
-            hidePagesFromScreenReaders();
+            coverLayers();
         }
         applyImageStatus();
         if (imageDetailsShown == 0) {
@@ -1972,7 +2027,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
                 pastImages.closed();
                 pastImagesRead = -1;
             }
-            hidePagesFromScreenReaders();
+            coverLayers();
         }
         if (pastImagesShown == 0) {
             return;
@@ -2004,7 +2059,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         }
         if (step != setupShown) {
             setupShown = step;
-            hidePagesFromScreenReaders();
+            coverLayers();
         }
         if (step < 0) {
             return;
@@ -2227,7 +2282,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         if (frame[SETTINGS] != settingsShown) {
             settingsShown = frame[SETTINGS];
             settings.setVisibility(settingsShown != 0 ? VISIBLE : GONE);
-            hidePagesFromScreenReaders();
+            coverLayers();
             if (settingsShown == 0) {
                 closeSettingsDialog();
             } else {
@@ -2329,7 +2384,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
                 settingsDialog = null;
             }
         });
-        dialog.show();
+        Dialogs.show(dialog);
         Dialogs.colour(dialog, surface, foreground, dim, frame[ACCENT], frame[SCRIM]);
     }
 
@@ -2381,7 +2436,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         body.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14);
         body.setPaddingRelative(dp(24), dp(8), dp(24), dp(8));
         Dialogs.colourText(body, foreground);
-        ScrollView scroll = new ScrollView(builder.getContext());
+        ScrollView scroll = new Scroll(builder.getContext());
         Themed.scrolling(scroll, dim);
         scroll.addView(body);
         showSettingsDialog(builder
@@ -2526,7 +2581,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
                 fillEventsMenu(eventsItems, eventsRow);
                 menuOpener = eventsList.rowAt(eventsRow);
             }
-            hidePagesFromScreenReaders();
+            coverLayers();
             if (!wasOpen && menuOpen() && !menuItems.isEmpty()) {
                 // A screen reader moves to the first item (A11Y-05).
                 TextView first = menuItems.get(0);
@@ -2566,7 +2621,8 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     /**
      * A cell's menu at {@code revision} (APPS-11): App info, Uninstall and Edit applications as
      * an app's offers them, then its shortcuts below a divider, or a folder's Rename folder and
-     * Edit applications. Its pane title names the app or the folder.
+     * Edit applications. In edit mode, the moves take Edit applications' place (ADR 0039). Its
+     * pane title names the app or the folder.
      */
     private void fillAppMenu(int revision) {
         clearMenu();
@@ -2579,20 +2635,30 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         boolean divided = false;
         for (int i = 0; i < count; i++) {
             int kind = parseKind(fields[i * APP_MENU_FIELDS]);
+            String name = orEmpty(fields[i * APP_MENU_FIELDS + 1]);
             CharSequence text;
             if (kind == APP_MENU_SHORTCUT) {
-                text = fields[i * APP_MENU_FIELDS + 1];
+                text = name;
                 if (!divided && i > 0) {
                     addMenuDivider();
                 }
                 divided = true;
+            } else if (kind == APP_MENU_MAKE_FOLDER) {
+                // "Make folder with Maps", the next app named as everywhere (A11Y-01).
+                boolean work = "1".equals(fields[i * APP_MENU_FIELDS + 2]);
+                text = getResources().getString(R.string.action_make_folder,
+                        A11y.appName(getResources(), name, work));
+            } else if (kind == APP_MENU_MOVE_INTO) {
+                // An unnamed folder shows as "Folder" (FOLD-03).
+                text = getResources().getString(R.string.action_move_into,
+                        name.isEmpty() ? getResources().getString(R.string.folder) : name);
             } else if (kind >= 0 && kind < APP_MENU_ITEMS.length && APP_MENU_ITEMS[kind] != 0) {
                 text = getResources().getText(APP_MENU_ITEMS[kind]);
             } else {
                 continue;
             }
             int index = i;
-            addMenuItem(text == null ? "" : text, view -> chooseAppMenuItem(revision, index));
+            addMenuItem(text, view -> chooseAppMenuItem(revision, index, kind));
         }
         colourMenu();
     }
@@ -2620,6 +2686,10 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         colourMenu();
     }
 
+    private static String orEmpty(String field) {
+        return field == null ? "" : field;
+    }
+
     private static int parseKind(String field) {
         try {
             return Integer.parseInt(field);
@@ -2629,14 +2699,47 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     }
 
     /**
-     * Item {@code index} of the app menu at {@code revision} was chosen. The system may refuse,
-     * such as an App info screen that can't open: its message shows briefly.
+     * Item {@code index}, of {@code kind}, of the app menu at {@code revision} was chosen. The
+     * system may refuse, such as an App info screen that can't open: its message shows briefly.
+     * A move says where the app went, as a screen reader's does, and the focus goes with it
+     * (A11Y-08, ADR 0039).
      */
-    private void chooseAppMenuItem(int revision, int index) {
+    private void chooseAppMenuItem(int revision, int index, int kind) {
+        AppsGrid grid = menuGrid();
+        int place = frame[APP_MENU];
+        View opener = menuOpener;
+        String name = grid.label(place);
         String message = nativeAppMenuChosen(revision, index);
         apply();
         if (message != null) {
             Toast.makeText(getContext(), message, Toast.LENGTH_SHORT).show();
+        }
+        if (name == null) {
+            return;
+        }
+        if (kind >= APP_MENU_MOVE_FIRST && kind <= APP_MENU_MOVE_LAST
+                && opener instanceof AppCell) {
+            // The cell's view moved with its app, and the focus goes back to it.
+            announce(getResources().getString(R.string.app_moved, name,
+                    ((AppCell) opener).index() + 1, grid.cellCount()));
+            keepInSight(opener);
+        } else if (kind == APP_MENU_MAKE_FOLDER || kind == APP_MENU_MOVE_INTO) {
+            // The folder is where the app was.
+            announce(getResources().getString(R.string.app_grouped, name));
+            focusLater(apps.cellAt(place));
+        } else if (kind == APP_MENU_MOVE_OUT) {
+            announce(getResources().getString(R.string.app_moved_out, name));
+            focusLater(folderApps.cellAt(Math.min(place, folderApps.cellCount() - 1)));
+        }
+    }
+
+    /**
+     * Gives {@code view} the focus once the menu has closed, after the focus going back to the
+     * cell the menu was for, which has gone.
+     */
+    private void focusLater(View view) {
+        if (view != null) {
+            post(() -> focusBack(view));
         }
     }
 
@@ -2765,8 +2868,9 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
 
     /**
      * Screen readers' focus goes back to {@code view}, such as the cell whose menu or folder
-     * just closed, which they then read: "Folder: Games, 3 apps" (A11Y-08). Not while another
-     * screen covers the home views, nor for a view that has gone.
+     * just closed, which they then read: "Folder: Games, 3 apps" (A11Y-08), and so does a
+     * keyboard's (A11Y-06). Not while another screen covers the home views, nor for a view that
+     * has gone.
      */
     private void focusBack(View view) {
         if (view == null) {
@@ -2776,22 +2880,14 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             if (view.isAttachedToWindow() && view.isShown() && !menuOpen()
                     && frame[SETTINGS] == 0 && frame[SETUP_STEP] < 0 && imageDetailsShown == 0
                     && pastImagesShown == 0) {
+                // A keyboard's focus goes back too (A11Y-06).
+                if (!isInTouchMode()) {
+                    view.requestFocus();
+                }
                 view.performAccessibilityAction(
                         AccessibilityNodeInfo.ACTION_ACCESSIBILITY_FOCUS, null);
             }
         });
-    }
-
-    /** While a menu or Settings covers the home views, screen readers skip them. */
-    private void hidePagesFromScreenReaders() {
-        int importance = menuShown != 0 || appMenuShown >= 0 || eventsMenuShown != 0
-                || settingsShown != 0 || imageDetailsShown != 0 || pastImagesShown != 0
-                || setupShown >= 0
-                ? IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
-                : IMPORTANT_FOR_ACCESSIBILITY_AUTO;
-        for (FrameLayout page : pages) {
-            page.setImportantForAccessibility(importance);
-        }
     }
 
     /** Dark system-bar icons on a light background, light ones on a dark background. */
@@ -2812,8 +2908,9 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         }
     }
 
-    // Screen readers switch views, open the home menu, open search, switch Recent between more
-    // and bigger cards and enter its close mode with actions instead of gestures (A11Y-05).
+    // The container scrolls between the views, a page at a time, for screen readers' scroll
+    // gestures and Switch Access's scroll (A11Y-05). Every other action is on each view's own
+    // element, which screen readers can focus (ADR 0039).
     @Override
     public void onInitializeAccessibilityNodeInfo(AccessibilityNodeInfo info) {
         super.onInitializeAccessibilityNodeInfo(info);
@@ -2822,63 +2919,15 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         info.addAction(AccessibilityAction.ACTION_SCROLL_BACKWARD);
         info.addAction(AccessibilityAction.ACTION_PAGE_LEFT);
         info.addAction(AccessibilityAction.ACTION_PAGE_RIGHT);
-        info.addAction(new AccessibilityAction(
-                R.id.action_next_view, getResources().getString(R.string.action_next_view)));
-        info.addAction(new AccessibilityAction(R.id.action_previous_view,
-                getResources().getString(R.string.action_previous_view)));
-        if (frame[MENU_OFFERED] != 0) {
-            info.addAction(new AccessibilityAction(
-                    R.id.action_home_menu, getResources().getString(R.string.action_home_menu)));
-        }
-        if ((frame[SEARCH] & SEARCH_OFFERED) != 0) {
-            info.addAction(new AccessibilityAction(
-                    R.id.action_search, getResources().getString(R.string.search_action)));
-        }
-        if (frame[RECENT_DENSITY_OFFERED] != 0) {
-            // The other density from the one shown (REC-05).
-            boolean bigger = frame[RECENT_ROWS] != 2;
-            info.addAction(new AccessibilityAction(
-                    bigger ? R.id.action_bigger_cards : R.id.action_more_cards,
-                    getResources().getString(
-                            bigger ? R.string.action_bigger_cards : R.string.action_more_cards)));
-        }
-        if (frame[RECENT_EDIT_OFFERED] != 0) {
-            // A long-press on Recent's cards enters close mode (REC-07).
-            info.addAction(new AccessibilityAction(R.id.action_edit_recent,
-                    getResources().getString(R.string.action_edit_recent)));
-        }
     }
 
     @Override
     public boolean performAccessibilityAction(int action, Bundle arguments) {
-        if (action == R.id.action_home_menu) {
-            boolean opened = nativeOpenMenu();
-            apply();
-            return opened;
-        }
-        if (action == R.id.action_search) {
-            nativeOpenSearch();
-            apply();
-            return (frame[SEARCH] & SEARCH_OPEN) != 0;
-        }
-        if (action == R.id.action_bigger_cards) {
-            return chooseDensity(2);
-        }
-        if (action == R.id.action_more_cards) {
-            return chooseDensity(3);
-        }
-        if (action == R.id.action_edit_recent) {
-            nativeRecentEditRequested();
-            apply();
-            return frame[RECENT_CLOSE] != 0;
-        }
         boolean rtl = getLayoutDirection() == LAYOUT_DIRECTION_RTL;
         Boolean next = null;
-        if (action == AccessibilityNodeInfo.ACTION_SCROLL_FORWARD
-                || action == R.id.action_next_view) {
+        if (action == AccessibilityNodeInfo.ACTION_SCROLL_FORWARD) {
             next = true;
-        } else if (action == AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD
-                || action == R.id.action_previous_view) {
+        } else if (action == AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD) {
             next = false;
         } else if (action == android.R.id.accessibilityActionPageLeft) {
             next = rtl;
@@ -2891,6 +2940,499 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         boolean moved = nativeShow(next);
         apply();
         return moved;
+    }
+
+    /**
+     * Each view's own element, {@link ViewNode} (A11Y-05, ADR 0039). It is named for the view,
+     * as in "Applications, 2 of 3". Its press is the view's long-press: the home menu, or Edit
+     * Recent. Its actions are Next view, Previous view, Search apps and Bigger or More cards,
+     * each while the Rust app offers it. Only the view showing offers anything.
+     */
+    private final ViewNode.Owner viewNodes = new ViewNode.Owner() {
+        @Override
+        public void describe(int view, AccessibilityNodeInfo info) {
+            info.setContentDescription(viewPosition(view));
+            if (view != frame[CURRENT]) {
+                return;
+            }
+            int press = press(view);
+            if (press != 0) {
+                String label = getResources().getString(press == R.id.action_home_menu
+                        ? R.string.action_home_menu
+                        : R.string.action_edit_recent);
+                info.setClickable(true);
+                info.setLongClickable(true);
+                info.addAction(new AccessibilityAction(
+                        AccessibilityNodeInfo.ACTION_CLICK, label));
+                info.addAction(new AccessibilityAction(
+                        AccessibilityNodeInfo.ACTION_LONG_CLICK, label));
+            }
+            info.addAction(new AccessibilityAction(
+                    R.id.action_next_view, getResources().getString(R.string.action_next_view)));
+            info.addAction(new AccessibilityAction(R.id.action_previous_view,
+                    getResources().getString(R.string.action_previous_view)));
+            if (view == APPLICATIONS && (frame[SEARCH] & SEARCH_OFFERED) != 0) {
+                info.addAction(new AccessibilityAction(
+                        R.id.action_search, getResources().getString(R.string.search_action)));
+            }
+            if (view == RECENT_VIEW && frame[RECENT_DENSITY_OFFERED] != 0) {
+                // The other density from the one shown (REC-05).
+                boolean bigger = frame[RECENT_ROWS] != 2;
+                info.addAction(new AccessibilityAction(
+                        bigger ? R.id.action_bigger_cards : R.id.action_more_cards,
+                        getResources().getString(bigger
+                                ? R.string.action_bigger_cards
+                                : R.string.action_more_cards)));
+            }
+        }
+
+        @Override
+        public boolean perform(int view, int action) {
+            if (view != frame[CURRENT]) {
+                return false;
+            }
+            if (action == AccessibilityNodeInfo.ACTION_CLICK
+                    || action == AccessibilityNodeInfo.ACTION_LONG_CLICK) {
+                action = press(view);
+            }
+            if (action == R.id.action_home_menu) {
+                boolean opened = nativeOpenMenu();
+                apply();
+                return opened;
+            }
+            if (action == R.id.action_edit_recent) {
+                nativeRecentEditRequested();
+                apply();
+                return frame[RECENT_CLOSE] != 0;
+            }
+            if (action == R.id.action_search && view == APPLICATIONS) {
+                openSearch();
+                return (frame[SEARCH] & SEARCH_OPEN) != 0;
+            }
+            if (action == R.id.action_bigger_cards && view == RECENT_VIEW) {
+                return chooseDensity(2);
+            }
+            if (action == R.id.action_more_cards && view == RECENT_VIEW) {
+                return chooseDensity(3);
+            }
+            if (action == R.id.action_next_view || action == R.id.action_previous_view) {
+                return switchView(action == R.id.action_next_view);
+            }
+            return false;
+        }
+
+        /** What a press on {@code view}'s element does now, as an action, or 0 for nothing. */
+        private int press(int view) {
+            if (view == RECENT_VIEW) {
+                // A long-press on Recent enters close mode (REC-07).
+                return frame[RECENT_EDIT_OFFERED] != 0 ? R.id.action_edit_recent : 0;
+            }
+            return frame[MENU_OFFERED] != 0 ? R.id.action_home_menu : 0;
+        }
+    };
+
+    /**
+     * The next or the previous view, from a view's element or a keyboard (A11Y-05, A11Y-06).
+     * The new view's element takes the focus, and reads its name, so the status doesn't say it
+     * too. Returns whether the views moved.
+     */
+    private boolean switchView(boolean next) {
+        int before = frame[CURRENT];
+        boolean moved = nativeShow(next);
+        if (moved) {
+            quietSwitch = true;
+        }
+        apply();
+        quietSwitch = false;
+        if (frame[CURRENT] != before) {
+            focusView(nodes[frame[CURRENT]]);
+        }
+        return moved;
+    }
+
+    /**
+     * Gives {@code view} the focus: a screen reader's, and a keyboard's out of touch mode
+     * (A11Y-06).
+     */
+    private void focusView(View view) {
+        post(() -> {
+            if (!view.isAttachedToWindow() || !view.isShown()) {
+                return;
+            }
+            if (!isInTouchMode()) {
+                view.requestFocus();
+            }
+            view.performAccessibilityAction(AccessibilityNodeInfo.ACTION_ACCESSIBILITY_FOCUS, null);
+        });
+    }
+
+    /** Sets what Back does, which Esc does too (HOME-08, A11Y-06). */
+    void setBack(Runnable back) {
+        this.back = back;
+    }
+
+    // Esc is Back (A11Y-06). Android would spend the first Esc clearing the focus, before any
+    // view or the activity sees it, so it is taken here, first. With nothing focused, the
+    // activity takes it.
+    @Override
+    public boolean dispatchKeyEventPreIme(KeyEvent event) {
+        if (event.getKeyCode() == KeyEvent.KEYCODE_ESCAPE && event.hasNoModifiers()) {
+            if (event.getAction() == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0) {
+                back.run();
+            }
+            return true;
+        }
+        return super.dispatchKeyEventPreIme(event);
+    }
+
+    // A hardware keyboard (A11Y-06, ADR 0039). Tab, the arrows and Enter are Android's own, and
+    // reach every element. The keys below reach what a gesture does, through the same actions
+    // screen readers use, so the Rust app decides what each does, as it does for them.
+    @Override
+    public boolean dispatchKeyEvent(KeyEvent event) {
+        // Edit mode's moves come before the grid's own arrows, which would move the focus.
+        if (event.getAction() == KeyEvent.ACTION_DOWN && moveFocusedCell(event)) {
+            return true;
+        }
+        if (super.dispatchKeyEvent(event)) {
+            return true;
+        }
+        return event.getAction() == KeyEvent.ACTION_DOWN && keyDown(event);
+    }
+
+    /**
+     * A key no element took:
+     *
+     * <ul>
+     *   <li>Menu, or Shift+F10, is a long-press: the focused element's menu, or the view's.
+     *   <li>Delete is the ✕: it uninstalls in edit mode and removes from Recent in close mode.
+     *   <li>← or → past the view's edge goes to the view beyond it. ↓ from the view's own
+     *       element goes into the view.
+     *   <li>Ctrl+F, or typing a letter, on Applications opens search, with the letter in it.
+     *   <li>Ctrl+= and Ctrl+- on Recent show bigger cards and more cards, as a pinch does.
+     * </ul>
+     *
+     * Returns whether the key did anything.
+     */
+    private boolean keyDown(KeyEvent event) {
+        int code = event.getKeyCode();
+        View focused = findFocus();
+        if (code == KeyEvent.KEYCODE_MENU
+                || (code == KeyEvent.KEYCODE_F10 && event.isShiftPressed())) {
+            return event.getRepeatCount() > 0 || longPress(focused);
+        }
+        if (code == KeyEvent.KEYCODE_DEL || code == KeyEvent.KEYCODE_FORWARD_DEL) {
+            return focused != null && (perform(focused, R.id.action_uninstall)
+                    || perform(focused, R.id.action_remove_from_recent));
+        }
+        if (code == KeyEvent.KEYCODE_F && event.isCtrlPressed() && !event.isAltPressed()) {
+            return openSearch();
+        }
+        if (event.isCtrlPressed() && frame[CURRENT] == RECENT_VIEW && topLayer() == LAYER_HOME) {
+            // Recent's density, as a zoom: bigger cards, or more of them (REC-05).
+            if (code == KeyEvent.KEYCODE_EQUALS || code == KeyEvent.KEYCODE_PLUS
+                    || code == KeyEvent.KEYCODE_NUMPAD_ADD) {
+                return viewNodes.perform(RECENT_VIEW, R.id.action_bigger_cards);
+            }
+            if (code == KeyEvent.KEYCODE_MINUS || code == KeyEvent.KEYCODE_NUMPAD_SUBTRACT) {
+                return viewNodes.perform(RECENT_VIEW, R.id.action_more_cards);
+            }
+        }
+        if (event.hasNoModifiers()) {
+            if (code == KeyEvent.KEYCODE_DPAD_LEFT) {
+                return pastTheEdge(focused, FOCUS_LEFT);
+            }
+            if (code == KeyEvent.KEYCODE_DPAD_RIGHT) {
+                return pastTheEdge(focused, FOCUS_RIGHT);
+            }
+            if (code == KeyEvent.KEYCODE_DPAD_DOWN && focused instanceof ViewNode) {
+                return intoTheView(focused);
+            }
+        }
+        return typeToSearch(event);
+    }
+
+    /**
+     * A long-press without a finger: the focused element's own, such as an app's menu or Edit
+     * Recent on a card, or with none, the view's. Returns whether it did anything.
+     */
+    private boolean longPress(View focused) {
+        if (focused != null && perform(focused, AccessibilityNodeInfo.ACTION_LONG_CLICK)) {
+            return true;
+        }
+        return topLayer() == LAYER_HOME && (focused == null || focused instanceof ViewNode)
+                && viewNodes.perform(frame[CURRENT], AccessibilityNodeInfo.ACTION_LONG_CLICK);
+    }
+
+    /** Does {@code action} on {@code view} if it offers it. Returns whether it did. */
+    private static boolean perform(View view, int action) {
+        AccessibilityNodeInfo info = view.createAccessibilityNodeInfo();
+        for (AccessibilityAction offered : info.getActionList()) {
+            if (offered.getId() == action) {
+                return view.performAccessibilityAction(action, null);
+            }
+        }
+        return false;
+    }
+
+    /**
+     * ← or → with nothing further that way in the view goes to the view beyond, as the home
+     * views' swipe does (HOME-03): mirrored right to left, and wrapping around as set
+     * (HOME-04). Not while anything covers the views, or holds them still: an open folder or
+     * search.
+     */
+    private boolean pastTheEdge(View focused, int direction) {
+        FrameLayout page = pages[frame[CURRENT]];
+        if (focused == null || topLayer() != LAYER_HOME || frame[FOLDER] >= 0 || searchOpen
+                || !inside(page, focused)) {
+            return false;
+        }
+        View next = FocusFinder.getInstance().findNextFocus(this, focused, direction);
+        if (next != null && inside(page, next)) {
+            return false;
+        }
+        boolean rtl = getLayoutDirection() == LAYOUT_DIRECTION_RTL;
+        switchView((direction == FOCUS_RIGHT) != rtl);
+        return true;
+    }
+
+    /** ↓ from a view's own element goes to its first element after it. */
+    private boolean intoTheView(View node) {
+        View next = FocusFinder.getInstance().findNextFocus(this, node, FOCUS_FORWARD);
+        if (next != null && inside((View) node.getParent(), next)) {
+            return next.requestFocus();
+        }
+        return false;
+    }
+
+    /** Whether {@code view} is {@code ancestor} or inside it. */
+    private static boolean inside(View ancestor, View view) {
+        for (View at = view; at != null;
+                at = at.getParent() instanceof View ? (View) at.getParent() : null) {
+            if (at == ancestor) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * In edit mode, Ctrl with an arrow moves the focused app or folder a place or a row, and
+     * Ctrl+Home or Ctrl+End to the start or the end (APPS-12, A11Y-05), mirrored right to left,
+     * as a drag and a screen reader's Move actions do. Its new place is announced, and the
+     * focus stays on it. Returns whether the key was one of these.
+     */
+    private boolean moveFocusedCell(KeyEvent event) {
+        View focused = findFocus();
+        if (!event.isCtrlPressed() || event.isAltPressed() || frame[EDITING] == 0
+                || !(focused instanceof AppCell)) {
+            return false;
+        }
+        AppCell cell = (AppCell) focused;
+        AppsGrid grid = cell.grid();
+        if (grid.surface() == AppsGrid.SEARCH) {
+            return false;
+        }
+        boolean rtl = getLayoutDirection() == LAYOUT_DIRECTION_RTL;
+        int index = cell.index();
+        int to;
+        switch (event.getKeyCode()) {
+            case KeyEvent.KEYCODE_DPAD_LEFT:
+                to = rtl ? index + 1 : index - 1;
+                break;
+            case KeyEvent.KEYCODE_DPAD_RIGHT:
+                to = rtl ? index - 1 : index + 1;
+                break;
+            case KeyEvent.KEYCODE_DPAD_UP:
+                to = index - grid.columns();
+                break;
+            case KeyEvent.KEYCODE_DPAD_DOWN:
+                to = index + grid.columns();
+                break;
+            case KeyEvent.KEYCODE_MOVE_HOME:
+                to = 0;
+                break;
+            case KeyEvent.KEYCODE_MOVE_END:
+                to = grid.cellCount() - 1;
+                break;
+            default:
+                return false;
+        }
+        to = Math.max(0, Math.min(to, grid.cellCount() - 1));
+        if (to != index && grid.moveTo(cell, to)) {
+            keepInSight(cell);
+        }
+        return true;
+    }
+
+    /** Scrolls {@code view} into sight once it is laid out where it now is. */
+    private static void keepInSight(View view) {
+        ViewTreeObserver observer = view.getViewTreeObserver();
+        observer.addOnPreDrawListener(new ViewTreeObserver.OnPreDrawListener() {
+            @Override
+            public boolean onPreDraw() {
+                view.getViewTreeObserver().removeOnPreDrawListener(this);
+                view.requestRectangleOnScreen(
+                        new Rect(0, 0, view.getWidth(), view.getHeight()), !Scroll.animating());
+                return true;
+            }
+        });
+    }
+
+    /**
+     * Opens search, as the pull and a screen reader's "Search apps" do, while it is offered
+     * (SRCH-01, A11Y-05). Returns whether it opened.
+     */
+    private boolean openSearch() {
+        if ((frame[SEARCH] & SEARCH_OFFERED) == 0) {
+            return false;
+        }
+        nativeOpenSearch();
+        apply();
+        return (frame[SEARCH] & SEARCH_OPEN) != 0;
+    }
+
+    /**
+     * Typing a letter on Applications opens search with it, as Android's own launchers do
+     * (SRCH-01, A11Y-06). Not with Ctrl, Alt or Meta, which are shortcuts, nor for a space or
+     * an accent still waiting for its letter.
+     */
+    private boolean typeToSearch(KeyEvent event) {
+        if (event.isCtrlPressed() || event.isAltPressed() || event.isMetaPressed()) {
+            return false;
+        }
+        int typed = event.getUnicodeChar();
+        if (typed == 0 || (typed & KeyCharacterMap.COMBINING_ACCENT) != 0
+                || Character.isWhitespace(typed) || Character.isISOControl(typed)) {
+            return false;
+        }
+        if (!openSearch()) {
+            return false;
+        }
+        searchPanel.type(new String(Character.toChars(typed)));
+        return true;
+    }
+
+    // What can cover the home views, from the lowest, as topLayer answers: the views themselves,
+    // the image details, Settings, the past week, setup and a menu.
+    private static final int LAYER_HOME = 0;
+    private static final int LAYER_DETAILS = 1;
+    private static final int LAYER_SETTINGS = 2;
+    private static final int LAYER_PAST = 3;
+    private static final int LAYER_SETUP = 4;
+    private static final int LAYER_MENU = 5;
+
+    /** The topmost of what shows, as last drawn. */
+    private int topLayer() {
+        if (menuOpen()) {
+            return LAYER_MENU;
+        }
+        if (setupShown >= 0) {
+            return LAYER_SETUP;
+        }
+        if (pastImagesShown != 0) {
+            return LAYER_PAST;
+        }
+        if (settingsShown != 0) {
+            return LAYER_SETTINGS;
+        }
+        return imageDetailsShown != 0 ? LAYER_DETAILS : LAYER_HOME;
+    }
+
+    /** The view that is layer {@code layer}: for the home views, the view showing. */
+    private View layer(int layer) {
+        switch (layer) {
+            case LAYER_MENU:
+                return menu;
+            case LAYER_SETUP:
+                return setup;
+            case LAYER_PAST:
+                return pastImages;
+            case LAYER_SETTINGS:
+                return settings;
+            case LAYER_DETAILS:
+                return imageDetails;
+            default:
+                return pages[frame[CURRENT]];
+        }
+    }
+
+    /**
+     * Only the topmost of the home views, the image details, Settings, the past week, setup and
+     * a menu is there for screen readers and for a keyboard. What it covers is skipped, as no
+     * finger reaches it (A11Y-06, ADR 0039).
+     */
+    private void coverLayers() {
+        int top = topLayer();
+        for (FrameLayout page : pages) {
+            cover(page, top > LAYER_HOME);
+        }
+        cover(imageDetails, top > LAYER_DETAILS);
+        cover(settings, top > LAYER_SETTINGS);
+        cover(pastImages, top > LAYER_PAST);
+        cover(setup, top > LAYER_SETUP);
+    }
+
+    private static void cover(ViewGroup layer, boolean covered) {
+        layer.setImportantForAccessibility(covered
+                ? IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+                : IMPORTANT_FOR_ACCESSIBILITY_AUTO);
+        // Uncovered, each takes Android's own default back: a scrolling screen's elements
+        // before itself.
+        layer.setDescendantFocusability(covered
+                ? FOCUS_BLOCK_DESCENDANTS
+                : layer instanceof ScrollView ? FOCUS_AFTER_DESCENDANTS : FOCUS_BEFORE_DESCENDANTS);
+    }
+
+    /**
+     * When something opens over the others, or closes, the focus goes to the topmost: to its
+     * first element when it opens, and when it closes to the element it was for, or the view's
+     * own element (A11Y-06). Only a keyboard's focus, out of touch mode: screen readers' is
+     * moved as each opens and closes. A view that went out of sight loses the focus to the
+     * view showing.
+     */
+    private void followLayers() {
+        int top = topLayer();
+        boolean changed = top != layerShown;
+        boolean opened = layerShown >= 0 && top > layerShown;
+        if (changed) {
+            layerShown = top;
+            coverLayers();
+        }
+        if (isInTouchMode()) {
+            return;
+        }
+        View focused = findFocus();
+        View layer = layer(top);
+        if (opened || focused == null || !inside(layer, focused)) {
+            focusOnceLaidOut(top == LAYER_HOME ? nodes[frame[CURRENT]] : layer, layer);
+        }
+    }
+
+    /**
+     * Gives {@code view}, or its first element, a keyboard's focus once it is laid out, unless
+     * the focus is in {@code within} by then, such as back on the cell a menu was for. A scroll
+     * view not laid out yet takes every element as off screen, and the focus itself.
+     */
+    private void focusOnceLaidOut(View view, View within) {
+        ViewTreeObserver observer = getViewTreeObserver();
+        observer.addOnPreDrawListener(new ViewTreeObserver.OnPreDrawListener() {
+            @Override
+            public boolean onPreDraw() {
+                getViewTreeObserver().removeOnPreDrawListener(this);
+                View focused = findFocus();
+                if (!isInTouchMode() && view.isShown()
+                        && (focused == null || !inside(within, focused))) {
+                    // Its first stop in Tab's order, so a scroll view never takes it itself.
+                    View first = view instanceof ViewGroup
+                            ? FocusFinder.getInstance().findNextFocus(
+                                    (ViewGroup) view, null, FOCUS_FORWARD)
+                            : null;
+                    (first != null ? first : view).requestFocus();
+                }
+                return true;
+            }
+        });
     }
 
     // The debug build's accessibility audit drives and reads the home views through what
@@ -2989,6 +3531,36 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     /** The open folder's name, which renames it when tapped. */
     TextView auditFolderName() {
         return folderPanel.auditName();
+    }
+
+    /** The element of the view shown, which carries the view's actions (ADR 0039). */
+    ViewNode auditNode() {
+        return nodes[frame[CURRENT]];
+    }
+
+    /**
+     * What a keyboard's focus may reach now, as a finger may (A11Y-06): the topmost screen or
+     * menu; an open folder; or the view shown and the banner below it.
+     */
+    List<View> auditFocusLayers() {
+        List<View> layers = new ArrayList<>();
+        int top = topLayer();
+        if (top != LAYER_HOME) {
+            layers.add(layer(top));
+        } else if (frame[FOLDER] >= 0 && frame[FOLDER_OPEN] != 0) {
+            layers.add(folderPanel);
+        } else {
+            layers.add(pages[frame[CURRENT]]);
+            layers.add(banner);
+        }
+        return layers;
+    }
+
+    /** Where the focus ring is drawn, in this view's coordinates, or an empty rect. */
+    Rect auditRing() {
+        Rect drawn = new Rect();
+        ring.drawnAt(drawn);
+        return drawn;
     }
 
     private int dp(int value) {

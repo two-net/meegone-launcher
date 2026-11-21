@@ -14,6 +14,22 @@
     <!-- Screen-reader actions that switch home views without a gesture (A11Y-05). -->
     <string name="action_next_view">Next view</string>
     <string name="action_previous_view">Previous view</string>
+    <!-- The keys of the home views that a hardware keyboard has beyond Tab, the arrows and
+         Enter, as Android's keyboard shortcut list (Meta+/) shows them (A11Y-06). -->
+    <string name="shortcuts_home">Home screen</string>
+    <string name="shortcut_menu">Open menu, as a long-press does</string>
+    <string name="shortcut_next_view">Next view, past the view\'s end</string>
+    <string name="shortcut_previous_view">Previous view, past the view\'s start</string>
+    <string name="shortcut_search">Search apps, or type a name</string>
+    <string name="shortcut_bigger_cards">Recent: bigger cards</string>
+    <string name="shortcut_more_cards">Recent: more cards</string>
+    <string name="shortcut_remove">Uninstall in edit mode, or remove from Recent</string>
+    <string name="shortcut_move_earlier">Edit mode: move earlier</string>
+    <string name="shortcut_move_later">Edit mode: move later</string>
+    <string name="shortcut_move_up">Edit mode: move up a row</string>
+    <string name="shortcut_move_down">Edit mode: move down a row</string>
+    <string name="shortcut_move_first">Edit mode: move to start</string>
+    <string name="shortcut_move_last">Edit mode: move to end</string>
 
     <!-- The home menu, opened by a long-press on empty space in Events or Applications
          (HOME-10). Screen readers announce its title and open it with the action

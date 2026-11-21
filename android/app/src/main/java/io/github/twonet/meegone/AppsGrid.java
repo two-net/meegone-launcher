@@ -9,7 +9,6 @@ import android.view.View;
 import android.view.ViewGroup;
 import android.view.ViewParent;
 import android.view.accessibility.AccessibilityEvent;
-import android.widget.ScrollView;
 import android.widget.Toast;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -56,7 +55,7 @@ import java.util.function.Consumer;
  * the frame says (ANIM-12). A tap on a ✕ asks the system to uninstall the app (APPS-13), and
  * screen readers move icons, make folders and take apps out of them with actions (A11Y-05).
  */
-final class AppsGrid extends ScrollView {
+final class AppsGrid extends Scroll {
     /** The surfaces, as the Rust app numbers them. */
     static final int GRID = 0;
     static final int FOLDER = 1;
@@ -149,6 +148,8 @@ final class AppsGrid extends ScrollView {
     AppsGrid(Context context, int surface, AppIcons icons, Runnable redraw,
             Consumer<String> announce) {
         super(context);
+        // Its cells are the stops; a grid with none, such as no results, is none (A11Y-06).
+        setFocusable(false);
         this.surface = surface;
         this.icons = icons;
         this.redraw = redraw;
@@ -659,6 +660,11 @@ final class AppsGrid extends ScrollView {
     void done() {
         nativeEditDone();
         redraw.run();
+    }
+
+    /** How many columns it lays its cells out in (APPS-02, FOLD-04). */
+    int columns() {
+        return columns;
     }
 
     /** How many cells the grid shows. */

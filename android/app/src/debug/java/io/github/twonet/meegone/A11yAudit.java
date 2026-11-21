@@ -44,6 +44,11 @@ import java.util.function.Consumer;
  *       4.5:1 against what is behind it, or 3:1 when it is large, unless it is disabled.
  *   <li><b>Scaling</b> (A11Y-04): no text is cut off by its view or an ancestor, no two texts
  *       overlap, and a text cut short is read whole by screen readers.
+ *   <li><b>Reach</b> (A11Y-05, A11Y-06, ADR 0039): every action of MeeGone's own is on an element
+ *       screen readers can focus, so they can offer it. A keyboard's Tab reaches every element
+ *       on top that takes a tap or a long-press. Every stop does something, and stays inside
+ *       what is on top. Stops that share a container come in reading order. The focus ring has
+ *       3:1 against what is around it ({@link #checkRing}).
  * </ul>
  *
  * <p>Each failure is logged under {@link #TAG} as one line, {@code FAIL <screen> <theme>
@@ -83,6 +88,15 @@ final class A11yAudit {
      */
     void check(Window window, View root, boolean drawn, String screen, String theme,
             Runnable done) {
+        check(window, root, drawn, null, screen, theme, done);
+    }
+
+    /**
+     * The same, with {@code layers}, the views a keyboard's focus may reach now, or null for
+     * all of {@code root}.
+     */
+    void check(Window window, View root, boolean drawn, List<View> layers, String screen,
+            String theme, Runnable done) {
         if (root.getWidth() <= 0 || root.getHeight() <= 0) {
             fail(screen, theme, "WINDOW", "has no size");
             done.run();
@@ -92,7 +106,8 @@ final class A11yAudit {
                 Bitmap.Config.ARGB_8888);
         if (drawn) {
             root.draw(new Canvas(pixels));
-            checkDrawn(root, pixels, screen, theme);
+            checkDrawn(root, pixels, screen, theme, layers);
+            checkFocus(root, layers, screen, theme);
             pixels.recycle();
             done.run();
             return;
@@ -100,7 +115,8 @@ final class A11yAudit {
         Handler main = new Handler(Looper.getMainLooper());
         PixelCopy.request(window, pixels, result -> {
             if (result == PixelCopy.SUCCESS) {
-                checkDrawn(root, pixels, screen, theme);
+                checkDrawn(root, pixels, screen, theme, layers);
+                checkFocus(root, layers, screen, theme);
             } else {
                 fail(screen, theme, "WINDOW", "its pixels couldn't be copied (" + result + ")");
             }
@@ -109,7 +125,8 @@ final class A11yAudit {
         }, main);
     }
 
-    private void checkDrawn(View root, Bitmap pixels, String screen, String theme) {
+    private void checkDrawn(View root, Bitmap pixels, String screen, String theme,
+            List<View> layers) {
         List<View> views = new ArrayList<>();
         collect(root, views);
         List<Drawn> texts = new ArrayList<>();
@@ -122,7 +139,9 @@ final class A11yAudit {
                 checkAudited((Audited) view, root, pixels, screen, theme, texts);
             }
             if (view instanceof TextView) {
-                Drawn text = checkText((TextView) view, root, pixels, screen, theme);
+                // A text under an open pane is read once it is on top again.
+                boolean onTop = layers == null || within(view, layers);
+                Drawn text = checkText((TextView) view, root, pixels, screen, theme, onTop);
                 if (text != null) {
                     texts.add(text);
                 }
@@ -193,8 +212,17 @@ final class A11yAudit {
             }
         }
         boolean taps = info.isClickable() || info.isLongClickable();
-        boolean acts = taps || info.isEditable()
-                || (custom && (info.isFocusable() || info.isScreenReaderFocusable()));
+        boolean focusable = info.isFocusable() || info.isScreenReaderFocusable();
+        if (custom) {
+            // Screen readers offer the actions of the element they focus, and never focus a
+            // container that only holds others (A11Y-05).
+            checked++;
+            if (!focusable && !taps) {
+                fail(screen, theme, "ACTION_REACH", describe(view)
+                        + " offers actions no screen reader can focus");
+            }
+        }
+        boolean acts = taps || info.isEditable() || (custom && focusable);
         if (acts) {
             checked++;
             if (!speaks(info) && !childrenSpeak(view)) {
@@ -210,6 +238,156 @@ final class A11yAudit {
                         + Math.round(width) + " × " + Math.round(height) + " dp");
             }
         }
+    }
+
+    // ---- A keyboard's reach (A11Y-06, ADR 0039).
+
+    /** Stops in one container closer than this, in px, are on one line. */
+    private static final int LINE_SLACK_PX = 4;
+
+    /**
+     * Walks Tab's stops in {@code root}, in Android's own order, without moving the focus, and
+     * checks them against what is on top: {@code layers}, or all of {@code root}.
+     */
+    private void checkFocus(View root, List<View> layers, String screen, String theme) {
+        ArrayList<View> stops = new ArrayList<>();
+        root.addFocusables(stops, View.FOCUS_FORWARD, View.FOCUSABLES_ALL);
+        List<View> allowed = layers != null ? layers : java.util.Collections.singletonList(root);
+        for (View stop : stops) {
+            checked++;
+            if (!within(stop, allowed) || !exposed(stop)) {
+                fail(screen, theme, "FOCUS_TRAP", describe(stop)
+                        + " is a stop under what is on top");
+                continue;
+            }
+            checked++;
+            AccessibilityNodeInfo info = stop.createAccessibilityNodeInfo();
+            boolean does = info.isClickable() || info.isLongClickable() || info.isEditable()
+                    || info.isScrollable() || stop instanceof ViewNode || hasOwnAction(info);
+            if (!does) {
+                fail(screen, theme, "FOCUS_EMPTY", describe(stop) + " is a stop that does nothing");
+            }
+        }
+        // Every element on top that a finger can tap or hold, a keyboard reaches.
+        List<View> shown = new ArrayList<>();
+        collect(root, shown);
+        for (View view : shown) {
+            if (!view.isEnabled() || !exposed(view) || !within(view, allowed)) {
+                continue;
+            }
+            AccessibilityNodeInfo info = view.createAccessibilityNodeInfo();
+            if (!info.isVisibleToUser() || !(info.isClickable() || info.isLongClickable())) {
+                continue;
+            }
+            checked++;
+            // A list's rows are reached through the list, which moves among them itself.
+            if (!stops.contains(view) && !inListThatIsAStop(view, stops)) {
+                fail(screen, theme, "FOCUS_REACH", describe(view) + " can't be reached by Tab");
+            }
+        }
+        // Stops side by side in one container come in reading order.
+        boolean rtl = root.getLayoutDirection() == View.LAYOUT_DIRECTION_RTL;
+        for (int i = 1; i < stops.size(); i++) {
+            View a = stops.get(i - 1);
+            View b = stops.get(i);
+            if (a.getParent() != b.getParent()) {
+                continue;
+            }
+            Rect first = inWindow(a, new Rect(0, 0, a.getWidth(), a.getHeight()), root);
+            Rect then = inWindow(b, new Rect(0, 0, b.getWidth(), b.getHeight()), root);
+            checked++;
+            boolean sameLine = Math.abs(then.top - first.top) <= LINE_SLACK_PX;
+            boolean back = sameLine
+                    ? (rtl ? then.left > first.left : then.left < first.left)
+                    : then.top < first.top;
+            if (back) {
+                fail(screen, theme, "FOCUS_ORDER", describe(b) + " comes after " + describe(a));
+            }
+        }
+    }
+
+    private static boolean hasOwnAction(AccessibilityNodeInfo info) {
+        for (AccessibilityAction action : info.getActionList()) {
+            if (isCustom(action.getId())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean inListThatIsAStop(View view, List<View> stops) {
+        for (ViewParent parent = view.getParent(); parent instanceof View;
+                parent = parent.getParent()) {
+            if (parent instanceof AbsListView && stops.contains((View) parent)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean within(View view, List<View> layers) {
+        for (View layer : layers) {
+            for (View at = view; at != null;
+                    at = at.getParent() instanceof View ? (View) at.getParent() : null) {
+                if (at == layer) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Checks the focus ring drawn at {@code ring}, in {@code root}'s coordinates: at the middle
+     * of each of its sides on screen, the ring has 3:1 against what is just outside it, the
+     * focused element's surroundings as they are without focus (A11Y-06, WCAG 2.4.13).
+     */
+    void checkRing(Window window, View root, Rect ring, String screen, String theme,
+            Runnable done) {
+        checked++;
+        if (ring.isEmpty()) {
+            fail(screen, theme, "FOCUS_RING", "nothing shows where the focus is");
+            done.run();
+            return;
+        }
+        Bitmap pixels = Bitmap.createBitmap(root.getWidth(), root.getHeight(),
+                Bitmap.Config.ARGB_8888);
+        PixelCopy.request(window, pixels, result -> {
+            if (result != PixelCopy.SUCCESS) {
+                fail(screen, theme, "WINDOW", "its pixels couldn't be copied (" + result + ")");
+            } else {
+                int out = Math.max(2, Math.round(2.5f * density));
+                int[][] sides = {
+                    {ring.centerX(), ring.top, 0, -out}, {ring.centerX(), ring.bottom, 0, out},
+                    {ring.left, ring.centerY(), -out, 0}, {ring.right, ring.centerY(), out, 0},
+                };
+                for (int[] side : sides) {
+                    int x = side[0];
+                    int y = side[1];
+                    int outsideX = x + side[2];
+                    int outsideY = y + side[3];
+                    if (!inside(pixels, x, y) || !inside(pixels, outsideX, outsideY)) {
+                        continue;
+                    }
+                    checked++;
+                    int drawnColour = pixels.getPixel(x, y) | 0xFF000000;
+                    int around = pixels.getPixel(outsideX, outsideY) | 0xFF000000;
+                    double ratio = contrast(drawnColour, around);
+                    if (ratio < LARGE_RATIO) {
+                        fail(screen, theme, "FOCUS_RING", "the ring is "
+                                + String.format("%.2f", ratio) + ":1 (" + hex(drawnColour)
+                                + " beside " + hex(around) + ") at " + Math.round(x / density)
+                                + "," + Math.round(y / density) + " dp");
+                    }
+                }
+            }
+            pixels.recycle();
+            done.run();
+        }, new Handler(Looper.getMainLooper()));
+    }
+
+    private static boolean inside(Bitmap pixels, int x, int y) {
+        return x >= 0 && y >= 0 && x < pixels.getWidth() && y < pixels.getHeight();
     }
 
     /** An action of MeeGone's own, named by one of its resources, rather than a standard one. */
@@ -298,7 +476,7 @@ final class A11yAudit {
     // ---- Contrast (A11Y-03) and scaling (A11Y-04) of a text view.
 
     private Drawn checkText(TextView view, View root, Bitmap pixels, String screen,
-            String theme) {
+            String theme, boolean onTop) {
         Layout layout = view.getLayout();
         CharSequence text = view.getText();
         boolean hint = TextUtils.isEmpty(text) && view instanceof EditText
@@ -357,7 +535,7 @@ final class A11yAudit {
         }
         if (shortened && !hint) {
             checked++;
-            if (!readWhole(view, text.toString())) {
+            if (onTop && !readWhole(view, text.toString())) {
                 fail(screen, theme, "TRUNCATED", what + " isn't read whole by screen readers");
             }
         }

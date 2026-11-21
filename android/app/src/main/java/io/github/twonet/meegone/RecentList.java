@@ -136,6 +136,13 @@ final class RecentList extends LinearLayout {
 
         /** In close mode, Clear all was tapped (REC-08). */
         void clearAll();
+
+        /**
+         * A card's long-press came without a finger, from a screen reader, a switch or a key:
+         * close mode starts, as the gesture starts it (REC-07, A11Y-05). Returns whether it
+         * did.
+         */
+        boolean editRequested();
     }
 
     private final AppIcons icons;
@@ -923,14 +930,18 @@ final class RecentList extends LinearLayout {
             return true;
         }
 
-        // A tap opens the app (REC-06, A11Y-05). In close mode it does nothing, and the card
-        // offers "Remove ‹app› from Recent", the ✕'s name (A11Y-01).
+        // A tap opens the app (REC-06, A11Y-05), and a long-press, "Edit Recent", enters close
+        // mode, as the gesture does (REC-07, ADR 0039). In close mode a tap does nothing, and
+        // the card offers "Remove ‹app› from Recent", the ✕'s name (A11Y-01).
         @Override
         public void onInitializeAccessibilityNodeInfo(AccessibilityNodeInfo info) {
             super.onInitializeAccessibilityNodeInfo(info);
             if (!closing) {
                 info.addAction(new AccessibilityAction(AccessibilityNodeInfo.ACTION_CLICK,
                         getResources().getString(R.string.action_open_app)));
+                info.setLongClickable(true);
+                info.addAction(new AccessibilityAction(AccessibilityNodeInfo.ACTION_LONG_CLICK,
+                        getResources().getString(R.string.action_edit_recent)));
                 return;
             }
             info.setClickable(false);
@@ -941,6 +952,9 @@ final class RecentList extends LinearLayout {
 
         @Override
         public boolean performAccessibilityAction(int action, Bundle arguments) {
+            if (action == AccessibilityNodeInfo.ACTION_LONG_CLICK && !closing) {
+                return listener.editRequested();
+            }
             if (action == R.id.action_remove_from_recent && closing) {
                 int index = shown.indexOf(this);
                 if (index >= 0) {

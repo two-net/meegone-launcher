@@ -306,6 +306,15 @@ final class SearchPanel extends FrameLayout {
         }
     }
 
+    /**
+     * A hardware keyboard typed {@code text} on Applications, which opened search (SRCH-01,
+     * A11Y-06): it goes into the field, as if typed there.
+     */
+    void type(String text) {
+        field.append(text);
+        field.setSelection(field.length());
+    }
+
     /** Search closed: the keyboard goes, and the field empties without telling anyone. */
     void dismiss() {
         InputMethodManager keyboards = getContext().getSystemService(InputMethodManager.class);

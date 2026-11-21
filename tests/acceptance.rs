@@ -3,8 +3,9 @@
 //!
 //! AC-18 to AC-20 (animation scale, screen reader, timing) need a device to check in full; they
 //! belong to the device matrix (#43) and the benchmarks (#40). Their core logic is tested
-//! without one: every flow with animations removed (AC-18, ANIM-05) and the screen-reader
-//! actions (AC-19, A11Y-05) here, and the carousel's in `meegone-shell-state`.
+//! without one: every flow with animations removed (AC-18, ANIM-05) and the actions a screen
+//! reader, a switch or a keyboard sends (AC-19, A11Y-05, A11Y-06) here, and the carousel's in
+//! `meegone-shell-state`.
 
 mod backup;
 
@@ -5434,4 +5435,257 @@ fn adr0036_setup_runs_once_per_install_and_again_after_a_restore_on_another_devi
     );
     let mut launcher = Launcher::start(upgraded.platform());
     assert_eq!(setup_step(&mut launcher), None);
+}
+
+/// Opens `key`'s menu without a gesture, as a screen reader's, a keyboard's or a switch's "Open
+/// menu" does, and chooses its first item `pick` accepts (A11Y-05, ADR 0039).
+fn choose_from_cell_menu(
+    launcher: &mut Launcher,
+    key: CellKey,
+    pick: impl Fn(&AppMenuItem) -> bool,
+) {
+    launcher.dispatch(ShellIntent::OpenCellMenu(key));
+    let menu = launcher.frame().apps.menu.expect("the menu opens");
+    let index = launcher
+        .view()
+        .apps()
+        .menu_items()
+        .iter()
+        .position(pick)
+        .expect("the menu offers it");
+    assert!(
+        launcher
+            .view()
+            .apps()
+            .menu_item_chosen(menu.revision, index)
+    );
+    assert_eq!(launcher.frame().apps.menu, None);
+}
+
+#[test]
+fn ac19_without_any_gesture_every_task_can_be_done_and_with_animations_removed_at_once() {
+    // Issue #38: AC-19, A11Y-05, A11Y-06, and AC-18 with animations removed. Every step is
+    // what a screen reader's, a keyboard's or a switch's action sends: the views switch, an
+    // app launches, an icon moves, a folder is made, joined and left, Recent is cleared and
+    // Settings opens. No pointer, long-press or pinch is used.
+    for speed in [1.0, 0.0] {
+        let fakes = Fakes::after_setup();
+        *fakes.system.animation_scale.lock().unwrap() = speed;
+        *fakes.apps.apps.lock().unwrap() = vec![
+            app("camera", "Camera"),
+            app("mail", "Mail"),
+            app("maps", "Maps"),
+            app("phone", "Phone"),
+        ];
+        *fakes.usage.access.lock().unwrap() = Access::Granted;
+        *fakes.system.now_ms.lock().unwrap() = 10_000_000;
+        *fakes.usage.uses.lock().unwrap() = vec![used("mail", 9_000_000), used("maps", 8_000_000)];
+        let (mut launcher, mut clock) = on_a_phone(&fakes);
+        grid_on_a_phone(&mut launcher);
+        // With animations removed, each step is over as it happens (AC-18).
+        let settle = |launcher: &mut Launcher, clock: &mut u64| {
+            if speed == 0.0 {
+                assert!(at_rest(launcher), "nothing moves with animations removed");
+            }
+            come_to_rest(launcher, clock);
+        };
+
+        // The views, both ways.
+        for (direction, view) in [
+            (Direction::Next, HomeView::Recent),
+            (Direction::Next, HomeView::Events),
+            (Direction::Previous, HomeView::Recent),
+            (Direction::Previous, HomeView::Applications),
+        ] {
+            launcher.dispatch(ShellIntent::Swipe(direction));
+            assert_eq!(launcher.frame().current, view);
+            settle(&mut launcher, &mut clock);
+        }
+
+        // An app launches.
+        let revision = launcher.frame().apps.revision;
+        assert!(
+            launcher
+                .view()
+                .apps()
+                .cell_tapped(Surface::Grid, revision, 0, Rect::default())
+        );
+        launcher.frame();
+        assert_eq!(*fakes.apps.launched.lock().unwrap(), [app_id("camera")]);
+        launcher.dispatch(ShellIntent::Resumed);
+        launcher.dispatch(ShellIntent::Returned { home: true });
+        settle(&mut launcher, &mut clock);
+
+        // Edit mode from an app's menu, then Camera to the end.
+        let camera = || CellKey::App(app_id("camera"));
+        choose_from_cell_menu(&mut launcher, camera(), |item| {
+            *item == AppMenuItem::EditApplications
+        });
+        assert!(launcher.frame().edit.on);
+        settle(&mut launcher, &mut clock);
+        choose_from_cell_menu(&mut launcher, camera(), |item| {
+            *item == AppMenuItem::MoveToEnd
+        });
+        assert_eq!(grid(&launcher), ["Mail", "Maps", "Phone", "Camera"]);
+        settle(&mut launcher, &mut clock);
+
+        // A folder of Mail and Maps, then Camera into it, then out again.
+        choose_from_cell_menu(
+            &mut launcher,
+            CellKey::App(app_id("mail")),
+            |item| matches!(item, AppMenuItem::MakeFolderWith { name, .. } if name == "Maps"),
+        );
+        assert_eq!(grid(&launcher), ["", "Phone", "Camera"]);
+        settle(&mut launcher, &mut clock);
+        choose_from_cell_menu(&mut launcher, camera(), |item| {
+            *item == AppMenuItem::MoveToStart
+        });
+        choose_from_cell_menu(&mut launcher, camera(), |item| {
+            matches!(item, AppMenuItem::MoveInto { .. })
+        });
+        assert_eq!(grid(&launcher), ["", "Phone"]);
+        settle(&mut launcher, &mut clock);
+        open_folder(&mut launcher, 0);
+        settle(&mut launcher, &mut clock);
+        // Mail went onto Maps, so the folder holds Maps first (FOLD-01).
+        assert_eq!(in_folder(&launcher), ["Maps", "Mail", "Camera"]);
+        choose_from_cell_menu(&mut launcher, camera(), |item| {
+            *item == AppMenuItem::MoveOutOfFolder
+        });
+        assert_eq!(grid(&launcher), ["", "Camera", "Phone"]);
+        settle(&mut launcher, &mut clock);
+        launcher.dispatch(ShellIntent::Back);
+        launcher.view().apps().done();
+        assert!(!launcher.frame().edit.on);
+        settle(&mut launcher, &mut clock);
+
+        // Recent is cleared.
+        launcher.dispatch(ShellIntent::Swipe(Direction::Next));
+        settle(&mut launcher, &mut clock);
+        launcher
+            .view()
+            .recent()
+            .laid_out(WIDTH - 2.0 * 16.0 * 2.75, 2.75);
+        assert_eq!(recent_cards(&mut launcher).1.len(), 2);
+        assert!(recent_frame(&mut launcher).close_offered);
+        launcher.view().recent().close_mode_requested();
+        settle(&mut launcher, &mut clock);
+        launcher.view().recent().clear_all_tapped();
+        settle(&mut launcher, &mut clock);
+        assert_eq!(recent_cards(&mut launcher), (RecentMode::Empty, Vec::new()));
+        launcher.dispatch(ShellIntent::Back);
+
+        // Settings opens from Events' menu.
+        launcher.dispatch(ShellIntent::Swipe(Direction::Next));
+        settle(&mut launcher, &mut clock);
+        assert!(launcher.frame().menu_offered);
+        launcher.dispatch(ShellIntent::OpenMenu);
+        launcher.dispatch(ShellIntent::ChooseMenuItem(MenuItem::LauncherSettings));
+        assert!(launcher.frame().settings_open);
+        settle(&mut launcher, &mut clock);
+
+        // The arrangement was saved.
+        drop(launcher);
+        assert_eq!(
+            grid(&Launcher::start(fakes.platform())),
+            ["", "Camera", "Phone"]
+        );
+    }
+}
+
+#[test]
+fn ac18_with_animations_removed_folders_removals_coming_home_and_search_closing_are_instant() {
+    // Issue #38: ANIM-05, A11Y-07, AC-18, for the flows the earlier AC-18 tests left out.
+    // A folder made by a drop: the wait before it is armed stays (FOLDER_HOVER), and the merge
+    // is over as the finger lifts (ANIM-14).
+    let fakes = animations_removed();
+    *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail"), app("maps", "Maps")];
+    let (mut launcher, mut clock) = on_a_phone(&fakes);
+    grid_on_a_phone(&mut launcher);
+    let (x, y) = phone_icon(1);
+    assert!(long_press_cell(&mut launcher, &mut clock, 1, x, y));
+    let (x, y) = phone_icon(0);
+    finger(&mut launcher, &mut clock, PointerKind::Move, x, y);
+    wait(&mut launcher, &mut clock, 480);
+    assert_eq!(launcher.frame().hover.expect("held over Mail").cell, 0);
+    finger(&mut launcher, &mut clock, PointerKind::Up, x, y);
+    assert_eq!(grid(&launcher), [""]);
+    assert!(at_rest(&mut launcher));
+
+    // Dragged out of the folder's panel: it closes, and the app lands, at once (ANIM-15).
+    open_folder(&mut launcher, 0);
+    folder_on_a_phone(&mut launcher);
+    assert!(at_rest(&mut launcher));
+    let (fx, fy) = (44.0 + 248.0 + 124.0, 600.0 + 99.0);
+    finger(&mut launcher, &mut clock, PointerKind::Down, fx, fy);
+    clock += 400;
+    launcher.dispatch(ShellIntent::LongPressCell {
+        surface: Surface::Folder,
+        key: CellKey::App(app_id("maps")),
+    });
+    finger(&mut launcher, &mut clock, PointerKind::Move, fx, fy - 40.0);
+    finger(&mut launcher, &mut clock, PointerKind::Move, fx, 300.0);
+    assert_eq!(launcher.frame().folder, None);
+    finger(&mut launcher, &mut clock, PointerKind::Up, fx, 300.0);
+    assert_eq!(grid(&launcher), ["Mail", "Maps"]);
+    assert!(at_rest(&mut launcher));
+    launcher.dispatch(ShellIntent::Back);
+
+    // An app removed leaves at once (ANIM-21).
+    fakes
+        .apps
+        .apps
+        .lock()
+        .unwrap()
+        .retain(|app| app.label != "Maps");
+    launcher.dispatch(ShellIntent::AppsChanged);
+    assert_eq!(grid(&launcher), ["Mail"]);
+    assert!(at_rest(&mut launcher));
+
+    // Notifications cleared, then one dismissed from its menu, go at once (ANIM-20).
+    *fakes.notifications.access.lock().unwrap() = Access::Granted;
+    *fakes.notifications.active.lock().unwrap() =
+        vec![notification("m1", "mail"), notification("c1", "chat")];
+    launcher.dispatch(ShellIntent::NotificationsChanged);
+    launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
+    assert!(at_rest(&mut launcher));
+    let (revision, _) = events_rows(&mut launcher);
+    let target = launcher
+        .view()
+        .events()
+        .row_target(revision, 0)
+        .expect("the row shows");
+    launcher.dispatch(ShellIntent::OpenNotificationMenu(target));
+    launcher
+        .view()
+        .events()
+        .menu_item_chosen(NotificationMenuItem::Dismiss);
+    fakes.notifications.active.lock().unwrap().remove(0);
+    launcher.dispatch(ShellIntent::NotificationsChanged);
+    assert_eq!(events_list(&mut launcher).1.len(), 1);
+    assert!(at_rest(&mut launcher));
+    launcher.view().events().clear_tapped();
+    fakes.notifications.active.lock().unwrap().clear();
+    launcher.dispatch(ShellIntent::NotificationsChanged);
+    assert_eq!(events_list(&mut launcher).0, EventsListMode::Empty);
+    assert!(at_rest(&mut launcher));
+
+    // Coming home to Recent with the system's Home, which animates the return itself.
+    launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
+    launcher.dispatch(ShellIntent::Resumed);
+    launcher.dispatch(ShellIntent::Returned { home: true });
+    let frame = launcher.frame();
+    assert_eq!(frame.current, HomeView::Recent);
+    assert_eq!((frame.content_scale, frame.content_alpha), (10_000, 255));
+    assert!(at_rest(&mut launcher));
+
+    // Search closes at once with Back (ANIM-16).
+    let fakes = animations_removed();
+    let (mut launcher, mut clock) = ready_to_search(&fakes);
+    open_search(&mut launcher, &mut clock);
+    launcher.dispatch(ShellIntent::Back);
+    let search = launcher.frame().search;
+    assert!(!search.open);
+    assert_eq!(search.reveal_px, 0);
+    assert!(at_rest(&mut launcher));
 }
