@@ -82,6 +82,17 @@ final class A11yAudit {
     }
 
     /**
+     * Counts one check of {@code rule} on {@code screen}, such as the views' order right to
+     * left (ADR 0040), which fails, saying {@code what}, unless it {@code held}.
+     */
+    void expect(boolean held, String screen, String theme, String rule, String what) {
+        checked++;
+        if (!held) {
+            fail(screen, theme, rule, what);
+        }
+    }
+
+    /**
      * Copies {@code window}'s pixels, then checks {@code root}, its content, and calls {@code
      * done} on the main thread. A dialog's window has room for its shadow around it, so a
      * dialog, {@code drawn}, is drawn into the pixels instead of copied.

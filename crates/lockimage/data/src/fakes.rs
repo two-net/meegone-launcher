@@ -4,9 +4,9 @@
 
 use std::sync::Mutex;
 
-use meegone_core_data::DataError;
+use meegone_core_data::{DataError, Problem};
 
-use crate::feed::{FORMAT_CHANGED, FeedImage, ImageFeed, ImageVersion};
+use crate::feed::{FeedImage, ImageFeed, ImageVersion};
 
 /// An image with one portrait and one landscape version.
 pub fn feed_image(id: &str, date: &str) -> FeedImage {
@@ -80,7 +80,7 @@ impl ImageFeed for FakeFeed {
             .lock()
             .unwrap()
             .clone()
-            .ok_or_else(|| DataError::Invalid(FORMAT_CHANGED.into()))
+            .ok_or(DataError::Invalid(Problem::FeedFormatChanged))
     }
 
     fn past_week(&self, region: &str) -> Result<Vec<FeedImage>, DataError> {
@@ -90,7 +90,7 @@ impl ImageFeed for FakeFeed {
         }
         let week = self.week.lock().unwrap().clone();
         if week.is_empty() {
-            return Err(DataError::Invalid(FORMAT_CHANGED.into()));
+            return Err(DataError::Invalid(Problem::FeedFormatChanged));
         }
         Ok(week)
     }

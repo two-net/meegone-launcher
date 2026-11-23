@@ -12,7 +12,6 @@ import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 import java.io.File;
-import java.util.Locale;
 
 /**
  * The image details screen (WALL-15, ADR 0031). It covers the home views in the surface colour:
@@ -262,13 +261,12 @@ final class ImageDetails extends Scroll {
         return res.getString(R.string.image_date_region, date, region);
     }
 
-    /** The feed region's tag, such as {@code en-GB}, named in the device's language. */
+    /**
+     * The feed region's tag, such as {@code en-GB}, named in the device's language as it is
+     * after the date (L10N-04).
+     */
     private static String regionName(String tag) {
-        if (tag.isEmpty()) {
-            return "";
-        }
-        String name = Locale.forLanguageTag(tag).getDisplayName(Locale.getDefault());
-        return name.isEmpty() ? tag : name;
+        return Regions.nameInSentence(tag);
     }
 
     /** Decodes the image as large as its box is now, behind the scenes. */

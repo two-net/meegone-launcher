@@ -11,6 +11,7 @@ use super::jni::{Env, GlobalRef, JValue, Local, LocalRef, MethodId, Vm};
 use crate::adapters::AppsAdapter;
 use crate::catalogue;
 use crate::model::{App, AppId, DataError, Profile, Rect, Shortcut};
+use crate::problem::Problem;
 
 pub struct AndroidApps {
     vm: Vm,
@@ -93,7 +94,7 @@ impl AndroidApps {
         let args = app_args(&first, &second, profile);
         match env.call_string(&self.bridge, method, &args)? {
             None => Ok(()),
-            Some(message) => Err(DataError::Failed(message)),
+            Some(code) => Err(DataError::Failed(Problem::from_host(&code))),
         }
     }
 }
@@ -170,7 +171,7 @@ impl AppsAdapter for AndroidApps {
         ];
         match env.call_string(&self.bridge, self.launch, &args)? {
             None => Ok(()),
-            Some(message) => Err(DataError::Failed(message)),
+            Some(code) => Err(DataError::Failed(Problem::from_host(&code))),
         }
     }
 
@@ -185,9 +186,7 @@ impl AppsAdapter for AndroidApps {
         let args = app_args(&package, &activity, app.profile.0);
         match env.call_strings(&self.bridge, self.shortcuts, &args)? {
             Some(fields) => Ok(catalogue::shortcuts(app, &fields)),
-            None => Err(DataError::Unsupported(
-                "Shortcuts need MeeGone as the default home app".into(),
-            )),
+            None => Err(DataError::Unsupported(Problem::ShortcutsNeedDefaultHome)),
         }
     }
 
@@ -222,5 +221,5 @@ impl AppsAdapter for AndroidApps {
 
 /// The bridge returns `null` when the system couldn't answer.
 fn unlisted() -> DataError {
-    DataError::Failed("The app list isn't available".into())
+    DataError::Failed(Problem::AppListUnavailable)
 }

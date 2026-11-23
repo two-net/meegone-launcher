@@ -25,6 +25,14 @@ android {
             abiFilters += "arm64-v8a"
         }
     }
+
+    buildTypes {
+        debug {
+            // The pseudo-locales en-XA (accented, a third longer) and ar-XB (right to left), so
+            // the accessibility audit can check every screen in them (L10N-02, ADR 0040).
+            isPseudoLocalesEnabled = true
+        }
+    }
 }
 
 /** Builds the Rust app as `libmeegone_launcher.so` for each ABI, with cargo-ndk. */

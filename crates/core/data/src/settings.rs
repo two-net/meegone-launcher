@@ -334,6 +334,7 @@ named!(RecentWindow {
 mod tests {
     use super::*;
     use crate::fakes::{FakeStorage, app_id};
+    use crate::problem::Problem;
     use crate::storage::format::seal;
     use crate::storage::{decode, encode};
 
@@ -523,7 +524,7 @@ mod tests {
         store
             .update(&mut |settings| settings.theme = ThemeChoice::Dark)
             .unwrap();
-        let failure = DataError::Failed("Not enough storage space".into());
+        let failure = DataError::Failed(Problem::StorageFull);
         *storage.error.lock().unwrap() = Some(failure.clone());
 
         let result = store.update(&mut |settings| settings.theme = ThemeChoice::Light);

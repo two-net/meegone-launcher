@@ -12,7 +12,7 @@ use meegone_core_data::{
     DataError, NotificationsAdapter, Settings, SettingsStore, SystemConfigAdapter, UsageAdapter,
     setup_done,
 };
-use meegone_core_state::{Access, HomeTarget, StateHolder, ThemeChoice};
+use meegone_core_state::{Access, HomeTarget, Problem, StateHolder, ThemeChoice};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SettingsState {
@@ -29,10 +29,10 @@ pub struct SettingsState {
     /// Written instructions for an Access item whose shortcut found no system screen to open,
     /// shown below that item until Settings is opened again or MeeGone comes back to the
     /// foreground (SRS 8.1).
-    pub instructions: Option<(AccessItem, String)>,
+    pub instructions: Option<(AccessItem, Problem)>,
     /// First-run setup, while it shows (ONB-01). It covers the home views.
     pub setup: Option<Setup>,
-    pub problem: Option<String>,
+    pub problem: Option<Problem>,
 }
 
 /// A screen of first-run setup, in order (ONB-01). Setup has no theme step: System applies
@@ -308,7 +308,7 @@ impl SettingsHolder {
             Err(DataError::Unsupported(instructions)) => {
                 self.state.instructions = Some((item, instructions));
             }
-            Err(error) => self.state.problem = Some(error.to_string()),
+            Err(error) => self.state.problem = Some(error.problem()),
         }
     }
 
@@ -329,7 +329,7 @@ impl SettingsHolder {
             .store
             .update(&mut change)
             .err()
-            .map(|error| error.to_string());
+            .map(|error| error.problem());
         self.refresh();
     }
 }
@@ -510,13 +510,13 @@ mod tests {
     fn a_dismissal_that_cant_be_saved_still_hides_the_banner_today() {
         let (fakes, store, mut holder) = setup();
         resume_at(&fakes, &mut holder, MIDNIGHT_UTC + HOUR_MS);
-        let failure = DataError::Failed("Not enough storage space".into());
+        let failure = DataError::Failed(Problem::StorageFull);
         *fakes.storage.error.lock().unwrap() = Some(failure.clone());
 
         holder.handle(SettingsIntent::DismissHomeBanner);
 
         assert!(!holder.state().home_banner);
-        assert_eq!(holder.state().problem, Some(failure.to_string()));
+        assert_eq!(holder.state().problem, Some(failure.problem()));
         assert_eq!(store.get().home_banner_dismissed_ms, None);
         resume_at(&fakes, &mut holder, MIDNIGHT_UTC + 2 * HOUR_MS);
         assert!(!holder.state().home_banner);
@@ -541,13 +541,13 @@ mod tests {
     fn a_request_whose_answer_cant_be_saved_says_why() {
         // ONB-04, REL-03: the dialog opened, but the day's answer wasn't saved.
         let (fakes, _, mut holder) = setup();
-        let failure = DataError::Failed("Not enough storage space".into());
+        let failure = DataError::Failed(Problem::StorageFull);
         *fakes.storage.error.lock().unwrap() = Some(failure.clone());
 
         holder.handle(SettingsIntent::RequestDefaultHome);
 
         assert_eq!(*fakes.system.default_home_requested.lock().unwrap(), 1);
-        assert_eq!(holder.state().problem, Some(failure.to_string()));
+        assert_eq!(holder.state().problem, Some(failure.problem()));
         assert!(!holder.state().home_banner);
     }
 
@@ -555,15 +555,15 @@ mod tests {
     fn a_request_the_system_cant_show_keeps_the_banner_and_says_why() {
         // SRS 8.1: without a system screen, show written instructions instead.
         let (fakes, _, mut holder) = setup();
-        let instructions = "Choose MeeGone in Settings";
-        *fakes.system.error.lock().unwrap() = Some(DataError::Unsupported(instructions.into()));
+        let instructions = Problem::DefaultHomeInstructions;
+        *fakes.system.error.lock().unwrap() = Some(DataError::Unsupported(instructions));
 
         holder.handle(SettingsIntent::RequestDefaultHome);
 
         assert!(holder.state().home_banner);
         assert_eq!(
             holder.state().instructions,
-            Some((AccessItem::DefaultHome, instructions.to_owned()))
+            Some((AccessItem::DefaultHome, instructions))
         );
         assert_eq!(holder.state().problem, None);
     }
@@ -572,14 +572,13 @@ mod tests {
     fn an_access_shortcut_without_a_system_screen_shows_written_instructions_below_its_item() {
         // SET-02, SRS 8.1: until Settings is opened again or MeeGone comes back.
         let (fakes, _, mut holder) = setup();
-        let instructions = "Open Settings, then Notification access";
-        *fakes.notifications.error.lock().unwrap() =
-            Some(DataError::Unsupported(instructions.into()));
+        let instructions = Problem::NotificationAccessInstructions;
+        *fakes.notifications.error.lock().unwrap() = Some(DataError::Unsupported(instructions));
 
         holder.handle(SettingsIntent::OpenNotificationAccess);
         assert_eq!(
             holder.state().instructions,
-            Some((AccessItem::Notifications, instructions.to_owned()))
+            Some((AccessItem::Notifications, instructions))
         );
         assert_eq!(holder.state().problem, None);
 
@@ -592,11 +591,11 @@ mod tests {
     #[test]
     fn a_shortcut_that_fails_otherwise_reports_a_problem_and_the_next_one_clears_it() {
         let (fakes, _, mut holder) = setup();
-        let failure = DataError::Failed("Something went wrong".into());
+        let failure = DataError::Failed(Problem::SystemFailed);
         *fakes.usage.error.lock().unwrap() = Some(failure.clone());
 
         holder.handle(SettingsIntent::OpenUsageAccess);
-        assert_eq!(holder.state().problem, Some(failure.to_string()));
+        assert_eq!(holder.state().problem, Some(failure.problem()));
         assert_eq!(holder.state().instructions, None);
 
         *fakes.usage.error.lock().unwrap() = None;
@@ -818,14 +817,14 @@ mod tests {
         for _ in 0..3 {
             holder.handle(SettingsIntent::SetupContinue);
         }
-        let failure = DataError::Failed("Not enough storage space".into());
+        let failure = DataError::Failed(Problem::StorageFull);
         *fakes.storage.error.lock().unwrap() = Some(failure.clone());
 
         holder.handle(SettingsIntent::SetupNotNow(AccessItem::Notifications));
         holder.handle(SettingsIntent::SetupNotNow(AccessItem::Usage));
 
         assert_eq!(holder.state().setup, None);
-        assert_eq!(holder.state().problem, Some(failure.to_string()));
+        assert_eq!(holder.state().problem, Some(failure.problem()));
         holder.handle(SettingsIntent::Refresh);
         assert_eq!(holder.state().setup, None);
         *fakes.storage.error.lock().unwrap() = None;

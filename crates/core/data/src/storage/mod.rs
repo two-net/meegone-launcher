@@ -20,6 +20,7 @@ pub use format::{
 };
 
 use crate::model::DataError;
+use crate::problem::Problem;
 
 /// Every file MeeGone stores. Each belongs to one of the three persistent stores (SRS 7.1).
 ///
@@ -84,10 +85,7 @@ pub(crate) fn check_budget(others: u64, new: usize, budget: u64) -> Result<(), D
     if total <= budget {
         Ok(())
     } else {
-        Err(DataError::Failed(format!(
-            "Stored data would go over {} MB",
-            budget / 1_000_000
-        )))
+        Err(DataError::Failed(Problem::StorageBudget))
     }
 }
 
@@ -110,7 +108,7 @@ mod tests {
         assert!(check_budget(30_000_000, 20_000_000, MAX_STORED_BYTES).is_ok());
         assert_eq!(
             check_budget(30_000_000, 20_000_001, MAX_STORED_BYTES),
-            Err(DataError::Failed("Stored data would go over 50 MB".into()))
+            Err(DataError::Failed(Problem::StorageBudget))
         );
         assert!(check_budget(u64::MAX, 1, MAX_STORED_BYTES).is_err());
     }

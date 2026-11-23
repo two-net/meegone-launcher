@@ -2,6 +2,8 @@
 
 use std::fmt;
 
+use crate::problem::Problem;
+
 /// A user profile on the device, such as personal or work (APPS-20).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct ProfileId(pub u32);
@@ -195,7 +197,9 @@ impl Rect {
 }
 
 /// How [`SystemConfigAdapter::format_time`](crate::SystemConfigAdapter::format_time) writes a
-/// moment: in the device's language, time zone and 12- or 24-hour setting (L10N-03).
+/// moment: in the device's language, time zone and 12- or 24-hour setting (L10N-03). The first
+/// two start a line, so a weekday or month is capitalised as the language does there; the rest
+/// sit inside a sentence, such as "Alarm ‹time›", and are capitalised as there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TimeStyle {
     /// The weekday in full, such as "Tuesday" (EVT-01).
@@ -263,31 +267,38 @@ pub struct ImageCrop {
 }
 
 /// An error from a platform adapter or a store. Each feature turns it into its own error state
-/// (ARCH-09).
+/// (ARCH-09), and the user is told its [`Problem`], which the host words (L10N-01, ADR 0040).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DataError {
     /// The user hasn't granted the special access this needs (C4).
     AccessDenied,
-    /// The device or its policy doesn't allow it; the text says why (WALL-13).
-    Unsupported(String),
+    /// The device or its policy doesn't allow it; the problem says why, or how to do it by hand
+    /// (WALL-13, SRS 8.1).
+    Unsupported(Problem),
     /// There is no network connection (WALL-16).
     Offline,
     /// Data from outside was rejected: not HTTPS, too large, malformed, or in a format that
-    /// changed (SEC-02). The text says why.
-    Invalid(String),
-    /// Anything else, in plain words for a status line.
-    Failed(String),
+    /// changed (SEC-02). The problem says why.
+    Invalid(Problem),
+    /// Anything else.
+    Failed(Problem),
+}
+
+impl DataError {
+    /// What the user is told.
+    pub const fn problem(&self) -> Problem {
+        match self {
+            Self::AccessDenied => Problem::AccessDenied,
+            Self::Offline => Problem::NoConnection,
+            Self::Unsupported(problem) | Self::Invalid(problem) | Self::Failed(problem) => *problem,
+        }
+    }
 }
 
 impl fmt::Display for DataError {
+    /// The problem's code, for logs.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::AccessDenied => f.write_str("Access not granted"),
-            Self::Offline => f.write_str("No connection"),
-            Self::Unsupported(reason) | Self::Invalid(reason) | Self::Failed(reason) => {
-                f.write_str(reason)
-            }
-        }
+        self.problem().fmt(f)
     }
 }
 
@@ -322,18 +333,23 @@ mod tests {
     }
 
     #[test]
-    fn errors_read_as_plain_words_for_a_status_line() {
-        // WALL-16
-        assert_eq!(DataError::AccessDenied.to_string(), "Access not granted");
-        assert_eq!(DataError::Offline.to_string(), "No connection");
+    fn every_error_tells_the_user_its_problem() {
+        // WALL-16, L10N-01: the host words the problem; the error's text is its code, for logs.
+        assert_eq!(DataError::AccessDenied.problem(), Problem::AccessDenied);
+        assert_eq!(DataError::Offline.problem(), Problem::NoConnection);
         assert_eq!(
-            DataError::Invalid("Too large".into()).to_string(),
-            "Too large"
+            DataError::Invalid(Problem::DownloadTooLarge).problem(),
+            Problem::DownloadTooLarge
         );
         assert_eq!(
-            DataError::Unsupported("Blocked by device policy".into()).to_string(),
-            "Blocked by device policy"
+            DataError::Unsupported(Problem::WallpaperNotAllowed).problem(),
+            Problem::WallpaperNotAllowed
         );
+        assert_eq!(
+            DataError::Failed(Problem::SystemFailed).problem(),
+            Problem::SystemFailed
+        );
+        assert_eq!(DataError::Offline.to_string(), "no_connection");
     }
 
     #[test]

@@ -11,6 +11,7 @@ use super::jni::{Env, GlobalRef, JValue, LocalRef, MethodId, Vm};
 use crate::adapters::NotificationsAdapter;
 use crate::model::{Access, DataError, Notification, ProfileId, Rect};
 use crate::notification_records;
+use crate::problem::Problem;
 
 pub struct AndroidNotifications {
     vm: Vm,
@@ -91,9 +92,7 @@ impl NotificationsAdapter for AndroidNotifications {
         let env = self.vm.env()?;
         match env.call_strings(&self.bridge, self.active_notifications, &[])? {
             Some(fields) => Ok(notification_records::notifications(&fields)),
-            None => Err(DataError::Failed(
-                "Notifications can't be read right now".into(),
-            )),
+            None => Err(DataError::Failed(Problem::NotificationsUnreadable)),
         }
     }
 
@@ -111,7 +110,7 @@ impl NotificationsAdapter for AndroidNotifications {
         ];
         match env.call_string(&self.bridge, self.open_notification, &args)? {
             None => Ok(()),
-            Some(message) => Err(DataError::Failed(message)),
+            Some(code) => Err(DataError::Failed(Problem::from_host(&code))),
         }
     }
 
@@ -128,7 +127,7 @@ impl NotificationsAdapter for AndroidNotifications {
             &[JValue::object(&keys)],
         )? {
             None => Ok(()),
-            Some(message) => Err(DataError::Failed(message)),
+            Some(code) => Err(DataError::Failed(Problem::from_host(&code))),
         }
     }
 
@@ -138,7 +137,7 @@ impl NotificationsAdapter for AndroidNotifications {
         let env = self.vm.env()?;
         match env.call_string(&self.bridge, self.open_notification_access, &[])? {
             None => Ok(()),
-            Some(message) => Err(DataError::Unsupported(message)),
+            Some(code) => Err(DataError::Unsupported(Problem::from_host(&code))),
         }
     }
 
@@ -149,7 +148,7 @@ impl NotificationsAdapter for AndroidNotifications {
         let args = [JValue::object(&package), JValue::long(i64::from(profile.0))];
         match env.call_string(&self.bridge, self.open_notification_settings, &args)? {
             None => Ok(()),
-            Some(message) => Err(DataError::Unsupported(message)),
+            Some(code) => Err(DataError::Unsupported(Problem::from_host(&code))),
         }
     }
 }

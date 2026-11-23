@@ -8,6 +8,7 @@
 //! most [`MAX_REDIRECTS`] of them.
 
 use crate::model::DataError;
+use crate::problem::Problem;
 
 /// How many redirects one request may follow before it fails.
 pub(crate) const MAX_REDIRECTS: usize = 3;
@@ -53,7 +54,7 @@ pub(crate) fn fetch(
             Hop::Redirect(location) => url = location,
         }
     }
-    Err(DataError::Failed("Too many redirects".into()))
+    Err(DataError::Failed(Problem::TooManyRedirects))
 }
 
 /// The hop the bridge reports: `body` and its `[kind, detail]` outcome.
@@ -68,7 +69,7 @@ pub(crate) fn hop(body: Option<Vec<u8>>, outcome: &[Option<String>]) -> Result<H
         (Some(OFFLINE), _) => Err(DataError::Offline),
         (Some(TOO_LARGE), _) => Err(too_large()),
         (Some(NOT_HTTPS), _) => Err(not_https()),
-        (Some(INSECURE), _) => Err(DataError::Failed("The connection isn't secure".into())),
+        (Some(INSECURE), _) => Err(DataError::Failed(Problem::ConnectionInsecure)),
         _ => Err(failed()),
     }
 }
@@ -82,15 +83,15 @@ fn is_https(url: &str) -> bool {
 }
 
 fn not_https() -> DataError {
-    DataError::Invalid("Only HTTPS is allowed".into())
+    DataError::Invalid(Problem::HttpsOnly)
 }
 
 fn too_large() -> DataError {
-    DataError::Invalid("Too large".into())
+    DataError::Invalid(Problem::DownloadTooLarge)
 }
 
 fn failed() -> DataError {
-    DataError::Failed("The download failed".into())
+    DataError::Failed(Problem::DownloadFailed)
 }
 
 #[cfg(test)]
@@ -145,7 +146,7 @@ mod tests {
 
         assert_eq!(
             server.fetch(FEED),
-            Err(DataError::Invalid("Only HTTPS is allowed".into()))
+            Err(DataError::Invalid(Problem::HttpsOnly))
         );
         assert_eq!(server.requested, [FEED]);
     }
@@ -163,7 +164,7 @@ mod tests {
 
             assert_eq!(
                 server.fetch(url),
-                Err(DataError::Invalid("Only HTTPS is allowed".into())),
+                Err(DataError::Invalid(Problem::HttpsOnly)),
                 "{url}"
             );
             assert!(server.requested.is_empty());
@@ -185,7 +186,7 @@ mod tests {
         );
         assert_eq!(
             endless.fetch(FEED),
-            Err(DataError::Failed("Too many redirects".into()))
+            Err(DataError::Failed(Problem::TooManyRedirects))
         );
         assert_eq!(endless.requested.len(), MAX_REDIRECTS + 1);
     }
@@ -197,7 +198,7 @@ mod tests {
 
         assert_eq!(
             server.fetch(FEED),
-            Err(DataError::Invalid("Too large".into()))
+            Err(DataError::Invalid(Problem::DownloadTooLarge))
         );
     }
 
@@ -224,21 +225,21 @@ mod tests {
         assert_eq!(hop(None, &outcome(OFFLINE, None)), Err(DataError::Offline));
         assert_eq!(
             hop(None, &outcome(TOO_LARGE, None)),
-            Err(DataError::Invalid("Too large".into()))
+            Err(DataError::Invalid(Problem::DownloadTooLarge))
         );
         assert_eq!(
             hop(None, &outcome(NOT_HTTPS, None)),
-            Err(DataError::Invalid("Only HTTPS is allowed".into()))
+            Err(DataError::Invalid(Problem::HttpsOnly))
         );
         assert_eq!(
             hop(None, &outcome(INSECURE, None)),
-            Err(DataError::Failed("The connection isn't secure".into()))
+            Err(DataError::Failed(Problem::ConnectionInsecure))
         );
     }
 
     #[test]
     fn an_outcome_that_doesnt_make_sense_is_a_failure() {
-        let failed = Err(DataError::Failed("The download failed".into()));
+        let failed = Err(DataError::Failed(Problem::DownloadFailed));
         for (body, outcome) in [
             (None, outcome(OK, None)),
             (None, outcome(REDIRECT, None)),

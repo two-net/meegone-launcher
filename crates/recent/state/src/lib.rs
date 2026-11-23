@@ -13,7 +13,7 @@ use meegone_core_data::{
     AppsAdapter, DataError, RecentUse, Settings, SettingsStore, SystemConfigAdapter, UsageAdapter,
 };
 use meegone_core_state::{
-    Access, App, AppId, ProfileId, RecentDensity, RecentWindow, Rect, StateHolder,
+    Access, App, AppId, Problem, ProfileId, RecentDensity, RecentWindow, Rect, StateHolder,
 };
 
 /// At most this many cards (REC-03).
@@ -128,7 +128,7 @@ pub struct RecentState {
     /// How wide the cards area is, inside its margins, in dp, as the host last laid it out; 0
     /// until it has.
     pub width_dp: f64,
-    pub problem: Option<String>,
+    pub problem: Option<Problem>,
 }
 
 impl RecentState {
@@ -302,13 +302,13 @@ impl RecentHolder {
                 return;
             }
             Err(error) => {
-                self.state.problem = Some(error.to_string());
+                self.state.problem = Some(error.problem());
                 return;
             }
         };
         match self.apps.launchable_apps() {
             Ok(apps) => self.state.cards = cards(&uses, &apps, &settings, now),
-            Err(error) => self.state.problem = Some(error.to_string()),
+            Err(error) => self.state.problem = Some(error.problem()),
         }
     }
 
@@ -325,7 +325,7 @@ impl RecentHolder {
                 self.state.density = settings.recent_density;
                 self.state.problem = None;
             }
-            Err(error) => self.state.problem = Some(error.to_string()),
+            Err(error) => self.state.problem = Some(error.problem()),
         }
     }
 
@@ -340,7 +340,7 @@ impl RecentHolder {
         });
         match saved {
             Ok(_) => self.refresh(),
-            Err(error) => self.state.problem = Some(error.to_string()),
+            Err(error) => self.state.problem = Some(error.problem()),
         }
     }
 
@@ -358,7 +358,7 @@ impl RecentHolder {
                 self.state.close_mode = false;
                 self.refresh();
             }
-            Err(error) => self.state.problem = Some(error.to_string()),
+            Err(error) => self.state.problem = Some(error.problem()),
         }
     }
 
@@ -382,7 +382,7 @@ impl RecentHolder {
                 self.state.removals = self.state.removals.wrapping_add(1);
                 self.state.problem = None;
             }
-            Err(error) => self.state.problem = Some(error.to_string()),
+            Err(error) => self.state.problem = Some(error.problem()),
         }
     }
 }
@@ -403,7 +403,7 @@ impl StateHolder for RecentHolder {
                     .usage
                     .open_access_settings()
                     .err()
-                    .map(|error| error.to_string());
+                    .map(|error| error.problem());
             }
             RecentIntent::Launch { .. } if self.state.close_mode => {}
             RecentIntent::Launch { app, from } => {
@@ -411,7 +411,7 @@ impl StateHolder for RecentHolder {
                     .apps
                     .launch(&app, from)
                     .err()
-                    .map(|error| error.to_string());
+                    .map(|error| error.problem());
             }
             RecentIntent::EnterCloseMode => self.state.close_mode = self.state.shows_cards(),
             RecentIntent::ExitCloseMode => self.state.close_mode = false,
@@ -539,16 +539,16 @@ mod tests {
         let (fakes, _, mut holder) = setup(vec![used("mail", 1)]);
         holder.handle(RecentIntent::Refresh);
 
-        *fakes.usage.error.lock().unwrap() = Some(DataError::Failed("No uses".into()));
+        *fakes.usage.error.lock().unwrap() = Some(DataError::Failed(Problem::RecentUnreadable));
         holder.handle(RecentIntent::Refresh);
         assert_eq!(packages(&holder), ["mail"]);
-        assert_eq!(holder.state().problem.as_deref(), Some("No uses"));
+        assert_eq!(holder.state().problem, Some(Problem::RecentUnreadable));
 
         *fakes.usage.error.lock().unwrap() = None;
-        *fakes.apps.error.lock().unwrap() = Some(DataError::Failed("No apps".into()));
+        *fakes.apps.error.lock().unwrap() = Some(DataError::Failed(Problem::AppListUnavailable));
         holder.handle(RecentIntent::Refresh);
         assert_eq!(packages(&holder), ["mail"]);
-        assert_eq!(holder.state().problem.as_deref(), Some("No apps"));
+        assert_eq!(holder.state().problem, Some(Problem::AppListUnavailable));
     }
 
     #[test]
@@ -749,14 +749,14 @@ mod tests {
         // REC-06
         let (fakes, _, mut holder) = setup(vec![used("mail", 1)]);
         holder.handle(RecentIntent::Refresh);
-        *fakes.apps.error.lock().unwrap() = Some(DataError::Failed("Mail can't open".into()));
+        *fakes.apps.error.lock().unwrap() = Some(DataError::Failed(Problem::AppUnavailable));
 
         holder.handle(RecentIntent::Launch {
             app: app_id("mail"),
             from: None,
         });
 
-        assert_eq!(holder.state().problem.as_deref(), Some("Mail can't open"));
+        assert_eq!(holder.state().problem, Some(Problem::AppUnavailable));
     }
 
     #[test]
@@ -921,12 +921,12 @@ mod tests {
         // ARCH-09
         let (fakes, settings, mut holder) = setup(vec![used("mail", 1), used("maps", 30)]);
         holder.handle(RecentIntent::Refresh);
-        *fakes.storage.error.lock().unwrap() = Some(DataError::Failed("Storage full".into()));
+        *fakes.storage.error.lock().unwrap() = Some(DataError::Failed(Problem::StorageFull));
 
         holder.handle(RecentIntent::SetWindow(RecentWindow::ThreeDays));
 
         assert_eq!(holder.state().window, RecentWindow::TwentyFourHours);
-        assert_eq!(holder.state().problem.as_deref(), Some("Storage full"));
+        assert_eq!(holder.state().problem, Some(Problem::StorageFull));
         assert_eq!(settings.get().recent_window, RecentWindow::TwentyFourHours);
         assert_eq!(packages(&holder), ["mail"]);
     }
@@ -961,12 +961,12 @@ mod tests {
         let (fakes, settings, mut holder) = setup(vec![used("mail", 1), used("maps", 30)]);
         holder.handle(RecentIntent::Refresh);
         holder.handle(RecentIntent::SetWindow(RecentWindow::ThreeDays));
-        *fakes.storage.error.lock().unwrap() = Some(DataError::Failed("Storage full".into()));
+        *fakes.storage.error.lock().unwrap() = Some(DataError::Failed(Problem::StorageFull));
 
         holder.handle(RecentIntent::Reset);
 
         assert_eq!(holder.state().window, RecentWindow::ThreeDays);
-        assert_eq!(holder.state().problem.as_deref(), Some("Storage full"));
+        assert_eq!(holder.state().problem, Some(Problem::StorageFull));
         assert_eq!(settings.get().recent_window, RecentWindow::ThreeDays);
         assert_eq!(packages(&holder), ["mail", "maps"]);
     }
@@ -976,12 +976,12 @@ mod tests {
         // ARCH-09
         let (fakes, settings, mut holder) = setup(vec![used("mail", 1)]);
         holder.handle(RecentIntent::Refresh);
-        *fakes.storage.error.lock().unwrap() = Some(DataError::Failed("Storage full".into()));
+        *fakes.storage.error.lock().unwrap() = Some(DataError::Failed(Problem::StorageFull));
 
         holder.handle(RecentIntent::SetDensity(RecentDensity::TwoColumns));
 
         assert_eq!(holder.state().density, RecentDensity::ThreeColumns);
-        assert_eq!(holder.state().problem.as_deref(), Some("Storage full"));
+        assert_eq!(holder.state().problem, Some(Problem::StorageFull));
         assert_eq!(settings.get().recent_density, RecentDensity::ThreeColumns);
         assert_eq!(packages(&holder), ["mail"]);
     }
@@ -1136,7 +1136,7 @@ mod tests {
         let (fakes, settings, mut holder) = setup(vec![used("mail", 2), used("maps", 1)]);
         holder.handle(RecentIntent::Refresh);
         holder.handle(RecentIntent::EnterCloseMode);
-        *fakes.storage.error.lock().unwrap() = Some(DataError::Failed("Storage full".into()));
+        *fakes.storage.error.lock().unwrap() = Some(DataError::Failed(Problem::StorageFull));
 
         holder.handle(RecentIntent::Remove(app_id("maps")));
         holder.handle(RecentIntent::ClearAll);
@@ -1144,7 +1144,7 @@ mod tests {
         assert_eq!(packages(&holder), ["maps", "mail"]);
         assert!(holder.state().close_mode);
         assert_eq!(holder.state().removals, 0);
-        assert_eq!(holder.state().problem.as_deref(), Some("Storage full"));
+        assert_eq!(holder.state().problem, Some(Problem::StorageFull));
         assert!(settings.get().removed_from_recent.is_empty());
 
         *fakes.storage.error.lock().unwrap() = None;

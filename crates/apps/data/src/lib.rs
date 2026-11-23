@@ -202,6 +202,7 @@ impl Decode for FolderId {
 
 #[cfg(test)]
 mod tests {
+    use meegone_core_data::Problem;
     use meegone_core_data::fakes::{FakeStorage, app_id};
     use meegone_core_data::storage::format::seal;
     use meegone_core_data::storage::{decode, encode};
@@ -298,7 +299,7 @@ mod tests {
         // REL-03
         let (storage, store) = store();
         store.save(&sample()).unwrap();
-        *storage.error.lock().unwrap() = Some(DataError::Failed("Disk error".into()));
+        *storage.error.lock().unwrap() = Some(DataError::Failed(Problem::SavedDataUnusable));
 
         assert!(store.save(&Layout::default()).is_err());
 
@@ -311,7 +312,7 @@ mod tests {
         // REL-02: a passing read error must never look like a layout to replace.
         let (storage, store) = store();
         store.save(&sample()).unwrap();
-        let error = DataError::Failed("Disk error".into());
+        let error = DataError::Failed(Problem::SavedDataUnusable);
         *storage.error.lock().unwrap() = Some(error.clone());
 
         assert_eq!(store.load(), Err(error));

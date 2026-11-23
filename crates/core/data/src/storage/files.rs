@@ -11,6 +11,7 @@ use std::sync::{Mutex, PoisonError};
 
 use super::{MAX_STORED_BYTES, StorageAdapter, StoredFile, check_budget};
 use crate::model::DataError;
+use crate::problem::Problem;
 
 /// Keeps each [`StoredFile`] as a file under one root folder.
 ///
@@ -150,8 +151,8 @@ fn sync_folder(_folder: &Path) -> io::Result<()> {
 
 fn failure(error: &io::Error) -> DataError {
     match error.kind() {
-        ErrorKind::StorageFull => DataError::Failed("Not enough storage space".into()),
-        _ => DataError::Failed(format!("Couldn't use saved data ({error})")),
+        ErrorKind::StorageFull => DataError::Failed(Problem::StorageFull),
+        _ => DataError::Failed(Problem::SavedDataUnusable),
     }
 }
 
@@ -377,22 +378,22 @@ mod tests {
     }
 
     #[test]
-    fn file_system_errors_are_reported_in_plain_words() {
+    fn file_system_errors_are_reported_as_problems() {
         let folder = Folder::new();
         fs::create_dir_all(folder.0.join("settings")).unwrap();
         fs::write(folder.0.join("images"), b"not a folder").unwrap();
         let storage = FileStorage::new(&folder.0);
 
-        let Err(DataError::Failed(reason)) = storage.read(StoredFile::Settings) else {
-            panic!("reading a folder should fail");
-        };
-        assert!(reason.starts_with("Couldn't use saved data"), "{reason}");
+        assert_eq!(
+            storage.read(StoredFile::Settings),
+            Err(DataError::Failed(Problem::SavedDataUnusable))
+        );
         assert!(storage.write(StoredFile::ImageDetails, b"x").is_err());
         assert!(storage.write(StoredFile::Settings, b"x").is_err());
         assert!(storage.remove(StoredFile::Settings).is_err());
         assert_eq!(
             failure(&io::Error::from(ErrorKind::StorageFull)),
-            DataError::Failed("Not enough storage space".into())
+            DataError::Failed(Problem::StorageFull)
         );
     }
 }

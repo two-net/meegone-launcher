@@ -13,6 +13,7 @@ use std::ffi::{CStr, CString, c_char, c_void};
 use std::{mem, ptr, slice};
 
 use crate::model::DataError;
+use crate::problem::Problem;
 
 /// A Java object reference: `jobject`, `jclass` or `jstring`.
 pub type JObject = *mut c_void;
@@ -193,9 +194,7 @@ impl Vm {
         if status == JNI_OK && !env.is_null() {
             Ok(Env(env))
         } else {
-            Err(DataError::Failed(
-                "This thread can't reach the system".into(),
-            ))
+            Err(DataError::Failed(Problem::SystemFailed))
         }
     }
 }
@@ -234,7 +233,7 @@ impl Env {
             self.function::<NoArgs>(env_slot::EXCEPTION_DESCRIBE)(self.0);
             self.function::<NoArgs>(env_slot::EXCEPTION_CLEAR)(self.0);
         }
-        Err(DataError::Failed("The system couldn't do that".into()))
+        Err(DataError::Failed(Problem::SystemFailed))
     }
 
     fn delete_local(&self, raw: JObject) {
@@ -256,7 +255,7 @@ impl Env {
         if status == JNI_OK && !vm.is_null() {
             Ok(Vm(vm))
         } else {
-            Err(DataError::Failed("The system couldn't do that".into()))
+            Err(DataError::Failed(Problem::SystemFailed))
         }
     }
 
@@ -269,7 +268,7 @@ impl Env {
             unsafe { self.function::<NewGlobalRef>(env_slot::NEW_GLOBAL_REF)(self.0, object.0) };
         self.check()?;
         if raw.is_null() {
-            return Err(DataError::Failed("The system couldn't do that".into()));
+            return Err(DataError::Failed(Problem::SystemFailed));
         }
         Ok(GlobalRef { vm, raw })
     }
@@ -302,7 +301,7 @@ impl Env {
             id
         };
         if id.is_null() {
-            return Err(DataError::Failed("The system couldn't do that".into()));
+            return Err(DataError::Failed(Problem::SystemFailed));
         }
         Ok(MethodId(id))
     }
@@ -512,15 +511,15 @@ impl Env {
     pub fn new_string(&self, text: &str) -> Result<Local, DataError> {
         type NewString = unsafe extern "system" fn(RawEnv, *const u16, JInt) -> JObject;
         let chars: Vec<u16> = text.encode_utf16().collect();
-        let length = JInt::try_from(chars.len())
-            .map_err(|_| DataError::Failed("The system couldn't do that".into()))?;
+        let length =
+            JInt::try_from(chars.len()).map_err(|_| DataError::Failed(Problem::SystemFailed))?;
         // SAFETY: the signature matches `jni.h`, and `chars` holds `length` UTF-16 units.
         let raw = unsafe {
             self.function::<NewString>(env_slot::NEW_STRING)(self.0, chars.as_ptr(), length)
         };
         let string = self.local(raw);
         self.check()?;
-        string.ok_or_else(|| DataError::Failed("The system couldn't do that".into()))
+        string.ok_or(DataError::Failed(Problem::SystemFailed))
     }
 
     /// A new `byte[]` holding `bytes`, such as an image for Java to decode.
@@ -528,7 +527,7 @@ impl Env {
         type NewByteArray = unsafe extern "system" fn(RawEnv, JInt) -> JObject;
         type SetByteArrayRegion =
             unsafe extern "system" fn(RawEnv, JObject, JInt, JInt, *const JByte);
-        let failed = || DataError::Failed("The system couldn't do that".into());
+        let failed = || DataError::Failed(Problem::SystemFailed);
         let length = JInt::try_from(bytes.len()).map_err(|_| failed())?;
         // SAFETY: the signature matches `jni.h`. Without the memory, the JVM returns `null`
         // with an `OutOfMemoryError` pending, which `check` reports.
@@ -560,7 +559,7 @@ impl Env {
         type FindClass = unsafe extern "system" fn(RawEnv, *const c_char) -> JObject;
         type NewObjectArray = unsafe extern "system" fn(RawEnv, JInt, JObject, JObject) -> JObject;
         type SetObjectArrayElement = unsafe extern "system" fn(RawEnv, JObject, JInt, JObject);
-        let failed = || DataError::Failed("The system couldn't do that".into());
+        let failed = || DataError::Failed(Problem::SystemFailed);
         let length = JInt::try_from(texts.len()).map_err(|_| failed())?;
         // SAFETY: the signatures match `jni.h`; the class reference lives until the array is
         // made.
@@ -621,7 +620,7 @@ impl Env {
             );
             self.check()?;
             if chars.is_null() {
-                return Err(DataError::Failed("The system couldn't do that".into()));
+                return Err(DataError::Failed(Problem::SystemFailed));
             }
             let length = usize::try_from(length).unwrap_or(0);
             let text = String::from_utf16_lossy(slice::from_raw_parts(chars, length));
@@ -666,8 +665,8 @@ impl Env {
     pub fn set_int_array(&self, array: &LocalRef, values: &[i32]) -> Result<(), DataError> {
         type SetIntArrayRegion =
             unsafe extern "system" fn(RawEnv, JObject, JInt, JInt, *const JInt);
-        let length = JInt::try_from(values.len())
-            .map_err(|_| DataError::Failed("The system couldn't do that".into()))?;
+        let length =
+            JInt::try_from(values.len()).map_err(|_| DataError::Failed(Problem::SystemFailed))?;
         // SAFETY: the signature matches `jni.h`; `array` is a live `int[]` reference and
         // `values` holds `length` ints. A region past the array's end raises a Java exception
         // instead of writing, which `check` reports.

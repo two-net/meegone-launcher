@@ -11,7 +11,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use meegone_core_ui::{Dispatch, Latest, Slot, Tokens};
-use meegone_lockimage_state::{ImageStatus, LockImageIntent, LockImageState};
+use meegone_lockimage_state::{ImageStatus, LockImageIntent, LockImageState, Problem};
 
 pub use meegone_lockimage_state::{CheckStatus, Preview, TodayEntry};
 
@@ -298,8 +298,8 @@ pub struct PastContent {
     pub images: Vec<PastImageContent>,
     /// Whether the week is being read.
     pub loading: bool,
-    /// The last problem browsing or pinning had, in plain words, with Try again.
-    pub problem: Option<String>,
+    /// The last problem browsing or pinning had, with Try again.
+    pub problem: Option<Problem>,
 }
 
 /// The past week's images (WALL-17; ADR 0032): today's and the six before, each with its
@@ -427,7 +427,7 @@ impl PastImagesScreen {
                 })
                 .collect(),
             loading: state.browsing,
-            problem: state.past_problem.clone(),
+            problem: state.past_problem,
         })
     }
 }
@@ -491,9 +491,9 @@ impl ImageSettingsSection {
     }
 
     /// Why the device can't set the lock-screen wallpaper, while it can't (WALL-13).
-    pub fn unavailable_reason(&self) -> Option<String> {
-        match &self.latest.get().status {
-            ImageStatus::Unavailable(reason) => Some(reason.clone()),
+    pub fn unavailable_reason(&self) -> Option<Problem> {
+        match self.latest.get().status {
+            ImageStatus::Unavailable(reason) => Some(reason),
             _ => None,
         }
     }

@@ -1964,6 +1964,7 @@ mod tests {
         PersistentSettingsStore, Profile, ProfileId, RecentUse, RecentWindow, Rect, Screen,
         Settings, Shortcut, UsageAdapter, WallpaperAdapter, WallpaperMarker,
     };
+    use meegone_core_state::Problem;
     use meegone_core_state::motion::{DRAG_LIFT_SCALE, ICON_PRESS_SCALE};
     use meegone_core_state::{Access, Health, Theme, ThemeChoice};
     use meegone_events_state::NotificationMenuItem;
@@ -2714,7 +2715,7 @@ mod tests {
         shell.dispatch(ShellIntent::ImageChecked);
         assert_eq!(
             shell.lockimage().state().checks,
-            CheckStatus::Retrying("No connection".into())
+            CheckStatus::Retrying(Problem::NoConnection)
         );
 
         // Turned off in the home, the job has nothing to do.
@@ -2747,7 +2748,7 @@ mod tests {
         assert!(!shell.lockimage().state().updating);
         assert_eq!(
             shell.lockimage().state().checks,
-            CheckStatus::Retrying("No connection".into())
+            CheckStatus::Retrying(Problem::NoConnection)
         );
     }
 
@@ -3168,11 +3169,11 @@ mod tests {
         // APPS-19, REL-03
         let fakes = Fakes::after_setup();
         let mut shell = with_recent_maps_and_mail(&fakes);
-        *fakes.storage.error.lock().unwrap() = Some(DataError::Failed("disk full".into()));
+        *fakes.storage.error.lock().unwrap() = Some(DataError::Failed(Problem::StorageFull));
 
         hide_maps(&mut shell);
 
-        assert_eq!(shell.apps().state().problem.as_deref(), Some("disk full"));
+        assert_eq!(shell.apps().state().problem, Some(Problem::StorageFull));
         assert_eq!(recent_labels(&shell), ["Mail", "Maps"]);
     }
 

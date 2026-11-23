@@ -14,6 +14,7 @@
 use super::jni::{Env, GlobalRef, JValue, LocalRef, MethodId, Vm};
 use crate::adapters::WallpaperAdapter;
 use crate::model::{DataError, ImageCrop, Screen, Size, WallpaperMarker};
+use crate::problem::Problem;
 
 /// What `lockScreenWallpaperId` answers when the system can't say.
 const UNKNOWN_ID: i32 = i32::MIN;
@@ -77,7 +78,7 @@ impl AndroidWallpaper {
         let env = self.vm.env()?;
         match env.call_string(&self.bridge, method, &[])? {
             None => Ok(()),
-            Some(message) => Err(DataError::Unsupported(message)),
+            Some(code) => Err(DataError::Unsupported(Problem::from_host(&code))),
         }
     }
 }
@@ -155,9 +156,7 @@ impl WallpaperAdapter for AndroidWallpaper {
             &[JValue::object(&image)],
         )? {
             id if id > 0 => Ok(Some(WallpaperMarker(id))),
-            _ => Err(DataError::Failed(
-                "The lock screen's wallpaper couldn't be set".into(),
-            )),
+            _ => Err(DataError::Failed(Problem::WallpaperNotSet)),
         }
     }
 
@@ -187,5 +186,5 @@ impl WallpaperAdapter for AndroidWallpaper {
 
 /// The bridge couldn't decode the image, or not at the size its header gives.
 fn unreadable() -> DataError {
-    DataError::Invalid("The image couldn't be read".into())
+    DataError::Invalid(Problem::ImageUnreadable)
 }

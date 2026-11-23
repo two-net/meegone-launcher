@@ -13,9 +13,8 @@
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use meegone_core_data::{DataError, Size};
+use meegone_core_data::{DataError, Problem, Size};
 
-use crate::download::NOT_AN_IMAGE;
 use crate::feed::FeedImage;
 use crate::jpeg;
 
@@ -24,15 +23,13 @@ pub const MAX_PREVIEW_BYTES: usize = 256 * 1024;
 /// A preview wider or taller than this is refused, so decoding it stays bounded (SEC-02). The
 /// feed's are 800 × 480.
 pub const MAX_PREVIEW_SIDE: u32 = 1920;
-/// What a preview larger than [`MAX_PREVIEW_SIDE`] fails with.
-pub const PREVIEW_TOO_LARGE: &str = "The preview is too large";
 
 /// The size of the preview in `bytes`, if it may be shown: a JPEG as `jpeg` reads it, at most
 /// [`MAX_PREVIEW_SIDE`] on either side (SEC-02).
 pub fn check_preview(bytes: &[u8]) -> Result<Size, DataError> {
-    let size = jpeg::size(bytes).ok_or_else(|| DataError::Invalid(NOT_AN_IMAGE.into()))?;
+    let size = jpeg::size(bytes).ok_or(DataError::Invalid(Problem::ImageUnreadable))?;
     if size.width.max(size.height) > MAX_PREVIEW_SIDE {
-        Err(DataError::Invalid(PREVIEW_TOO_LARGE.into()))
+        Err(DataError::Invalid(Problem::PreviewTooLarge))
     } else {
         Ok(size)
     }
@@ -108,7 +105,7 @@ pub struct PastImages {
 #[derive(Debug, Default)]
 struct Browsed {
     week: Option<Week>,
-    problem: Option<String>,
+    problem: Option<Problem>,
 }
 
 impl PastImages {
@@ -121,8 +118,8 @@ impl PastImages {
     }
 
     /// The last browse or pin that failed, in plain words (WALL-16).
-    pub fn problem(&self) -> Option<String> {
-        self.browsed().problem.clone()
+    pub fn problem(&self) -> Option<Problem> {
+        self.browsed().problem
     }
 
     /// Keeps `week`, and forgets the last problem.
@@ -133,7 +130,7 @@ impl PastImages {
         };
     }
 
-    pub fn set_problem(&self, problem: Option<String>) {
+    pub fn set_problem(&self, problem: Option<Problem>) {
         self.browsed().problem = problem;
     }
 
@@ -226,15 +223,15 @@ mod tests {
         assert!(check_preview(&header(1920, 1080)).is_ok());
         assert_eq!(
             check_preview(&header(1921, 1080)),
-            Err(DataError::Invalid(PREVIEW_TOO_LARGE.into()))
+            Err(DataError::Invalid(Problem::PreviewTooLarge))
         );
         assert_eq!(
             check_preview(&header(480, 4000)),
-            Err(DataError::Invalid(PREVIEW_TOO_LARGE.into()))
+            Err(DataError::Invalid(Problem::PreviewTooLarge))
         );
         assert_eq!(
             check_preview(b"<html>"),
-            Err(DataError::Invalid(NOT_AN_IMAGE.into()))
+            Err(DataError::Invalid(Problem::ImageUnreadable))
         );
         assert!(Preview::new(b"").is_err());
     }
@@ -259,7 +256,7 @@ mod tests {
         let past = PastImages::default();
         assert_eq!(past.week(), None);
 
-        past.set_problem(Some("No connection".into()));
+        past.set_problem(Some(Problem::NoConnection));
         let week = Week {
             region: "en-US".into(),
             day: 20_411,
@@ -277,8 +274,8 @@ mod tests {
         );
         assert_eq!(week.image("a1"), None);
 
-        past.set_problem(Some("No connection".into()));
-        assert_eq!(past.problem().as_deref(), Some("No connection"));
+        past.set_problem(Some(Problem::NoConnection));
+        assert_eq!(past.problem(), Some(Problem::NoConnection));
         past.clear();
         assert_eq!((past.week(), past.problem()), (None, None));
     }

@@ -38,6 +38,7 @@ import android.icu.lang.UCharacter;
 import android.icu.text.Collator;
 import android.icu.text.DateFormat;
 import android.icu.text.DisplayContext;
+import android.icu.text.Transliterator;
 import android.net.ConnectivityManager;
 import android.net.Network;
 import android.net.NetworkCapabilities;
@@ -191,8 +192,18 @@ final class Bridge {
     private static final int STYLE_WEEKDAY_TIME = 3;
     private static final int STYLE_DAY_MONTH_TIME = 4;
     private static final char[] HEX = "0123456789abcdef".toCharArray();
-    /** Accents and other marks that sit on a letter, removed for search (L10N-04). */
-    private static final Pattern MARKS = Pattern.compile("\\p{Mn}+");
+    /**
+     * Accents that sit on a letter, removed for search (L10N-04, ADR 0040): the combining
+     * diacritical marks, Hebrew points and Arabic vowel marks. Other marks make another letter,
+     * such as kana's voicing marks and Indic vowel signs, so they stay.
+     */
+    private static final Pattern ACCENTS = Pattern.compile("[[\\u0300-\\u036F\\u1AB0-\\u1AFF"
+            + "\\u1DC0-\\u1DFF\\u20D0-\\u20FF\\uFE20-\\uFE2F\\u0591-\\u05C7\\u0610-\\u061A"
+            + "\\u064B-\\u065F\\u0670\\u06D6-\\u06ED]&&\\p{Mn}]+");
+    /** Characters that only shape text, such as a soft hyphen or a zero-width space. */
+    private static final Pattern INVISIBLE = Pattern.compile("\\p{Cf}+");
+    /** Letters that don't decompose into a letter and an accent, such as ø, ł and æ. */
+    static final String LATIN_LETTERS = "Latin-ASCII";
     /** Runs of spaces of any kind, collapsed to one for search. */
     private static final Pattern SPACES = Pattern.compile("[\\s\\p{Z}]+");
     private static final int REQUEST_HOME_ROLE = 1;
@@ -279,8 +290,8 @@ final class Bridge {
 
     /**
      * Opens the system dialog for choosing the default home app, or else the system's home-app
-     * settings. Returns null, or written instructions if no system screen could be opened
-     * (SRS 8.1). Called from Rust.
+     * settings. Returns null, or the {@link Problems} code of written instructions if no system
+     * screen could be opened (SRS 8.1). Called from Rust.
      */
     String requestDefaultHome() {
         Activity current = activity;
@@ -305,11 +316,11 @@ final class Bridge {
     }
 
     /**
-     * How to make MeeGone the home app without a system screen to open, in the device's language
-     * (SRS 8.1, L10N-01).
+     * How to make MeeGone the home app without a system screen to open: the code of written
+     * instructions, which the host words in the device's language (SRS 8.1, L10N-01).
      */
     private String homeInstructions() {
-        return context.getString(R.string.default_home_instructions);
+        return Problems.DEFAULT_HOME_INSTRUCTIONS;
     }
 
     /**
@@ -410,8 +421,8 @@ final class Bridge {
 
     /**
      * Searches the web for {@code query} with the device's default search handler (SRCH-05,
-     * ADR 0016). Returns null, or a short message if nothing could search. The query is never
-     * logged. Called from Rust.
+     * ADR 0016). Returns null, or a {@link Problems} code if nothing could search. The query is
+     * never logged. Called from Rust.
      */
     String webSearch(String query) {
         try {
@@ -424,22 +435,22 @@ final class Bridge {
         } catch (RuntimeException e) {
             // ActivityNotFoundException: nothing handles web searches.
             Log.w(TAG, "Couldn't search the web: " + e.getClass().getSimpleName());
-            return context.getString(R.string.web_search_unavailable);
+            return Problems.WEB_SEARCH_UNAVAILABLE;
         }
     }
 
     /**
      * Opens {@code url} in the device's browser, outside MeeGone (WALL-15, SEC-02, ADR 0031).
-     * Anything but an {@code https:} link with a host is refused. Where a default browser is
-     * set, the link goes to it, so an app that claims the site's links doesn't take it. Returns
-     * null, or a short message if no browser could open it. The link is never logged. Called
-     * from Rust.
+     * Anything but an {@code https:} link with a host is refused. Where a default browser is set,
+     * the link goes to it, so an app that claims the site's links doesn't take it. Returns null, or
+     * a {@link Problems} code if no browser could open it. The link is never logged. Called from
+     * Rust.
      */
     String openInBrowser(String url) {
         try {
             Uri link = Uri.parse(url);
             if (!"https".equals(link.getScheme()) || TextUtils.isEmpty(link.getHost())) {
-                return context.getString(R.string.browser_unavailable);
+                return Problems.BROWSER_UNAVAILABLE;
             }
             Intent view = new Intent(Intent.ACTION_VIEW, link)
                     .addCategory(Intent.CATEGORY_BROWSABLE)
@@ -460,7 +471,7 @@ final class Bridge {
         } catch (RuntimeException e) {
             // ActivityNotFoundException: no browser is installed.
             Log.w(TAG, "Couldn't open a link: " + e.getClass().getSimpleName());
-            return context.getString(R.string.browser_unavailable);
+            return Problems.BROWSER_UNAVAILABLE;
         }
     }
 
@@ -487,20 +498,23 @@ final class Bridge {
      */
     String searchKey(String text) {
         try {
-            return fold(text);
+            return fold(text, Transliterator.getInstance(LATIN_LETTERS));
         } catch (RuntimeException e) {
             return null;
         }
     }
 
     /**
-     * Compatibility-decomposed, without the marks that sit on letters, case-folded and with runs
-     * of spaces collapsed to one: "Café" and " CAFE " are both "cafe", and "ﬁle" is "file".
+     * Compatibility-decomposed, without accents or invisible characters, with Latin letters
+     * that have no decomposition spelt plainly, case-folded and with runs of spaces collapsed to
+     * one (L10N-04): "Café" and " CAFE " are both "cafe", "ﬁle" is "file", "Łódź" is "lodz" and
+     * "Ærø" is "aero". {@code latin} is {@link #LATIN_LETTERS}, one per thread.
      */
-    private static String fold(String text) {
-        String bare = MARKS.matcher(Normalizer.normalize(text, Normalizer.Form.NFKD))
+    static String fold(String text, Transliterator latin) {
+        String bare = ACCENTS.matcher(Normalizer.normalize(text, Normalizer.Form.NFKD))
                 .replaceAll("");
-        return SPACES.matcher(UCharacter.foldCase(bare, true)).replaceAll(" ").trim();
+        String plain = INVISIBLE.matcher(latin.transliterate(bare)).replaceAll("");
+        return SPACES.matcher(UCharacter.foldCase(plain, true)).replaceAll(" ").trim();
     }
 
     /**
@@ -522,6 +536,7 @@ final class Bridge {
             // Made for each read, so it follows the current language.
             Collator collator = Collator.getInstance();
             collator.setStrength(Collator.PRIMARY);
+            Transliterator latin = Transliterator.getInstance(LATIN_LETTERS);
             List<String> fields = new ArrayList<>();
             for (UserHandle user : launcher.getProfiles()) {
                 int profile = profileFlags(launcher, users, user);
@@ -557,7 +572,7 @@ final class Bridge {
                     String name = text.isEmpty() ? component.getPackageName() : text;
                     fields.add(hex(collator.getCollationKey(name).toByteArray()));
                     fields.add(Long.toString(Math.max(0, info.getFirstInstallTime())));
-                    fields.add(fold(name));
+                    fields.add(fold(name, latin));
                 }
             }
             accents.deriveWaiting();
@@ -676,11 +691,11 @@ final class Bridge {
     }
 
     /**
-     * Starts or resumes an app (APPS-10). Its window grows from the icon at the given screen
-     * rect with the platform's launch-from-bounds transition (ANIM-08); an empty rect gets the
-     * system's default. An unavailable app is launched too: the system shows why it can't open,
-     * and offers to unpause a work profile (APPS-09). Returns null, or a short message if the
-     * system couldn't start it. Called from Rust.
+     * Starts or resumes an app (APPS-10). Its window grows from the icon at the given screen rect
+     * with the platform's launch-from-bounds transition (ANIM-08); an empty rect gets the system's
+     * default. An unavailable app is launched too: the system shows why it can't open, and offers
+     * to unpause a work profile (APPS-09). Returns null, or a {@link Problems} code if the system
+     * couldn't start it. Called from Rust.
      */
     String launch(String packageName, String activityName, long profile, int left, int top,
             int right, int bottom) {
@@ -689,7 +704,7 @@ final class Bridge {
             UserHandle user = context.getSystemService(UserManager.class)
                     .getUserForSerialNumber(profile);
             if (user == null) {
-                return context.getString(R.string.app_unavailable);
+                return Problems.APP_UNAVAILABLE;
             }
             Rect icon = right > left && bottom > top ? new Rect(left, top, right, bottom) : null;
             Bundle options = growFrom(icon);
@@ -701,7 +716,7 @@ final class Bridge {
             // ActivityNotFoundException, SecurityException or IllegalStateException: the app
             // or its profile is gone, or the system refused.
             Log.w(TAG, "Couldn't launch an app: " + e.getClass().getSimpleName());
-            return context.getString(R.string.app_unavailable);
+            return Problems.APP_UNAVAILABLE;
         }
     }
 
@@ -749,21 +764,21 @@ final class Bridge {
     }
 
     /**
-     * Starts one of an app's shortcuts (APPS-11). Returns null, or a short message if the
+     * Starts one of an app's shortcuts (APPS-11). Returns null, or a {@link Problems} code if the
      * system couldn't start it, such as when the app disabled it meanwhile. Called from Rust.
      */
     String launchShortcut(String packageName, String id, long profile) {
         try {
             UserHandle user = user(profile);
             if (user == null) {
-                return context.getString(R.string.shortcut_unavailable);
+                return Problems.SHORTCUT_UNAVAILABLE;
             }
             context.getSystemService(LauncherApps.class)
                     .startShortcut(packageName, id, null, null, user);
             return null;
         } catch (RuntimeException e) {
             Log.w(TAG, "Couldn't start a shortcut: " + e.getClass().getSimpleName());
-            return context.getString(R.string.shortcut_unavailable);
+            return Problems.SHORTCUT_UNAVAILABLE;
         }
     }
 
@@ -771,13 +786,13 @@ final class Bridge {
      * Opens the system's confirmation to uninstall an app, in its own profile (APPS-13).
      * MeeGone never uninstalls anything itself: the user confirms, and the system reports the
      * removal like any other. It needs REQUEST_DELETE_PACKAGES, granted at install (SEC-03).
-     * Returns null, or a short message if the system refused. Called from Rust.
+     * Returns null, or a {@link Problems} code if the system refused. Called from Rust.
      */
     String requestUninstall(String packageName, String activityName, long profile) {
         try {
             UserHandle user = user(profile);
             if (user == null) {
-                return context.getString(R.string.uninstall_unavailable);
+                return Problems.UNINSTALL_UNAVAILABLE;
             }
             Intent intent = new Intent(Intent.ACTION_DELETE,
                     Uri.fromParts("package", packageName, activityName))
@@ -789,26 +804,26 @@ final class Bridge {
             return null;
         } catch (RuntimeException e) {
             Log.w(TAG, "Couldn't ask to uninstall: " + e.getClass().getSimpleName());
-            return context.getString(R.string.uninstall_unavailable);
+            return Problems.UNINSTALL_UNAVAILABLE;
         }
     }
 
     /**
      * Opens the system's App info screen for an app, in its own profile (APPS-11). Returns null,
-     * or a short message if the system couldn't open it. Called from Rust.
+     * or a {@link Problems} code if the system couldn't open it. Called from Rust.
      */
     String openAppInfo(String packageName, String activityName, long profile) {
         try {
             UserHandle user = user(profile);
             if (user == null) {
-                return context.getString(R.string.app_info_unavailable);
+                return Problems.APP_INFO_UNAVAILABLE;
             }
             context.getSystemService(LauncherApps.class).startAppDetailsActivity(
                     new ComponentName(packageName, activityName), user, null, null);
             return null;
         } catch (RuntimeException e) {
             Log.w(TAG, "Couldn't open App info: " + e.getClass().getSimpleName());
-            return context.getString(R.string.app_info_unavailable);
+            return Problems.APP_INFO_UNAVAILABLE;
         }
     }
 
@@ -953,21 +968,24 @@ final class Bridge {
     /**
      * {@code atMs} in the style numbered by {@code style}, in the device's language, time zone
      * and 12- or 24-hour setting, or null (EVT-01, EVT-02, WALL-16, L10N-03, ADR 0019,
-     * ADR 0031). The language's
-     * own patterns order the fields, such as "17 November" or "November 17", and a weekday or a
-     * month shown on its own is capitalised as the language does at the start of a line. Called
-     * from Rust.
+     * ADR 0031). The language's own patterns order the fields, such as "17 November" or
+     * "November 17". A weekday or a date shown on its own is capitalised as the language does at
+     * the start of a line; a time, which sits inside a sentence such as "Alarm ‹time›" or "Last
+     * updated ‹time›", as it does there. Called from Rust.
      */
     String formatTime(long atMs, int style) {
         try {
             boolean hour24 = android.text.format.DateFormat.is24HourFormat(context);
             String skeleton;
+            DisplayContext capitals = DisplayContext.CAPITALIZATION_FOR_MIDDLE_OF_SENTENCE;
             switch (style) {
                 case STYLE_WEEKDAY:
                     skeleton = "EEEE";
+                    capitals = DisplayContext.CAPITALIZATION_FOR_STANDALONE;
                     break;
                 case STYLE_DAY_MONTH:
                     skeleton = "MMMMd";
+                    capitals = DisplayContext.CAPITALIZATION_FOR_STANDALONE;
                     break;
                 case STYLE_TIME:
                     skeleton = hour24 ? "Hm" : "hm";
@@ -985,7 +1003,7 @@ final class Bridge {
             // The time zone as of now, which the system sets before TIMEZONE_CHANGED arrives.
             format.setTimeZone(
                     android.icu.util.TimeZone.getTimeZone(TimeZone.getDefault().getID()));
-            format.setContext(DisplayContext.CAPITALIZATION_FOR_STANDALONE);
+            format.setContext(capitals);
             return format.format(new Date(atMs));
         } catch (RuntimeException e) {
             Log.w(TAG, "Couldn't write a time: " + e.getClass().getSimpleName());
@@ -1168,13 +1186,13 @@ final class Bridge {
      * it, with the window growing from the tapped row, a rect on the screen (ANIM-08). Without
      * one, or if its app cancelled it, opens the app instead. It never removes the notification:
      * the Rust app dismisses one meant to disappear when opened. One that is already gone opens
-     * nothing, as the list follows. Returns null, or a short message if nothing could open.
+     * nothing, as the list follows. Returns null, or a {@link Problems} code if nothing could open.
      * Called from Rust.
      */
     String openNotification(String key, int left, int top, int right, int bottom) {
         NotificationListener listener = NotificationListener.connected();
         if (listener == null) {
-            return context.getString(R.string.notification_unavailable);
+            return Problems.NOTIFICATION_UNAVAILABLE;
         }
         Rect row = right > left && bottom > top ? new Rect(left, top, right, bottom) : null;
         StatusBarNotification posted;
@@ -1183,7 +1201,7 @@ final class Bridge {
             posted = found != null && found.length > 0 ? found[0] : null;
         } catch (RuntimeException e) {
             Log.w(TAG, "Couldn't find a notification: " + e.getClass().getSimpleName());
-            return context.getString(R.string.notification_unavailable);
+            return Problems.NOTIFICATION_UNAVAILABLE;
         }
         if (posted == null) {
             return null;
@@ -1202,7 +1220,7 @@ final class Bridge {
         if (openApp(posted.getPackageName(), posted.getUser(), row)) {
             return null;
         }
-        return context.getString(R.string.notification_unavailable);
+        return Problems.NOTIFICATION_UNAVAILABLE;
     }
 
     /**
@@ -1233,29 +1251,29 @@ final class Bridge {
     String dismissNotifications(String[] keys) {
         NotificationListener listener = NotificationListener.connected();
         if (listener == null) {
-            return context.getString(R.string.notifications_dismiss_unavailable);
+            return Problems.NOTIFICATIONS_DISMISS_UNAVAILABLE;
         }
         try {
             listener.cancelNotifications(keys);
             return null;
         } catch (RuntimeException e) {
             Log.w(TAG, "Couldn't dismiss notifications: " + e.getClass().getSimpleName());
-            return context.getString(R.string.notifications_dismiss_unavailable);
+            return Problems.NOTIFICATIONS_DISMISS_UNAVAILABLE;
         }
     }
 
     /**
-     * Opens the system's notification settings for an app, in its own profile (EVT-08,
-     * APPS-20). Settings learns another profile's copy by its uid, in {@link #EXTRA_APP_UID}.
-     * If that screen doesn't open, the app's App info does. Returns null, or a short message if
-     * neither opens. Called from Rust.
+     * Opens the system's notification settings for an app, in its own profile (EVT-08, APPS-20).
+     * Settings learns another profile's copy by its uid, in {@link #EXTRA_APP_UID}. If that screen
+     * doesn't open, the app's App info does. Returns null, or a {@link Problems} code if neither
+     * opens. Called from Rust.
      */
     String openNotificationSettings(String packageName, long profile) {
         Activity current = activity;
         Context from = current != null ? current : context;
         UserHandle user = user(profile);
         if (user == null) {
-            return context.getString(R.string.notification_settings_unavailable);
+            return Problems.NOTIFICATION_SETTINGS_UNAVAILABLE;
         }
         LauncherApps launcher = context.getSystemService(LauncherApps.class);
         try {
@@ -1281,12 +1299,12 @@ final class Bridge {
         } catch (RuntimeException e) {
             Log.w(TAG, "Couldn't open App info: " + e.getClass().getSimpleName());
         }
-        return context.getString(R.string.notification_settings_unavailable);
+        return Problems.NOTIFICATION_SETTINGS_UNAVAILABLE;
     }
 
     /**
-     * Opens MeeGone's page of the system's notification-access screen, or the screen itself,
-     * where the user grants access (EVT-03). Returns null, or a short message if neither opens.
+     * Opens MeeGone's page of the system's notification-access screen, or the screen itself, where
+     * the user grants access (EVT-03). Returns null, or a {@link Problems} code if neither opens.
      * Called from Rust.
      */
     String openNotificationAccess() {
@@ -1309,7 +1327,7 @@ final class Bridge {
             }
         }
         Log.w(TAG, "Couldn't open the notification-access screen");
-        return context.getString(R.string.notification_access_unavailable);
+        return Problems.NOTIFICATION_ACCESS_INSTRUCTIONS;
     }
 
     /**
@@ -1454,8 +1472,8 @@ final class Bridge {
 
     /**
      * Opens MeeGone's page of the system's usage-access screen, or the screen itself, where the
-     * user grants access (REC-02). Returns null, or a short message if neither opens. Called
-     * from Rust.
+     * user grants access (REC-02). Returns null, or a {@link Problems} code if neither opens.
+     * Called from Rust.
      */
     String openUsageAccess() {
         Activity current = activity;
@@ -1474,7 +1492,7 @@ final class Bridge {
             }
         }
         Log.w(TAG, "Couldn't open the usage-access screen");
-        return context.getString(R.string.usage_access_unavailable);
+        return Problems.USAGE_ACCESS_INSTRUCTIONS;
     }
 
     /**
@@ -1494,8 +1512,8 @@ final class Bridge {
 
     /**
      * Opens what the app that set the next alarm shows for it, or the clock app's alarms if it
-     * shows nothing (EVT-02, ADR 0019). Returns null, or a short message if nothing could open.
-     * Called from Rust.
+     * shows nothing (EVT-02, ADR 0019). Returns null, or a {@link Problems} code if nothing could
+     * open. Called from Rust.
      */
     String openNextAlarm() {
         Activity current = activity;
@@ -1518,7 +1536,7 @@ final class Bridge {
         } catch (RuntimeException e) {
             // ActivityNotFoundException: no clock app shows alarms.
             Log.w(TAG, "Couldn't show the alarms: " + e.getClass().getSimpleName());
-            return context.getString(R.string.alarm_unavailable);
+            return Problems.ALARM_UNAVAILABLE;
         }
     }
 
@@ -1842,22 +1860,23 @@ final class Bridge {
     }
 
     /**
-     * Why the lock-screen wallpaper can't be set, or null if it can (WALL-13, ADR 0030): a
-     * device without wallpapers, or a policy that forbids changing them. Called from Rust.
+     * Why the lock-screen wallpaper can't be set, as a {@link Problems} code, or null if it can
+     * (WALL-13, ADR 0030): a device without wallpapers, or a policy that forbids changing them.
+     * Called from Rust.
      */
     String lockScreenUnsupported() {
         try {
             WallpaperManager wallpapers = WallpaperManager.getInstance(context);
             if (!wallpapers.isWallpaperSupported()) {
-                return context.getString(R.string.wallpaper_not_supported);
+                return Problems.WALLPAPER_NOT_SUPPORTED;
             }
             if (!wallpapers.isSetWallpaperAllowed()) {
-                return context.getString(R.string.wallpaper_not_allowed);
+                return Problems.WALLPAPER_NOT_ALLOWED;
             }
             return null;
         } catch (RuntimeException e) {
             Log.w(TAG, "Couldn't ask about wallpapers: " + e.getClass().getSimpleName());
-            return context.getString(R.string.wallpaper_not_supported);
+            return Problems.WALLPAPER_NOT_SUPPORTED;
         }
     }
 
@@ -1907,7 +1926,7 @@ final class Bridge {
 
     /**
      * Removes the lock screen's own wallpaper, so it shows the home wallpaper (WALL-12, ADR
-     * 0030). Returns null, or a short message if it couldn't. Called from Rust.
+     * 0030). Returns null, or a {@link Problems} code if it couldn't. Called from Rust.
      */
     String resetLockScreen() {
         try {
@@ -1915,15 +1934,15 @@ final class Bridge {
             return null;
         } catch (IOException | RuntimeException e) {
             Log.w(TAG, "Couldn't reset the lock screen: " + e.getClass().getSimpleName());
-            return context.getString(R.string.lock_screen_reset_failed);
+            return Problems.LOCK_SCREEN_RESET_FAILED;
         }
     }
 
     /**
      * Opens the system's wallpaper settings, where the user picks any wallpaper (WALL-12, ADR
      * 0030): the system Settings' own wallpaper screen where it has one, as Samsung's and
-     * Google's do, or else the system's choice of wallpaper apps. Returns null, or written
-     * instructions if neither opens. Called from Rust.
+     * Google's do, or else the system's choice of wallpaper apps. Returns null, or the {@link
+     * Problems} code of written instructions if neither opens. Called from Rust.
      */
     String openWallpaperSettings() {
         Activity current = activity;
@@ -1940,7 +1959,7 @@ final class Bridge {
             }
         }
         Log.w(TAG, "Couldn't open the wallpaper settings");
-        return context.getString(R.string.wallpaper_settings_unavailable);
+        return Problems.WALLPAPER_SETTINGS_INSTRUCTIONS;
     }
 
     /**

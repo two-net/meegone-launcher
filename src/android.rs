@@ -36,7 +36,7 @@ use std::time::Duration;
 
 use meegone_core_data::android::{self, Env, JObject, LocalRef, RawEnv};
 use meegone_core_data::{
-    App, HomeTarget, RecentDensity, RecentWindow, Rect, Rgb, ThemeChoice, accent,
+    App, HomeTarget, Problem, RecentDensity, RecentWindow, Rect, Rgb, ThemeChoice, accent,
 };
 
 use crate::{
@@ -857,16 +857,17 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeUnhi
 
 /// Applications' problem as a Java string, or `null` if there is none.
 fn problem(env: Env, launcher: &Launcher) -> Result<JObject, String> {
-    message(env, launcher.shell().apps().state().problem.as_deref())
+    message(env, launcher.shell().apps().state().problem)
 }
 
-/// A message for the host to show as a Java string, or `null` for none.
-fn message(env: Env, text: Option<&str>) -> Result<JObject, String> {
-    match text {
-        Some(text) => env
-            .new_string(text)
-            .map(|text| text.into_raw())
-            .map_err(|error| format!("Couldn't pass the message: {error}")),
+/// A problem for the host to show, as its code in a Java string, or `null` for none. The host
+/// words it with `Problems.text` (L10N-01, ADR 0040).
+fn message(env: Env, problem: Option<Problem>) -> Result<JObject, String> {
+    match problem {
+        Some(problem) => env
+            .new_string(problem.code())
+            .map(|code| code.into_raw())
+            .map_err(|error| format!("Couldn't pass the problem: {error}")),
         None => Ok(std::ptr::null_mut()),
     }
 }
@@ -936,7 +937,7 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeOpen
             }
             launcher.view().events().alarm_tapped();
             launcher.frame();
-            shown = message(env, launcher.shell().events().state().problem.as_deref())?;
+            shown = message(env, launcher.shell().events().state().problem)?;
             Ok(())
         })
     });
@@ -1032,7 +1033,7 @@ fn with_events_message(env: Env, step: impl FnOnce(&Launcher) -> bool) -> JObjec
                 return Ok(());
             }
             launcher.frame();
-            shown = message(env, launcher.shell().events().state().problem.as_deref())?;
+            shown = message(env, launcher.shell().events().state().problem)?;
             Ok(())
         })
     });
@@ -1279,7 +1280,7 @@ fn with_recent_message(env: Env, step: impl FnOnce(&Launcher) -> bool) -> JObjec
                 return Ok(());
             }
             launcher.frame();
-            shown = message(env, launcher.shell().recent().state().problem.as_deref())?;
+            shown = message(env, launcher.shell().recent().state().problem)?;
             Ok(())
         })
     });
@@ -1298,7 +1299,7 @@ fn with_settings_message(env: Env, step: impl FnOnce(&Launcher) -> bool) -> JObj
                 return Ok(());
             }
             launcher.frame();
-            shown = message(env, launcher.shell().settings().state().problem.as_deref())?;
+            shown = message(env, launcher.shell().settings().state().problem)?;
             Ok(())
         })
     });
@@ -1613,10 +1614,10 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeSetu
             let shell = launcher.shell();
             let image_problem = (setup.step == SetupStep::LockScreenImage
                 && shell.lockimage_ready())
-            .then(|| shell.lockimage().state().problem.clone())
+            .then(|| shell.lockimage().state().problem)
             .flatten();
-            let problem = image_problem.or_else(|| shell.settings().state().problem.clone());
-            shown = message(env, problem.as_deref())?;
+            let problem = image_problem.or_else(|| shell.settings().state().problem);
+            shown = message(env, problem)?;
             Ok(())
         })
     });
@@ -1712,8 +1713,8 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeAcce
                 return Ok(());
             };
             let state = launcher.shell().settings().state();
-            let text = state.instructions.as_ref().map(|(_, text)| text.as_str());
-            instructions = message(env, text)?;
+            let problem = state.instructions.map(|(_, problem)| problem);
+            instructions = message(env, problem)?;
             Ok(())
         })
     });
@@ -1818,11 +1819,10 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRese
                 .apps()
                 .state()
                 .problem
-                .clone()
-                .or_else(|| shell.recent().state().problem.clone())
-                .or_else(|| shell.lockimage().state().problem.clone())
-                .or_else(|| shell.settings().state().problem.clone());
-            shown = message(env, problem.as_deref())?;
+                .or_else(|| shell.recent().state().problem)
+                .or_else(|| shell.lockimage().state().problem)
+                .or_else(|| shell.settings().state().problem);
+            shown = message(env, problem)?;
             Ok(())
         })
     });
@@ -2253,8 +2253,8 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeImag
             let Some(launcher) = launcher.as_ref().filter(|l| l.shell().lockimage_ready()) else {
                 return Ok(());
             };
-            let text = launcher.view().image_settings().unavailable_reason();
-            reason = message(env, text.as_deref())?;
+            let problem = launcher.view().image_settings().unavailable_reason();
+            reason = message(env, problem)?;
             Ok(())
         })
     });
@@ -2319,7 +2319,7 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeImag
 /// details screen, as of the last frame (WALL-16, ADR 0031), mirrored in `ImageSettings.java`:
 /// 1. when MeeGone last set an image on the lock screen, in the device's language, or empty
 ///    before the first;
-/// 2. the last problem, in plain words, or empty while nothing fails;
+/// 2. the last problem, as its code for `Problems.text`, or empty while nothing fails;
 /// 3. how the checks are going: "retrying", "unavailable" after 3 days of failures (SRS 7.6),
 ///    or empty;
 /// 4. "1" while the image is pinned, so daily updates wait: the line says so in place of the
@@ -2349,8 +2349,8 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeImag
             let texts: Vec<&str> = status.as_ref().map_or_else(Vec::new, |status| {
                 let (problem, kind) = match &status.checks {
                     CheckStatus::Fine => ("", ""),
-                    CheckStatus::Retrying(problem) => (problem.as_str(), "retrying"),
-                    CheckStatus::Unavailable(problem) => (problem.as_str(), "unavailable"),
+                    CheckStatus::Retrying(problem) => (problem.code(), "retrying"),
+                    CheckStatus::Unavailable(problem) => (problem.code(), "unavailable"),
                 };
                 vec![
                     status.updated.as_deref().unwrap_or(""),
@@ -2415,7 +2415,7 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeImag
 /// (WALL-17, ADR 0032), mirrored in `PastImages.java`. Two fields, then seven for each image,
 /// today's first:
 /// 1. "1" while the week is being read;
-/// 2. the last problem browsing or pinning had, in plain words, or empty;
+/// 2. the last problem browsing or pinning had, as its code for `Problems.text`, or empty;
 ///
 /// and for each image:
 /// 1. the feed's id, by which the host keeps its decoded preview;
@@ -2451,7 +2451,7 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativePast
             let texts: Vec<&str> = content.as_ref().map_or_else(Vec::new, |content| {
                 let mut texts = vec![
                     flag(content.loading),
-                    content.problem.as_deref().unwrap_or(""),
+                    content.problem.map_or("", Problem::code),
                 ];
                 for image in &content.images {
                     texts.extend([
@@ -2729,7 +2729,7 @@ fn with_image_message(env: Env, step: impl FnOnce(&Launcher) -> bool) -> JObject
                 return Ok(());
             }
             launcher.frame();
-            shown = message(env, launcher.shell().lockimage().state().problem.as_deref())?;
+            shown = message(env, launcher.shell().lockimage().state().problem)?;
             Ok(())
         })
     });

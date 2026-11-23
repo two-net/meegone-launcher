@@ -257,13 +257,14 @@ final class ImageSettings extends LinearLayout {
     }
 
     /**
-     * The last problem in words, "No connection. Will try again later." while the checks retry,
+     * The last problem in the device's language (L10N-01), "No connection. Will try again later."
+     * while the checks retry,
      * or just "No connection." below "Daily image unavailable"; null while nothing fails
      * (WALL-16, SRS 7.6).
      */
     static String problemLine(Resources res, String[] status) {
-        String problem = status[STATUS_PROBLEM];
-        if (problem.isEmpty()) {
+        String problem = Problems.text(res, status[STATUS_PROBLEM]);
+        if (problem == null) {
             return null;
         }
         switch (status[STATUS_KIND]) {

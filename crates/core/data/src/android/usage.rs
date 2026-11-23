@@ -9,6 +9,7 @@
 use super::jni::{Env, GlobalRef, JValue, LocalRef, MethodId, Vm};
 use crate::adapters::UsageAdapter;
 use crate::model::{Access, DataError, RecentUse};
+use crate::problem::Problem;
 use crate::usage_records;
 
 pub struct AndroidUsage {
@@ -66,9 +67,7 @@ impl UsageAdapter for AndroidUsage {
         let since = i64::try_from(since_ms).unwrap_or(i64::MAX);
         match env.call_strings(&self.bridge, self.recent_uses, &[JValue::long(since)])? {
             Some(fields) => Ok(usage_records::uses(&fields)),
-            None => Err(DataError::Failed(
-                "Recent apps can't be read right now".into(),
-            )),
+            None => Err(DataError::Failed(Problem::RecentUnreadable)),
         }
     }
 
@@ -78,7 +77,7 @@ impl UsageAdapter for AndroidUsage {
         let env = self.vm.env()?;
         match env.call_string(&self.bridge, self.open_usage_access, &[])? {
             None => Ok(()),
-            Some(message) => Err(DataError::Unsupported(message)),
+            Some(code) => Err(DataError::Unsupported(Problem::from_host(&code))),
         }
     }
 }

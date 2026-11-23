@@ -28,6 +28,7 @@ use std::str::{FromStr, Split, SplitTerminator};
 
 use super::{StorageAdapter, StoredFile};
 use crate::model::{AppId, DataError, ProfileId};
+use crate::problem::Problem;
 
 /// Turns a body saved at one version into the body of the next version, or `None` if it can't.
 pub type Migration = fn(body: &str) -> Option<String>;
@@ -449,6 +450,20 @@ impl Decode for AppId {
     }
 }
 
+/// A problem is its code (L10N-01, ADR 0040), so it is shown in the language of the day it is
+/// read. A code this version doesn't know makes the record unreadable, like any other field.
+impl Encode for Problem {
+    fn encode(&self, line: &mut Line<'_>) {
+        line.token(self.code());
+    }
+}
+
+impl Decode for Problem {
+    fn decode(fields: &mut Fields<'_>) -> Option<Self> {
+        Problem::from_code(fields.token()?)
+    }
+}
+
 /// `text` as one field: never empty, never [`NONE`], and without spaces or line breaks.
 fn escape(text: &str) -> Cow<'_, str> {
     match text {
@@ -559,6 +574,24 @@ mod tests {
         let bytes = encode(&sample());
 
         assert_eq!(decode::<Sample>(&bytes), Some(sample()));
+    }
+
+    #[test]
+    fn a_problem_is_saved_as_its_code() {
+        // L10N-01: what is saved is the code, never words.
+        let mut out = Writer::default();
+        out.line("problem", Some(Problem::NoConnection))
+            .line("problem", None::<Problem>);
+        let body = out.into_body();
+        assert_eq!(body, "problem no_connection\nproblem -\n");
+
+        let mut input = Reader::new(&body);
+        assert_eq!(input.line("problem"), Some(Some(Problem::NoConnection)));
+        assert_eq!(input.line::<Option<Problem>>("problem"), Some(None));
+        assert!(input.is_done());
+
+        let mut unknown = Reader::new("problem no_such_problem\n");
+        assert_eq!(unknown.line::<Problem>("problem"), None);
     }
 
     #[test]
@@ -796,7 +829,7 @@ mod tests {
         );
 
         save(&storage, StoredFile::Layout, &sample()).unwrap();
-        *storage.error.lock().unwrap() = Some(DataError::Failed("Disk error".into()));
+        *storage.error.lock().unwrap() = Some(DataError::Failed(Problem::SavedDataUnusable));
         assert_eq!(
             load::<Sample>(&storage, StoredFile::Layout),
             Sample::default()
@@ -829,7 +862,7 @@ mod tests {
             Ok(Stored::Unreadable(garbage))
         );
 
-        let error = DataError::Failed("Disk error".into());
+        let error = DataError::Failed(Problem::SavedDataUnusable);
         *storage.error.lock().unwrap() = Some(error.clone());
         assert_eq!(read::<Sample>(&storage, StoredFile::Layout), Err(error));
     }

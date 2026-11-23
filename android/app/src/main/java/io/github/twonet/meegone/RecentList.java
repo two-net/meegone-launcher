@@ -800,7 +800,7 @@ final class RecentList extends LinearLayout {
                     ago(res, unit, count, true));
             setContentDescription(available
                     ? described
-                    : res.getString(R.string.recent_card_description, described,
+                    : res.getString(R.string.described_state, described,
                             res.getString(R.string.app_state_unavailable)));
             image.setAlpha(available ? 1f : DIMMED_ALPHA);
             paint();

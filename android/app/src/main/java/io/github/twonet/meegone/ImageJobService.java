@@ -111,8 +111,8 @@ public final class ImageJobService extends JobService {
     /**
      * Schedules the job to run no earlier than {@code notBeforeMs}, on any network or only an
      * unmetered one, replacing the one scheduled (WALL-04). While the job runs, the request
-     * waits until it finishes, as scheduling it would stop it. Returns null, or a short
-     * message when the system can't schedule it. Called from Rust, through {@link Bridge}.
+     * waits until it finishes, as scheduling it would stop it. Returns null, or a {@link
+     * Problems} code when the system can't schedule it. Called from Rust, through {@link Bridge}.
      */
     static String schedule(Context context, long notBeforeMs, boolean anyNetwork) {
         long delay = Math.max(0, notBeforeMs - System.currentTimeMillis());
@@ -173,7 +173,7 @@ public final class ImageJobService extends JobService {
         } catch (RuntimeException e) {
             Log.w(TAG, "Couldn't schedule the daily image: " + e.getClass().getSimpleName());
         }
-        return context.getString(R.string.image_job_unavailable);
+        return Problems.IMAGE_JOB_UNAVAILABLE;
     }
 
     /** Runs one check. Returns whether it reached the feed. Never on the main thread. */

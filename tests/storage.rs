@@ -8,7 +8,9 @@ mod backup;
 use std::collections::BTreeSet;
 
 use meegone_core_data::fakes::{Fakes, app, app_id, used};
-use meegone_core_data::{Access, DataError, Notification, ProfileId, StoredFile, ThemeChoice};
+use meegone_core_data::{
+    Access, DataError, Notification, Problem, ProfileId, StoredFile, ThemeChoice,
+};
 use meegone_core_state::{Health, Theme};
 use meegone_launcher::{AppMenuItem, CellKey, Direction, Launcher, ShellIntent};
 
@@ -121,7 +123,7 @@ fn failing_storage_never_stops_the_app() {
     // REL-01, REL-03
     let fakes = Fakes::after_setup();
     fakes.apps.apps.lock().unwrap().push(app("mail", "Mail"));
-    let full = DataError::Failed("Not enough storage space".into());
+    let full = DataError::Failed(Problem::StorageFull);
     *fakes.storage.error.lock().unwrap() = Some(full);
     let mut launcher = Launcher::start(fakes.platform());
     // Setup's end can't be saved, so it shows again; it still goes to the home.
@@ -143,10 +145,7 @@ fn failing_storage_never_stops_the_app() {
     launcher.view().settings().theme_chosen(ThemeChoice::Dark);
     launcher.frame();
     let settings = launcher.shell().settings().state();
-    assert_eq!(
-        settings.problem.as_deref(),
-        Some("Not enough storage space")
-    );
+    assert_eq!(settings.problem, Some(Problem::StorageFull));
     assert_eq!(settings.theme, ThemeChoice::System);
     assert_eq!(launcher.shell().theme().state().theme, Theme::Light);
 }

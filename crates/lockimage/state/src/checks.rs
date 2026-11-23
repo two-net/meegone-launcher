@@ -13,6 +13,7 @@
 //! The log of what the checks did, [`Checks`], is kept in the image cache.
 
 use meegone_core_data::{ImageJob, JobNetwork};
+use meegone_core_state::Problem;
 use meegone_lockimage_data::Checks;
 
 const MINUTE_MS: u64 = 60_000;
@@ -45,10 +46,10 @@ pub enum CheckStatus {
     #[default]
     Fine,
     /// The last attempt failed for this reason; the job will try again (REL-04).
-    Retrying(String),
+    Retrying(Problem),
     /// Every attempt has failed for [`UNAVAILABLE_AFTER_MS`], the last for this reason:
     /// "Daily image unavailable", with Try again (SRS 7.6). The job still tries.
-    Unavailable(String),
+    Unavailable(Problem),
 }
 
 /// The local day `at_ms` falls on, in days since 1 January 1970.
@@ -197,8 +198,8 @@ pub fn answered(checks: &mut Checks, new: bool) {
     checks.problem = None;
 }
 
-/// The attempt failed, for `problem` in plain words (WALL-16).
-pub fn failed(checks: &mut Checks, problem: String) {
+/// The attempt failed, for `problem` (WALL-16).
+pub fn failed(checks: &mut Checks, problem: Problem) {
     checks.problem = Some(problem);
 }
 
@@ -212,7 +213,7 @@ pub fn try_again(checks: &mut Checks) {
 
 /// How the checks are going at `now_ms` (WALL-16, SRS 7.6).
 pub fn status(checks: &Checks, now_ms: u64) -> CheckStatus {
-    let Some(problem) = checks.problem.clone() else {
+    let Some(problem) = checks.problem else {
         return CheckStatus::Fine;
     };
     let failing_for = checks
@@ -257,7 +258,7 @@ mod tests {
             begin(&mut checks, at, offset);
             match result {
                 Some(new) => answered(&mut checks, new),
-                None => failed(&mut checks, "No connection".into()),
+                None => failed(&mut checks, Problem::NoConnection),
             }
         }
         checks
@@ -387,7 +388,7 @@ mod tests {
         assert_eq!(due_ms(&checks, tomorrow, &utc), NOV_19 + DAY_MS);
         // The failure streak carries on, for Settings (SRS 7.6).
         assert_eq!(fresh.failing_since_ms, Some(NOV_19));
-        assert_eq!(fresh.problem.as_deref(), Some("No connection"));
+        assert_eq!(fresh.problem, Some(Problem::NoConnection));
     }
 
     #[test]
@@ -408,20 +409,20 @@ mod tests {
         let mut checks = after(&[(NOV_19, None)], &utc);
         assert_eq!(
             status(&checks, NOV_19),
-            CheckStatus::Retrying("No connection".into())
+            CheckStatus::Retrying(Problem::NoConnection)
         );
 
         let three_days = NOV_19 + UNAVAILABLE_AFTER_MS;
         checks = today(&checks, three_days, &utc);
         begin(&mut checks, three_days, &utc);
-        failed(&mut checks, "The feed's format has changed".into());
+        failed(&mut checks, Problem::FeedFormatChanged);
         assert_eq!(
             status(&checks, three_days - 1),
-            CheckStatus::Retrying("The feed's format has changed".into())
+            CheckStatus::Retrying(Problem::FeedFormatChanged)
         );
         assert_eq!(
             status(&checks, three_days),
-            CheckStatus::Unavailable("The feed's format has changed".into())
+            CheckStatus::Unavailable(Problem::FeedFormatChanged)
         );
 
         // An answer from the feed ends it.

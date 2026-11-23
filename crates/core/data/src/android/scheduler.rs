@@ -10,6 +10,7 @@
 use super::jni::{Env, GlobalRef, JValue, LocalRef, MethodId, Vm};
 use crate::adapters::SchedulerAdapter;
 use crate::model::{DataError, ImageJob, JobNetwork};
+use crate::problem::Problem;
 
 pub struct AndroidScheduler {
     vm: Vm,
@@ -44,7 +45,7 @@ impl AndroidScheduler {
         match env.call_string(&self.bridge, method, args)? {
             None => Ok(()),
             // The image is then checked at the next start (SRS 8.1).
-            Some(message) => Err(DataError::Unsupported(message)),
+            Some(code) => Err(DataError::Unsupported(Problem::from_host(&code))),
         }
     }
 }

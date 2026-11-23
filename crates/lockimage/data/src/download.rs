@@ -19,10 +19,11 @@
 use std::sync::Arc;
 
 use meegone_core_data::{
-    DataError, ImageCrop, NetworkAdapter, Screen, Size, SystemConfigAdapter, WallpaperAdapter,
+    DataError, ImageCrop, NetworkAdapter, Problem, Screen, Size, SystemConfigAdapter,
+    WallpaperAdapter,
 };
 
-use crate::feed::{FORMAT_CHANGED, FeedImage, ImageVersion};
+use crate::feed::{FeedImage, ImageVersion};
 use crate::{ImageCache, ImageRecord, jpeg};
 
 /// The largest download accepted (WALL-06). The feed's largest image is about 4 MB.
@@ -32,18 +33,6 @@ pub const MIN_SHORT_SIDE: u32 = 720;
 /// An image may be at most this many pixels on either side, so decoding it stays bounded
 /// (SEC-02). The feed's largest image is 3840 px wide.
 pub const MAX_SIDE: u32 = 8192;
-
-/// What [`Downloader::download`] fails with, as [`DataError::Invalid`], when the download isn't
-/// a JPEG image as the platform decodes it (WALL-07).
-pub const NOT_AN_IMAGE: &str = "The image couldn't be read";
-/// As [`DataError::Invalid`]: the image is less than [`MIN_SHORT_SIDE`] on its short side
-/// (WALL-07).
-pub const IMAGE_TOO_SMALL: &str = "The image is too small";
-/// As [`DataError::Invalid`]: the image is more than [`MAX_SIDE`] on a side (SEC-02).
-pub const IMAGE_TOO_LARGE: &str = "The image is too large";
-/// As [`DataError::Failed`]: storage is too low to download, so nothing was requested
-/// (SRS 7.6). A full disk, found while writing, says the same.
-pub const LOW_STORAGE: &str = "Not enough storage space";
 
 /// Screens at least this many dp across their smallest side turn freely, as MeeGone lets them
 /// (HOME-12): tablets, and foldables unfolded.
@@ -115,11 +104,11 @@ pub fn pick_version(versions: &[ImageVersion], screen: Size) -> Option<&ImageVer
 /// `jpeg` reads it, at least [`MIN_SHORT_SIDE`] on its short side and at most [`MAX_SIDE`] on
 /// either side.
 pub fn check_image(bytes: &[u8]) -> Result<Size, DataError> {
-    let size = jpeg::size(bytes).ok_or_else(|| invalid(NOT_AN_IMAGE))?;
+    let size = jpeg::size(bytes).ok_or_else(|| invalid(Problem::ImageUnreadable))?;
     if size.width.min(size.height) < MIN_SHORT_SIDE {
-        Err(invalid(IMAGE_TOO_SMALL))
+        Err(invalid(Problem::ImageTooSmall))
     } else if size.width.max(size.height) > MAX_SIDE {
-        Err(invalid(IMAGE_TOO_LARGE))
+        Err(invalid(Problem::ImageTooLarge))
     } else {
         Ok(size)
     }
@@ -202,11 +191,11 @@ impl Downloader {
     ///
     /// Fails without caching anything, each failure in plain words for the status line
     /// (WALL-16):
-    /// - [`LOW_STORAGE`] without a request, when free storage is under [`MAX_DOWNLOAD_BYTES`];
-    /// - [`FORMAT_CHANGED`] without a request, if the feed offers no `https://` version;
+    /// - [`Problem::StorageFull`] without a request, when free storage is under [`MAX_DOWNLOAD_BYTES`];
+    /// - [`Problem::FeedFormatChanged`] without a request, if the feed offers no `https://` version;
     /// - [`DataError::Offline`], or "Too large" for a download over [`MAX_DOWNLOAD_BYTES`],
     ///   from the network;
-    /// - [`NOT_AN_IMAGE`], [`IMAGE_TOO_SMALL`] or [`IMAGE_TOO_LARGE`] for an image that isn't
+    /// - [`Problem::ImageUnreadable`], [`Problem::ImageTooSmall`] or [`Problem::ImageTooLarge`] for an image that isn't
     ///   usable;
     /// - the cache's error if it can't be saved.
     pub fn download(
@@ -217,9 +206,7 @@ impl Downloader {
     ) -> Result<ImageRecord, DataError> {
         let screen = lock_screen_target(self.wallpaper.screen(), self.wallpaper.folds());
         if screen.is_empty() {
-            return Err(DataError::Failed(
-                "The lock screen's size is unknown".into(),
-            ));
+            return Err(DataError::Failed(Problem::ScreenSizeUnknown));
         }
         let max_bytes = u64::try_from(MAX_DOWNLOAD_BYTES).unwrap_or(u64::MAX);
         if self
@@ -227,11 +214,11 @@ impl Downloader {
             .free_storage_bytes()
             .is_some_and(|free| free < max_bytes)
         {
-            return Err(DataError::Failed(LOW_STORAGE.into()));
+            return Err(DataError::Failed(Problem::StorageFull));
         }
         let version = pick_version(&image.versions, screen).ok_or_else(|| {
             // The feed's one implementation offers only `https://` versions.
-            invalid(FORMAT_CHANGED)
+            invalid(Problem::FeedFormatChanged)
         })?;
         let download = self.network.get(&version.url, MAX_DOWNLOAD_BYTES)?;
         let crop = plan_crop(check_image(&download)?, screen);
@@ -239,13 +226,13 @@ impl Downloader {
             .wallpaper
             .crop_image(&download, &crop)
             .map_err(|error| match error {
-                DataError::Invalid(_) => invalid(NOT_AN_IMAGE),
+                DataError::Invalid(_) => invalid(Problem::ImageUnreadable),
                 error => error,
             })?;
         drop(download);
         // What comes back is checked too: a JPEG of exactly the size asked for.
         if jpeg::size(&cropped) != Some(crop.size) {
-            return Err(invalid(NOT_AN_IMAGE));
+            return Err(invalid(Problem::ImageUnreadable));
         }
         let record = ImageRecord {
             date: image.date.clone(),
@@ -263,8 +250,8 @@ impl Downloader {
     }
 }
 
-fn invalid(reason: &str) -> DataError {
-    DataError::Invalid(reason.to_owned())
+fn invalid(problem: Problem) -> DataError {
+    DataError::Invalid(problem)
 }
 
 #[cfg(test)]
@@ -436,9 +423,9 @@ mod tests {
         for (size, expected) in [
             (px(720, 1280), Ok(px(720, 1280))),
             (px(1280, 720), Ok(px(1280, 720))),
-            (px(719, 1280), Err(invalid(IMAGE_TOO_SMALL))),
-            (px(3840, 719), Err(invalid(IMAGE_TOO_SMALL))),
-            (px(600, 800), Err(invalid(IMAGE_TOO_SMALL))),
+            (px(719, 1280), Err(invalid(Problem::ImageTooSmall))),
+            (px(3840, 719), Err(invalid(Problem::ImageTooSmall))),
+            (px(600, 800), Err(invalid(Problem::ImageTooSmall))),
         ] {
             assert_eq!(check_image(&fakes::jpeg(size)), expected, "{size:?}");
         }
@@ -449,8 +436,8 @@ mod tests {
         // SEC-02: bounded decoding.
         for (size, expected) in [
             (px(8192, 8192), Ok(px(8192, 8192))),
-            (px(8193, 4320), Err(invalid(IMAGE_TOO_LARGE))),
-            (px(720, 8193), Err(invalid(IMAGE_TOO_LARGE))),
+            (px(8193, 4320), Err(invalid(Problem::ImageTooLarge))),
+            (px(720, 8193), Err(invalid(Problem::ImageTooLarge))),
         ] {
             assert_eq!(check_image(&fakes::jpeg(size)), expected, "{size:?}");
         }
@@ -464,7 +451,7 @@ mod tests {
             b"<html><body>Not found</body></html>",
             b"\x89PNG\r\n\x1a\n",
         ] {
-            assert_eq!(check_image(bytes), Err(invalid(NOT_AN_IMAGE)));
+            assert_eq!(check_image(bytes), Err(invalid(Problem::ImageUnreadable)));
         }
     }
 
@@ -716,7 +703,7 @@ mod tests {
 
         let result = downloader.download(&feed_image("20261119"), "en-GB", false);
 
-        assert_eq!(result, Err(invalid("Too large")));
+        assert_eq!(result, Err(invalid(Problem::DownloadTooLarge)));
         assert_eq!(cached(&cache), before);
         assert_eq!(fakes.wallpaper.crops.lock().unwrap().len(), 1);
     }
@@ -726,9 +713,15 @@ mod tests {
         // Issue #27: "Given an image 600 px on its short side, or content that isn't an image,
         // then it is discarded and the current wallpaper is kept."
         for (download, problem) in [
-            (fakes::jpeg(px(1066, 600)), IMAGE_TOO_SMALL),
-            (b"<html><body>Moved</body></html>".to_vec(), NOT_AN_IMAGE),
-            (b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec(), NOT_AN_IMAGE),
+            (fakes::jpeg(px(1066, 600)), Problem::ImageTooSmall),
+            (
+                b"<html><body>Moved</body></html>".to_vec(),
+                Problem::ImageUnreadable,
+            ),
+            (
+                b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec(),
+                Problem::ImageUnreadable,
+            ),
         ] {
             let Setup {
                 fakes,
@@ -807,11 +800,11 @@ mod tests {
             cache,
             downloader,
         } = setup(uhd());
-        *fakes.wallpaper.error.lock().unwrap() = Some(invalid("Couldn't decode"));
+        *fakes.wallpaper.error.lock().unwrap() = Some(invalid(Problem::SystemFailed));
 
         let result = downloader.download(&feed_image("20261119"), "en-GB", false);
 
-        assert_eq!(result, Err(invalid(NOT_AN_IMAGE)));
+        assert_eq!(result, Err(invalid(Problem::ImageUnreadable)));
         assert_eq!(cache.current(), None);
         assert!(fakes.storage.files.lock().unwrap().is_empty());
     }
@@ -833,7 +826,7 @@ mod tests {
 
             let result = downloader.download(&feed_image("20261119"), "en-GB", false);
 
-            assert_eq!(result, Err(invalid(NOT_AN_IMAGE)));
+            assert_eq!(result, Err(invalid(Problem::ImageUnreadable)));
             assert_eq!(cache.current(), None);
         }
     }
@@ -845,11 +838,11 @@ mod tests {
             cache,
             downloader,
         } = setup(uhd());
-        *fakes.wallpaper.error.lock().unwrap() = Some(DataError::Failed("Out of memory".into()));
+        *fakes.wallpaper.error.lock().unwrap() = Some(DataError::Failed(Problem::SystemFailed));
 
         let result = downloader.download(&feed_image("20261119"), "en-GB", false);
 
-        assert_eq!(result, Err(DataError::Failed("Out of memory".into())));
+        assert_eq!(result, Err(DataError::Failed(Problem::SystemFailed)));
         assert_eq!(cache.current(), None);
     }
 
@@ -868,7 +861,7 @@ mod tests {
 
         let result = downloader.download(&image, "en-GB", false);
 
-        assert_eq!(result, Err(invalid(FORMAT_CHANGED)));
+        assert_eq!(result, Err(invalid(Problem::FeedFormatChanged)));
         assert!(fakes.network.requests.lock().unwrap().is_empty());
         assert_eq!(cache.current(), None);
     }
@@ -885,7 +878,7 @@ mod tests {
 
         let result = downloader.download(&feed_image("20261119"), "en-GB", false);
 
-        assert_eq!(result, Err(DataError::Failed(LOW_STORAGE.into())));
+        assert_eq!(result, Err(DataError::Failed(Problem::StorageFull)));
         assert!(fakes.network.requests.lock().unwrap().is_empty());
         assert_eq!(cache.current(), None);
 
@@ -909,12 +902,7 @@ mod tests {
 
         let result = downloader.download(&feed_image("20261119"), "en-GB", false);
 
-        assert_eq!(
-            result,
-            Err(DataError::Failed(
-                "The lock screen's size is unknown".into()
-            ))
-        );
+        assert_eq!(result, Err(DataError::Failed(Problem::ScreenSizeUnknown)));
         assert!(fakes.network.requests.lock().unwrap().is_empty());
     }
 
@@ -949,11 +937,11 @@ mod tests {
         downloader
             .download(&feed_image("20261118"), "en-GB", false)
             .unwrap();
-        *fakes.storage.error.lock().unwrap() = Some(DataError::Failed(LOW_STORAGE.into()));
+        *fakes.storage.error.lock().unwrap() = Some(DataError::Failed(Problem::StorageFull));
 
         let result = downloader.download(&feed_image("20261119"), "en-GB", false);
 
-        assert_eq!(result, Err(DataError::Failed(LOW_STORAGE.into())));
+        assert_eq!(result, Err(DataError::Failed(Problem::StorageFull)));
         *fakes.storage.error.lock().unwrap() = None;
         assert_eq!(cache.current().unwrap().date, "20261118");
     }

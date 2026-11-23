@@ -18,8 +18,8 @@ use meegone_core_data::fakes::{
 use meegone_core_data::storage::format::seal;
 use meegone_core_data::{
     App, DataError, HomeTarget, JobNetwork, NetworkState, Notification, NotificationsAdapter,
-    PersistentSettingsStore, Profile, ProfileId, RecentDensity, Rect, Rgb, SettingsStore, Shortcut,
-    Size, StoredFile, ThemeChoice, accent,
+    PersistentSettingsStore, Problem, Profile, ProfileId, RecentDensity, Rect, Rgb, SettingsStore,
+    Shortcut, Size, StoredFile, ThemeChoice, accent,
 };
 use meegone_core_state::{Access, Health, Theme};
 use meegone_core_ui::tokens;
@@ -49,6 +49,17 @@ fn phone() -> Layout {
 fn on_a_phone(fakes: &Fakes) -> (Launcher, u64) {
     let mut launcher = Launcher::start(fakes.platform());
     launcher.dispatch(ShellIntent::Layout(phone()));
+    (launcher, 0)
+}
+
+/// A launcher laid out on that phone in a right-to-left language, such as Arabic (L10N-02),
+/// with the time at 0 ms.
+fn on_a_phone_right_to_left(fakes: &Fakes) -> (Launcher, u64) {
+    let mut launcher = Launcher::start(fakes.platform());
+    launcher.dispatch(ShellIntent::Layout(Layout {
+        rtl: true,
+        ..phone()
+    }));
     (launcher, 0)
 }
 
@@ -155,6 +166,49 @@ fn ac02_dragging_right_to_left_three_times_goes_recent_events_applications() {
         seen,
         [HomeView::Recent, HomeView::Events, HomeView::Applications]
     );
+}
+
+#[test]
+fn l10n02_right_to_left_the_views_are_mirrored_and_dragging_left_to_right_goes_recent_events_applications()
+ {
+    // Issue #39: L10N-02, AC-02 mirrored. Recent is on Applications' left and Events on its
+    // right, so the finger moves the other way, and the order of the views is the same.
+    let (mut launcher, mut clock) = on_a_phone_right_to_left(&Fakes::after_setup());
+    let width = WIDTH as i32;
+    let frame = launcher.frame();
+    assert_eq!(frame.current, HomeView::Applications);
+    assert_eq!(frame.pages[HomeView::Recent.index()], -width);
+    assert_eq!(frame.pages[HomeView::Events.index()], width);
+
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        swipe(
+            &mut launcher,
+            &mut clock,
+            WIDTH - 900.0,
+            WIDTH - 300.0,
+            400,
+            100,
+        );
+        let frame = launcher.frame();
+        assert_eq!(frame.pages[frame.current.index()], 0);
+        seen.push(frame.current);
+    }
+
+    assert_eq!(
+        seen,
+        [HomeView::Recent, HomeView::Events, HomeView::Applications]
+    );
+    // And the other way, as Previous view does.
+    swipe(
+        &mut launcher,
+        &mut clock,
+        WIDTH - 300.0,
+        WIDTH - 900.0,
+        400,
+        100,
+    );
+    assert_eq!(launcher.frame().current, HomeView::Events);
 }
 
 #[test]
@@ -1618,7 +1672,7 @@ fn apps09_given_a_paused_work_profile_its_apps_are_dimmed_and_a_tap_defers_to_th
     assert_eq!(*fakes.apps.launched_from.lock().unwrap(), [Some(icon)]);
     assert_eq!(launcher.shell().apps().state().problem, None);
 
-    *fakes.apps.error.lock().unwrap() = Some(DataError::Unsupported("App isn't available".into()));
+    *fakes.apps.error.lock().unwrap() = Some(DataError::Unsupported(Problem::AppUnavailable));
     assert!(
         launcher
             .view()
@@ -1627,8 +1681,8 @@ fn apps09_given_a_paused_work_profile_its_apps_are_dimmed_and_a_tap_defers_to_th
     );
     launcher.frame();
     assert_eq!(
-        launcher.shell().apps().state().problem.as_deref(),
-        Some("App isn't available")
+        launcher.shell().apps().state().problem,
+        Some(Problem::AppUnavailable)
     );
 }
 
@@ -2064,6 +2118,65 @@ fn ac07_given_edit_mode_when_maps_is_dragged_to_the_first_cell_then_the_others_m
     come_to_rest(&mut launcher, &mut clock);
     assert_eq!(launcher.frame().lifted, None);
     assert_eq!(grid(&launcher), ["Maps", "Camera", "Mail", "Phone"]);
+    drop(launcher);
+
+    let restarted = Launcher::start(fakes.platform());
+    assert_eq!(grid(&restarted), ["Maps", "Camera", "Mail", "Phone"]);
+}
+
+#[test]
+fn l10n02_right_to_left_in_edit_mode_maps_dragged_to_the_first_cell_on_the_right_stays_first() {
+    // Issue #39: L10N-02, AC-07 mirrored. The grid fills from the right, so the first cell is
+    // the top right one, and the icon is held where the finger holds it.
+    let fakes = Fakes::after_setup();
+    *fakes.apps.apps.lock().unwrap() = vec![
+        App {
+            can_uninstall: false,
+            ..app("camera", "Camera")
+        },
+        app("mail", "Mail"),
+        app("maps", "Maps"),
+        app("phone", "Phone"),
+    ];
+    let (mut launcher, mut clock) = on_a_phone_right_to_left(&fakes);
+    grid_on_a_phone(&mut launcher);
+    long_press(&mut launcher, &mut clock, 500.0, 1500.0);
+    launcher.dispatch(ShellIntent::ChooseMenuItem(MenuItem::EditApplications));
+    come_to_rest(&mut launcher, &mut clock);
+    assert!(launcher.frame().edit.on);
+
+    assert!(long_press_cell(
+        &mut launcher,
+        &mut clock,
+        2,
+        WIDTH - 620.0,
+        300.0
+    ));
+    finger(
+        &mut launcher,
+        &mut clock,
+        PointerKind::Move,
+        WIDTH - 124.0,
+        451.0,
+    );
+    wait(&mut launcher, &mut clock, 192);
+
+    assert_eq!(grid(&launcher), ["Maps", "Camera", "Mail", "Phone"]);
+    let lifted = launcher.frame().lifted.expect("still lifted");
+    // Held 44 px right of its icon's centre, which is over the first cell's.
+    assert_eq!(
+        (lifted.cell, lifted.x, lifted.y),
+        (Some(0), 1080 - 168, 336)
+    );
+
+    finger(
+        &mut launcher,
+        &mut clock,
+        PointerKind::Up,
+        WIDTH - 124.0,
+        451.0,
+    );
+    come_to_rest(&mut launcher, &mut clock);
     drop(launcher);
 
     let restarted = Launcher::start(fakes.platform());
@@ -2715,6 +2828,28 @@ fn srch02_given_an_app_labelled_cafe_when_the_user_types_cafe_then_it_matches() 
 }
 
 #[test]
+fn l10n04_search_ignores_accents_and_letters_with_strokes() {
+    // Issue #39: L10N-04. "lodz" finds "Łódź" and "aero" finds "Ærø", as the platform folds
+    // them; here the fake's stand-in.
+    let fakes = Fakes::after_setup();
+    let (mut launcher, mut clock) = ready_to_search(&fakes);
+    fakes
+        .apps
+        .apps
+        .lock()
+        .unwrap()
+        .extend([app("lodz", "Łódź Transit"), app("aero", "Ærø Ferries")]);
+    launcher.dispatch(ShellIntent::AppsChanged);
+    launcher.frame();
+    open_search(&mut launcher, &mut clock);
+
+    type_in(&mut launcher, "lodz");
+    assert_eq!(results(&launcher), ["Łódź Transit"]);
+    type_in(&mut launcher, "AERO");
+    assert_eq!(results(&launcher), ["Ærø Ferries"]);
+}
+
+#[test]
 fn srch03_given_results_when_the_user_presses_the_action_key_then_the_first_result_launches() {
     // Issue #15: SRCH-03, the issue's third acceptance criterion, from the result's icon
     // (ANIM-08). Coming back shows the grid, not the old query (SRCH-04).
@@ -3271,7 +3406,7 @@ fn ac16_given_no_connection_the_daily_check_keeps_the_wallpaper_says_it_will_try
     let settings = launcher.view().image_settings();
     assert_eq!(
         settings.checks(),
-        CheckStatus::Retrying("No connection".into())
+        CheckStatus::Retrying(Problem::NoConnection)
     );
     assert!(!settings.daily_image_unavailable());
     // The next attempt is the next day's check, after local midnight (WALL-03).
@@ -3553,7 +3688,7 @@ fn wall16_given_the_last_attempt_failed_for_lack_of_connection_then_settings_say
     assert!(frame.image_status.is_some());
     let status = UpdateStatus {
         updated: Some("16 November, 6:00 AM".into()),
-        checks: CheckStatus::Retrying("No connection".into()),
+        checks: CheckStatus::Retrying(Problem::NoConnection),
         pinned: false,
     };
     assert_eq!(
@@ -3749,8 +3884,7 @@ fn wall11_update_now_fetches_the_image_at_once_over_mobile_data() {
 fn wall13_given_the_device_cant_set_wallpapers_then_the_feature_is_unavailable_with_the_reason() {
     // Issue #29: WALL-13.
     let fakes = Fakes::after_setup();
-    *fakes.wallpaper.unsupported.lock().unwrap() =
-        Some("Your organisation doesn't allow changing the wallpaper".into());
+    *fakes.wallpaper.unsupported.lock().unwrap() = Some(Problem::WallpaperNotAllowed);
     let mut launcher = Launcher::start(fakes.platform());
     launcher.dispatch(ShellIntent::OpenSettings);
 
@@ -3759,12 +3893,8 @@ fn wall13_given_the_device_cant_set_wallpapers_then_the_feature_is_unavailable_w
 
     assert_eq!(frame.daily_image, Some(DailyImage::Unavailable));
     assert_eq!(
-        launcher
-            .view()
-            .image_settings()
-            .unavailable_reason()
-            .as_deref(),
-        Some("Your organisation doesn't allow changing the wallpaper")
+        launcher.view().image_settings().unavailable_reason(),
+        Some(Problem::WallpaperNotAllowed)
     );
     assert_eq!(frame.update_now, None);
     assert!(!frame.image_off_actions);
@@ -5036,8 +5166,8 @@ fn set02_settings_offers_every_group_with_the_status_of_each_access() {
 fn set02_an_access_shortcut_opens_its_system_screen_or_shows_written_instructions() {
     // Issue #34: SET-02, SRS 8.1. Usage access has no screen on this device.
     let fakes = Fakes::after_setup();
-    let instructions = "Open Settings, then Apps, Special app access, Usage access";
-    *fakes.usage.error.lock().unwrap() = Some(DataError::Unsupported(instructions.into()));
+    let instructions = Problem::UsageAccessInstructions;
+    *fakes.usage.error.lock().unwrap() = Some(DataError::Unsupported(instructions));
     let (mut launcher, _) = on_a_phone(&fakes);
     launcher.dispatch(ShellIntent::OpenSettings);
 
@@ -5051,7 +5181,7 @@ fn set02_an_access_shortcut_opens_its_system_screen_or_shows_written_instruction
     let access = frame.access.expect("Settings works");
     assert_eq!(access.instructions, Some(AccessItem::Usage));
     let state = launcher.shell().settings().state();
-    assert_eq!(state.instructions.as_ref().unwrap().1, instructions);
+    assert_eq!(state.instructions.unwrap().1, instructions);
     assert_eq!(state.problem, None);
 
     // Back from the system's screens, the status is read again and the instructions go.

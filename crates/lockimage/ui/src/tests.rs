@@ -74,7 +74,7 @@ fn the_card_shows_only_while_the_daily_image_is_on_with_an_image_and_not_hidden(
             ..on()
         },
         LockImageState {
-            status: ImageStatus::Unavailable("Blocked by device policy".into()),
+            status: ImageStatus::Unavailable(Problem::WallpaperNotAllowed),
             ..on()
         },
         LockImageState {
@@ -105,7 +105,7 @@ fn the_revision_changes_only_when_what_the_card_shows_does() {
     let (latest, card, _) = card(on());
     let first = card.revision();
     latest.set(Arc::new(LockImageState {
-        problem: Some("No connection".into()),
+        problem: Some(Problem::NoConnection),
         ..on()
     }));
     assert_eq!(card.revision(), first);
@@ -289,7 +289,7 @@ fn settings_show_and_switch_use_mobile_data() {
 #[test]
 fn settings_say_the_daily_image_is_unavailable_after_3_days_of_failures() {
     // SRS 7.6
-    let unavailable = CheckStatus::Unavailable("No connection".into());
+    let unavailable = CheckStatus::Unavailable(Problem::NoConnection);
     let (latest, section, sent) = section(LockImageState {
         checks: unavailable.clone(),
         ..on()
@@ -302,7 +302,7 @@ fn settings_say_the_daily_image_is_unavailable_after_3_days_of_failures() {
 
     // Not while it is only retrying, or while the daily image is off.
     latest.set(Arc::new(LockImageState {
-        checks: CheckStatus::Retrying("No connection".into()),
+        checks: CheckStatus::Retrying(Problem::NoConnection),
         ..on()
     }));
     assert!(!section.daily_image_unavailable());
@@ -331,13 +331,13 @@ fn settings_switch_the_daily_image_and_say_why_it_cant_be_used() {
     assert_eq!(section.daily_image(), DailyImage::On);
 
     latest.set(Arc::new(LockImageState {
-        status: ImageStatus::Unavailable("Blocked by device policy".into()),
+        status: ImageStatus::Unavailable(Problem::WallpaperNotAllowed),
         ..LockImageState::default()
     }));
     assert_eq!(section.daily_image(), DailyImage::Unavailable);
     assert_eq!(
-        section.unavailable_reason().as_deref(),
-        Some("Blocked by device policy")
+        section.unavailable_reason(),
+        Some(Problem::WallpaperNotAllowed)
     );
     assert!(!section.is_switch_enabled());
 }
@@ -403,7 +403,7 @@ fn once_off_settings_offer_the_reset_and_the_wallpaper_settings() {
     latest.set(Arc::new(on()));
     assert!(!section.off_actions_offered());
     latest.set(Arc::new(LockImageState {
-        status: ImageStatus::Unavailable("No wallpapers".into()),
+        status: ImageStatus::Unavailable(Problem::WallpaperNotSupported),
         ..LockImageState::default()
     }));
     assert!(!section.off_actions_offered());
@@ -469,7 +469,7 @@ fn the_details_are_offered_only_while_the_daily_image_is_on_and_has_an_image() {
         ..on()
     }));
     assert!(!shown(LockImageState {
-        status: ImageStatus::Unavailable("Blocked".into()),
+        status: ImageStatus::Unavailable(Problem::WallpaperNotAllowed),
         ..on()
     }));
     assert!(!shown(LockImageState {
@@ -554,7 +554,7 @@ fn the_details_revision_changes_only_when_what_they_show_does() {
 #[test]
 fn the_status_line_says_when_the_image_last_updated_and_the_last_problem() {
     // WALL-16, SRS 7.6
-    let retrying = CheckStatus::Retrying("No connection".into());
+    let retrying = CheckStatus::Retrying(Problem::NoConnection);
     let (latest, section, _) = section(LockImageState {
         updated: Some("19 November, 07:00".into()),
         checks: retrying.clone(),
@@ -600,7 +600,7 @@ fn the_status_line_revision_changes_only_when_it_does() {
     assert_eq!(section.status_revision(), first);
 
     latest.set(Arc::new(LockImageState {
-        checks: CheckStatus::Retrying("No connection".into()),
+        checks: CheckStatus::Retrying(Problem::NoConnection),
         ..on()
     }));
     assert_ne!(section.status_revision(), first);
@@ -781,7 +781,7 @@ fn the_details_screen_and_settings_open_the_past_week_and_say_what_is_pinned() {
     // WALL-17
     let pinned = LockImageState {
         pinned: true,
-        checks: CheckStatus::Unavailable("No connection".into()),
+        checks: CheckStatus::Unavailable(Problem::NoConnection),
         ..browsed()
     };
     let (_, details, sent) = details(pinned.clone());
@@ -910,7 +910,7 @@ fn setups_switch_is_its_own_until_continue() {
     ));
 
     latest.set(Arc::new(LockImageState {
-        status: ImageStatus::Unavailable("Not allowed".into()),
+        status: ImageStatus::Unavailable(Problem::WallpaperNotAllowed),
         ..at_setups_step(None, false)
     }));
     assert_eq!(step.switch(), Some(DailyImage::Unavailable));

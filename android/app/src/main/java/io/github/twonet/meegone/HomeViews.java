@@ -46,7 +46,6 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Locale;
 
 /**
  * The three home views, Events, Applications and Recent, in a wrap-around carousel (HOME-02 to
@@ -252,10 +251,6 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     };
     /** Settings → Recent → Time window, in hours, as {@code RecentWindow::hours} gives them. */
     private static final int[] RECENT_HOURS = {12, 24, 72};
-    private static final int[] RECENT_LABELS = {
-        R.string.recent_window_12_hours, R.string.recent_window_24_hours,
-        R.string.recent_window_3_days,
-    };
     private static final int SEARCH_OPEN = 1; // the field has the keyboard
     private static final int SEARCH_RESULTS = 2; // the results show instead of the grid
     private static final int SEARCH_NOTHING = 4; // nothing matches
@@ -831,7 +826,8 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         homeSettings.setVisibility(GONE);
         // Settings → Recent → Time window (REC-11), after Applications in SET-02's order.
         recentSettings = new ChoiceSettings(context, R.string.settings_group_recent,
-                R.string.recent_time_window, RECENT_HOURS, RECENT_LABELS, hours -> {
+                R.string.recent_time_window, RECENT_HOURS, recentWindows(getResources()),
+                hours -> {
                     String message = nativeRecentWindow(hours);
                     apply();
                     toast(message);
@@ -868,10 +864,10 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
 
             @Override
             public void resetLockScreen() {
-                String message = nativeResetLockScreen();
+                String problem = nativeResetLockScreen();
                 apply();
-                toast(message != null
-                        ? message
+                say(problem != null
+                        ? Problems.text(getResources(), problem)
                         : getContext().getString(R.string.lock_screen_reset));
             }
 
@@ -1785,9 +1781,18 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         toast(message);
     }
 
-    private void toast(String message) {
-        if (message != null) {
-            Toast.makeText(getContext(), message, Toast.LENGTH_SHORT).show();
+    /**
+     * Shows {@code problem}, a {@link Problems} code from the Rust app, briefly in the device's
+     * language (L10N-01); nothing for null.
+     */
+    private void toast(String problem) {
+        say(Problems.text(getResources(), problem));
+    }
+
+    /** Shows {@code text} briefly; nothing for null. */
+    private void say(String text) {
+        if (text != null) {
+            Toast.makeText(getContext(), text, Toast.LENGTH_SHORT).show();
         }
     }
 
@@ -2074,7 +2079,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             case SetupScreens.LOCK_SCREEN_IMAGE:
                 int switchState = frame[SETUP_IMAGE_SWITCH];
                 String reason = switchState == SetupScreens.SWITCH_UNAVAILABLE
-                        ? nativeImageUnavailableReason()
+                        ? Problems.text(getResources(), nativeImageUnavailableReason())
                         : null;
                 setup.showImage(switchState, reason, regionName(frame[REGION]));
                 int revision = frame[SETUP_IMAGE_REVISION];
@@ -2353,21 +2358,41 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         int instructed = frame[ACCESS_INSTRUCTIONS];
         if (instructed != instructionsShown) {
             instructionsShown = instructed;
-            instructions = instructed >= 0 ? nativeAccessInstructions() : null;
+            instructions = instructed >= 0
+                    ? Problems.text(getResources(), nativeAccessInstructions())
+                    : null;
         }
         accessSettings.show(frame[DEFAULT_HOME] > 0, frame[NOTIFICATION_ACCESS] > 0,
                 frame[USAGE_ACCESS] > 0, instructed, instructions);
     }
 
-    /** A region by name: "Automatic (English (United States))" first, then "Deutsch (…)". */
+    /**
+     * Each of {@link #RECENT_HOURS} in words, "12 hours", "24 hours" and "3 days", with the
+     * locale's digits (L10N-03).
+     */
+    private static CharSequence[] recentWindows(Resources res) {
+        CharSequence[] names = new CharSequence[RECENT_HOURS.length];
+        for (int i = 0; i < RECENT_HOURS.length; i++) {
+            int hours = RECENT_HOURS[i];
+            names[i] = hours % 24 == 0 && hours > 24
+                    ? res.getQuantityString(R.plurals.recent_window_days, hours / 24, hours / 24)
+                    : res.getQuantityString(R.plurals.recent_window_hours, hours, hours);
+        }
+        return names;
+    }
+
+    /**
+     * A region by name, in the device's language (L10N-04): "Automatic (English (United
+     * States))" first, then "Deutsch (Deutschland)" and the others.
+     */
     private String regionName(int place) {
         if (place < 0 || place >= regions.length) {
             return "";
         }
-        String name = Locale.forLanguageTag(regions[place]).getDisplayName();
         return place == 0
-                ? getResources().getString(R.string.image_region_automatic, name)
-                : name;
+                ? getResources().getString(R.string.image_region_automatic,
+                        Regions.nameInSentence(regions[place]))
+                : Regions.name(regions[place]);
     }
 
     /** A dialog over Settings, laid out as the device's in MeeGone's theme (THEME-03). */
@@ -2398,8 +2423,9 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     }
 
     /**
-     * Settings → Lock-screen image → Region: Automatic, then the feed's regions by name, the
-     * chosen one checked (WALL-05). A choice is saved at once (SET-03).
+     * Settings → Lock-screen image → Region: Automatic, then the feed's regions by name in the
+     * language's alphabetical order (L10N-04), the chosen one checked (WALL-05). A choice is
+     * saved at once (SET-03).
      */
     private void chooseRegion() {
         if (regions.length == 0 || frame[REGION] < 0) {
@@ -2409,11 +2435,20 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         for (int place = 0; place < regions.length; place++) {
             names[place] = regionName(place);
         }
+        int[] order = Regions.order(names);
+        String[] listed = new String[order.length];
+        int checked = -1;
+        for (int at = 0; at < order.length; at++) {
+            listed[at] = names[order[at]];
+            if (order[at] == frame[REGION]) {
+                checked = at;
+            }
+        }
         showSettingsDialog(dialogOverSettings()
                 .setTitle(R.string.image_region)
-                .setSingleChoiceItems(names, frame[REGION], (shown, place) -> {
+                .setSingleChoiceItems(listed, checked, (shown, at) -> {
                     shown.dismiss();
-                    String message = nativeRegion(place);
+                    String message = nativeRegion(order[at]);
                     apply();
                     toast(message);
                 })
@@ -2469,10 +2504,10 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
                 .setTitle(R.string.reset_launcher_title)
                 .setMessage(R.string.reset_launcher_message)
                 .setPositiveButton(R.string.reset_launcher_confirm, (shown, which) -> {
-                    String message = nativeResetLauncher();
+                    String problem = nativeResetLauncher();
                     apply();
-                    toast(message != null
-                            ? message
+                    say(problem != null
+                            ? Problems.text(getResources(), problem)
                             : getContext().getString(R.string.launcher_reset));
                 })
                 .setNegativeButton(android.R.string.cancel, null)
@@ -2516,7 +2551,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             imageSettings.showRegion(regionName(regionShown));
         }
         String reason = daily == ImageSettings.DAILY_IMAGE_UNAVAILABLE
-                ? nativeImageUnavailableReason()
+                ? Problems.text(getResources(), nativeImageUnavailableReason())
                 : null;
         imageSettings.show(
                 daily,
@@ -2711,9 +2746,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         String name = grid.label(place);
         String message = nativeAppMenuChosen(revision, index);
         apply();
-        if (message != null) {
-            Toast.makeText(getContext(), message, Toast.LENGTH_SHORT).show();
-        }
+        toast(message);
         if (name == null) {
             return;
         }
@@ -3531,6 +3564,11 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     /** The open folder's name, which renames it when tapped. */
     TextView auditFolderName() {
         return folderPanel.auditName();
+    }
+
+    /** Home view {@code view}'s page, 0 to 2, where it is drawn (L10N-02, ADR 0040). */
+    View auditPage(int view) {
+        return pages[view];
     }
 
     /** The element of the view shown, which carries the view's actions (ADR 0039). */

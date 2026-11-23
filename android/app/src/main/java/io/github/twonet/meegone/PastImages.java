@@ -165,9 +165,9 @@ final class PastImages extends Scroll {
         boolean busy = SET.equals(fields[LOADING]);
         // Loading shows only while there is nothing yet to look at.
         loading.setVisibility(busy && count == 0 ? VISIBLE : GONE);
-        String why = fields[PROBLEM];
-        problem.setText(why.isEmpty() ? null : res.getString(R.string.image_last_problem, why));
-        problemRow.setVisibility(why.isEmpty() ? GONE : VISIBLE);
+        String why = Problems.text(res, fields[PROBLEM]);
+        problem.setText(why == null ? null : res.getString(R.string.image_last_problem, why));
+        problemRow.setVisibility(why == null ? GONE : VISIBLE);
         tryAgain.setEnabled(!busy);
         tryAgain.setTextColor(busy ? dim : accent);
 
@@ -279,7 +279,8 @@ final class PastImages extends Scroll {
         row.setGravity(Gravity.CENTER_VERTICAL);
         row.setMinimumHeight(dp(ROW_DP));
         int margin = dp(MARGIN_DP);
-        row.setPadding(margin, 0, 0, 0);
+        // The button ends the row, on the right or, right to left, on the left (L10N-02).
+        row.setPaddingRelative(margin, 0, 0, 0);
         row.addView(text, new LinearLayout.LayoutParams(0, LayoutParams.WRAP_CONTENT, 1f));
         button.setTextSize(TypedValue.COMPLEX_UNIT_SP, BODY_SP + 1);
         button.setTypeface(Typeface.create(Typeface.DEFAULT, MEDIUM, false));
@@ -350,7 +351,9 @@ final class PastImages extends Scroll {
             String when = image[DATE];
             if (SET.equals(image[CURRENT])) {
                 String here = res.getString(R.string.image_on_lock_screen);
-                when = when.isEmpty() ? here : res.getString(R.string.image_date_region, when, here);
+                when = when.isEmpty()
+                        ? here
+                        : res.getString(R.string.image_date_on_lock_screen, when);
             }
             date.setText(when);
             date.setVisibility(when.isEmpty() ? GONE : VISIBLE);

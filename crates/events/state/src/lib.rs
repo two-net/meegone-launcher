@@ -12,8 +12,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use meegone_core_data::{AppsAdapter, NotificationsAdapter, SystemConfigAdapter, TimeStyle};
-use meegone_core_state::StateHolder;
 pub use meegone_core_state::{Access, App, AppId, Notification, ProfileId, Rect};
+use meegone_core_state::{Problem, StateHolder};
 
 /// An alarm that rings within this long shows only its time; a later one also shows its
 /// weekday, so a time alone always means the next time the clock shows it (EVT-02).
@@ -232,7 +232,7 @@ pub struct EventsState {
     pub expanded: Option<GroupId>,
     /// A notification's or a group's long-press menu, while it is open (EVT-08).
     pub menu: Option<NotificationMenu>,
-    pub problem: Option<String>,
+    pub problem: Option<Problem>,
 }
 
 impl EventsState {
@@ -397,7 +397,7 @@ impl EventsHolder {
             }
             Err(error) => {
                 self.set_groups(Vec::new());
-                self.state.problem = Some(error.to_string());
+                self.state.problem = Some(error.problem());
             }
         }
     }
@@ -439,7 +439,7 @@ impl EventsHolder {
             .system
             .open_next_alarm()
             .err()
-            .map(|error| error.to_string());
+            .map(|error| error.problem());
     }
 
     /// EVT-06: a row that no longer shows does nothing.
@@ -470,7 +470,7 @@ impl EventsHolder {
     /// (EVT-06), with the summaries hidden behind it if it was the last of its group.
     fn open(&mut self, group: &NotificationGroup, notification: &Notification, from: Option<Rect>) {
         if let Err(error) = self.notifications.open(&notification.key, from) {
-            self.state.problem = Some(error.to_string());
+            self.state.problem = Some(error.problem());
             return;
         }
         if notification.auto_cancel {
@@ -488,7 +488,7 @@ impl EventsHolder {
             .notifications
             .dismiss(&keys)
             .err()
-            .map(|error| error.to_string());
+            .map(|error| error.problem());
     }
 
     /// EVT-08: a row that no longer shows has no menu.
@@ -517,7 +517,7 @@ impl EventsHolder {
                     .notifications
                     .open_app_settings(target.group.profile, &target.group.package)
                     .err()
-                    .map(|error| error.to_string());
+                    .map(|error| error.problem());
             }
         }
     }
@@ -554,7 +554,7 @@ impl StateHolder for EventsHolder {
                     .notifications
                     .open_access_settings()
                     .err()
-                    .map(|error| error.to_string());
+                    .map(|error| error.problem());
             }
             EventsIntent::Tap { row, from } => self.tap(&row, from),
             EventsIntent::Collapse => self.state.expanded = None,
@@ -941,7 +941,7 @@ mod tests {
     #[test]
     fn with_nothing_showing_the_catalogue_waits_for_a_notification() {
         let fakes = Fakes::default();
-        *fakes.apps.error.lock().unwrap() = Some(DataError::Failed("No apps".into()));
+        *fakes.apps.error.lock().unwrap() = Some(DataError::Failed(Problem::AppListUnavailable));
         showing(&fakes, Vec::new());
         let mut holder = holder(&fakes);
         holder.handle(EventsIntent::Refresh);
@@ -959,7 +959,7 @@ mod tests {
     fn without_the_catalogue_groups_still_show_with_the_systems_names() {
         // REL-01: Events never depends on Applications.
         let fakes = Fakes::default();
-        *fakes.apps.error.lock().unwrap() = Some(DataError::Failed("No apps".into()));
+        *fakes.apps.error.lock().unwrap() = Some(DataError::Failed(Problem::AppListUnavailable));
         showing(
             &fakes,
             vec![Notification {
@@ -1007,11 +1007,11 @@ mod tests {
         let mut holder = holder(&fakes);
         holder.handle(EventsIntent::Refresh);
 
-        *fakes.notifications.error.lock().unwrap() = Some(DataError::Failed("Busy".into()));
+        *fakes.notifications.error.lock().unwrap() = Some(DataError::Failed(Problem::SystemFailed));
         holder.handle(EventsIntent::RefreshNotifications);
 
         assert!(holder.state().groups.is_empty());
-        assert_eq!(holder.state().problem.as_deref(), Some("Busy"));
+        assert_eq!(holder.state().problem, Some(Problem::SystemFailed));
     }
 
     #[test]
@@ -1237,11 +1237,12 @@ mod tests {
         *fakes.system.next_alarm_ms.lock().unwrap() = Some(TUESDAY);
         let mut holder = holder(&fakes);
         holder.handle(EventsIntent::Refresh);
-        *fakes.system.error.lock().unwrap() = Some(DataError::Unsupported("No clock".into()));
+        *fakes.system.error.lock().unwrap() =
+            Some(DataError::Unsupported(Problem::AlarmUnavailable));
 
         holder.handle(EventsIntent::OpenAlarm);
 
-        assert_eq!(holder.state().problem.as_deref(), Some("No clock"));
+        assert_eq!(holder.state().problem, Some(Problem::AlarmUnavailable));
     }
 
     #[test]
@@ -1552,13 +1553,13 @@ mod tests {
         let mut holder = holder(&fakes);
         holder.handle(EventsIntent::Refresh);
         *fakes.notifications.error.lock().unwrap() =
-            Some(DataError::Failed("This notification can't open".into()));
+            Some(DataError::Failed(Problem::NotificationUnavailable));
 
         tap(&mut holder, group_row("chat"));
 
         assert_eq!(
-            holder.state().problem.as_deref(),
-            Some("This notification can't open")
+            holder.state().problem,
+            Some(Problem::NotificationUnavailable)
         );
         assert!(dismissed(&fakes).is_empty(), "nothing opened, so it stays");
     }
@@ -1718,7 +1719,7 @@ mod tests {
         let mut holder = mail_and_chat(&fakes);
         holder.handle(EventsIntent::OpenMenu(group_row("chat")));
         *fakes.notifications.error.lock().unwrap() = Some(DataError::Unsupported(
-            "Notification settings can't open".into(),
+            Problem::NotificationSettingsUnavailable,
         ));
 
         holder.handle(EventsIntent::ChooseMenuItem(
@@ -1726,8 +1727,8 @@ mod tests {
         ));
 
         assert_eq!(
-            holder.state().problem.as_deref(),
-            Some("Notification settings can't open")
+            holder.state().problem,
+            Some(Problem::NotificationSettingsUnavailable)
         );
     }
 
@@ -1839,15 +1840,14 @@ mod tests {
         // ARCH-09
         let fakes = Fakes::default();
         let mut holder = mail_and_chat(&fakes);
-        *fakes.notifications.error.lock().unwrap() = Some(DataError::Failed(
-            "Notifications can't be cleared right now".into(),
-        ));
+        *fakes.notifications.error.lock().unwrap() =
+            Some(DataError::Failed(Problem::NotificationsDismissUnavailable));
 
         holder.handle(EventsIntent::Clear);
 
         assert_eq!(
-            holder.state().problem.as_deref(),
-            Some("Notifications can't be cleared right now")
+            holder.state().problem,
+            Some(Problem::NotificationsDismissUnavailable)
         );
     }
 

@@ -39,9 +39,15 @@ final class ChoiceSettings extends LinearLayout {
 
     /**
      * An item headed {@code group}, or 0 for none, and {@code title}, offering {@code values}
-     * with the matching {@code labels}, as the Rust app numbers them.
+     * with the matching {@code labels}, string resources, as the Rust app numbers them.
      */
     ChoiceSettings(Context context, int group, int title, int[] values, int[] labels,
+            Choice choice) {
+        this(context, group, title, values, texts(context, labels), choice);
+    }
+
+    /** As above, with each label written out, such as one with a number in it (L10N-03). */
+    ChoiceSettings(Context context, int group, int title, int[] values, CharSequence[] labels,
             Choice choice) {
         super(context);
         this.values = values.clone();
@@ -82,6 +88,14 @@ final class ChoiceSettings extends LinearLayout {
                     LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
         }
         addView(choices, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
+    }
+
+    private static CharSequence[] texts(Context context, int[] labels) {
+        CharSequence[] texts = new CharSequence[labels.length];
+        for (int i = 0; i < labels.length; i++) {
+            texts[i] = context.getText(labels[i]);
+        }
+        return texts;
     }
 
     private TextView heading(int text, float sizeSp) {

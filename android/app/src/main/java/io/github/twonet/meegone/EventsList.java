@@ -16,6 +16,7 @@ import android.view.accessibility.AccessibilityNodeInfo.AccessibilityAction;
 import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.TextView;
+import java.text.NumberFormat;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -520,7 +521,8 @@ final class EventsList extends LinearLayout {
             int padding = dp(notification ? GAP_DP / 2 : GAP_DP);
             setPadding(0, padding, 0, padding);
             name.setText(label);
-            count.setText(Integer.toString(notifications));
+            // In the locale's digits, such as ٣ in Arabic (L10N-03).
+            count.setText(NumberFormat.getIntegerInstance().format(notifications));
             String said = said();
             message.setText(said);
             message.setVisibility(said.isEmpty() ? GONE : VISIBLE);

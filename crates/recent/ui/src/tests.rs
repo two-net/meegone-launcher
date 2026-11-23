@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use meegone_core_state::{App, ProfileId};
+use meegone_core_state::{App, Problem, ProfileId};
 use meegone_core_ui::tokens::{DARK, LIGHT};
 
 use super::*;
@@ -161,7 +161,7 @@ fn the_revision_changes_only_when_what_shows_does() {
 
     // A problem or close mode shows nothing new here.
     let mut troubled = recent.clone();
-    troubled.problem = Some("Mail can't open".into());
+    troubled.problem = Some(Problem::AppUnavailable);
     troubled.close_mode = true;
     assert_eq!(view.show_cards(&troubled, &LIGHT), first);
 

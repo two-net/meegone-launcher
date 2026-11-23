@@ -17,6 +17,11 @@ The store listing is in `fastlane/metadata/android/`, in the layout F-Droid read
   - every colour the host draws is one of the theme's tokens, and every pairing of them meets its contrast in both themes, the focus ring's included (A11Y-03, A11Y-06);
   - every text size is in sp (A11Y-04);
   - AC-19's tasks can be done with no gesture, and with animations removed every flow is over as it happens (A11Y-05, AC-18).
+- [ ] `cargo test -p arch-check` and `cargo test --workspace` also check the localisation rules (ADR 0040):
+  - neither the Java host nor the Rust app writes text for the user outside string resources, and every problem is worded from one (L10N-01);
+  - every string resource has a comment for translators, numbers its arguments when it has several, and only the product's name is untranslatable;
+  - no number reaches the screen in ASCII digits whatever the language (L10N-03);
+  - right to left, the views' order, the swipes and edit mode's drags are mirrored (L10N-02).
 
 ## Open questions that block a release
 
@@ -40,7 +45,8 @@ The store listing is in `fastlane/metadata/android/`, in the layout F-Droid read
 - [ ] The launcher icon is MeeGone's own original icon, recorded in `ASSETS.md`, not Android's default.
 - [ ] Settings → About shows the version, the privacy notice, the non-affiliation statement and "Open-source licences", whose texts open in full (SET-05, LEGAL-05, LEGAL-06).
 - [ ] The image-of-the-day card, the image details screen, the past week and setup each show the image's attribution in full (LEGAL-03).
-- [ ] `tools/a11y-audit.sh` passes with the debug build of the release's commit, on a test device with a folder, notifications and a work profile, and again with `--first-run` for setup's screens. It checks every screen in both themes at font scale 1.0, at 2.0, and with animations removed: names, 48 dp targets, contrast, text cut off or overlapping, what screen readers and Tab reach, and the focus ring (A11Y-01 to A11Y-07, ADR 0038, ADR 0039).
+- [ ] `tools/a11y-audit.sh` passes with the debug build of the release's commit, on a test device with Android 13 or later, a folder, notifications and a work profile, and again with `--first-run` for setup's screens. It checks every screen in both themes at font scale 1.0, at 2.0, and with animations removed: names, 48 dp targets, contrast, text cut off or overlapping, what screen readers and Tab reach, and the focus ring (A11Y-01 to A11Y-07, ADR 0038, ADR 0039).
+  - It does so again in the pseudo-locales en-XA, whose text is about a third longer, and ar-XB, right to left (ADR 0040). In each pass, it checks the views' order and a finger's swipes, and search's folding. Below Android 13 it skips the pseudo-locales and says so; that doesn't count as passing.
 - [ ] With TalkBack on, the home views, a folder, edit mode, Recent's close mode and Settings read as ADR 0038 says: apps by name with "work" for a work app, "Folder: ‹name›, N apps", "Uninstall ‹app›" and "Remove ‹app› from Recent", and "Applications, 2 of 3", "Edit mode" and "‹app› removed from Recent" as they happen (A11Y-01, A11Y-08).
 - [ ] AC-19's six tasks, done three ways with no gesture: switch views, launch an app, move an icon, make a folder, clear Recent and open Settings (A11Y-05, A11Y-06, ADR 0039).
   - **With TalkBack:**
@@ -54,3 +60,13 @@ The store listing is in `fastlane/metadata/android/`, in the layout F-Droid read
     - The ring shows wherever the focus is, and Meta+/ lists the keys.
   - **With Switch Access** (Universal Switch on Samsung): every element and each view's element can be reached and acted on.
 - [ ] With Accessibility → Remove animations on, the same tasks and every screen are instant, or fades of 100 ms or less, and nothing is missing (AC-18, A11Y-07).
+- [ ] With the device in Arabic or Hebrew (L10N-02, ADR 0040):
+  - Recent is on Applications' left and Events on its right, and a swipe to the right goes from Applications to Recent.
+  - With a hardware keyboard, → past a view's end goes to the next view, and ← past its start to the one before.
+  - TalkBack's page actions go the same way.
+  - Settings, a folder, edit mode and Recent's close mode lay out from the right, with each ✕ at the start corner.
+- [ ] Dates, times and numbers (L10N-03, L10N-04):
+  - With 24-hour time on, the Events alarm and "Last updated" show 24-hour times; with it off, 12-hour ones.
+  - In Arabic, Events' counts use Arabic-Indic digits.
+  - In Swedish, Settings → Applications → Hidden apps, and a first start's grid, put "Ö…" after "Z…".
+  - Searching "lodz" finds an app called "Łódź…".

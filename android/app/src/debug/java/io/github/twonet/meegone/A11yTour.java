@@ -2,7 +2,10 @@ package io.github.twonet.meegone;
 
 import android.app.AlertDialog;
 import android.os.Build;
+import android.os.SystemClock;
 import android.util.Log;
+import android.view.InputDevice;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.accessibility.AccessibilityNodeInfo;
 import android.widget.CompoundButton;
@@ -13,6 +16,7 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Deque;
 import java.util.List;
+import java.util.Locale;
 
 /**
  * Debug builds only: goes through every screen of MeeGone in the Light theme, then the Dark one,
@@ -26,6 +30,11 @@ import java.util.List;
  * Reset launcher's included. The theme and Recent's density are put back as they were found, so
  * the tour changes nothing it doesn't restore. Setup is checked only while it shows, on a first
  * run; then the tour answers it Continue and Not now, with the daily image off.
+ *
+ * <p>In every pass it also checks the views' order and the swipes' directions with a finger's
+ * drags, mirrored right to left (L10N-02), and search's folding and the collation sorting relies
+ * on ({@link L10nCheck}, L10N-04, ADR 0040). In the pseudo-locales, every screen's checks show
+ * that longer text and right-to-left layouts break nothing.
  *
  * <p>It logs {@code START}, any {@code FAIL} and {@code SKIP} lines, and {@code DONE screens=…
  * checked=… failed=…} under {@link A11yAudit#TAG}; {@code tools/a11y-audit.sh} reads them.
@@ -44,6 +53,9 @@ final class A11yTour {
     private static final long PATIENCE_MS = 8000;
     private static final int MAX_PAGES = 12;
     private static final int MAX_GRID_PAGES = 3;
+    /** A finger's drag across the views: this many moves, one a frame. */
+    private static final int DRAG_MOVES = 15;
+    private static final long FRAME_MS = 16;
 
     private static boolean running;
 
@@ -78,7 +90,9 @@ final class A11yTour {
     private void begin() {
         float scale = activity.getResources().getConfiguration().fontScale;
         Log.i(A11yAudit.TAG, "START font scale " + scale + ", animations "
-                + (Scroll.animating() ? "on" : "removed") + ", Android " + Build.VERSION.SDK_INT);
+                + (Scroll.animating() ? "on" : "removed") + ", Android " + Build.VERSION.SDK_INT
+                + ", " + Locale.getDefault().toLanguageTag() + ", "
+                + (rtl() ? "right to left" : "left to right"));
         int themeFound = views.auditTheme();
         int rowsFound = views.auditRecentRows();
         if (views.auditSetupStep() >= 0) {
@@ -87,6 +101,10 @@ final class A11yTour {
         for (int each : new int[] {LIGHT, DARK}) {
             queueTheme(each);
         }
+        // A finger's drags, before the keyboard leaves touch mode.
+        steps.add(this::closeAll);
+        steps.add(this::direction);
+        steps.add(act(() -> L10nCheck.check(audit, theme)));
         for (int each : new int[] {LIGHT, DARK}) {
             queueKeyboard(each);
         }
@@ -286,6 +304,72 @@ final class A11yTour {
                 settle(() -> ring("Focus ring in the home menu", () -> closeAll(next)));
             }));
         });
+    }
+
+    /**
+     * The views' order and the swipes' directions, as a finger finds them (L10N-02, ADR 0040).
+     * On Applications, Events is drawn on the left and Recent on the right, or the other way
+     * round right to left. A drag to the right shows the view on the left, and one to the left
+     * the view on the right.
+     */
+    private void direction(Runnable next) {
+        boolean rtl = rtl();
+        String screen = rtl ? "Right to left" : "Left to right";
+        goTo(APPLICATIONS, () -> {
+            float events = views.auditPage(EVENTS).getTranslationX();
+            float recent = views.auditPage(RECENT).getTranslationX();
+            boolean mirrored = rtl ? events > 0 && recent < 0 : events < 0 && recent > 0;
+            audit.expect(mirrored, screen, theme, "ORDER",
+                    "Events is drawn at " + events + " px and Recent at " + recent + " px");
+            float width = views.getWidth();
+            drag(width * 0.2f, width * 0.8f, () -> {
+                int shown = views.auditView();
+                audit.expect(shown == (rtl ? RECENT : EVENTS), screen, theme, "SWIPE",
+                        "a drag to the right showed view " + shown);
+                goTo(APPLICATIONS, () -> drag(width * 0.8f, width * 0.2f, () -> {
+                    int then = views.auditView();
+                    audit.expect(then == (rtl ? EVENTS : RECENT), screen, theme, "SWIPE",
+                            "a drag to the left showed view " + then);
+                    goTo(APPLICATIONS, next);
+                }));
+            });
+        });
+    }
+
+    /** Whether the home views are laid out right to left. */
+    private boolean rtl() {
+        return views.getLayoutDirection() == View.LAYOUT_DIRECTION_RTL;
+    }
+
+    /**
+     * A finger's drag across the middle of the home views, from {@code fromX} to {@code toX} px
+     * from their left, a move each frame, as a person's; then {@code next} once all is still.
+     */
+    private void drag(float fromX, float toX, Runnable next) {
+        long down = SystemClock.uptimeMillis();
+        float y = views.getHeight() / 2f;
+        touch(down, MotionEvent.ACTION_DOWN, fromX, y);
+        dragOn(down, fromX, toX, y, 1, next);
+    }
+
+    private void dragOn(long down, float fromX, float toX, float y, int move, Runnable next) {
+        A11yAudit.later(FRAME_MS, () -> {
+            float x = fromX + (toX - fromX) * Math.min(move, DRAG_MOVES) / DRAG_MOVES;
+            if (move <= DRAG_MOVES) {
+                touch(down, MotionEvent.ACTION_MOVE, x, y);
+                dragOn(down, fromX, toX, y, move + 1, next);
+            } else {
+                touch(down, MotionEvent.ACTION_UP, x, y);
+                settle(next);
+            }
+        });
+    }
+
+    private void touch(long down, int action, float x, float y) {
+        MotionEvent event = MotionEvent.obtain(down, SystemClock.uptimeMillis(), action, x, y, 0);
+        event.setSource(InputDevice.SOURCE_TOUCHSCREEN);
+        views.dispatchTouchEvent(event);
+        event.recycle();
     }
 
     /** Checks the focus ring where it is drawn. */

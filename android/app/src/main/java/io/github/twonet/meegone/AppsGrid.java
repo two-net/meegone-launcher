@@ -586,10 +586,8 @@ final class AppsGrid extends Scroll {
         String message = nativeAppTapped(surface, revision, cell.index(), icon.left, icon.top,
                 icon.right, icon.bottom);
         redraw.run();
-        if (message != null) {
-            // The system gave no explanation of its own (APPS-09).
-            Toast.makeText(getContext(), message, Toast.LENGTH_SHORT).show();
-        }
+        // The system gave no explanation of its own (APPS-09).
+        toast(message);
     }
 
     /**
@@ -608,8 +606,14 @@ final class AppsGrid extends Scroll {
     void badgeTapped(AppCell cell) {
         String message = nativeAppBadgeTapped(surface, revision, cell.index());
         redraw.run();
-        if (message != null) {
-            Toast.makeText(getContext(), message, Toast.LENGTH_SHORT).show();
+        toast(message);
+    }
+
+    /** Shows {@code problem}, a {@link Problems} code, briefly; nothing for null (L10N-01). */
+    private void toast(String problem) {
+        String text = Problems.text(getResources(), problem);
+        if (text != null) {
+            Toast.makeText(getContext(), text, Toast.LENGTH_SHORT).show();
         }
     }
 

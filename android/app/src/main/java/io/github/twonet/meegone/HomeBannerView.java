@@ -34,7 +34,9 @@ final class HomeBannerView extends LinearLayout {
         float density = getResources().getDisplayMetrics().density;
         int gap = Math.round(SettingsRows.GAP_DP * density);
         setOrientation(VERTICAL);
-        setPadding(gap, gap, gap / 2, 0);
+        // The buttons' row ends half a gap from the edge, on the right or, right to left, on
+        // the left (L10N-02).
+        setPaddingRelative(gap, gap, gap / 2, 0);
         card.setCornerRadius(12 * density);
         setBackground(card);
         // Touches on the card stay there: none reaches the views behind it.

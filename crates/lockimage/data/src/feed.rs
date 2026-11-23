@@ -6,12 +6,6 @@
 
 use meegone_core_data::DataError;
 
-/// What [`ImageFeed::today`] and [`ImageFeed::past_week`] fail with, as [`DataError::Invalid`],
-/// when a response can't be read: the feed's format has changed, or the response is malformed,
-/// truncated or too large. A failure of its own for the status line, never a crash (SRS 8.2,
-/// WALL-16).
-pub const FORMAT_CHANGED: &str = "The feed's format has changed";
-
 /// One size of an image that the feed offers (WALL-06).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageVersion {
@@ -58,7 +52,7 @@ pub trait ImageFeed: Send + Sync {
     ///
     /// Fails with [`DataError::Offline`] without a connection, and with
     /// [`DataError::Invalid`] for a region the feed doesn't list, without a request, or with
-    /// [`FORMAT_CHANGED`] if the response can't be read.
+    /// [`Problem::FeedFormatChanged`] if the response can't be read.
     fn today(&self, region: &str) -> Result<FeedImage, DataError>;
     /// The images of the past seven days for `region`, today's first, at most
     /// [`PAST_WEEK_IMAGES`], in exactly one request (WALL-17, ADR 0032). It fails as

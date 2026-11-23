@@ -50,6 +50,7 @@ use meegone_lockimage_data::{
 };
 
 use crate::checks::{self, WAIT_MS};
+use meegone_core_state::Problem;
 
 /// What a check did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,11 +98,6 @@ pub enum Wait {
     /// The network is metered, and "Use mobile data" is off or Data Saver is on.
     UnmeteredNetwork,
 }
-
-/// What pinning an image the past week no longer lists fails with (WALL-17).
-pub const NOT_LISTED: &str = "The image is no longer available";
-/// What pinning an image not offered as a wallpaper fails with (LEGAL-04).
-pub const NOT_OFFERED: &str = "The image isn't offered as a wallpaper";
 
 /// The feed's answer.
 enum Answer {
@@ -264,7 +260,7 @@ impl ImageUpdater {
         let answer = self.ask(&options, now);
         let recorded = self.cache.update_checks(&mut |saved| match &answer {
             Ok(answer) => checks::answered(saved, matches!(answer, Answer::New(_))),
-            Err(error) => checks::failed(saved, error.to_string()),
+            Err(error) => checks::failed(saved, error.problem()),
         });
         if let Ok(recorded) = recorded {
             self.schedule(checks::next_job(
@@ -356,7 +352,7 @@ impl ImageUpdater {
         }
         match week {
             Ok(week) => past.set_week(week),
-            Err(error) => past.set_problem(Some(error.to_string())),
+            Err(error) => past.set_problem(Some(error.problem())),
         }
     }
 
@@ -425,7 +421,7 @@ impl ImageUpdater {
         let _checking = self.checking();
         let pinned = self.pin_locked(id, past);
         past.set_problem(match &pinned {
-            Checked::Failed(error) => Some(error.to_string()),
+            Checked::Failed(error) => Some(error.problem()),
             _ => None,
         });
         pinned
@@ -440,10 +436,10 @@ impl ImageUpdater {
             let image = week.image(id)?.clone();
             Some((image, week.region))
         }) else {
-            return Checked::Failed(DataError::Invalid(NOT_LISTED.into()));
+            return Checked::Failed(DataError::Invalid(Problem::ImageNoLongerListed));
         };
         if !image.offered_as_wallpaper {
-            return Checked::Failed(DataError::Invalid(NOT_OFFERED.into()));
+            return Checked::Failed(DataError::Invalid(Problem::ImageNotOffered));
         }
         // Any failure here leaves the cache and the lock screen as they were (WALL-08).
         let record = match self.cache_pinned(&image, &region) {
@@ -492,7 +488,7 @@ impl ImageUpdater {
             Some(file) => self
                 .cache
                 .choose(file, true)?
-                .ok_or_else(|| DataError::Failed("The image isn't cached".into())),
+                .ok_or(DataError::Failed(Problem::ImageNotCached)),
             None => self.downloader.download(image, region, true),
         }
     }
@@ -574,7 +570,7 @@ impl ImageUpdater {
             return Ok(None);
         }
         let (Some(file), Some(image)) = (record.image, self.cache.image(record)?) else {
-            return Err(DataError::Failed("The image isn't cached".into()));
+            return Err(DataError::Failed(Problem::ImageNotCached));
         };
         let set = self.wallpaper.set_lock_screen(&image)?;
         drop(image);
@@ -884,7 +880,7 @@ mod tests {
         assert_eq!(cache.current(), current);
         assert_eq!(
             checks::status(&cache.checks(), NOV_20 + 12 * HOUR_MS),
-            CheckStatus::Retrying("No connection".into())
+            CheckStatus::Retrying(Problem::NoConnection)
         );
         assert_eq!(job(&fakes).unwrap().not_before_ms, NOV_20 + 24 * HOUR_MS);
     }
@@ -898,8 +894,7 @@ mod tests {
             updater,
             ..
         } = setup("puffins");
-        *feed.error.lock().unwrap() =
-            Some(DataError::Invalid("The feed's format has changed".into()));
+        *feed.error.lock().unwrap() = Some(DataError::Invalid(Problem::FeedFormatChanged));
 
         assert!(matches!(updater.check(), Checked::Failed(_)));
 
@@ -1031,7 +1026,7 @@ mod tests {
             updater,
             ..
         } = setup("puffins");
-        *fakes.wallpaper.unsupported.lock().unwrap() = Some("Blocked by device policy".into());
+        *fakes.wallpaper.unsupported.lock().unwrap() = Some(Problem::WallpaperNotAllowed);
 
         assert_eq!(updater.check(), Checked::Off);
 
@@ -1042,9 +1037,8 @@ mod tests {
     fn without_background_scheduling_the_check_still_runs() {
         // SRS 8.1: MeeGone's start checks instead.
         let Setup { fakes, updater, .. } = setup("puffins");
-        *fakes.scheduler.error.lock().unwrap() = Some(DataError::Unsupported(
-            "Background work is restricted".into(),
-        ));
+        *fakes.scheduler.error.lock().unwrap() =
+            Some(DataError::Unsupported(Problem::ImageJobUnavailable));
 
         assert!(matches!(updater.check(), Checked::New(_)));
     }
@@ -1058,11 +1052,11 @@ mod tests {
             updater,
             ..
         } = setup("puffins");
-        *fakes.storage.error.lock().unwrap() = Some(DataError::Failed("Disk error".into()));
+        *fakes.storage.error.lock().unwrap() = Some(DataError::Failed(Problem::SavedDataUnusable));
 
         assert_eq!(
             updater.check(),
-            Checked::Failed(DataError::Failed("Disk error".into()))
+            Checked::Failed(DataError::Failed(Problem::SavedDataUnusable))
         );
 
         assert_eq!(feed_requests(&feed), 0);
@@ -1135,7 +1129,8 @@ mod tests {
             |fakes: &Fakes| *fakes.network.state.lock().unwrap() = NetworkState::Offline,
             |fakes: &Fakes| *fakes.wallpaper.cropped.lock().unwrap() = Some(b"garbage".to_vec()),
             |fakes: &Fakes| {
-                *fakes.storage.error.lock().unwrap() = Some(DataError::Failed("Full".into()));
+                *fakes.storage.error.lock().unwrap() =
+                    Some(DataError::Failed(Problem::StorageFull));
             },
         ] {
             let Setup {
@@ -1164,16 +1159,16 @@ mod tests {
             updater,
             ..
         } = setup("puffins");
-        *fakes.wallpaper.refuses.lock().unwrap() = Some(DataError::Failed("Refused".into()));
+        *fakes.wallpaper.refuses.lock().unwrap() = Some(DataError::Failed(Problem::SystemFailed));
 
         assert_eq!(
             updater.check(),
-            Checked::Failed(DataError::Failed("Refused".into()))
+            Checked::Failed(DataError::Failed(Problem::SystemFailed))
         );
         // Cached, but not on the lock screen, and retried after the back-off.
         assert!(!cache.current().unwrap().applied());
         assert_eq!(lock_screen(&fakes), None);
-        assert_eq!(cache.checks().problem.as_deref(), Some("Refused"));
+        assert_eq!(cache.checks().problem, Some(Problem::SystemFailed));
         let retry = job(&fakes).unwrap().not_before_ms;
         assert_eq!(retry, NOV_19 + 8 * HOUR_MS + FIRST_BACK_OFF_MS);
 
@@ -1488,7 +1483,7 @@ mod tests {
         *feed.error.lock().unwrap() = Some(DataError::Offline);
         updater.browse(&past);
         assert_eq!(past.week(), None);
-        assert_eq!(past.problem().as_deref(), Some("No connection"));
+        assert_eq!(past.problem(), Some(Problem::NoConnection));
 
         *feed.error.lock().unwrap() = None;
         offer_week(&fakes, &feed, a_week());
@@ -1727,21 +1722,21 @@ mod tests {
         // Nothing browsed yet.
         assert_eq!(
             updater.pin("owls", &past),
-            Checked::Failed(DataError::Invalid(NOT_LISTED.into()))
+            Checked::Failed(DataError::Invalid(Problem::ImageNoLongerListed))
         );
-        assert_eq!(past.problem().as_deref(), Some(NOT_LISTED));
+        assert_eq!(past.problem(), Some(Problem::ImageNoLongerListed));
 
         offer_week(&fakes, &feed, a_week());
         updater.browse(&past);
         let before = downloads(&fakes).len();
         assert_eq!(
             updater.pin("sculpture", &past),
-            Checked::Failed(DataError::Invalid(NOT_OFFERED.into()))
+            Checked::Failed(DataError::Invalid(Problem::ImageNotOffered))
         );
-        assert_eq!(past.problem().as_deref(), Some(NOT_OFFERED));
+        assert_eq!(past.problem(), Some(Problem::ImageNotOffered));
         assert_eq!(
             updater.pin("lighthouse", &past),
-            Checked::Failed(DataError::Invalid(NOT_LISTED.into()))
+            Checked::Failed(DataError::Invalid(Problem::ImageNoLongerListed))
         );
 
         assert_eq!(downloads(&fakes).len(), before);
@@ -1765,11 +1760,11 @@ mod tests {
             updater,
             ..
         } = browsed();
-        *fakes.wallpaper.refuses.lock().unwrap() = Some(DataError::Failed("Refused".into()));
+        *fakes.wallpaper.refuses.lock().unwrap() = Some(DataError::Failed(Problem::SystemFailed));
 
         assert_eq!(
             updater.pin("owls", &past),
-            Checked::Failed(DataError::Failed("Refused".into()))
+            Checked::Failed(DataError::Failed(Problem::SystemFailed))
         );
         let current = cache.current().unwrap();
         assert!(current.pinned && !current.applied());
@@ -1911,7 +1906,7 @@ mod tests {
         assert_eq!(today.get(), None);
 
         *fakes.network.state.lock().unwrap() = NetworkState::Unmetered;
-        *fakes.wallpaper.unsupported.lock().unwrap() = Some("Not allowed".into());
+        *fakes.wallpaper.unsupported.lock().unwrap() = Some(Problem::WallpaperNotAllowed);
         updater.preview_today(&today);
         assert_eq!(today.get(), None);
         assert_eq!(feed_requests(&feed), 0);

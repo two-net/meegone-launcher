@@ -35,18 +35,17 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use meegone_core_data::storage::format::{Fields, Line};
 use meegone_core_data::storage::{Decode, Encode, Format, Migration, Reader, Writer, load, save};
-use meegone_core_data::{DataError, StorageAdapter, StoredFile, WallpaperMarker};
+use meegone_core_data::{DataError, Problem, StorageAdapter, StoredFile, WallpaperMarker};
 
 pub use bing::BingFeed;
 pub use download::{
-    Downloader, IMAGE_TOO_LARGE, IMAGE_TOO_SMALL, LARGE_SCREEN_DP, LOW_STORAGE, MAX_DOWNLOAD_BYTES,
-    MAX_SIDE, MIN_SHORT_SIDE, NOT_AN_IMAGE, check_image, lock_screen_target, pick_version,
-    plan_crop,
+    Downloader, LARGE_SCREEN_DP, MAX_DOWNLOAD_BYTES, MAX_SIDE, MIN_SHORT_SIDE, check_image,
+    lock_screen_target, pick_version, plan_crop,
 };
-pub use feed::{FORMAT_CHANGED, FeedImage, ImageFeed, ImageVersion, PAST_WEEK_IMAGES};
+pub use feed::{FeedImage, ImageFeed, ImageVersion, PAST_WEEK_IMAGES};
 pub use past::{
-    MAX_PREVIEW_BYTES, MAX_PREVIEW_SIDE, PREVIEW_TOO_LARGE, PastImage, PastImages, Preview, Today,
-    TodayImage, Week, check_preview,
+    MAX_PREVIEW_BYTES, MAX_PREVIEW_SIDE, PastImage, PastImages, Preview, Today, TodayImage, Week,
+    check_preview,
 };
 pub use tasks::{ImageTask, ImageTasks};
 
@@ -63,11 +62,16 @@ pub struct ImageMemory {
 /// Version of the saved image-details format (MAINT-04). Changing the format means a new
 /// version, a migration in [`IMAGE_CACHE_MIGRATIONS`] and a fixture (ARCHITECTURE.md,
 /// "Persistence").
-pub const IMAGE_CACHE_VERSION: u32 = 5;
+pub const IMAGE_CACHE_VERSION: u32 = 6;
 
 /// Brings image details saved by older versions up to date, one version at a time.
-const IMAGE_CACHE_MIGRATIONS: [Migration; IMAGE_CACHE_VERSION as usize - 1] =
-    [add_image_file, add_ids_and_checks, add_markers, add_pins];
+const IMAGE_CACHE_MIGRATIONS: [Migration; IMAGE_CACHE_VERSION as usize - 1] = [
+    add_image_file,
+    add_ids_and_checks,
+    add_markers,
+    add_pins,
+    problems_as_codes,
+];
 
 /// Version 2 names the file that holds each record's image (ADR 0022). Records saved before
 /// had no image.
@@ -129,6 +133,105 @@ fn add_pins(body: &str) -> Option<String> {
         migrated.push('\n');
     }
     Some(migrated)
+}
+
+/// Version 6 saves the check log's last problem as its code, which the host words in the
+/// language of the day (L10N-01, ADR 0040). Version 5 saved it in English, as Rust wrote it, or in
+/// the device's language of the day when the platform said it. The English is read back as its
+/// code; anything else becomes `system_failed`, shown only until the next check.
+fn problems_as_codes(body: &str) -> Option<String> {
+    let mut migrated = String::with_capacity(body.len());
+    for line in body.lines() {
+        match line.strip_prefix("checks ") {
+            Some(fields) if fields != "-" => {
+                // The problem is the last of the record's eight fields.
+                let (counts, problem) = fields.rsplit_once(' ')?;
+                if counts.split(' ').count() != 7 {
+                    return None;
+                }
+                let code = match problem {
+                    "-" => "-",
+                    saved => v5_problem(saved).code(),
+                };
+                migrated.push_str("checks ");
+                migrated.push_str(counts);
+                migrated.push(' ');
+                migrated.push_str(code);
+            }
+            _ => migrated.push_str(line),
+        }
+        migrated.push('\n');
+    }
+    Some(migrated)
+}
+
+/// Each problem as version 5 saved it: the English Rust wrote, escaped as the format escapes a
+/// field, with `\s` for each space.
+const V5_PROBLEMS: [(&str, Problem); 23] = [
+    (r"Access\snot\sgranted", Problem::AccessDenied),
+    (r"No\sconnection", Problem::NoConnection),
+    (r"Too\smany\sredirects", Problem::TooManyRedirects),
+    (
+        r"The\sconnection\sisn't\ssecure",
+        Problem::ConnectionInsecure,
+    ),
+    (r"Only\sHTTPS\sis\sallowed", Problem::HttpsOnly),
+    (r"Too\slarge", Problem::DownloadTooLarge),
+    (r"The\sdownload\sfailed", Problem::DownloadFailed),
+    (r"Not\senough\sstorage\sspace", Problem::StorageFull),
+    (
+        r"Stored\sdata\swould\sgo\sover\s50\sMB",
+        Problem::StorageBudget,
+    ),
+    (
+        r"This\sthread\scan't\sreach\sthe\ssystem",
+        Problem::SystemFailed,
+    ),
+    (r"The\ssystem\scouldn't\sdo\sthat", Problem::SystemFailed),
+    (
+        r"The\slock\sscreen's\swallpaper\scouldn't\sbe\sset",
+        Problem::WallpaperNotSet,
+    ),
+    (
+        r"The\slock\sscreen's\ssize\sis\sunknown",
+        Problem::ScreenSizeUnknown,
+    ),
+    (r"The\simage\scouldn't\sbe\sread", Problem::ImageUnreadable),
+    (r"The\simage\sis\stoo\ssmall", Problem::ImageTooSmall),
+    (r"The\simage\sis\stoo\slarge", Problem::ImageTooLarge),
+    (r"The\spreview\sis\stoo\slarge", Problem::PreviewTooLarge),
+    (
+        r"The\sfeed's\sformat\shas\schanged",
+        Problem::FeedFormatChanged,
+    ),
+    (
+        r"The\simage\sfeed\shas\sno\ssuch\sregion",
+        Problem::NoSuchRegion,
+    ),
+    (
+        r"The\simage\sis\sno\slonger\savailable",
+        Problem::ImageNoLongerListed,
+    ),
+    (
+        r"The\simage\sisn't\soffered\sas\sa\swallpaper",
+        Problem::ImageNotOffered,
+    ),
+    (r"The\simage\sisn't\scached", Problem::ImageNotCached),
+    (r"Only\sHTTPS\slinks\sopen", Problem::HttpsLinksOnly),
+];
+
+/// How version 5 began "Couldn't use saved data (‹the system's error›)".
+const SAVED_DATA_UNUSABLE: &str = r"Couldn't\suse\ssaved\sdata\s";
+
+/// The problem version 5 saved as `saved`.
+fn v5_problem(saved: &str) -> Problem {
+    if saved.starts_with(SAVED_DATA_UNUSABLE) {
+        return Problem::SavedDataUnusable;
+    }
+    V5_PROBLEMS
+        .iter()
+        .find(|(text, _)| saved == *text)
+        .map_or(Problem::SystemFailed, |&(_, problem)| problem)
 }
 
 /// One of the two files that hold the cached images (WALL-09).
@@ -226,8 +329,8 @@ pub struct Checks {
     pub last_attempt_ms: Option<u64>,
     /// When the first attempt failed since the feed last answered (SRS 7.6).
     pub failing_since_ms: Option<u64>,
-    /// The last failure, in plain words for Settings (WALL-16).
-    pub problem: Option<String>,
+    /// The last failure, which Settings shows (WALL-16).
+    pub problem: Option<Problem>,
 }
 
 pub trait ImageCache: Send + Sync {
@@ -576,6 +679,7 @@ mod tests {
         (include_str!("../fixtures/image-cache-v3.txt"), sample_v3),
         (include_str!("../fixtures/image-cache-v4.txt"), sample_v4),
         (include_str!("../fixtures/image-cache-v5.txt"), sample),
+        (include_str!("../fixtures/image-cache-v6.txt"), sample),
     ];
 
     fn record(date: &str) -> ImageRecord {
@@ -619,7 +723,7 @@ mod tests {
                 failures: 2,
                 last_attempt_ms: Some(1_763_283_600_000),
                 failing_since_ms: Some(1_763_280_000_000),
-                problem: Some("No connection".into()),
+                problem: Some(Problem::NoConnection),
             },
         }
     }
@@ -797,7 +901,7 @@ mod tests {
         cache
             .update_checks(&mut |checks| checks.attempts = 1)
             .unwrap();
-        *storage.error.lock().unwrap() = Some(DataError::Failed("Disk error".into()));
+        *storage.error.lock().unwrap() = Some(DataError::Failed(Problem::SavedDataUnusable));
 
         assert!(
             cache
@@ -897,7 +1001,7 @@ mod tests {
         // REL-03
         let (storage, cache) = cache();
         cache.put(record("20261115"), b"one").unwrap();
-        *storage.error.lock().unwrap() = Some(DataError::Failed("Disk error".into()));
+        *storage.error.lock().unwrap() = Some(DataError::Failed(Problem::SavedDataUnusable));
 
         assert!(cache.put(record("20261116"), b"two").is_err());
 
@@ -1089,7 +1193,7 @@ mod tests {
 
         fn write(&self, file: StoredFile, bytes: &[u8]) -> Result<(), DataError> {
             if self.failing.load(std::sync::atomic::Ordering::Relaxed) {
-                return Err(DataError::Failed("Disk error".into()));
+                return Err(DataError::Failed(Problem::SavedDataUnusable));
             }
             self.storage.write(file, bytes)
         }
@@ -1131,6 +1235,36 @@ mod tests {
                 "image-cache-v{version}.txt"
             );
         }
+    }
+
+    #[test]
+    fn version_5_problems_become_codes() {
+        // L10N-01: English Rust wrote reads back as its code; the platform's words, in whatever
+        // language they were, can't, so they are a system failure until the next check.
+        let checks = |problem: &str| format!("checks 20408 3 1 false 2 - - {problem}\n");
+        for (saved, code) in [
+            (r"No\sconnection", "no_connection"),
+            (r"The\simage\sisn't\scached", "image_not_cached"),
+            (
+                r"Couldn't\suse\ssaved\sdata\s(Is\sa\sdirectory)",
+                "saved_data_unusable",
+            ),
+            (
+                r"Cet\sappareil\sne\sprend\spas\sen\scharge\sles\sfonds\sd'écran.",
+                "system_failed",
+            ),
+            ("-", "-"),
+        ] {
+            let body = format!("current -\nprevious -\n{}", checks(saved));
+            assert_eq!(
+                problems_as_codes(&body),
+                Some(format!("current -\nprevious -\n{}", checks(code))),
+                "{saved}"
+            );
+        }
+        let none = "current -\nprevious -\nchecks -\n";
+        assert_eq!(problems_as_codes(none).as_deref(), Some(none));
+        assert_eq!(problems_as_codes("checks 1 2 No\\sconnection\n"), None);
     }
 
     #[test]

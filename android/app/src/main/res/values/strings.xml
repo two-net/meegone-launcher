@@ -9,7 +9,7 @@
     <string name="view_applications">Applications</string>
     <string name="view_recent">Recent</string>
     <!-- Read by screen readers when the home view changes, e.g. "Applications, 2 of 3"
-         (A11Y-08). %1$s is the view, %2$d its place from the left, %3$d how many there are. -->
+         (A11Y-08). %1$s is the view, %2$d its place from the start, %3$d how many there are. -->
     <string name="view_position">%1$s, %2$d of %3$d</string>
     <!-- Screen-reader actions that switch home views without a gesture (A11Y-05). -->
     <string name="action_next_view">Next view</string>
@@ -54,9 +54,6 @@
          then its state, e.g. "Mail, Unavailable" or "Messages, 3 notifications, Expanded"
          (A11Y-01). %1$s is the name, %2$s the state. -->
     <string name="described_state">%1$s, %2$s</string>
-    <!-- Shown briefly when a tapped app couldn't open and the system said nothing itself
-         (APPS-09). -->
-    <string name="app_unavailable">This app can\'t open right now</string>
 
     <!-- An app's long-press menu (APPS-11). Screen readers announce its title, e.g. "Mail
          menu", where %1$s is the app's name, and open it with the action (A11Y-05). Edit
@@ -68,10 +65,6 @@
     <!-- Leaves the app out of Applications, search and Recent until it is unhidden in
          Settings (APPS-19). -->
     <string name="menu_hide">Hide</string>
-    <!-- Shown briefly when the system refuses an item of the app menu. -->
-    <string name="app_info_unavailable">App info can\'t open right now</string>
-    <string name="uninstall_unavailable">This app can\'t be uninstalled right now</string>
-    <string name="shortcut_unavailable">This shortcut can\'t open right now</string>
 
     <!-- Edit mode in Applications (APPS-12). The button that ends it. -->
     <string name="edit_done">Done</string>
@@ -125,8 +118,6 @@
     <!-- Offered when no app matches: searches the web with the device's default search app
          (SRCH-05). %1$s is what was typed, e.g. "Search the web for “zebra”". -->
     <string name="search_web">Search the web for “%1$s”</string>
-    <!-- Shown briefly when nothing on the device can search the web (SRCH-05). -->
-    <string name="web_search_unavailable">Web search isn\'t available</string>
 
     <!-- Settings' title (SET-01). -->
     <string name="settings_title">Launcher settings</string>
@@ -152,11 +143,17 @@
     <!-- The Recent group of Settings (SET-02). -->
     <string name="settings_group_recent">Recent</string>
     <!-- Settings → Recent → Time window: how far back Recent looks for recently used apps
-         (REC-11). Its three choices follow. -->
+         (REC-11). Its three choices follow: "12 hours", "24 hours" and "3 days". %d is how many
+         hours or days. -->
     <string name="recent_time_window">Time window</string>
-    <string name="recent_window_12_hours">12 hours</string>
-    <string name="recent_window_24_hours">24 hours</string>
-    <string name="recent_window_3_days">3 days</string>
+    <plurals name="recent_window_hours">
+        <item quantity="one">%d hour</item>
+        <item quantity="other">%d hours</item>
+    </plurals>
+    <plurals name="recent_window_days">
+        <item quantity="one">%d day</item>
+        <item quantity="other">%d days</item>
+    </plurals>
 
     <!-- The Home group of Settings (SET-02). -->
     <string name="settings_group_home">Home</string>
@@ -176,18 +173,12 @@
     <string name="events_alarm">Alarm %1$s</string>
     <!-- What screen readers say a tap on the alarm row does (A11Y-01). -->
     <string name="action_open_alarm">Open alarm</string>
-    <!-- Shown briefly when neither the app that set the alarm nor a clock app could open
-         (EVT-02). -->
-    <string name="alarm_unavailable">The alarm can\'t open right now</string>
 
     <!-- Events' card while MeeGone has no notification access: one plain sentence saying what
          is read and why (EVT-03, ONB-02), and the button that opens the system's
          notification-access screen. -->
     <string name="events_access_explainer">MeeGone reads your notifications only to list them here, and they never leave this phone.</string>
     <string name="events_access_allow">Allow</string>
-    <!-- Written instructions, shown when no system screen for notification access could open:
-         briefly in Events, and below the item in Settings → Access (EVT-03, SRS 8.1). -->
-    <string name="notification_access_unavailable">Notification access can\'t open from here. In the system Settings, find Notification access, usually under Apps, Special app access, and turn MeeGone on.</string>
     <!-- The heading over Events' notifications, drawn in capitals (EVT-04, SRS 5.2). -->
     <string name="events_notifications">Notifications</string>
     <!-- Events with nothing to show (EVT-11). -->
@@ -227,13 +218,6 @@
     <string name="notification_menu">Notification menu</string>
     <string name="menu_dismiss">Dismiss</string>
     <string name="menu_notification_settings">Notification settings</string>
-    <!-- Shown briefly when neither a notification nor its app could open (EVT-06). -->
-    <string name="notification_unavailable">This notification can\'t open right now</string>
-    <!-- Shown briefly when the system refused to remove notifications (EVT-07, EVT-08). -->
-    <string name="notifications_dismiss_unavailable">Notifications can\'t be cleared right now</string>
-    <!-- Shown briefly when neither an app's notification settings nor its App info could open
-         (EVT-08). -->
-    <string name="notification_settings_unavailable">Notification settings can\'t open right now</string>
     <!-- MeeGone's notification listener, as the system's notification-access screen names it
          (EVT-03). -->
     <string name="notification_listener_label">MeeGone Events</string>
@@ -253,15 +237,10 @@
          with the button that checks again. -->
     <string name="image_unavailable">Daily image unavailable</string>
     <string name="image_try_again">Try again</string>
-    <!-- What Settings says when the system can't schedule the daily image's check (SRS 8.1). -->
-    <string name="image_job_unavailable">Background work isn\'t available. The image is checked when MeeGone starts.</string>
     <!-- Settings → Lock-screen image: the switch that puts Bing's image of the day on the lock
          screen. Turning it on is the user's confirmation: nothing changes before (WALL-01,
          WALL-02, SET-02). -->
     <string name="daily_image">Daily lock-screen image</string>
-    <!-- Below that switch, disabled, when the device can't set wallpapers (WALL-13). -->
-    <string name="wallpaper_not_supported">This device doesn\'t support wallpapers.</string>
-    <string name="wallpaper_not_allowed">This device\'s policy doesn\'t allow changing the wallpaper.</string>
     <!-- Settings → Lock-screen image: fetches today's image at once, over any connection, and
          what it reads while it does (WALL-11). -->
     <string name="image_update_now">Update now</string>
@@ -280,9 +259,6 @@
     <string name="wallpaper_settings">Wallpaper settings</string>
     <!-- Shown briefly once the lock screen shows the home wallpaper again (WALL-12). -->
     <string name="lock_screen_reset">The lock screen shows the home wallpaper</string>
-    <string name="lock_screen_reset_failed">The lock screen couldn\'t be reset.</string>
-    <!-- Written instructions when the system has no wallpaper settings to open (SRS 8.1). -->
-    <string name="wallpaper_settings_unavailable">To change the wallpaper, open Settings, then Wallpaper.</string>
     <!-- Settings → Lock-screen image and the image details screen: when MeeGone last put an
          image on the lock screen (WALL-16). %1$s is the date and time, such as
          "19 November, 07:00". -->
@@ -304,8 +280,6 @@
     <string name="image_more_info">More info</string>
     <!-- The image details screen: opens Settings at its Lock-screen image group (WALL-15). -->
     <string name="image_open_settings">Settings</string>
-    <!-- Shown briefly when no browser could open a link (SEC-02, SRS 8.1). -->
-    <string name="browser_unavailable">No browser can open this link</string>
     <!-- The image details screen's row that opens the past week's images, and that screen's
          name and title (WALL-17). -->
     <string name="image_past_week">Past week</string>
@@ -328,8 +302,11 @@
     <!-- Below a past image the source doesn't offer as a wallpaper, in place of Pin
          (LEGAL-04). -->
     <string name="image_not_offered">Not offered as a wallpaper</string>
-    <!-- After a past image's date, when it is the one on the lock screen now (WALL-17). -->
+    <!-- Below a past image, when it is the one on the lock screen now (WALL-17): alone when the
+         image has no date, or after its date, such as "15 November · On the lock screen", where
+         %1$s is the date. -->
     <string name="image_on_lock_screen">On the lock screen</string>
+    <string name="image_date_on_lock_screen">%1$s · On the lock screen</string>
     <!-- Settings → Lock-screen image and the image details screen, while an image is pinned
          (WALL-17). -->
     <string name="image_pinned">Pinned. Daily updates are paused.</string>
@@ -338,9 +315,6 @@
          screen. -->
     <string name="recent_access_explainer">MeeGone reads which apps you used recently only to show them here, and that never leaves this phone.</string>
     <string name="recent_access_allow">Allow</string>
-    <!-- Written instructions, shown when no system screen for usage access could open: briefly
-         in Recent, and below the item in Settings → Access (REC-02, SRS 8.1). -->
-    <string name="usage_access_unavailable">Usage access can\'t open from here. In the system Settings, find Usage access, usually under Apps, Special app access, and turn MeeGone on.</string>
     <!-- Recent with usage access and no app used lately (REC-10). -->
     <string name="recent_empty">No recent apps</string>
     <!-- How long ago an app was last used, below its label on its Recent card (REC-04). It
@@ -429,9 +403,6 @@
     <!-- What screen readers read for an Access item's button, e.g. "Usage access: Allow"
          (A11Y-01). %1$s is the item, %2$s the button. -->
     <string name="access_button_description">%1$s: %2$s</string>
-    <!-- Written instructions, shown below Settings → Access → "Default home app" when no system
-         screen for choosing the home app could open (HOME-01, SRS 8.1). -->
-    <string name="default_home_instructions">To make MeeGone your home screen, open the system Settings, then Apps, Default apps, Home app, and choose MeeGone.</string>
 
     <!-- The About group of Settings, its last (SET-05). -->
     <string name="settings_group_about">About</string>
@@ -482,4 +453,96 @@
          day (ONB-04). Its buttons are "Make default" and this dismiss button. -->
     <string name="home_banner_text">MeeGone isn\'t your home screen yet.</string>
     <string name="home_banner_dismiss">Dismiss</string>
+
+    <!-- Problems (L10N-01, ADR 0040). Each is named problem_ and the code the Rust app gives it,
+         and Problems.java shows it: briefly at the bottom of the screen, below a setting, or in
+         a status line, where a full stop and "Will try again later." may follow (WALL-16). So
+         each is a short phrase without a full stop of its own, unless it is written
+         instructions. -->
+
+    <!-- The user hasn't granted the access this needs. -->
+    <string name="problem_access_denied">Access not granted</string>
+    <!-- The system refused or failed, without saying why. -->
+    <string name="problem_system_failed">The system couldn\'t do that</string>
+    <!-- The list of installed apps couldn't be read (APPS-01). -->
+    <string name="problem_app_list_unavailable">The app list isn\'t available</string>
+    <!-- The system shows an app's shortcuts only to the default home app (APPS-11). -->
+    <string name="problem_shortcuts_need_default_home">Shortcuts need MeeGone as the default home app</string>
+    <!-- Events couldn't read the notifications, though it has access (EVT-04). -->
+    <string name="problem_notifications_unreadable">Notifications can\'t be read right now</string>
+    <!-- Recent couldn't read the apps used recently, though it has access (REC-01). -->
+    <string name="problem_recent_unreadable">Recent apps can\'t be read right now</string>
+
+    <!-- A tapped app couldn't open, and the system said nothing itself (APPS-09). -->
+    <string name="problem_app_unavailable">This app can\'t open right now</string>
+    <!-- The system refused an item of the app menu (APPS-11, APPS-13). -->
+    <string name="problem_shortcut_unavailable">This shortcut can\'t open right now</string>
+    <string name="problem_uninstall_unavailable">This app can\'t be uninstalled right now</string>
+    <string name="problem_app_info_unavailable">App info can\'t open right now</string>
+    <!-- Neither a notification nor its app could open (EVT-06). -->
+    <string name="problem_notification_unavailable">This notification can\'t open right now</string>
+    <!-- The system refused to remove notifications (EVT-07, EVT-08). -->
+    <string name="problem_notifications_dismiss_unavailable">Notifications can\'t be cleared right now</string>
+    <!-- Neither an app's notification settings nor its App info could open (EVT-08). -->
+    <string name="problem_notification_settings_unavailable">Notification settings can\'t open right now</string>
+    <!-- Neither the app that set the alarm nor a clock app could open (EVT-02). -->
+    <string name="problem_alarm_unavailable">The alarm can\'t open right now</string>
+    <!-- No browser could open a link (SEC-02, SRS 8.1). -->
+    <string name="problem_browser_unavailable">No browser can open this link</string>
+    <!-- Nothing on the device can search the web (SRCH-05). -->
+    <string name="problem_web_search_unavailable">Web search isn\'t available</string>
+    <!-- A link that isn't https:// was refused (SEC-02). -->
+    <string name="problem_https_links_only">Only secure links open</string>
+
+    <!-- Written instructions, shown below Settings → Access → "Default home app", and below
+         Make default in setup, when no system screen for choosing the home app could open
+         (HOME-01, SRS 8.1). -->
+    <string name="problem_default_home_instructions">To make MeeGone your home screen, open the system Settings, then Apps, Default apps, Home app, and choose MeeGone.</string>
+    <!-- Written instructions, shown when no system screen for notification access could open:
+         briefly in Events, and below the item in Settings → Access and in setup (EVT-03,
+         SRS 8.1). -->
+    <string name="problem_notification_access_instructions">Notification access can\'t open from here. In the system Settings, find Notification access, usually under Apps, Special app access, and turn MeeGone on.</string>
+    <!-- Written instructions, shown when no system screen for usage access could open: briefly
+         in Recent, and below the item in Settings → Access and in setup (REC-02, SRS 8.1). -->
+    <string name="problem_usage_access_instructions">Usage access can\'t open from here. In the system Settings, find Usage access, usually under Apps, Special app access, and turn MeeGone on.</string>
+    <!-- Written instructions when the system has no wallpaper settings to open (SRS 8.1). -->
+    <string name="problem_wallpaper_settings_instructions">To change the wallpaper, open Settings, then Wallpaper.</string>
+
+    <!-- Downloading the daily image (WALL-16, SEC-02). -->
+    <string name="problem_no_connection">No connection</string>
+    <string name="problem_too_many_redirects">Too many redirects</string>
+    <string name="problem_connection_insecure">The connection isn\'t secure</string>
+    <!-- An address that isn't https:// was refused (SEC-02). -->
+    <string name="problem_https_only">Only secure connections are allowed</string>
+    <string name="problem_download_too_large">The download is too large</string>
+    <string name="problem_download_failed">The download failed</string>
+
+    <!-- MeeGone's own saved data (REL-03, PERF-08). -->
+    <string name="problem_storage_full">Not enough storage space</string>
+    <string name="problem_saved_data_unusable">Saved data couldn\'t be used</string>
+    <!-- Saving would take MeeGone's saved data past the most it keeps (PERF-08). -->
+    <string name="problem_storage_budget">MeeGone\'s saved data is full</string>
+
+    <!-- The daily lock-screen image. Below the switch, disabled, when the device can't set
+         wallpapers (WALL-13). -->
+    <string name="problem_wallpaper_not_supported">This device doesn\'t support wallpapers</string>
+    <string name="problem_wallpaper_not_allowed">This device\'s policy doesn\'t allow changing the wallpaper</string>
+    <!-- Setting the image on the lock screen failed (WALL-10). -->
+    <string name="problem_wallpaper_not_set">The lock screen\'s wallpaper couldn\'t be set</string>
+    <!-- Shown briefly when the lock screen couldn't go back to the home wallpaper (WALL-12). -->
+    <string name="problem_lock_screen_reset_failed">The lock screen couldn\'t be reset</string>
+    <!-- What Settings says when the system can't schedule the daily image's check (SRS 8.1). -->
+    <string name="problem_image_job_unavailable">Background work isn\'t available. The image is checked when MeeGone starts.</string>
+    <!-- What a check of the daily image can fail with (WALL-07, WALL-16, SEC-02). -->
+    <string name="problem_screen_size_unknown">The lock screen\'s size is unknown</string>
+    <string name="problem_image_unreadable">The image couldn\'t be read</string>
+    <string name="problem_image_too_small">The image is too small</string>
+    <string name="problem_image_too_large">The image is too large</string>
+    <string name="problem_preview_too_large">The preview is too large</string>
+    <string name="problem_feed_format_changed">The image source\'s format has changed</string>
+    <string name="problem_no_such_region">The image source has no such region</string>
+    <!-- Pinning an image from the past week (WALL-17). -->
+    <string name="problem_image_no_longer_listed">The image is no longer available</string>
+    <string name="problem_image_not_offered">The image isn\'t offered as a wallpaper</string>
+    <string name="problem_image_not_cached">The image isn\'t saved on this device</string>
 </resources>

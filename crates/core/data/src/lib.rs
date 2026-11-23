@@ -2,6 +2,7 @@
 //!
 //! - [`model`]: data that several features read, such as [`App`], and colour maths on [`Rgb`]
 //!   (WCAG contrast, THEME-07).
+//! - [`problem`]: what went wrong, as a code the host words (L10N-01).
 //! - [`accent`]: an app's accent colour, derived from its icon (APPS-17).
 //! - [`adapters`]: narrow traits for everything MeeGone asks of the operating system (ARCH-04),
 //!   bundled in [`Platform`].
@@ -26,6 +27,7 @@ mod https;
 pub mod model;
 #[cfg(any(test, target_os = "android"))]
 mod notification_records;
+pub mod problem;
 pub mod settings;
 pub mod storage;
 #[cfg(any(test, target_os = "android"))]
@@ -39,6 +41,7 @@ pub use model::{
     Access, App, AppId, DataError, ImageCrop, ImageJob, JobNetwork, NetworkState, Notification,
     Profile, ProfileId, RecentUse, Rect, Rgb, Screen, Shortcut, Size, TimeStyle, WallpaperMarker,
 };
+pub use problem::Problem;
 pub use settings::{
     HomeTarget, ImageOptions, PersistentSettingsStore, RecentDensity, RecentWindow,
     SETTINGS_VERSION, Settings, SettingsStore, ThemeChoice, setup_done,

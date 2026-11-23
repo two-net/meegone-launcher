@@ -3,7 +3,7 @@
 //!
 //! The feed is public but undocumented, and may change without notice (A2). Its responses are
 //! untrusted (SEC-02): bounded in size, parsed strictly and checked field by field. Anything
-//! unexpected is [`FORMAT_CHANGED`], a failure of its own for the status line, never a crash.
+//! unexpected is [`Problem::FeedFormatChanged`], a failure of its own for the status line, never a crash.
 //!
 //! A request asks for today's image, or the past week's (WALL-17), for one region, and carries
 //! nothing else (PRIV-02). Each call makes exactly one request and never retries, so the
@@ -11,9 +11,9 @@
 
 use std::sync::Arc;
 
-use meegone_core_data::{DataError, NetworkAdapter};
+use meegone_core_data::{DataError, NetworkAdapter, Problem};
 
-use crate::feed::{FORMAT_CHANGED, FeedImage, ImageFeed, ImageVersion, PAST_WEEK_IMAGES};
+use crate::feed::{FeedImage, ImageFeed, ImageVersion, PAST_WEEK_IMAGES};
 use crate::json::{self, Value};
 
 /// Where the feed and its images are. Every URL MeeGone requests starts with it (PRIV-02).
@@ -66,13 +66,13 @@ impl ImageFeed for BingFeed {
     /// A region the feed doesn't list is refused without a request.
     fn today(&self, region: &str) -> Result<FeedImage, DataError> {
         let body = self.details(region, 1)?;
-        parse(&body).ok_or_else(|| DataError::Invalid(FORMAT_CHANGED.into()))
+        parse(&body).ok_or(DataError::Invalid(Problem::FeedFormatChanged))
     }
 
     /// A region the feed doesn't list is refused without a request.
     fn past_week(&self, region: &str) -> Result<Vec<FeedImage>, DataError> {
         let body = self.details(region, PAST_WEEK_IMAGES)?;
-        parse_week(&body).ok_or_else(|| DataError::Invalid(FORMAT_CHANGED.into()))
+        parse_week(&body).ok_or(DataError::Invalid(Problem::FeedFormatChanged))
     }
 }
 
@@ -81,9 +81,7 @@ impl BingFeed {
     /// doesn't list.
     fn details(&self, region: &str, count: usize) -> Result<Vec<u8>, DataError> {
         if !REGIONS.contains(&region) {
-            return Err(DataError::Invalid(
-                "The image feed has no such region".into(),
-            ));
+            return Err(DataError::Invalid(Problem::NoSuchRegion));
         }
         self.network
             .get(&details_url(region, count), MAX_DETAILS_BYTES)
@@ -259,7 +257,7 @@ mod tests {
     }
 
     fn format_changed() -> Result<FeedImage, DataError> {
-        Err(DataError::Invalid(FORMAT_CHANGED.into()))
+        Err(DataError::Invalid(Problem::FeedFormatChanged))
     }
 
     #[test]
@@ -594,7 +592,7 @@ mod tests {
             let (_, feed) = online_week("en-US", body.as_bytes());
             assert_eq!(
                 feed.past_week("en-US"),
-                Err(DataError::Invalid(FORMAT_CHANGED.into())),
+                Err(DataError::Invalid(Problem::FeedFormatChanged)),
                 "case {case}"
             );
         }

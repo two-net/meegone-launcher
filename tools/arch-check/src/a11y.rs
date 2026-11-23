@@ -312,28 +312,28 @@ pub fn java_code_only(source: &str) -> String {
     code
 }
 
-fn is_word_char(c: char) -> bool {
+pub(crate) fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '$'
 }
 
 /// Whether the character before byte `at` of `text` continues a word, so a match there is the
 /// end of a longer name, as `MyColor.` or `a0x`.
-fn word_before(text: &str, at: usize) -> bool {
+pub(crate) fn word_before(text: &str, at: usize) -> bool {
     text[..at].chars().next_back().is_some_and(is_word_char)
 }
 
 /// The word that starts `text`.
-fn word_at(text: &str) -> &str {
+pub(crate) fn word_at(text: &str) -> &str {
     &text[..text.find(|c: char| !is_word_char(c)).unwrap_or(text.len())]
 }
 
 /// The 1-based line of byte `at` in `text`.
-fn line_of(text: &str, at: usize) -> usize {
+pub(crate) fn line_of(text: &str, at: usize) -> usize {
     text[..at].matches('\n').count() + 1
 }
 
 /// The byte index of the `)` that closes the call whose arguments start `text`, or its length.
-fn closing_paren(text: &str) -> usize {
+pub(crate) fn closing_paren(text: &str) -> usize {
     let mut depth = 0usize;
     for (i, c) in text.char_indices() {
         match c {

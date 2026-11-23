@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use meegone_apps_data::{Layout, LayoutStore, SavedLayout};
 use meegone_core_data::{AppsAdapter, DataError, Profile, SettingsStore, SystemConfigAdapter};
-use meegone_core_state::{App, AppId, Rect, Shortcut, StateHolder};
+use meegone_core_state::{App, AppId, Problem, Rect, Shortcut, StateHolder};
 
 pub use meegone_apps_data::FolderId;
 use reconcile::{
@@ -401,7 +401,7 @@ pub struct AppsState {
     /// changed.
     pub hidden_apps: Arc<[App]>,
     /// The last problem, in plain words. The grid keeps working (REL-01).
-    pub problem: Option<String>,
+    pub problem: Option<Problem>,
 }
 
 impl Default for AppsState {
@@ -691,7 +691,7 @@ impl AppsHolder {
         let (installed, profiles) = match self.catalogue() {
             Ok(catalogue) => catalogue,
             Err(error) => {
-                self.state.problem = Some(error.to_string());
+                self.state.problem = Some(error.problem());
                 return;
             }
         };
@@ -743,7 +743,7 @@ impl AppsHolder {
                     self.take_on(installed, hidden);
                     self.draft = None;
                     self.show_layout(&rebuilt);
-                    self.state.problem = Some(error.to_string());
+                    self.state.problem = Some(error.problem());
                     return;
                 }
             },
@@ -761,7 +761,7 @@ impl AppsHolder {
             {
                 Ok(settings) => settings.hidden_apps,
                 Err(error) => {
-                    self.state.problem = Some(error.to_string());
+                    self.state.problem = Some(error.problem());
                     hidden
                 }
             }
@@ -831,7 +831,7 @@ impl AppsHolder {
                 hidden.remove(app);
             })
             .err()
-            .map(|error| error.to_string());
+            .map(|error| error.problem());
     }
 
     /// Settings → Reset launcher (SET-06). Hidden apps are cleared first, so a failed save
@@ -841,7 +841,7 @@ impl AppsHolder {
             .settings
             .update(&mut |settings| settings.hidden_apps.clear())
         {
-            self.state.problem = Some(error.to_string());
+            self.state.problem = Some(error.problem());
             return;
         }
         self.state.menu = None;
@@ -864,7 +864,7 @@ impl AppsHolder {
         let saved = self.store.save(layout);
         self.unsaved = saved.is_err();
         if let Err(error) = saved {
-            self.state.problem = Some(error.to_string());
+            self.state.problem = Some(error.problem());
         }
     }
 
@@ -1003,7 +1003,7 @@ impl AppsHolder {
                 self.state.problem = None;
                 self.close_search();
             }
-            Err(error) => self.state.problem = Some(error.to_string()),
+            Err(error) => self.state.problem = Some(error.problem()),
         }
     }
 
@@ -1024,7 +1024,7 @@ impl AppsHolder {
             .apps
             .launch(app, from)
             .err()
-            .map(|error| error.to_string());
+            .map(|error| error.problem());
         if self.state.problem.is_none() {
             self.opened(app);
             // Coming back shows the grid, not an old query (SRCH-04).
@@ -1186,7 +1186,7 @@ impl AppsHolder {
             }
             _ => Ok(()),
         };
-        self.state.problem = done.err().map(|error| error.to_string());
+        self.state.problem = done.err().map(|error| error.problem());
     }
 
     /// Where `key`'s cell is for its menu: in the open folder, or else in the grid, with its
@@ -1348,7 +1348,7 @@ impl AppsHolder {
                 .apps
                 .request_uninstall(id)
                 .err()
-                .map(|error| error.to_string());
+                .map(|error| error.problem());
         }
     }
 }
@@ -1666,17 +1666,13 @@ mod tests {
         let fakes = Fakes::default();
         install(&fakes, &[("mail", "Mail")]);
         let mut holder = holder(&fakes, &layout_store());
-        *fakes.apps.error.lock().unwrap() =
-            Some(DataError::Unsupported("App isn't available".into()));
+        *fakes.apps.error.lock().unwrap() = Some(DataError::Unsupported(Problem::AppUnavailable));
 
         holder.handle(AppsIntent::Launch {
             app: app_id("mail"),
             from: Some(ICON),
         });
-        assert_eq!(
-            holder.state().problem.as_deref(),
-            Some("App isn't available")
-        );
+        assert_eq!(holder.state().problem, Some(Problem::AppUnavailable));
 
         *fakes.apps.error.lock().unwrap() = None;
         holder.handle(AppsIntent::Launch {
@@ -1835,14 +1831,11 @@ mod tests {
     #[test]
     fn a_failing_adapter_becomes_a_problem_not_a_crash() {
         let fakes = Fakes::default();
-        *fakes.apps.error.lock().unwrap() = Some(DataError::Failed("App list unavailable".into()));
+        *fakes.apps.error.lock().unwrap() = Some(DataError::Failed(Problem::AppListUnavailable));
 
         let holder = holder(&fakes, &layout_store());
 
-        assert_eq!(
-            holder.state().problem.as_deref(),
-            Some("App list unavailable")
-        );
+        assert_eq!(holder.state().problem, Some(Problem::AppListUnavailable));
     }
 
     #[test]
@@ -2044,16 +2037,12 @@ mod tests {
         install(&fakes, &[("mail", "Mail")]);
         let mut holder = holder(&fakes, &layout_store());
         holder.handle(AppsIntent::OpenMenu(CellKey::App(app_id("mail"))));
-        *fakes.apps.error.lock().unwrap() =
-            Some(DataError::Failed("App info can't open right now".into()));
+        *fakes.apps.error.lock().unwrap() = Some(DataError::Failed(Problem::AppInfoUnavailable));
 
         holder.handle(AppsIntent::ChooseMenuItem(AppMenuItem::AppInfo));
 
         assert_eq!(holder.state().menu, None);
-        assert_eq!(
-            holder.state().problem.as_deref(),
-            Some("App info can't open right now")
-        );
+        assert_eq!(holder.state().problem, Some(Problem::AppInfoUnavailable));
     }
 
     #[test]
@@ -2349,20 +2338,20 @@ mod tests {
         let fakes = Fakes::default();
         install(&fakes, &[("mail", "Mail"), ("maps", "Maps")]);
         let mut holder = holder(&fakes, &layout_store());
-        *fakes.storage.error.lock().unwrap() = Some(DataError::Failed("disk full".into()));
+        *fakes.storage.error.lock().unwrap() = Some(DataError::Failed(Problem::StorageFull));
 
         hide(&mut holder, app_id("maps"));
         assert_eq!(holder.state().menu, None);
-        assert_eq!(holder.state().problem.as_deref(), Some("disk full"));
+        assert_eq!(holder.state().problem, Some(Problem::StorageFull));
         assert_eq!(labels(holder.state()), ["Mail", "Maps"]);
         assert!(hidden_labels(&holder).is_empty());
 
         *fakes.storage.error.lock().unwrap() = None;
         hide(&mut holder, app_id("maps"));
         assert_eq!(holder.state().problem, None);
-        *fakes.storage.error.lock().unwrap() = Some(DataError::Failed("disk full".into()));
+        *fakes.storage.error.lock().unwrap() = Some(DataError::Failed(Problem::StorageFull));
         holder.handle(AppsIntent::Unhide(app_id("maps")));
-        assert_eq!(holder.state().problem.as_deref(), Some("disk full"));
+        assert_eq!(holder.state().problem, Some(Problem::StorageFull));
         assert_eq!(labels(holder.state()), ["Mail"]);
         assert_eq!(hidden_labels(&holder), ["Maps"]);
     }
@@ -2637,11 +2626,11 @@ mod tests {
         install(&fakes, &[("mail", "Mail"), ("maps", "Maps")]);
         let mut holder = holder(&fakes, &layout_store());
         hide(&mut holder, app_id("maps"));
-        *fakes.storage.error.lock().unwrap() = Some(DataError::Failed("disk full".into()));
+        *fakes.storage.error.lock().unwrap() = Some(DataError::Failed(Problem::StorageFull));
 
         holder.handle(AppsIntent::Reset);
 
-        assert_eq!(holder.state().problem.as_deref(), Some("disk full"));
+        assert_eq!(holder.state().problem, Some(Problem::StorageFull));
         assert_eq!(labels(holder.state()), ["Mail"]);
         assert_eq!(hidden_labels(&holder), ["Maps"]);
     }
@@ -2655,10 +2644,10 @@ mod tests {
         let mut holder = holder(&fakes, &layout);
         assert_eq!(labels(holder.state()), ["Atlas", "Phone"]);
         *fakes.apps.default_apps.lock().unwrap() = vec!["dialer".into()];
-        *fakes.apps.error.lock().unwrap() = Some(DataError::Failed("busy".into()));
+        *fakes.apps.error.lock().unwrap() = Some(DataError::Failed(Problem::SystemFailed));
 
         holder.handle(AppsIntent::Reset);
-        assert_eq!(holder.state().problem.as_deref(), Some("busy"));
+        assert_eq!(holder.state().problem, Some(Problem::SystemFailed));
 
         *fakes.apps.error.lock().unwrap() = None;
         holder.handle(AppsIntent::Refresh);
@@ -2715,11 +2704,11 @@ mod tests {
             })
             .unwrap();
         storage.writes.lock().unwrap().clear();
-        *storage.error.lock().unwrap() = Some(DataError::Failed("Disk busy".into()));
+        *storage.error.lock().unwrap() = Some(DataError::Failed(Problem::SavedDataUnusable));
 
         let mut holder = holder(&fakes, &layout);
         assert_eq!(labels(holder.state()), ["Atlas", "Mail"]);
-        assert_eq!(holder.state().problem.as_deref(), Some("Disk busy"));
+        assert_eq!(holder.state().problem, Some(Problem::SavedDataUnusable));
 
         *storage.error.lock().unwrap() = None;
         holder.handle(AppsIntent::Refresh);
@@ -2754,11 +2743,11 @@ mod tests {
         install(&fakes, &[("mail", "Mail")]);
         let (storage, layout) = storage_and_store();
         let mut holder = holder(&fakes, &layout);
-        *storage.error.lock().unwrap() = Some(DataError::Failed("Disk full".into()));
+        *storage.error.lock().unwrap() = Some(DataError::Failed(Problem::StorageFull));
         install(&fakes, &[("mail", "Mail"), ("maps", "Maps")]);
 
         holder.handle(AppsIntent::Refresh);
-        assert_eq!(holder.state().problem.as_deref(), Some("Disk full"));
+        assert_eq!(holder.state().problem, Some(Problem::StorageFull));
         assert_eq!(labels(holder.state()), ["Mail", "Maps•"]);
 
         *storage.error.lock().unwrap() = None;
@@ -2779,7 +2768,7 @@ mod tests {
         assert_eq!(labels(holder.state()), ["Mail", "Maps•"]);
 
         // A launch the system refuses didn't open it.
-        *fakes.apps.error.lock().unwrap() = Some(DataError::Failed("No".into()));
+        *fakes.apps.error.lock().unwrap() = Some(DataError::Failed(Problem::SystemFailed));
         holder.handle(AppsIntent::Launch {
             app: app_id("maps"),
             from: None,
@@ -3042,7 +3031,7 @@ mod tests {
                 ..Layout::default()
             })
             .unwrap();
-        *storage.error.lock().unwrap() = Some(DataError::Failed("Disk busy".into()));
+        *storage.error.lock().unwrap() = Some(DataError::Failed(Problem::SavedDataUnusable));
         storage.writes.lock().unwrap().clear();
         let mut holder = holder(&fakes, &layout);
         holder.handle(AppsIntent::EnterEditMode);
@@ -3100,9 +3089,9 @@ mod tests {
         assert!(holder.state().edit_mode);
 
         // The system refusing is a problem shown briefly.
-        *fakes.apps.error.lock().unwrap() = Some(DataError::Failed("No".into()));
+        *fakes.apps.error.lock().unwrap() = Some(DataError::Failed(Problem::SystemFailed));
         holder.handle(AppsIntent::RequestUninstall(app_id("mail")));
-        assert_eq!(holder.state().problem.as_deref(), Some("No"));
+        assert_eq!(holder.state().problem, Some(Problem::SystemFailed));
     }
 
     #[test]
@@ -3883,11 +3872,11 @@ mod tests {
         let fakes = Fakes::default();
         let mut holder = searching(&fakes);
         holder.handle(AppsIntent::Search("ma".into()));
-        *fakes.apps.error.lock().unwrap() = Some(DataError::Failed("Can't open".into()));
+        *fakes.apps.error.lock().unwrap() = Some(DataError::Failed(Problem::SystemFailed));
 
         holder.handle(AppsIntent::SubmitSearch { from: None });
 
-        assert_eq!(holder.state().problem.as_deref(), Some("Can't open"));
+        assert_eq!(holder.state().problem, Some(Problem::SystemFailed));
         assert_eq!(holder.state().search.as_deref(), Some("ma"));
     }
 
@@ -3953,11 +3942,12 @@ mod tests {
         let fakes = Fakes::default();
         let mut holder = searching(&fakes);
         holder.handle(AppsIntent::Search("zebra".into()));
-        *fakes.system.error.lock().unwrap() = Some(DataError::Unsupported("No search".into()));
+        *fakes.system.error.lock().unwrap() =
+            Some(DataError::Unsupported(Problem::WebSearchUnavailable));
 
         holder.handle(AppsIntent::SearchWeb);
 
-        assert_eq!(holder.state().problem.as_deref(), Some("No search"));
+        assert_eq!(holder.state().problem, Some(Problem::WebSearchUnavailable));
         assert_eq!(holder.state().search.as_deref(), Some("zebra"));
     }
 

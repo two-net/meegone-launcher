@@ -20,6 +20,7 @@ use crate::model::{
     Access, App, AppId, DataError, ImageCrop, ImageJob, NetworkState, Notification, Profile,
     ProfileId, RecentUse, Rect, Screen, Shortcut, Size, TimeStyle, WallpaperMarker,
 };
+use crate::problem::Problem;
 use crate::settings::Settings;
 use crate::storage::{MAX_STORED_BYTES, StorageAdapter, StoredFile, check_budget, encode};
 
@@ -142,20 +143,27 @@ pub fn notification(key: &str, package: &str) -> Notification {
 }
 
 /// A stand-in for the platform's search folding (SRCH-02, L10N-04): lowercase, the accents of
-/// Latin-1 letters removed, and runs of spaces collapsed to one, without spaces at either end.
-/// The platform folds every script; this is enough for tests.
+/// Latin-1 and Polish letters removed, the letters that have no accent to remove spelt plainly
+/// (ø, ł, đ, æ, œ), and runs of spaces collapsed to one, without spaces at either end. The
+/// platform folds every script; this is enough for tests.
 pub fn fold(text: &str) -> String {
     let mut folded = String::with_capacity(text.len());
     for c in text.chars().flat_map(char::to_lowercase) {
         match c {
-            'à'..='å' => folded.push('a'),
-            'ç' => folded.push('c'),
-            'è'..='ë' => folded.push('e'),
+            'à'..='å' | 'ą' => folded.push('a'),
+            'ç' | 'ć' => folded.push('c'),
+            'è'..='ë' | 'ę' => folded.push('e'),
             'ì'..='ï' => folded.push('i'),
-            'ñ' => folded.push('n'),
-            'ò'..='ö' => folded.push('o'),
+            'ñ' | 'ń' => folded.push('n'),
+            'ò'..='ö' | 'ø' => folded.push('o'),
+            'ś' => folded.push('s'),
             'ù'..='ü' => folded.push('u'),
             'ý' | 'ÿ' => folded.push('y'),
+            'ź' | 'ż' => folded.push('z'),
+            'ł' => folded.push('l'),
+            'đ' => folded.push('d'),
+            'æ' => folded.push_str("ae"),
+            'œ' => folded.push_str("oe"),
             // Case folding, as the platform's, turns ß into ss.
             'ß' => folded.push_str("ss"),
             c => folded.push(c),
@@ -265,9 +273,7 @@ impl AppsAdapter for FakeApps {
     fn shortcuts(&self, app: &AppId) -> Result<Vec<Shortcut>, DataError> {
         check(&self.error)?;
         if !*self.shortcuts_allowed.lock().unwrap() {
-            return Err(DataError::Unsupported(
-                "Shortcuts need MeeGone as the default home app".into(),
-            ));
+            return Err(DataError::Unsupported(Problem::ShortcutsNeedDefaultHome));
         }
         Ok(self
             .shortcuts
@@ -288,9 +294,7 @@ impl AppsAdapter for FakeApps {
         check(&self.error)?;
         let apps = self.apps.lock().unwrap();
         if apps.iter().any(|a| a.id == *app && !a.can_uninstall) {
-            return Err(DataError::Unsupported(
-                "This app can't be uninstalled".into(),
-            ));
+            return Err(DataError::Unsupported(Problem::UninstallUnavailable));
         }
         record(&self.uninstall_requested, app.clone());
         Ok(())
@@ -409,7 +413,7 @@ impl UsageAdapter for FakeUsage {
 
 pub struct FakeWallpaper {
     /// When set, the lock-screen wallpaper can't be set, for this reason (WALL-13).
-    pub unsupported: Mutex<Option<String>>,
+    pub unsupported: Mutex<Option<Problem>>,
     /// A typical phone screen, unless set.
     pub screen: Mutex<Screen>,
     /// Whether the device folds: false unless set.
@@ -494,7 +498,7 @@ impl FakeWallpaper {
 impl WallpaperAdapter for FakeWallpaper {
     fn lock_screen_support(&self) -> Result<(), DataError> {
         check(&self.error)?;
-        match self.unsupported.lock().unwrap().clone() {
+        match *self.unsupported.lock().unwrap() {
             Some(reason) => Err(DataError::Unsupported(reason)),
             None => Ok(()),
         }
@@ -578,15 +582,17 @@ impl NetworkAdapter for FakeNetwork {
         record(&self.requests, https_url.to_owned());
         check(&self.error)?;
         if !https_url.starts_with("https://") {
-            return Err(DataError::Invalid("Only HTTPS is allowed".into()));
+            return Err(DataError::Invalid(Problem::HttpsOnly));
         }
         if self.state() == NetworkState::Offline {
             return Err(DataError::Offline);
         }
         match self.responses.lock().unwrap().get(https_url) {
-            Some(body) if body.len() > max_bytes => Err(DataError::Invalid("Too large".into())),
+            Some(body) if body.len() > max_bytes => {
+                Err(DataError::Invalid(Problem::DownloadTooLarge))
+            }
             Some(body) => Ok(body.clone()),
-            None => Err(DataError::Failed("Not found".into())),
+            None => Err(DataError::Failed(Problem::DownloadFailed)),
         }
     }
 }
@@ -686,7 +692,7 @@ impl FakeSystem {
         if self.has_browser() {
             Ok(())
         } else {
-            Err(DataError::Unsupported("No web browser is installed".into()))
+            Err(DataError::Unsupported(Problem::WebSearchUnavailable))
         }
     }
 }
@@ -777,7 +783,7 @@ impl SystemConfigAdapter for FakeSystem {
     fn open_next_alarm(&self) -> Result<(), DataError> {
         check(&self.error)?;
         if self.next_alarm_ms().is_none() {
-            return Err(DataError::Unsupported("No alarm is set".into()));
+            return Err(DataError::Unsupported(Problem::AlarmUnavailable));
         }
         *self.alarm_opened.lock().unwrap() += 1;
         Ok(())
@@ -794,7 +800,7 @@ impl SystemConfigAdapter for FakeSystem {
     fn open_in_browser(&self, https_url: &str) -> Result<(), DataError> {
         self.check_browser()?;
         if !https_url.starts_with("https://") {
-            return Err(DataError::Invalid("Only HTTPS links open".into()));
+            return Err(DataError::Invalid(Problem::HttpsLinksOnly));
         }
         record(&self.opened_urls, https_url.to_owned());
         Ok(())
@@ -912,6 +918,7 @@ mod tests {
         // SRCH-02, L10N-04, as the platform's folding does.
         assert_eq!(fold("  Café  Crème "), "cafe creme");
         assert_eq!(fold("STRASSE Straße"), "strasse strasse");
+        assert_eq!(fold("Łódź Ærø Œuvre"), "lodz aero oeuvre");
         assert_eq!(app("cafe", "Café").search_key, "cafe");
         assert_eq!(FakeApps::default().search_key("CAFÉ"), "cafe");
     }

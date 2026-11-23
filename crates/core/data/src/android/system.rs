@@ -14,6 +14,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::jni::{Env, GlobalRef, JValue, LocalRef, MethodId, Vm};
 use crate::adapters::SystemConfigAdapter;
 use crate::model::{DataError, TimeStyle};
+use crate::problem::Problem;
 
 pub struct AndroidSystem {
     vm: Vm,
@@ -190,8 +191,8 @@ impl SystemConfigAdapter for AndroidSystem {
             .unwrap_or(false)
     }
 
-    /// Written by `android.text.format.DateFormat` in the default locale and time zone, so it
-    /// follows the device's language and 12- or 24-hour setting (L10N-03). Empty if the bridge
+    /// Written by ICU's `DateFormat` in the default locale and time zone, with the 12- or 24-hour
+    /// setting from `android.text.format.DateFormat`, so it follows the device's (L10N-03). Empty if the bridge
     /// can't answer, and the header then leaves that line out.
     fn format_time(&self, at_ms: u64, style: TimeStyle) -> String {
         let at = JValue::long(i64::try_from(at_ms).unwrap_or(i64::MAX));
@@ -215,7 +216,7 @@ impl SystemConfigAdapter for AndroidSystem {
         let env = self.vm.env()?;
         match env.call_string(&self.bridge, self.request_default_home, &[])? {
             None => Ok(()),
-            Some(instructions) => Err(DataError::Unsupported(instructions)),
+            Some(code) => Err(DataError::Unsupported(Problem::from_host(&code))),
         }
     }
 
@@ -235,7 +236,7 @@ impl SystemConfigAdapter for AndroidSystem {
         let env = self.vm.env()?;
         match env.call_string(&self.bridge, self.open_next_alarm, &[])? {
             None => Ok(()),
-            Some(message) => Err(DataError::Unsupported(message)),
+            Some(code) => Err(DataError::Unsupported(Problem::from_host(&code))),
         }
     }
 
@@ -261,13 +262,13 @@ impl SystemConfigAdapter for AndroidSystem {
     /// bridge checks the scheme again (SEC-02, WALL-15).
     fn open_in_browser(&self, https_url: &str) -> Result<(), DataError> {
         if !https_url.starts_with("https://") {
-            return Err(DataError::Invalid("Only HTTPS links open".into()));
+            return Err(DataError::Invalid(Problem::HttpsLinksOnly));
         }
         let env = self.vm.env()?;
         let url = env.new_string(https_url)?;
         match env.call_string(&self.bridge, self.open_in_browser, &[JValue::object(&url)])? {
             None => Ok(()),
-            Some(message) => Err(DataError::Unsupported(message)),
+            Some(code) => Err(DataError::Unsupported(Problem::from_host(&code))),
         }
     }
 
@@ -277,7 +278,7 @@ impl SystemConfigAdapter for AndroidSystem {
         let query = env.new_string(query)?;
         match env.call_string(&self.bridge, self.web_search, &[JValue::object(&query)])? {
             None => Ok(()),
-            Some(message) => Err(DataError::Unsupported(message)),
+            Some(code) => Err(DataError::Unsupported(Problem::from_host(&code))),
         }
     }
 }

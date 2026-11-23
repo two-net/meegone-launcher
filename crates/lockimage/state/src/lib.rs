@@ -25,11 +25,12 @@ use meegone_core_state::StateHolder;
 use meegone_lockimage_data::{ImageCache, ImageFeed, region};
 
 pub use checks::CheckStatus;
+pub use meegone_core_state::Problem;
 pub use meegone_lockimage_data::{
     ImageFile, ImageMemory, ImageRecord, ImageTask, ImageTasks, Marker, PAST_WEEK_IMAGES,
     PastImages, Preview, TodayImage,
 };
-pub use updater::{Checked, ImageUpdater, NOT_LISTED, NOT_OFFERED, Wait};
+pub use updater::{Checked, ImageUpdater, Wait};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ImageStatus {
@@ -37,8 +38,8 @@ pub enum ImageStatus {
     #[default]
     Off,
     On,
-    /// The lock-screen wallpaper can't be set on this device; the text says why (WALL-13).
-    Unavailable(String),
+    /// The lock-screen wallpaper can't be set on this device; the problem says why (WALL-13).
+    Unavailable(Problem),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -82,11 +83,11 @@ pub struct LockImageState {
     pub browsing: bool,
     /// The past week's image being pinned, by the feed's id.
     pub pinning: Option<String>,
-    /// The last problem browsing or pinning had, in plain words.
-    pub past_problem: Option<String>,
+    /// The last problem browsing or pinning had.
+    pub past_problem: Option<Problem>,
     /// Setup's lock-screen image step, from when setup reaches it until Continue (ONB-01).
     pub setup: Option<ImageSetup>,
-    pub problem: Option<String>,
+    pub problem: Option<Problem>,
 }
 
 /// Setup's lock-screen image step (ONB-01, ADR 0036). Nothing of it is saved, and nothing
@@ -279,7 +280,7 @@ impl LockImageHolder {
         self.state.current = self.cache.current();
         self.state.checks = checks::status(&self.cache.checks(), self.system.now_ms());
         self.state.status = match self.wallpaper.lock_screen_support() {
-            Err(reason) => ImageStatus::Unavailable(reason.to_string()),
+            Err(reason) => ImageStatus::Unavailable(reason.problem()),
             Ok(()) if options.enabled => ImageStatus::On,
             Ok(()) => ImageStatus::Off,
         };
@@ -372,7 +373,7 @@ impl LockImageHolder {
             .settings
             .update(&mut |settings| settings.image.enabled = on)
             .and_then(|settings| self.apply(&settings.image));
-        self.state.problem = result.err().map(|error| error.to_string());
+        self.state.problem = result.err().map(|error| error.problem());
         self.refresh();
     }
 
@@ -384,7 +385,7 @@ impl LockImageHolder {
             .settings
             .update(&mut |settings| settings.image = ImageOptions::default())
             .and_then(|settings| self.apply(&settings.image));
-        self.state.problem = result.err().map(|error| error.to_string());
+        self.state.problem = result.err().map(|error| error.problem());
         self.refresh();
     }
 
@@ -392,7 +393,7 @@ impl LockImageHolder {
         let result = self
             .settings
             .update(&mut |settings| settings.image.show_card = on);
-        self.state.problem = result.err().map(|error| error.to_string());
+        self.state.problem = result.err().map(|error| error.problem());
         self.refresh();
     }
 
@@ -409,7 +410,7 @@ impl LockImageHolder {
             .settings
             .update(&mut |settings| settings.image.region = choice.clone());
         let saved = result.is_ok();
-        self.state.problem = result.err().map(|error| error.to_string());
+        self.state.problem = result.err().map(|error| error.problem());
         self.refresh();
         // Setup's step shows today's image in the region chosen (ONB-01).
         if saved {
@@ -424,7 +425,7 @@ impl LockImageHolder {
             .settings
             .update(&mut |settings| settings.image.use_mobile_data = on)
             .and_then(|settings| self.arm(settings.image.enabled, settings.image.use_mobile_data));
-        self.state.problem = result.err().map(|error| error.to_string());
+        self.state.problem = result.err().map(|error| error.problem());
         self.refresh();
     }
 
@@ -436,7 +437,7 @@ impl LockImageHolder {
             .cache
             .update_checks(&mut checks::try_again)
             .and_then(|_| self.arm(options.enabled, options.use_mobile_data));
-        self.state.problem = result.err().map(|error| error.to_string());
+        self.state.problem = result.err().map(|error| error.problem());
         self.refresh();
     }
 
@@ -543,7 +544,7 @@ impl LockImageHolder {
             if result.is_err() {
                 self.memory.tasks.withdraw(&task);
             }
-            self.state.problem = result.err().map(|error| error.to_string());
+            self.state.problem = result.err().map(|error| error.problem());
         }
         self.read_tasks();
     }
@@ -559,12 +560,12 @@ impl LockImageHolder {
             return;
         }
         let result = self.wallpaper.reset_lock_screen();
-        self.state.problem = result.err().map(|error| error.to_string());
+        self.state.problem = result.err().map(|error| error.problem());
     }
 
     fn open_wallpaper_settings(&mut self) {
         let result = self.wallpaper.open_wallpaper_settings();
-        self.state.problem = result.err().map(|error| error.to_string());
+        self.state.problem = result.err().map(|error| error.problem());
     }
 
     /// Only a link the details screen offers opens: the daily image is on, the current image
@@ -583,7 +584,7 @@ impl LockImageHolder {
             return;
         };
         let result = self.system.open_in_browser(link);
-        self.state.problem = result.err().map(|error| error.to_string());
+        self.state.problem = result.err().map(|error| error.problem());
     }
 
     fn apply(&self, options: &ImageOptions) -> Result<(), DataError> {
@@ -798,17 +799,13 @@ mod tests {
         let Setup {
             fakes, mut holder, ..
         } = setup();
-        *fakes.scheduler.error.lock().unwrap() = Some(DataError::Unsupported(
-            "Background work is restricted".into(),
-        ));
+        *fakes.scheduler.error.lock().unwrap() =
+            Some(DataError::Unsupported(Problem::ImageJobUnavailable));
 
         holder.handle(LockImageIntent::SetEnabled(true));
 
         assert_eq!(holder.state().status, ImageStatus::On);
-        assert_eq!(
-            holder.state().problem.as_deref(),
-            Some("Background work is restricted")
-        );
+        assert_eq!(holder.state().problem, Some(Problem::ImageJobUnavailable));
     }
 
     #[test]
@@ -866,7 +863,7 @@ mod tests {
                 checks.failures = 6;
                 checks.last_attempt_ms = Some(since_ms);
                 checks.failing_since_ms = Some(since_ms);
-                checks.problem = Some("No connection".into());
+                checks.problem = Some(Problem::NoConnection);
             })
             .unwrap();
     }
@@ -888,14 +885,14 @@ mod tests {
         holder.handle(LockImageIntent::Refresh);
         assert_eq!(
             holder.state().checks,
-            CheckStatus::Retrying("No connection".into())
+            CheckStatus::Retrying(Problem::NoConnection)
         );
 
         *fakes.system.now_ms.lock().unwrap() = 13 * day;
         holder.handle(LockImageIntent::Refresh);
         assert_eq!(
             holder.state().checks,
-            CheckStatus::Unavailable("No connection".into())
+            CheckStatus::Unavailable(Problem::NoConnection)
         );
     }
 
@@ -995,11 +992,11 @@ mod tests {
         // SET-06, ARCH-09
         let mut setup = setup();
         setup.holder.handle(LockImageIntent::SetShowCard(false));
-        *setup.fakes.storage.error.lock().unwrap() = Some(DataError::Failed("disk full".into()));
+        *setup.fakes.storage.error.lock().unwrap() = Some(DataError::Failed(Problem::StorageFull));
 
         setup.holder.handle(LockImageIntent::Reset);
 
-        assert_eq!(setup.holder.state().problem.as_deref(), Some("disk full"));
+        assert_eq!(setup.holder.state().problem, Some(Problem::StorageFull));
         assert!(!setup.holder.state().show_card);
     }
 
@@ -1009,14 +1006,14 @@ mod tests {
         let Setup {
             fakes, mut holder, ..
         } = setup();
-        *fakes.wallpaper.unsupported.lock().unwrap() = Some("Blocked by device policy".into());
+        *fakes.wallpaper.unsupported.lock().unwrap() = Some(Problem::WallpaperNotAllowed);
         holder.handle(LockImageIntent::Refresh);
 
         holder.handle(LockImageIntent::SetEnabled(true));
 
         assert_eq!(
             holder.state().status,
-            ImageStatus::Unavailable("Blocked by device policy".into())
+            ImageStatus::Unavailable(Problem::WallpaperNotAllowed)
         );
         assert_eq!(*fakes.scheduler.job.lock().unwrap(), None);
     }
@@ -1049,11 +1046,11 @@ mod tests {
         let Setup {
             fakes, mut holder, ..
         } = setup();
-        *fakes.storage.error.lock().unwrap() = Some(DataError::Failed("Disk error".into()));
+        *fakes.storage.error.lock().unwrap() = Some(DataError::Failed(Problem::SavedDataUnusable));
 
         holder.handle(LockImageIntent::SetShowCard(false));
 
-        assert_eq!(holder.state().problem.as_deref(), Some("Disk error"));
+        assert_eq!(holder.state().problem, Some(Problem::SavedDataUnusable));
     }
 
     #[test]
@@ -1160,11 +1157,11 @@ mod tests {
         let Setup {
             fakes, mut holder, ..
         } = setup();
-        *fakes.storage.error.lock().unwrap() = Some(DataError::Failed("Disk error".into()));
+        *fakes.storage.error.lock().unwrap() = Some(DataError::Failed(Problem::SavedDataUnusable));
 
         holder.handle(LockImageIntent::SetRegion(Some("en-GB".into())));
 
-        assert_eq!(holder.state().problem.as_deref(), Some("Disk error"));
+        assert_eq!(holder.state().problem, Some(Problem::SavedDataUnusable));
         assert_eq!(holder.state().region, None);
     }
 
@@ -1305,15 +1302,14 @@ mod tests {
             Some("https://example.com/puffins"),
             None,
         );
-        *setup.fakes.system.error.lock().unwrap() = Some(DataError::Unsupported(
-            "No browser can open this link".into(),
-        ));
+        *setup.fakes.system.error.lock().unwrap() =
+            Some(DataError::Unsupported(Problem::BrowserUnavailable));
 
         setup.holder.handle(LockImageIntent::OpenInfoLink);
 
         assert_eq!(
-            setup.holder.state().problem.as_deref(),
-            Some("No browser can open this link")
+            setup.holder.state().problem,
+            Some(Problem::BrowserUnavailable)
         );
     }
 
@@ -1371,7 +1367,7 @@ mod tests {
         let mut setup = setup();
         setup.holder.handle(LockImageIntent::UpdateNow);
 
-        *setup.fakes.wallpaper.unsupported.lock().unwrap() = Some("Blocked".into());
+        *setup.fakes.wallpaper.unsupported.lock().unwrap() = Some(Problem::WallpaperNotAllowed);
         setup.holder.handle(LockImageIntent::Refresh);
         setup.holder.handle(LockImageIntent::UpdateNow);
 
@@ -1460,13 +1456,14 @@ mod tests {
         let Setup {
             fakes, mut holder, ..
         } = setup();
-        *fakes.wallpaper.error.lock().unwrap() =
-            Some(DataError::Unsupported("No wallpaper settings".into()));
+        *fakes.wallpaper.error.lock().unwrap() = Some(DataError::Unsupported(
+            Problem::WallpaperSettingsInstructions,
+        ));
 
         holder.handle(LockImageIntent::OpenWallpaperSettings);
         assert_eq!(
-            holder.state().problem.as_deref(),
-            Some("No wallpaper settings")
+            holder.state().problem,
+            Some(Problem::WallpaperSettingsInstructions)
         );
 
         *fakes.wallpaper.error.lock().unwrap() = None;
@@ -1474,9 +1471,9 @@ mod tests {
         assert_eq!(holder.state().problem, None);
         assert_eq!(*fakes.wallpaper.settings_opened.lock().unwrap(), 1);
 
-        *fakes.wallpaper.error.lock().unwrap() = Some(DataError::Failed("Couldn't".into()));
+        *fakes.wallpaper.error.lock().unwrap() = Some(DataError::Failed(Problem::SystemFailed));
         holder.handle(LockImageIntent::ResetLockScreen);
-        assert_eq!(holder.state().problem.as_deref(), Some("Couldn't"));
+        assert_eq!(holder.state().problem, Some(Problem::SystemFailed));
     }
     /// The feed offers `images` as the past week, and serves each one's sizes and preview.
     fn offer_week(setup: &Setup, images: Vec<meegone_lockimage_data::FeedImage>) {
@@ -1604,7 +1601,7 @@ mod tests {
         run_tasks(&mut setup);
 
         let state = setup.holder.state();
-        assert_eq!(state.past_problem.as_deref(), Some("No connection"));
+        assert_eq!(state.past_problem, Some(Problem::NoConnection));
         assert!(!state.pinned);
         assert_eq!(
             state.current.as_ref().unwrap().id.as_deref(),
@@ -1788,7 +1785,7 @@ mod tests {
             mut holder,
             ..
         } = setup();
-        *fakes.wallpaper.unsupported.lock().unwrap() = Some("Not allowed".into());
+        *fakes.wallpaper.unsupported.lock().unwrap() = Some(Problem::WallpaperNotAllowed);
         holder.handle(LockImageIntent::Refresh);
 
         holder.handle(LockImageIntent::OpenSetup);

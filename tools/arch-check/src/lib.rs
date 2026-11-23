@@ -8,16 +8,21 @@
 //! - in [`legal`], the legal and branding rules of ADR 0037: the product's name, no
 //!   third-party names, every bundled asset in ASSETS.md, every licence in About, and the store
 //!   listing (LEGAL-01 to LEGAL-06, PRIV-04);
-//! - and, in [`a11y`], the accessibility rules of ADR 0038: every colour the Java host draws
-//!   comes from the theme's tokens, and every text size follows the system font size (A11Y-03,
-//!   A11Y-04).
+//! - in [`a11y`], the accessibility rules of ADR 0038: every colour the Java host draws comes
+//!   from the theme's tokens, and every text size follows the system font size (A11Y-03,
+//!   A11Y-04);
+//! - and, in [`l10n`], the localisation rules of ADR 0040: neither the Java host nor the Rust
+//!   app writes text for the user outside string resources, no number reaches the screen in
+//!   ASCII digits whatever the language, every `Problem` is worded, and every string resource
+//!   can be translated (L10N-01, L10N-03).
 //!
 //! The rules are pure functions over a [`Graph`] and over source text; [`load`] reads the graph
 //! with `cargo metadata`, and [`os_access_violations`] reads the app's sources.
-//! `tests/workspace.rs`, `tests/legal.rs` and `tests/a11y.rs` run them on this repository, so
-//! CI fails on any violation.
+//! `tests/workspace.rs`, `tests/legal.rs`, `tests/a11y.rs` and `tests/l10n.rs` run them on this
+//! repository, so CI fails on any violation.
 
 pub mod a11y;
+pub mod l10n;
 pub mod legal;
 
 use std::collections::BTreeSet;

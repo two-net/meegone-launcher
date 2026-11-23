@@ -969,6 +969,143 @@ mod tests {
         assert_eq!(settled_on(&mut shell, end), HomeView::Recent);
     }
 
+    // Right to left (L10N-02, ADR 0040): each test above, mirrored. A point `x` from the left is
+    // `mirror(x)`, a page drawn at `p` px is at `-p`, and what the row does is the same.
+
+    fn mirror(x: f64) -> f64 {
+        WIDTH - x
+    }
+
+    fn rtl_shell() -> HomeShell {
+        laid_out(&Fakes::after_setup(), true)
+    }
+
+    #[test]
+    fn right_to_left_the_row_follows_the_finger_the_other_way() {
+        let mut shell = rtl_shell();
+
+        drag(&mut shell, mirror(600.0), mirror(400.0), 0, 80);
+
+        let state = shell.state();
+        assert!(state.carousel.dragging);
+        assert_near(state.carousel.offset, 0.19);
+        assert_near(state.page_offset_px(HomeView::Applications), 190.0);
+        assert_near(state.page_offset_px(HomeView::Recent), -810.0);
+        assert_near(state.page_offset_px(HomeView::Events), 1190.0);
+    }
+
+    #[test]
+    fn right_to_left_a_fling_settles_on_the_next_view() {
+        let mut shell = rtl_shell();
+
+        let end = flick(&mut shell, mirror(600.0), mirror(500.0), 0);
+        assert_eq!(settled_on(&mut shell, end), HomeView::Recent);
+
+        let end = flick(&mut shell, mirror(500.0), mirror(600.0), end + 100);
+        assert_eq!(settled_on(&mut shell, end), HomeView::Applications);
+    }
+
+    #[test]
+    fn right_to_left_a_flick_back_against_the_drag_returns() {
+        let mut shell = rtl_shell();
+
+        let moved = drag(&mut shell, mirror(900.0), mirror(450.0), 0, 800);
+        let end = drag(&mut shell, mirror(450.0), mirror(520.0), moved, 32);
+        touch(&mut shell, PointerKind::Up, mirror(520.0), end);
+
+        assert_eq!(settled_on(&mut shell, end), HomeView::Applications);
+    }
+
+    #[test]
+    fn right_to_left_moving_past_either_end_wraps_around_from_the_left() {
+        // HOME-04: Events comes in from the left of Recent.
+        let mut shell = rtl_shell();
+        shell.dispatch(ShellIntent::Swipe(Direction::Next));
+        settle(&mut shell, 0);
+        assert_eq!(shell.state().current, HomeView::Recent);
+
+        touch(&mut shell, PointerKind::Down, mirror(900.0), 1000);
+        for step in 1..=60 {
+            let x = mirror(900.0 - 10.0 * f64::from(step));
+            touch(&mut shell, PointerKind::Move, x, 1000 + 8 * step as u64);
+            if step >= 2 {
+                let travel = x - mirror(890.0);
+                assert_near(
+                    shell.state().page_offset_px(HomeView::Events),
+                    -(WIDTH - travel),
+                );
+                assert_near(shell.state().page_offset_px(HomeView::Recent), travel);
+            }
+        }
+        touch(&mut shell, PointerKind::Up, mirror(300.0), 1600);
+        assert_eq!(settled_on(&mut shell, 1600), HomeView::Events);
+
+        let state = shell.state();
+        assert_eq!(state.page_offset_px(HomeView::Events), 0.0);
+        assert_eq!(state.page_offset_px(HomeView::Applications), -WIDTH);
+        assert_eq!(state.page_offset_px(HomeView::Recent), WIDTH);
+
+        let end = slow_swipe(&mut shell, mirror(200.0), mirror(600.0), 3000);
+        assert_eq!(settled_on(&mut shell, end), HomeView::Recent);
+    }
+
+    #[test]
+    fn right_to_left_with_wrap_around_off_the_row_resists_past_the_ends() {
+        let mut shell = rtl_shell();
+        shell.dispatch(ShellIntent::Settings(SettingsIntent::SetWrapAround(false)));
+        shell.dispatch(ShellIntent::Swipe(Direction::Next));
+        settle(&mut shell, 0);
+
+        let moved = drag(&mut shell, mirror(900.0), mirror(100.0), 1000, 400);
+        let offset = shell.state().carousel.offset;
+        assert!(offset > 0.0 && offset <= VIEW_EDGE_STRETCH, "{offset}");
+        touch(&mut shell, PointerKind::Up, mirror(100.0), moved + 100);
+
+        assert_eq!(settled_on(&mut shell, moved + 100), HomeView::Recent);
+        assert_eq!(shell.state().page_offset_px(HomeView::Events), 2.0 * WIDTH);
+    }
+
+    #[test]
+    fn right_to_left_touching_the_moving_row_catches_it_where_it_is() {
+        let mut shell = rtl_shell();
+        let end = flick(&mut shell, mirror(600.0), mirror(500.0), 0);
+        for frame in 0..=15 {
+            shell.dispatch(ShellIntent::Frame(ms(end + 8 * frame)));
+        }
+        let caught = shell.state().carousel.offset;
+        assert!(caught < 0.0 && caught > -0.5, "{caught}");
+
+        touch(&mut shell, PointerKind::Down, mirror(300.0), end + 124);
+        assert_eq!(shell.state().carousel.offset, caught);
+        touch(&mut shell, PointerKind::Move, mirror(310.0), end + 132);
+        assert_near(shell.state().carousel.offset, caught - 0.01);
+
+        touch(&mut shell, PointerKind::Up, mirror(310.0), end + 300);
+        assert_eq!(settled_on(&mut shell, end + 300), HomeView::Recent);
+    }
+
+    #[test]
+    fn right_to_left_a_drag_that_starts_anywhere_moves_between_views() {
+        for (from, to, view) in [
+            (500.0, 100.0, HomeView::Recent),
+            (995.0, 600.0, HomeView::Recent),
+            (5.0, 400.0, HomeView::Events),
+        ] {
+            let mut shell = rtl_shell();
+            let end = slow_swipe(&mut shell, mirror(from), mirror(to), 0);
+            assert_eq!(settled_on(&mut shell, end), view, "from {from}");
+        }
+    }
+
+    #[test]
+    fn right_to_left_the_indicator_highlights_the_view_nearest_the_row() {
+        let mut shell = rtl_shell();
+        drag(&mut shell, mirror(900.0), mirror(500.0), 0, 200);
+        assert_eq!(shell.state().nearest_view(), HomeView::Applications);
+        touch(&mut shell, PointerKind::Move, mirror(300.0), 208);
+        assert_eq!(shell.state().nearest_view(), HomeView::Recent);
+    }
+
     #[test]
     fn a_drag_that_starts_anywhere_moves_between_views() {
         // HOME-13: no edge swipe is needed, so the system Back gesture keeps the edges.
