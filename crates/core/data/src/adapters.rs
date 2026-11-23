@@ -126,13 +126,13 @@ pub trait NetworkAdapter: Send + Sync {
     /// (PWR-04, ADR 0029).
     fn saves_data(&self) -> bool;
     /// Fetches an `https://` URL with the platform's certificate validation, following only
-    /// `https://` redirects. The request carries the URL and nothing that tells the device or
-    /// the user apart (PRIV-02). It blocks: on Android, call it from a JVM thread other than the
-    /// main one (ADR 0027).
+    /// `https://` redirects on the URL's own origin. The request carries the URL and nothing
+    /// that tells the device or the user apart (PRIV-02). It blocks: on Android, call it from a
+    /// JVM thread other than the main one (ADR 0027, ADR 0042).
     ///
-    /// Fails with [`DataError::Offline`] without a connection, and with
-    /// [`DataError::Invalid`] for a URL or redirect that isn't HTTPS, or a body larger than
-    /// `max_bytes` (SEC-01, SEC-02, WALL-06).
+    /// Fails with [`DataError::Offline`] without a connection, with [`DataError::Invalid`] for
+    /// a URL or redirect that isn't HTTPS, or a body larger than `max_bytes` (SEC-01, SEC-02,
+    /// WALL-06), and with [`DataError::Failed`] for a redirect to another origin (PRIV-02).
     fn get(&self, https_url: &str, max_bytes: usize) -> Result<Vec<u8>, DataError>;
 }
 

@@ -12,6 +12,10 @@
 //!   arithmetic-coded, hierarchical, 12-bit and CMYK files are refused, as is a height left for
 //!   later (DNL).
 //!
+//! It also says whether the frame is progressive. A progressive image's decoder keeps the whole
+//! image's coefficients in memory, wherever it crops, so the caller bounds its pixels (SEC-02,
+//! ADR 0042).
+//!
 //! It reads only as far as the frame header and never panics: anything else is `None`.
 
 use meegone_core_data::Size;
@@ -22,11 +26,26 @@ const SOI: u8 = 0xD8;
 const EOI: u8 = 0xD9;
 /// Start of scan: the compressed pixels follow.
 const SOS: u8 = 0xDA;
+/// A progressive frame, Huffman-coded.
+const PROGRESSIVE: u8 = 0xC2;
 /// The frames read here: baseline, extended sequential and progressive, all Huffman-coded.
-const FRAMES: [u8; 3] = [0xC0, 0xC1, 0xC2];
+const FRAMES: [u8; 3] = [0xC0, 0xC1, PROGRESSIVE];
+
+/// What a JPEG file's frame header says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Frame {
+    pub(crate) size: Size,
+    /// Its decoder holds every coefficient of the image at once.
+    pub(crate) progressive: bool,
+}
 
 /// The size of the JPEG image in `bytes`, if the file is as the module describes.
 pub(crate) fn size(bytes: &[u8]) -> Option<Size> {
+    read_frame(bytes).map(|frame| frame.size)
+}
+
+/// The frame of the JPEG image in `bytes`, if the file is as the module describes.
+pub(crate) fn read_frame(bytes: &[u8]) -> Option<Frame> {
     let mut rest = bytes
         .strip_prefix(&[0xFF, SOI])?
         .strip_suffix(&[0xFF, EOI])?;
@@ -34,7 +53,12 @@ pub(crate) fn size(bytes: &[u8]) -> Option<Size> {
         let (code, after) = marker(rest)?;
         let (segment, after) = segment(after)?;
         match code {
-            code if FRAMES.contains(&code) => return frame(segment),
+            code if FRAMES.contains(&code) => {
+                return frame(segment).map(|size| Frame {
+                    size,
+                    progressive: code == PROGRESSIVE,
+                });
+            }
             // Another frame, a scan before the frame, or a marker that stands alone here.
             0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF | SOS | 0x00 | 0x01 | 0xD0..=EOI => {
                 return None;
@@ -153,6 +177,31 @@ mod tests {
     fn real_files_give_their_size() {
         for (bytes, width, height) in FIXTURES {
             assert_eq!(size(bytes), Some(px(width, height)), "{width}×{height}");
+        }
+    }
+
+    #[test]
+    fn only_a_progressive_frame_reads_as_progressive() {
+        // SEC-02, ADR 0042
+        for (bytes, width, height) in FIXTURES {
+            let frame = read_frame(bytes).expect("a fixture reads");
+            assert_eq!(frame.size, px(width, height));
+            assert_eq!(
+                frame.progressive,
+                width == 1280 && height == 720,
+                "{width}×{height}"
+            );
+        }
+        for (code, progressive) in [(0xC0, false), (0xC1, false), (PROGRESSIVE, true)] {
+            let frame = read_frame(&file(&[&frame_segment(code, 3840, 2160)]));
+            assert_eq!(
+                frame,
+                Some(Frame {
+                    size: px(3840, 2160),
+                    progressive
+                }),
+                "{code:#X}"
+            );
         }
     }
 

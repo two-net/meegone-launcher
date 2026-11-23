@@ -4,8 +4,8 @@
 //! `Bridge.httpsGet(url, maxBytes, outcome)` makes one request and never follows a redirect
 //! itself. It returns the body, or `null`, and fills `outcome` with a kind and a detail: one of
 //! the kinds below, which must stay in step with `Bridge.java`. [`fetch`] decides which
-//! redirects to follow, so the policy is tested without a device: only to `https://`, and at
-//! most [`MAX_REDIRECTS`] of them.
+//! redirects to follow, so the policy is tested without a device: only to `https://`, only on
+//! the first URL's origin, and at most [`MAX_REDIRECTS`] of them (PRIV-02, ADR 0042).
 
 use crate::model::DataError;
 use crate::problem::Problem;
@@ -36,17 +36,26 @@ pub(crate) enum Hop {
 }
 
 /// Fetches `url`, asking `hop` for each request, and follows at most [`MAX_REDIRECTS`]
-/// redirects, each only to `https://`. A URL that isn't `https://` is never requested, so a
-/// redirect to plain HTTP fails without reaching it (SEC-01).
+/// redirects, each only to `https://` on `url`'s own origin. A URL that isn't `https://` is
+/// never requested, so a redirect to plain HTTP fails without reaching it (SEC-01). Nor is a
+/// redirect to another host or port, so a request never leaves the destination its caller
+/// chose: for the image feed, its one host (PRIV-02, ADR 0042).
 pub(crate) fn fetch(
     url: &str,
     max_bytes: usize,
     mut hop: impl FnMut(&str) -> Result<Hop, DataError>,
 ) -> Result<Vec<u8>, DataError> {
+    if !is_https(url) {
+        return Err(not_https());
+    }
+    let first = origin(url).to_owned();
     let mut url = url.to_owned();
     for _ in 0..=MAX_REDIRECTS {
         if !is_https(&url) {
             return Err(not_https());
+        }
+        if !origin(&url).eq_ignore_ascii_case(&first) {
+            return Err(failed());
         }
         match hop(&url)? {
             Hop::Body(body) if body.len() > max_bytes => return Err(too_large()),
@@ -80,6 +89,17 @@ fn is_https(url: &str) -> bool {
         && url
             .get(.."https://".len())
             .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
+}
+
+/// The scheme and authority of an `https://` URL: everything before the path, query or
+/// fragment, user information and port included, so `https://www.bing.com@example.com` and
+/// `https://www.bing.com:8443` are origins of their own.
+fn origin(https_url: &str) -> &str {
+    let scheme = "https://".len();
+    let end = https_url[scheme..]
+        .find(['/', '?', '#'])
+        .map_or(https_url.len(), |at| scheme + at);
+    &https_url[..end]
 }
 
 fn not_https() -> DataError {
@@ -172,8 +192,8 @@ mod tests {
     }
 
     #[test]
-    fn https_redirects_are_followed_up_to_the_limit() {
-        let moved = "HTTPS://cdn.example.com/feed";
+    fn https_redirects_on_the_same_origin_are_followed_up_to_the_limit() {
+        let moved = "HTTPS://WWW.example.com/moved?feed";
         let mut server = Server::new([
             Ok(Hop::Redirect(moved.into())),
             Ok(Hop::Body(b"moved".to_vec())),
@@ -182,13 +202,59 @@ mod tests {
         assert_eq!(server.requested, [FEED, moved]);
 
         let mut endless = Server::new(
-            (0..=MAX_REDIRECTS).map(|n| Ok(Hop::Redirect(format!("https://example.com/{n}")))),
+            (0..=MAX_REDIRECTS).map(|n| Ok(Hop::Redirect(format!("https://www.example.com/{n}")))),
         );
         assert_eq!(
             endless.fetch(FEED),
             Err(DataError::Failed(Problem::TooManyRedirects))
         );
         assert_eq!(endless.requested.len(), MAX_REDIRECTS + 1);
+    }
+
+    #[test]
+    fn a_redirect_to_another_origin_fails_without_requesting_it() {
+        // PRIV-02: the feed's host is the only destination, whatever a response says.
+        for elsewhere in [
+            "https://cdn.example.com/feed",
+            "https://www.example.com.evil.example/feed",
+            "https://www.example.com@evil.example/feed",
+            "https://www.example.com:8443/feed",
+            "https://evil.example?www.example.com/",
+            "https://evil.example#www.example.com/",
+        ] {
+            let mut server = Server::new([
+                Ok(Hop::Redirect(elsewhere.into())),
+                Ok(Hop::Body(b"{}".to_vec())),
+            ]);
+
+            assert_eq!(
+                server.fetch(FEED),
+                Err(DataError::Failed(Problem::DownloadFailed)),
+                "{elsewhere}"
+            );
+            assert_eq!(server.requested, [FEED], "{elsewhere}");
+        }
+    }
+
+    #[test]
+    fn an_origin_ends_where_the_path_query_or_fragment_begins() {
+        assert_eq!(
+            origin("https://www.example.com/feed"),
+            "https://www.example.com"
+        );
+        assert_eq!(
+            origin("https://www.example.com?n=1"),
+            "https://www.example.com"
+        );
+        assert_eq!(
+            origin("https://www.example.com#top"),
+            "https://www.example.com"
+        );
+        assert_eq!(origin("https://www.example.com"), "https://www.example.com");
+        assert_eq!(
+            origin("https://a@www.example.com:8443/feed"),
+            "https://a@www.example.com:8443"
+        );
     }
 
     #[test]

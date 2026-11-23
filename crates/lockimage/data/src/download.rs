@@ -33,6 +33,11 @@ pub const MIN_SHORT_SIDE: u32 = 720;
 /// An image may be at most this many pixels on either side, so decoding it stays bounded
 /// (SEC-02). The feed's largest image is 3840 px wide.
 pub const MAX_SIDE: u32 = 8192;
+/// A progressive image may have at most this many pixels (SEC-02, ADR 0042). Its decoder keeps
+/// every coefficient of the whole image while it crops, 2 to 6 bytes a pixel: up to 400 MB at
+/// [`MAX_SIDE`] square, in the home's own process, but under 100 MB here. The feed's largest
+/// image, 3840 × 2160, has about 8.3 million.
+pub const MAX_PROGRESSIVE_PIXELS: u64 = 16_000_000;
 
 /// Screens at least this many dp across their smallest side turn freely, as MeeGone lets them
 /// (HOME-12): tablets, and foldables unfolded.
@@ -102,12 +107,16 @@ pub fn pick_version(versions: &[ImageVersion], screen: Size) -> Option<&ImageVer
 
 /// The size of the JPEG image in `bytes`, if it may be used (WALL-07, SEC-02): a JPEG as
 /// `jpeg` reads it, at least [`MIN_SHORT_SIDE`] on its short side and at most [`MAX_SIDE`] on
-/// either side.
+/// either side, and if progressive, at most [`MAX_PROGRESSIVE_PIXELS`] in all.
 pub fn check_image(bytes: &[u8]) -> Result<Size, DataError> {
-    let size = jpeg::size(bytes).ok_or_else(|| invalid(Problem::ImageUnreadable))?;
+    let frame = jpeg::read_frame(bytes).ok_or_else(|| invalid(Problem::ImageUnreadable))?;
+    let size = frame.size;
+    let pixels = u64::from(size.width) * u64::from(size.height);
     if size.width.min(size.height) < MIN_SHORT_SIDE {
         Err(invalid(Problem::ImageTooSmall))
-    } else if size.width.max(size.height) > MAX_SIDE {
+    } else if size.width.max(size.height) > MAX_SIDE
+        || (frame.progressive && pixels > MAX_PROGRESSIVE_PIXELS)
+    {
         Err(invalid(Problem::ImageTooLarge))
     } else {
         Ok(size)
@@ -441,6 +450,29 @@ mod tests {
         ] {
             assert_eq!(check_image(&fakes::jpeg(size)), expected, "{size:?}");
         }
+    }
+
+    #[test]
+    fn a_progressive_image_may_have_at_most_16_million_pixels() {
+        // SEC-02, ADR 0042: its decoder holds the whole image's coefficients.
+        let progressive = |size: Size| {
+            let mut bytes = fakes::jpeg(size);
+            bytes[3] = 0xC2;
+            bytes
+        };
+        for (size, expected) in [
+            (px(3840, 2160), Ok(px(3840, 2160))),
+            (px(5000, 3200), Ok(px(5000, 3200))),
+            (px(5000, 3201), Err(invalid(Problem::ImageTooLarge))),
+            (px(8192, 8192), Err(invalid(Problem::ImageTooLarge))),
+        ] {
+            assert_eq!(check_image(&progressive(size)), expected, "{size:?}");
+        }
+        // A baseline image of the same size decodes only the rows it keeps.
+        assert_eq!(
+            check_image(&fakes::jpeg(px(8192, 8192))),
+            Ok(px(8192, 8192))
+        );
     }
 
     #[test]

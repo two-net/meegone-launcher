@@ -70,7 +70,19 @@ And the localisation rules ([ADR 0040](docs/adr/0040-localisation-and-right-to-l
 - **Every string resource can be translated:** each follows a comment for translators, numbers its arguments when it has several, and only `app_name` is untranslatable.
 - **The allow-lists stay true:** an entry of `TEXT_ALLOWED` or `PROSE_ALLOWED` that matches nothing fails.
 
-What a check can't decide, such as the image source's terms (LEGAL-04) and the store graphics, is in [RELEASING.md](RELEASING.md). What only a device can show, every screen as it is drawn, is checked by the debug build's accessibility audit (`tools/a11y-audit.sh`, ADR 0038). Its tour also runs in an expanded and a right-to-left pseudo-locale (ADR 0040).
+And the security and privacy rules ([ADR 0042](docs/adr/0042-security-and-privacy.md)):
+- **The manifest asks only for SRS 8.1's access:** exactly the permissions in `PERMISSIONS_ALLOWED`, each with its row of SRS 8.1 (SEC-03).
+- **Other apps reach only the home entry, the settings entry and the notification listener:** exactly the components, guards and intent filters in `EXPORTED_ALLOWED`. Every component says whether it is exported (SEC-04).
+- **No role or reach that SEC-03 and SEC-05 rule out:** no accessibility service or device administrator, and nothing over the lock screen.
+- **HTTPS with the system's certificates only:** the app names its network security config, which refuses cleartext and has no `debug-overrides` or `domain-config`. The app isn't debuggable, test-only or profileable from the shell (SEC-01, SEC-06).
+- **The Java code that ships:**
+  - It uses none of `FORBIDDEN`: web views and links in text, the lock screen's flags, device identifiers, stack traces (SEC-02, SEC-05, PRIV-01, PRIV-03).
+  - It connects only from the files in `NETWORK_ALLOWED`, `Bridge.java` (PRIV-02).
+  - No log passes an exception (PRIV-03).
+- **The release APK as built:** after the Gradle build, CI reads it with `aapt2` and `dexdump`. It fails on the manifest rules above, and on any class only the debug build's source sets define (SEC-06).
+- **The allow-lists stay true** here too.
+
+What a check can't decide, such as the image source's terms (LEGAL-04) and the store graphics, is in [RELEASING.md](RELEASING.md). What only a device can show, every screen as it is drawn, is checked by the debug build's accessibility audit (`tools/a11y-audit.sh`, ADR 0038). Its tour also runs in an expanded and a right-to-left pseudo-locale (ADR 0040). Where the release build's traffic goes over a day is checked by `tools/net-audit.sh` (ADR 0042).
 
 ## How a feature works
 
@@ -149,7 +161,7 @@ AppsView.cell_tapped(revision, 4, icon)          ui     sends AppsIntent::Launch
   - When the host has decoded a new thumbnail over the old one, it sends `NewImageShown`, and the shell fades it in over 300 ms (ANIM-22).
 - **The image details screen** ([ADR 0031](docs/adr/0031-the-image-details-screen.md)). It shows the image, its title, its attribution as the source gives it, its date and its region, with More info, Update now and Settings (WALL-15, LEGAL-03). The card opens it, and so does the home menu's Lock-screen image once there is an image; before that, the item opens Settings at its group.
   - It is offered only while the daily image is on and has an image, and closes once it hasn't, such as when the image is turned off in Settings over it. Settings opens over it at Lock-screen image, and Back returns to it.
-  - More info opens the image's `https://` link in the default browser, only while the daily image is on, the image has a link and a browser is installed; otherwise it is hidden (SEC-02, SRS 8.1).
+  - More info opens the image's `https://` link in the default browser, or, without one, in a browser the user picks, never in another app that claims the site's links (ADR 0042). It is offered only while the daily image is on, the image has a link and a browser is installed; otherwise it is hidden (SEC-02, SRS 8.1).
   - The platform writes the date (at local noon, so the zone never moves it) and when the image last updated (`TimeStyle::DayMonthTime`). `ClockChanged` writes them again (L10N-03).
   - **The status line** (WALL-16), in Settings and on the screen: "Last updated ‹time›" and, while the checks retry, "‹problem›. Will try again later." Rust gives the parts (`UpdateStatus`), the problem as its code; the host words them from string resources (ADR 0040).
 - **Recent's cards** ([ADR 0023](docs/adr/0023-recent-cards.md)). With usage access, Recent shows up to 18 apps used in its time window, 24 hours by default, newest top-left, each as a card in its accent with its icon, label and how long ago it was used. Without access, a card says what Recent reads and why, with Allow. With nothing used, it reads "No recent apps" (REC-01 to REC-04, REC-10).
@@ -176,11 +188,11 @@ AppsView.cell_tapped(revision, 4, icon)          ui     sends AppsIntent::Launch
   - `today(region)` makes exactly one request for today's image and never retries; the updater keeps to the call budget (REL-04). The response is read strictly, at most 64 KiB, by a small JSON reader (`json.rs`). Anything unexpected is `Invalid(FORMAT_CHANGED)`, never a panic (SEC-02).
   - It gives the date, the headline as the title, the whole credit line as the attribution (LEGAL-03), an `https://` info link if there is one, whether the image is offered as a wallpaper, and three sizes, each built on `https://www.bing.com` from the image's checked name (PRIV-02).
   - The region is Automatic unless the user chose one the feed lists. Automatic matches the device's language and country, then its language, then falls back to en-US (`region.rs`, WALL-05). The lock-screen image saves the choice (`LockImageIntent::SetRegion`), chosen in Settings → Lock-screen image → Region (ADR 0035).
-  - On Android, `Bridge.httpsGet` makes one HTTPS request with the platform's certificate checks and follows no redirect. `https::fetch` follows at most 3, only to `https://` (SEC-01). Requests carry a fixed user agent, no cookies and no cache. The network security config refuses cleartext. `get` blocks, so it runs only on a JVM thread other than the main one.
+  - On Android, `Bridge.httpsGet` makes one HTTPS request with the platform's certificate checks and follows no redirect. `https::fetch` follows at most 3, only to `https://` on the first URL's origin, so a response can't send a request to another host (SEC-01, PRIV-02, ADR 0042). Requests carry a fixed user agent, no cookies and no cache. The network security config refuses cleartext. `get` blocks, so it runs only on a JVM thread other than the main one.
 - **The daily image's download** ([ADR 0028](docs/adr/0028-downloading-and-cropping-the-daily-image.md)). `Downloader::download` turns one feed image into the lock-screen image. It caches the result only when every step succeeds, so any failure keeps the current image and the wallpaper set from it (WALL-08).
   - The pure steps are tested without a device:
     - `pick_version` takes the smallest portrait version that covers the lock screen, or else the largest (WALL-06).
-    - `check_image` reads the JPEG header strictly (`jpeg.rs`) and requires 720 to 8192 px on each side (WALL-07, SEC-02).
+    - `check_image` reads the JPEG header strictly (`jpeg.rs`) and requires 720 to 8192 px on each side, and at most 16 million pixels for a progressive image, whose decoder holds the whole image (WALL-07, SEC-02, ADR 0042).
     - `plan_crop` keeps the middle in the lock screen's proportions and never scales up. It decodes at a power-of-two fraction, so the decoded picture is less than twice the result.
   - Downloads stop at 20 MB. With less free storage than that, nothing is requested ("Not enough storage space"). Every failure is plain words for the status line (WALL-16).
   - The platform decodes and crops (`WallpaperAdapter::crop_image`). On Android, `Bridge.cropImage` uses `BitmapRegionDecoder` and writes a new JPEG without metadata. What comes back is checked again, and the cache keeps the crop, never the download (PERF-08).
@@ -347,7 +359,7 @@ On Android, `meegone_core_data::android` builds the `Platform` ([ADR 0005](docs/
   - The lock screen's size, cropping the daily image, and free storage ([ADR 0028](docs/adr/0028-downloading-and-cropping-the-daily-image.md)).
   - The daily image's job through `JobScheduler` and `ImageJobService`, battery saver and Data Saver ([ADR 0029](docs/adr/0029-scheduling-the-daily-image-check.md)).
   - Setting, reading and resetting the lock screen's wallpaper through `WallpaperManager`, the system's wallpaper settings, whether the device folds, and "Update now" on the job's thread ([ADR 0030](docs/adr/0030-setting-the-lock-screen-wallpaper.md)).
-  - Opening `https://` links in the default browser ([ADR 0031](docs/adr/0031-the-image-details-screen.md)).
+  - Opening `https://` links in the default browser, or only in a browser the user picks ([ADR 0031](docs/adr/0031-the-image-details-screen.md), [ADR 0042](docs/adr/0042-security-and-privacy.md)).
   - Browsing the past week and pinning an image on the job's thread, with the rest of the user's tasks ([ADR 0032](docs/adr/0032-browsing-the-past-week-and-pinning-an-image.md)).
   - The device's dark theme, as a question and as `SystemThemeChanged` ([ADR 0033](docs/adr/0033-themes-and-the-theme-cross-fade.md)).
   - The system animation speed, as a question and as `AnimationScaleChanged` ([ADR 0034](docs/adr/0034-the-shared-motion-system.md)).
@@ -388,7 +400,7 @@ On Android, `meegone_core_data::android` builds the `Platform` ([ADR 0005](docs/
 
 Expected problems are part of each feature's own state. Examples are missing access (`Access::Missing`), a failed adapter call (`problem`, a `Problem`) and an unsupported device (`ImageStatus::Unavailable`).
 
-Bugs are contained by `Store`. It runs every intent inside `catch_unwind`. If a holder panics, the store marks that feature `Health::Failed` and never calls it again. The shell and every other feature keep working. This requires `panic = "unwind"`, which is Cargo's default; never set `panic = "abort"` in a profile.
+Bugs are contained by `Store`. It runs every intent inside `catch_unwind`. If a holder panics, the store marks that feature `Health::Failed` and never calls it again. The shell and every other feature keep working. This requires `panic = "unwind"`, which is Cargo's default; never set `panic = "abort"` in a profile. A panic that reaches the Android entry points becomes a Java exception that names only its file and line, never its message, which can quote the data it was handling (PRIV-03, ADR 0042).
 
 ## Sources of truth (ARCH-06)
 
@@ -416,7 +428,7 @@ MeeGone keeps three persistent stores, each in its own file under one private fo
 
 - **Where.**
   - `StoredFile` names every file, so nothing else can be stored. Notification content and usage history have no file (PRIV-03, EVT-13).
-  - The host gives `FileStorage` a folder in the app's private internal storage (`Context.getFilesDir()`). Android deletes that folder on uninstall and on "Clear storage" (PRIV-05).
+  - The host gives `FileStorage` a folder in the app's private internal storage (`Context.getFilesDir()`). Android deletes that folder on uninstall and on "Clear storage" (PRIV-05). The lock screen's wallpaper is the system's, and keeps the last daily image until the user changes it, as the privacy notice says (ADR 0042).
 - **Atomic writes.** `FileStorage` writes `<file>.tmp`, flushes it, renames it over the file and flushes the folder. A crash at any point leaves the old file or the new one (REL-03). Its tests stop writes part-way to check this.
 - **Format.**
   - Text: a `meegone-<kind> <version>` header, one `key field …` record per line, and an `end <checksum>` trailer.
@@ -476,7 +488,7 @@ The budgets of SRS 6.1 apply to the reference device (#48). Each has a repeatabl
 
 ## Not built yet
 
-The skeleton is from issue #1; the Android host and the home-app role from #4; the carousel of home views from #5; Home, Back and coming back to the home from #6; the home menu from #7; edge to edge, screen sizes and navigation modes from #8; the Applications grid and the app catalogue from #9; one icon shape and each app's accent from #10; the layout kept in step with the installed apps from #11; the app long-press menu from #12; edit mode from #13; folders from #14; app search from #15; hiding apps from #16; backup and restore from #17; the Events header from #18; Events' notifications from #19; opening, clearing and dismissing them from #20; the image-of-the-day card from #21; Recent's cards from #22; Recent's density and its pinch from #23; Recent's close mode and Clear all from #24; Recent's time window from #25; the image feed, the network adapter and the region from #26; downloading, checking, cropping and caching the daily image from #27; the daily image check, its retries and back-off from #28; the daily image as the lock-screen wallpaper, "Update now", the pause and the reset from #29; the image details screen, opening links and the update status from #30; browsing the past week and pinning an image from #31; System, Light and Dark themes and the theme cross-fade from #32; the shared motion system and the system animation speed from #33; the Settings screen and Reset launcher from #34; first-run setup and the home-app banner from #35; the product's name, the asset inventory, the store listing and their checks from #36; names, targets, contrast, large text, announcements and the accessibility audit from #37; gestures' alternatives, keyboards, switch access, the focus ring and reduced motion's scrolls from #38; problems as codes, the localisation checks, the locale's numbers, dates, regions and search, right-to-left tests and the pseudo-locale audit from #39; the performance benchmarks on a device and in CI, the benchmark build, icons held only near sight, and caches that shrink under memory pressure from #40. The following arrive with later requirements:
+The skeleton is from issue #1; the Android host and the home-app role from #4; the carousel of home views from #5; Home, Back and coming back to the home from #6; the home menu from #7; edge to edge, screen sizes and navigation modes from #8; the Applications grid and the app catalogue from #9; one icon shape and each app's accent from #10; the layout kept in step with the installed apps from #11; the app long-press menu from #12; edit mode from #13; folders from #14; app search from #15; hiding apps from #16; backup and restore from #17; the Events header from #18; Events' notifications from #19; opening, clearing and dismissing them from #20; the image-of-the-day card from #21; Recent's cards from #22; Recent's density and its pinch from #23; Recent's close mode and Clear all from #24; Recent's time window from #25; the image feed, the network adapter and the region from #26; downloading, checking, cropping and caching the daily image from #27; the daily image check, its retries and back-off from #28; the daily image as the lock-screen wallpaper, "Update now", the pause and the reset from #29; the image details screen, opening links and the update status from #30; browsing the past week and pinning an image from #31; System, Light and Dark themes and the theme cross-fade from #32; the shared motion system and the system animation speed from #33; the Settings screen and Reset launcher from #34; first-run setup and the home-app banner from #35; the product's name, the asset inventory, the store listing and their checks from #36; names, targets, contrast, large text, announcements and the accessibility audit from #37; gestures' alternatives, keyboards, switch access, the focus ring and reduced motion's scrolls from #38; problems as codes, the localisation checks, the locale's numbers, dates, regions and search, right-to-left tests and the pseudo-locale audit from #39; the performance benchmarks on a device and in CI, the benchmark build, icons held only near sight, and caches that shrink under memory pressure from #40; the security and privacy checks of the manifest, the Java host and the release APK, redirects kept on the feed's origin, links only to a browser, progressive images bounded, logs without data, and the traffic audit on a device from #41. The following arrive with later requirements:
 
 - **Android adapters.**
   - Built:
@@ -513,7 +525,7 @@ These are the commands CI runs (`.github/workflows/ci.yml`):
 
 ```sh
 cargo fmt --all --check
-cargo test -p arch-check                       # architecture, legal, accessibility and localisation rules
+cargo test -p arch-check                       # architecture, legal, accessibility, localisation and security rules
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 cargo bench --bench budgets                    # the Rust app's share of each performance budget
@@ -521,6 +533,7 @@ cargo coverage                                 # core-logic line coverage, fails
 cargo clippy --workspace --exclude arch-check --all-targets --target aarch64-linux-android -- -D warnings
 (cd android && ./gradlew assembleDebug assembleRelease assembleBenchmark)   # the APKs (separate CI job),
                                                # and the release APK within 15 MB (PERF-08)
+cargo test -p arch-check --test release_apk -- --ignored   # then the release APK's access and classes
 ```
 
 Building the APK needs JDK 17 or later, the Android SDK with NDK 27.3 (`ANDROID_HOME`, or `sdk.dir` in `android/local.properties`), cargo-ndk and the `aarch64-linux-android` Rust target. The workspace checks above need none of them.
@@ -537,3 +550,5 @@ The acceptance scenarios of SRS section 9 run in `tests/acceptance.rs`, one test
 The accessibility audit runs on a device, not in CI (ADR 0038). With the debug build installed (`(cd android && ./gradlew installDebug)`), `tools/a11y-audit.sh` checks every screen in both themes at font scale 1.0 and 2.0, with animations removed, and on Android 13 or later in the pseudo-locales en-XA and ar-XB, and fails on any problem it finds (ADR 0040). `--first-run` clears MeeGone's data first, so setup is checked too; use it only on a test device.
 
 The performance budgets are measured on a device too (ADR 0041). With the benchmark build installed (`(cd android && ./gradlew installBenchmark)`), `tools/perf-bench.sh` measures every budget with 300 apps, puts back what it changed, and fails on any miss. `--record` writes the results to `docs/benchmarks/`, and `--quick` takes fewer samples while trying a change.
+
+Where the traffic goes is checked on a device too (ADR 0042). With the release build and PCAPdroid installed, `tools/net-audit.sh --start` captures MeeGone's traffic alone; after a day of use, `--stop` pulls the capture and checks with tshark that every connection went to `www.bing.com` over HTTPS. `--record` writes the result to `docs/privacy/`, and `--check FILE` reads a capture made another way.

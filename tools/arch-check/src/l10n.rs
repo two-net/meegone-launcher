@@ -108,9 +108,10 @@ pub const PROSE_ALLOWED: [(&str, &str, &str); 6] = [
         "a panic's message, kept with a failed feature's health and never shown (ARCH-09)",
     ),
     (
-        "src/android.rs",
-        "panic_message",
-        "a panic's message, thrown as a Java exception for logcat only (ADR 0005)",
+        "src/panics.rs",
+        "message",
+        "where a panic happened, never its message, thrown as a Java exception for logcat \
+         only (ADR 0005, ADR 0042)",
     ),
     (
         "src/android.rs",

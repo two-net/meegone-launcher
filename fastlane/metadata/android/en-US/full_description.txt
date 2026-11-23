@@ -19,6 +19,6 @@ ACCESS
 Events needs notification access, and Recent needs usage access. Both are optional, and MeeGone says what each one reads before you allow it.
 
 PRIVACY
-MeeGone has no accounts, analytics, advertising or tracking, and collects nothing about you. Its only connection is to Bing's image feed, for the daily image, and those requests carry only the region and image size, never anything that identifies you or your device. Your notifications and app-usage history are read on this device, in memory only; the only usage data kept is which apps you removed from Recent, and when. Your layout and settings are included in the system's backup. Uninstalling MeeGone or clearing its data removes everything it stored.
+MeeGone has no accounts, analytics, advertising or tracking, and collects nothing about you. Its only connection is to Bing's image feed, for the daily image, and those requests carry only the region and image size, never anything that identifies you or your device. Your notifications and app-usage history are read on this device, in memory only; the only usage data kept is which apps you removed from Recent, and when. Your layout and settings are included in the system's backup. Uninstalling MeeGone or clearing its data removes everything it stored. The lock screen keeps the last daily image as its wallpaper until you change it, or reset it in Settings first.
 
 MeeGone Launcher is an independent project and is not affiliated with or endorsed by Nokia or Microsoft.

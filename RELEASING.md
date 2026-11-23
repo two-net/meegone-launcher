@@ -25,6 +25,14 @@ The store listing is in `fastlane/metadata/android/`, in the layout F-Droid read
 - [ ] `cargo bench --bench budgets` and the APK job also check the performance budgets as far as CI can (ADR 0041):
   - with 300 apps, the Rust app's share of Home, a cold start, a frame, a keystroke and a launch each stays within a tenth of its budget (PERF-01 to PERF-06);
   - the release APK is 15 MB or less (PERF-08).
+- [ ] `cargo test -p arch-check`, `cargo test --workspace` and the APK job also check the security and privacy rules (#41, ADR 0042):
+  - the release APK asks for exactly the permissions SRS 8.1 lists, and nothing else (SEC-03);
+  - other apps can reach only the home entry, the settings entry and the notification listener, each by its own intent filters (SEC-04);
+  - no component is an accessibility service or a device administrator, or shows over the lock screen (SEC-03, SEC-05);
+  - every connection is HTTPS with the system's certificates, with no exception for a domain or a debug build (SEC-01);
+  - the release APK isn't debuggable, test-only or profileable, and holds none of the debug build's classes (SEC-06);
+  - the shipped Java has no web view, links in text or device identifiers, connects only from the bridge, and logs no exception (SEC-02, PRIV-01, PRIV-02, PRIV-03);
+  - a redirect never leaves the image feed's origin, and a day's requests all go to `https://www.bing.com/` (PRIV-02).
 
 ## Open questions that block a release
 
@@ -76,6 +84,13 @@ The store listing is in `fastlane/metadata/android/`, in the layout F-Droid read
   - search within 50 ms of a keystroke, and a launch leaving within 50 ms of the tap (PERF-05, PERF-06);
   - at most 150 MB at rest with 300 apps, giving icons back when the system asks (PERF-07);
   - stored data within 50 MB and the APK within 15 MB (PERF-08).
+- [ ] `tools/net-audit.sh --stop --record` passes with the release build of the release's commit, after a day of use started with `tools/net-audit.sh --start`, and its results file in `docs/privacy/` is committed (#41, ADR 0042). It needs PCAPdroid on the device and Wireshark's tshark. During the day, with the daily image on:
+  - the daily job runs, and Update now is tapped once;
+  - the details screen and More info are opened;
+  - the past week is browsed, and an image is pinned and unpinned.
+
+  Every connection goes to `www.bing.com` over HTTPS (PRIV-02, SEC-01).
+- [ ] With no default browser set, More info offers only browsers, never another app that opens the site's links (SEC-02, ADR 0042).
 - [ ] Dates, times and numbers (L10N-03, L10N-04):
   - With 24-hour time on, the Events alarm and "Last updated" show 24-hour times; with it off, 12-hour ones.
   - In Arabic, Events' counts use Arabic-Indic digits.

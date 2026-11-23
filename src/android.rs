@@ -24,11 +24,12 @@
 //! lock-screen image step is read with `nativeSetupImage` (ADR 0036).
 //!
 //! A bug in MeeGone becomes a Java `RuntimeException` instead of an abort, so its message
-//! reaches logcat. Containing it keeps `panic = "unwind"`, as ARCH-09 already requires.
+//! reaches logcat. Containing it keeps `panic = "unwind"`, as ARCH-09 already requires. A
+//! panic's message says only where it happened, never the data it was handling (PRIV-03,
+//! ADR 0042).
 
 #![allow(non_snake_case)] // JNI names native methods `Java_<class>_<method>`.
 
-use std::any::Any;
 use std::cell::RefCell;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::OnceLock;
@@ -4046,22 +4047,14 @@ fn with_launcher(env: Env, step: impl FnOnce(&mut Launcher)) {
     });
 }
 
-/// Runs `body`, turning an error or a panic into a Java exception.
+/// Runs `body`, turning an error or a panic into a Java exception. An error's message is a
+/// Problem's code or fixed text; a panic's says only where it happened (PRIV-03).
 fn guarded(env: Env, body: impl FnOnce() -> Result<(), String>) {
+    crate::panics::hide_messages();
     let message = match panic::catch_unwind(AssertUnwindSafe(body)) {
         Ok(Ok(())) => return,
         Ok(Err(message)) => message,
-        Err(payload) => panic_message(payload.as_ref()),
+        Err(_) => crate::panics::message(),
     };
     env.throw_runtime_exception(&message);
-}
-
-fn panic_message(payload: &(dyn Any + Send)) -> String {
-    if let Some(message) = payload.downcast_ref::<&str>() {
-        (*message).to_owned()
-    } else if let Some(message) = payload.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "MeeGone failed".to_owned()
-    }
 }

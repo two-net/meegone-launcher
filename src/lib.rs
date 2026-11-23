@@ -7,6 +7,8 @@
 
 #[cfg(target_os = "android")]
 mod android;
+#[cfg(any(target_os = "android", test))]
+mod panics;
 
 pub use meegone_core_data::{Platform, Rect};
 pub use meegone_shell_state::{

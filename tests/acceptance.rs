@@ -5152,6 +5152,64 @@ fn pwr03_browsing_and_pinning_keep_a_day_within_10_mb() {
 }
 
 #[test]
+fn priv02_a_day_of_use_asks_only_the_image_feeds_origin() {
+    // Issue #41: PRIV-02, SEC-01, SEC-02. The host's half of "traffic captured over a day of
+    // use goes only to the image feed's hosts"; tools/net-audit.sh checks a device (ADR 0042).
+    // The morning is offline, so the job retries. Then the connection comes back, and the user
+    // reads the details, opens More info, browses the past week, pins an image and unpins it,
+    // and taps Update now.
+    const FEED_ORIGIN: &str = "https://www.bing.com/";
+    let fakes = Fakes::after_setup();
+    serve_todays_image(&fakes);
+    serve_the_past_week(&fakes, 1_000, 1_000);
+    *fakes.network.state.lock().unwrap() = NetworkState::Offline;
+    let (shared, mut launcher) = with_the_daily_check(&fakes);
+    assert!(run_the_daily_job(&fakes, &shared, &mut launcher, NOV_19_MS + 2 * HOUR_MS) > 1);
+    assert_eq!(lock_screen(&fakes), None);
+
+    *fakes.network.state.lock().unwrap() = NetworkState::Unmetered;
+    run_the_daily_job(&fakes, &shared, &mut launcher, NOV_19_MS + 8 * HOUR_MS);
+    assert!(lock_screen(&fakes).is_some());
+
+    launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
+    tap_the_image_card(&mut launcher);
+    assert!(
+        image_details(&mut launcher)
+            .expect("the details show")
+            .more_info
+    );
+    assert!(launcher.view().image_details().more_info());
+    launcher.frame();
+    assert!(launcher.view().image_details().past_images());
+    launcher.frame();
+    run_update_now(&shared, &mut launcher);
+    let (revision, _) = past_images(&mut launcher).expect("the past week shows");
+    assert!(launcher.view().past_images().pin(revision, 2));
+    launcher.frame();
+    run_update_now(&shared, &mut launcher);
+    assert_eq!(current_image(&fakes), Some((WEEK[2].to_owned(), true)));
+    assert!(launcher.view().past_images().unpin());
+    launcher.frame();
+    run_update_now(&shared, &mut launcher);
+    launcher.dispatch(ShellIntent::OpenSettings);
+    launcher.view().image_settings().update_now();
+    launcher.frame();
+    run_update_now(&shared, &mut launcher);
+    run_the_daily_job(&fakes, &shared, &mut launcher, NOV_19_MS + 24 * HOUR_MS);
+
+    // Every request, failed or not, went to the feed's one origin.
+    let requests = fakes.network.requests.lock().unwrap();
+    assert!(requests.len() > 10, "{requests:#?}");
+    for url in requests.iter() {
+        assert!(url.starts_with(FEED_ORIGIN), "{url}");
+    }
+    // More info opened in the browser, outside MeeGone, which didn't request it itself.
+    let opened = fakes.system.opened_urls.lock().unwrap();
+    assert_eq!(opened.len(), 1);
+    assert!(requests.iter().all(|url| url != &opened[0]));
+}
+
+#[test]
 fn set01_settings_opens_from_the_home_menu_and_from_the_systems_settings_entry() {
     // Issue #34: SET-01, AC-19. The menu opens without a gesture, as a screen reader opens it.
     let (mut launcher, _) = on_a_phone(&Fakes::after_setup());

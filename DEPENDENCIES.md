@@ -20,3 +20,8 @@ The Android app in `android/` (ADR 0005) adds no library to the app. Its Java co
 - **cargo-ndk**, pinned in CI, which builds the Rust app with the Android NDK.
 
 Neither collects or transmits data from the app; both run only on the build machine.
+
+Checking the release build (ADR 0042) uses tools that aren't part of the app either:
+
+- **`aapt2` and `dexdump`**, from the Android SDK's build tools, which CI's runner already has. `tools/arch-check/tests/release_apk.rs` reads the release APK's manifest and classes with them.
+- **PCAPdroid** on a test device and **Wireshark's tshark** on the computer, for `tools/net-audit.sh` before a release. PCAPdroid captures only MeeGone's traffic, into a file on the device that the script pulls; nothing is sent anywhere.

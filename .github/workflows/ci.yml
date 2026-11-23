@@ -36,6 +36,11 @@ jobs:
       # text for the user written in Java or Rust code rather than a string resource, a number
       # shown in ASCII digits whatever the language, a Problem without its words, and a string
       # resource without a comment for translators or with unnumbered arguments (ADR 0040).
+      # And fails on a permission SRS 8.1 doesn't list, a component other apps can reach beyond
+      # the home entry, the settings entry and the notification listener, a network config that
+      # allows cleartext or certificates other than the system's, an API MeeGone rules out (web
+      # views, links in text, the lock screen, device identifiers), a connection outside the
+      # bridge, and a log that carries an exception (ADR 0042).
       - name: Architecture rules
         run: cargo test -p arch-check
 
@@ -105,6 +110,13 @@ jobs:
       - name: Build the APK
         working-directory: android
         run: ./gradlew assembleDebug assembleRelease assembleBenchmark
+
+      # SEC-03, SEC-04, SEC-06: the release APK, as built, asks for exactly SRS 8.1's
+      # permissions, lets other apps reach only the home entry, the settings entry and the
+      # notification listener, isn't debuggable, and holds none of the debug build's own
+      # classes. The runner's aapt2 and dexdump read it (ADR 0042).
+      - name: Release build's access
+        run: cargo test -p arch-check --test release_apk -- --ignored
 
       # PERF-08: the release APK, which is what installs, stays within 15 MB.
       - name: Install size

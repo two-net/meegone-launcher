@@ -408,10 +408,11 @@
     <string name="settings_group_about">About</string>
     <!-- Above the installed version, e.g. "0.1.0". -->
     <string name="about_version">Version</string>
-    <!-- The privacy notice (PRIV-04): exactly what PRIV-01 to PRIV-03 and PRIV-05 promise, and
-         that the layout and settings join the system's backup (ADR 0018). -->
+    <!-- The privacy notice (PRIV-04): exactly what PRIV-01 to PRIV-03 and PRIV-05 promise, that
+         the layout and settings join the system's backup (ADR 0018), and that the lock screen's
+         wallpaper, which the system keeps, stays after an uninstall (ADR 0042). -->
     <string name="about_privacy">Privacy notice</string>
-    <string name="about_privacy_notice">MeeGone has no accounts, analytics, advertising or tracking, and collects nothing about you. Its only connection is to Bing\'s image feed, for the daily image, and those requests carry only the region and image size, never anything that identifies you or your device. Your notifications and app-usage history are read on this device, in memory only; the only usage data kept is which apps you removed from Recent, and when. Your layout and settings are included in the system\'s backup. Uninstalling MeeGone or clearing its data removes everything it stored.</string>
+    <string name="about_privacy_notice">MeeGone has no accounts, analytics, advertising or tracking, and collects nothing about you. Its only connection is to Bing\'s image feed, for the daily image, and those requests carry only the region and image size, never anything that identifies you or your device. Your notifications and app-usage history are read on this device, in memory only; the only usage data kept is which apps you removed from Recent, and when. Your layout and settings are included in the system\'s backup. Uninstalling MeeGone or clearing its data removes everything it stored. The lock screen keeps the last daily image as its wallpaper until you change it, or reset it in Settings first.</string>
     <!-- The non-affiliation statement (LEGAL-05), word for word. -->
     <string name="about_independent">MeeGone Launcher is an independent project and is not affiliated with or endorsed by Nokia or Microsoft.</string>
     <!-- Opens the third-party code MeeGone includes, with their licences (LEGAL-06). -->

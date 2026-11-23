@@ -281,7 +281,7 @@ final class Bridge {
                         && context.getPackageName().equals(info.activityInfo.packageName);
             }
         } catch (RuntimeException e) {
-            Log.w(TAG, "Couldn't check the default home app", e);
+            Log.w(TAG, "Couldn't check the default home app: " + e.getClass().getSimpleName());
             held = false;
         }
         Log.i(TAG, "Default home app: " + held);
@@ -310,7 +310,7 @@ final class Bridge {
             }
             return openHomeSettings(current) ? null : homeInstructions();
         } catch (RuntimeException e) {
-            Log.w(TAG, "Couldn't ask for the home role", e);
+            Log.w(TAG, "Couldn't ask for the home role: " + e.getClass().getSimpleName());
             return homeInstructions();
         }
     }
@@ -381,7 +381,7 @@ final class Bridge {
             Log.i(TAG, "Gesture navigation: " + gestures);
             return gestures;
         } catch (RuntimeException e) {
-            Log.w(TAG, "Couldn't check the navigation mode", e);
+            Log.w(TAG, "Couldn't check the navigation mode: " + e.getClass().getSimpleName());
             return true;
         }
     }
@@ -398,7 +398,7 @@ final class Bridge {
             return decor != null
                     && decor.performHapticFeedback(HapticFeedbackConstants.LONG_PRESS);
         } catch (RuntimeException e) {
-            Log.w(TAG, "Couldn't play the haptic tick", e);
+            Log.w(TAG, "Couldn't play the haptic tick: " + e.getClass().getSimpleName());
             return false;
         }
     }
@@ -440,11 +440,12 @@ final class Bridge {
     }
 
     /**
-     * Opens {@code url} in the device's browser, outside MeeGone (WALL-15, SEC-02, ADR 0031).
-     * Anything but an {@code https:} link with a host is refused. Where a default browser is set,
-     * the link goes to it, so an app that claims the site's links doesn't take it. Returns null, or
-     * a {@link Problems} code if no browser could open it. The link is never logged. Called from
-     * Rust.
+     * Opens {@code url} in the device's browser, outside MeeGone (WALL-15, SEC-02, ADR 0031,
+     * ADR 0042). Anything but an {@code https:} link with a host is refused. Only a browser may
+     * take it, never an app that claims the site's links: the default browser where one is set,
+     * and otherwise whichever browser the user picks, as the selector lets only apps in the
+     * browser category answer. Returns null, or a {@link Problems} code if no browser could open
+     * it. The link is never logged. Called from Rust.
      */
     String openInBrowser(String url) {
         try {
@@ -458,15 +459,18 @@ final class Bridge {
             String browser = defaultBrowser();
             Activity current = activity;
             Context from = current != null ? current : context;
-            try {
-                from.startActivity(new Intent(view).setPackage(browser));
-            } catch (ActivityNotFoundException e) {
-                if (browser == null) {
-                    throw e;
+            if (browser != null) {
+                try {
+                    from.startActivity(new Intent(view).setPackage(browser));
+                    return null;
+                } catch (ActivityNotFoundException e) {
+                    // The default browser can't take it after all: another browser may.
                 }
-                // The default browser can't take it after all: any browser may.
-                from.startActivity(view);
             }
+            // A selector can't be combined with a package, so this one has none.
+            view.setSelector(Intent.makeMainSelectorActivity(
+                    Intent.ACTION_MAIN, Intent.CATEGORY_APP_BROWSER));
+            from.startActivity(view);
             return null;
         } catch (RuntimeException e) {
             // ActivityNotFoundException: no browser is installed.
@@ -579,7 +583,7 @@ final class Bridge {
             DebugHooks.padApps(fields, collator, latin);
             return fields.toArray(new String[0]);
         } catch (RuntimeException e) {
-            Log.w(TAG, "Couldn't list the apps", e);
+            Log.w(TAG, "Couldn't list the apps: " + e.getClass().getSimpleName());
             return null;
         }
     }
@@ -599,7 +603,7 @@ final class Bridge {
             }
             return fields.toArray(new String[0]);
         } catch (RuntimeException e) {
-            Log.w(TAG, "Couldn't list the profiles", e);
+            Log.w(TAG, "Couldn't list the profiles: " + e.getClass().getSimpleName());
             return null;
         }
     }
@@ -872,7 +876,7 @@ final class Bridge {
             context.getSystemService(LauncherApps.class).registerCallback(new AppsCallback(), main);
             receive(CATALOGUE_CHANGES, this::appsChanged);
         } catch (RuntimeException e) {
-            Log.w(TAG, "Couldn't watch the apps", e);
+            Log.w(TAG, "Couldn't watch the apps: " + e.getClass().getSimpleName());
         }
     }
 
@@ -898,7 +902,7 @@ final class Bridge {
                 main.post(reportClockChanged);
             });
         } catch (RuntimeException e) {
-            Log.w(TAG, "Couldn't watch the clock", e);
+            Log.w(TAG, "Couldn't watch the clock: " + e.getClass().getSimpleName());
         }
     }
 

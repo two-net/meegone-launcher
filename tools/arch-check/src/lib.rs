@@ -11,19 +11,26 @@
 //! - in [`a11y`], the accessibility rules of ADR 0038: every colour the Java host draws comes
 //!   from the theme's tokens, and every text size follows the system font size (A11Y-03,
 //!   A11Y-04);
-//! - and, in [`l10n`], the localisation rules of ADR 0040: neither the Java host nor the Rust
-//!   app writes text for the user outside string resources, no number reaches the screen in
-//!   ASCII digits whatever the language, every `Problem` is worded, and every string resource
-//!   can be translated (L10N-01, L10N-03).
+//! - in [`l10n`], the localisation rules of ADR 0040: neither the Java host nor the Rust app
+//!   writes text for the user outside string resources, no number reaches the screen in ASCII
+//!   digits whatever the language, every `Problem` is worded, and every string resource can be
+//!   translated (L10N-01, L10N-03);
+//! - and, in [`security`], the security and privacy rules of ADR 0042: the manifest asks only
+//!   for SRS 8.1's access and lets other apps reach only the home entry, the settings entry and
+//!   the notification listener, the network config allows only HTTPS with the system's
+//!   certificates, and the shipped Java stays off the APIs MeeGone rules out, connects only from
+//!   the bridge and logs no exception (SEC-01 to SEC-06, PRIV-01 to PRIV-03).
 //!
 //! The rules are pure functions over a [`Graph`] and over source text; [`load`] reads the graph
 //! with `cargo metadata`, and [`os_access_violations`] reads the app's sources.
-//! `tests/workspace.rs`, `tests/legal.rs`, `tests/a11y.rs` and `tests/l10n.rs` run them on this
-//! repository, so CI fails on any violation.
+//! `tests/workspace.rs`, `tests/legal.rs`, `tests/a11y.rs`, `tests/l10n.rs` and
+//! `tests/security.rs` run them on this repository, so CI fails on any violation.
+//! `tests/release_apk.rs` runs the manifest rules on the release APK once Gradle has built it.
 
 pub mod a11y;
 pub mod l10n;
 pub mod legal;
+pub mod security;
 
 use std::collections::BTreeSet;
 use std::fmt;

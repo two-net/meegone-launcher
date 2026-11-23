@@ -39,8 +39,8 @@ use meegone_core_data::{DataError, Problem, StorageAdapter, StoredFile, Wallpape
 
 pub use bing::BingFeed;
 pub use download::{
-    Downloader, LARGE_SCREEN_DP, MAX_DOWNLOAD_BYTES, MAX_SIDE, MIN_SHORT_SIDE, check_image,
-    lock_screen_target, pick_version, plan_crop,
+    Downloader, LARGE_SCREEN_DP, MAX_DOWNLOAD_BYTES, MAX_PROGRESSIVE_PIXELS, MAX_SIDE,
+    MIN_SHORT_SIDE, check_image, lock_screen_target, pick_version, plan_crop,
 };
 pub use feed::{FeedImage, ImageFeed, ImageVersion, PAST_WEEK_IMAGES};
 pub use past::{
