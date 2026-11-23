@@ -52,6 +52,13 @@ android {
             java.directories += "src/debug/java"
         }
     }
+
+    // A call newer than Android 10 without its version check fails the release build (COMP-01,
+    // ADR 0044): assembleRelease runs lint's vital checks, which leave NewApi out by default.
+    // They check the shipped code only; the debug hooks meet Android 10 on its emulator run.
+    lint {
+        fatal += "NewApi"
+    }
 }
 
 /** Builds the Rust app as `libmeegone_launcher.so` for each ABI, with cargo-ndk. */

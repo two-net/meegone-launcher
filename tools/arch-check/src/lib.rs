@@ -21,19 +21,23 @@
 //!   the notification listener, the network config allows only HTTPS with the system's
 //!   certificates, and the shipped Java stays off the APIs MeeGone rules out, connects only from
 //!   the bridge and logs no exception (SEC-01 to SEC-06, PRIV-01 to PRIV-03);
-//! - and, in [`reliability`], the reliability rules of ADR 0043: nothing keeps a crash from the
+//! - in [`reliability`], the reliability rules of ADR 0043: nothing keeps a crash from the
 //!   platform's stability reports or ends the process but Restart MeeGone, and the build adds
 //!   no library or SDK, such as a crash reporter, nor bugs made to order outside the debug
-//!   build (REL-07, ARCH-09).
+//!   build (REL-07, ARCH-09);
+//! - and, in [`compat`], the compatibility rules of ADR 0044: the oldest Android is the same in
+//!   the SRS, the APK and the Rust library, lint's `NewApi` stays fatal, and the shipped Java
+//!   hides no call from it without a reason (COMP-01).
 //!
 //! The rules are pure functions over a [`Graph`] and over source text; [`load`] reads the graph
 //! with `cargo metadata`, and [`os_access_violations`] reads the app's sources.
 //! `tests/workspace.rs`, `tests/legal.rs`, `tests/a11y.rs`, `tests/l10n.rs`,
-//! `tests/security.rs` and `tests/reliability.rs` run them on this repository, so CI fails on any
-//! violation. `tests/release_apk.rs` runs the manifest rules on the release APK once Gradle has
+//! `tests/security.rs`, `tests/reliability.rs` and `tests/compat.rs` run them on this repository,
+//! so CI fails on any violation. `tests/release_apk.rs` runs the manifest rules on the release APK once Gradle has
 //! built it, and checks it holds nothing but MeeGone's own code.
 
 pub mod a11y;
+pub mod compat;
 pub mod l10n;
 pub mod legal;
 pub mod reliability;

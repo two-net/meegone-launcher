@@ -39,6 +39,10 @@ The store listing is in `fastlane/metadata/android/`, in the layout F-Droid read
   - a saved file that a bug can't read loads as the defaults, and a daily check that panics backs off and says so;
   - nothing in the Java host hides a crash or ends the process but Restart MeeGone; the build adds no library, and the release APK holds only MeeGone's own classes and no fault hook (REL-07, SEC-06);
   - `meegone-core-state` doesn't compile unless panics unwind.
+- [ ] `cargo test -p arch-check` and the APK job also check the compatibility rules (#43, ADR 0044):
+  - Android 10, API level 29, is the oldest version everywhere it is set: SRS.md, the APK's `minSdk` and the Rust library's build (COMP-01);
+  - lint's `NewApi` is fatal, so a call newer than Android 10 without its version check fails the release build, and nothing turns it off;
+  - the shipped Java hides no call from that check without a reason in `API_HIDING_ALLOWED`.
 
 ## Open questions that block a release
 
@@ -107,6 +111,46 @@ The store listing is in `fastlane/metadata/android/`, in the layout F-Droid read
   - In Arabic, Events' counts use Arabic-Indic digits.
   - In Swedish, Settings → Applications → Hidden apps, and a first start's grid, put "Ö…" after "Z…".
   - Searching "lodz" finds an app called "Łódź…".
+
+## The device matrix
+
+Before each release, MeeGone runs on the devices and in the modes it claims (COMP-01 to COMP-04, #43, ADR 0044). Every row uses the debug build of the release's commit, `(cd android && ./gradlew installDebug)`, with setup done and the daily image on. Each `tools/compat-check.sh --record` writes a file in `docs/devices/`; commit every one. ADR 0044 says which earlier ADR's checks each item covers.
+
+- [ ] `tools/compat-check.sh --record` passes on each row that runs every release:
+  - the reference device, with `--reference`: the Galaxy S22 until #48;
+  - Android 10 (API 29), a phone or an arm64 emulator, in all three navigation modes. Two-button navigation exists only on Android 10 and 11;
+  - a tablet, and a foldable, physical or emulated.
+
+  Where adb can't switch the navigation mode, as on Samsung, run it from a terminal so it can ask for each mode, or once per mode with `--mode`, which records each in its own file. Without a terminal it asks nothing; pass the lock screen's answer with `--lock-screen yes` or `no`.
+- [ ] At least one row has a work profile, made by a device-policy app such as Test DPC; its file lists it under Profiles.
+- [ ] COMP-04's rows are recorded for this release, or carried over with the version in their files: a Google Pixel phone, a Samsung phone, a phone from another major brand, a physical tablet and a physical foldable. They run again if the Java host has changed how it handles the window, its insets, Back, Home or profiles. An emulator never fills one.
+- [ ] Every file says whether the lock-screen image appeared on that device (SRS C5). A "doesn't appear" is recorded, not failed: a maker's lock screen drawing over the wallpaper is beyond MeeGone.
+- [ ] Every ❌ in a file is fixed, or the file links an open issue for it. A skipped check isn't a pass.
+- [ ] `tools/a11y-audit.sh` passes on the Android 10, tablet and foldable rows, the tablet's with a folder, and again with `--first-run` on the Android 10 row.
+- [ ] By hand:
+  - **On the reference device, with MeeGone as the default home:**
+    - an app's window grows from its icon (ANIM-08);
+    - an app's long-press menu shows its shortcuts;
+    - a view caught by a finger mid-motion stops there;
+    - a badge tapped as it appears works;
+    - changing the theme with search open keeps its text.
+  - **On the Android 10 row:**
+    - search's results stay above the keyboard;
+    - an edge's overscroll glow takes the theme's colour, in both themes;
+    - setup's default-home step shows the system's dialog, the home-app banner shows when it's declined, and Back steps back through setup.
+  - **On the tablet or foldable row:**
+    - a pinch on Recent changes its density and reflows the cards;
+    - the image-of-the-day card fades to a new image.
+  - **With the work profile:**
+    - a work app's notification shows in Events and opens, and its menu opens the app's notification settings;
+    - if the profile has its own lock, after a restart its apps keep their places until it is unlocked.
+  - **In Events:**
+    - the alarm row opens the clock app;
+    - changing the time zone, and midnight passing, update the header;
+    - a playing media notification shows;
+    - turning notification access on with the system's own switch fills Events;
+    - tapping a notification opens its app, and it is cleared if it auto-cancels.
+  - **On a test device, as they change the owner's data:** Clear in Events, and a confirmed reset in Settings.
 
 ## After a release
 

@@ -105,6 +105,7 @@ public final class HomeActivity extends Activity {
         }
         DebugHooks.readAuditExtras(this, views, getIntent());
         DebugHooks.readFaultExtras(getIntent());
+        DebugHooks.readCompatExtras(this, views, getIntent());
         DebugHooks.created(views, started);
     }
 
@@ -130,6 +131,7 @@ public final class HomeActivity extends Activity {
         }
         DebugHooks.readAuditExtras(this, views, intent);
         DebugHooks.readFaultExtras(intent);
+        DebugHooks.readCompatExtras(this, views, intent);
     }
 
     @Override
@@ -220,6 +222,7 @@ public final class HomeActivity extends Activity {
     private void back() {
         nativeBack();
         views.refresh();
+        DebugHooks.back(views);
     }
 
     /**

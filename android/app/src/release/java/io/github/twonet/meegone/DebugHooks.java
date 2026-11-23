@@ -25,6 +25,10 @@ final class DebugHooks {
 
     static void home(HomeViews views) {}
 
+    static void back(HomeViews views) {}
+
+    static void readCompatExtras(HomeActivity activity, HomeViews views, Intent intent) {}
+
     static void typed(HomeViews views) {}
 
     static void touched(MotionEvent event) {}

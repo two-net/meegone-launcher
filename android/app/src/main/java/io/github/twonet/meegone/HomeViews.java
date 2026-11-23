@@ -3859,6 +3859,16 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         return frame[CURRENT];
     }
 
+    /** Settings: 0 closed, 1 open, 2 open at Lock-screen image. */
+    int auditSettings() {
+        return frame[SETTINGS];
+    }
+
+    /** Whether Settings says the device may not show the image on its lock screen (C5). */
+    boolean auditImageMayNotShow() {
+        return frame[IMAGE_MAY_NOT_SHOW] != 0;
+    }
+
     /** The theme chosen in Settings, a value of {@link #THEMES}, or -1 while not offered. */
     int auditTheme() {
         return frame[THEME];

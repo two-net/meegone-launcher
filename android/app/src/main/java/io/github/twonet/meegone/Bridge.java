@@ -109,10 +109,10 @@ final class Bridge {
     private static final int APP_AVAILABLE = 1;
     private static final int APP_CAN_UNINSTALL = 2;
     private static final int APP_WORK = 4;
-    // A profile: serial number, flags.
-    private static final int PROFILE_WORK = 1;
-    private static final int PROFILE_PAUSED = 2;
-    private static final int PROFILE_LOCKED = 4;
+    // A profile: serial number, flags. Also read by the debug build's CompatProbe (ADR 0044).
+    static final int PROFILE_WORK = 1;
+    static final int PROFILE_PAUSED = 2;
+    static final int PROFILE_LOCKED = 4;
     // A shortcut (ADR 0013): id, short label, flags, rank.
     private static final int SHORTCUT_MANIFEST = 1;
     // A notification (ADR 0020), mirrored in crates/core/data/src/notification_records.rs: key,
@@ -354,11 +354,21 @@ final class Bridge {
     /**
      * Whether the system animates the home's return from an app itself, so MeeGone's own return
      * motion would double up (ANIM-09, ADR 0007). It does with gesture navigation, whose
-     * swipe-home motion carries the app into the home: the navigation bar is then there but
-     * has nothing to tap. With unknown insets the answer is yes, so the two never double up.
-     * Called from Rust.
+     * swipe-home motion carries the app into the home. Two signs tell it from buttons (ADR 0044):
+     *
+     * <ul>
+     *   <li>A side edge takes system gestures beyond any bar there: the Back swipe's edge. Only
+     *       gesture navigation has one, and it shows even with a taskbar, which has buttons to
+     *       tap whatever the mode.
+     *   <li>Nothing at the screen's edges can be tapped, yet the bar or the system's gestures
+     *       take the bottom: the navigation handle, shown or hidden.
+     * </ul>
+     *
+     * <p>With unknown insets the answer is yes, so the two never double up. Each answer is
+     * logged with its insets, which {@code tools/compat-check.sh} reads in every mode. Called
+     * from Rust.
      */
-    @SuppressWarnings("deprecation") // getTappableElementInsets is the only way on Android 10.
+    @SuppressWarnings("deprecation") // The Insets getters are the only way on Android 10.
     boolean animatesReturnHome() {
         Activity current = activity;
         try {
@@ -369,16 +379,24 @@ final class Bridge {
             }
             Insets tappable;
             Insets bars;
+            Insets gestureEdges;
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 tappable = insets.getInsets(WindowInsets.Type.tappableElement());
                 bars = insets.getInsets(WindowInsets.Type.navigationBars());
+                gestureEdges = insets.getInsets(WindowInsets.Type.systemGestures());
             } else {
                 tappable = insets.getTappableElementInsets();
                 bars = insets.getSystemWindowInsets();
+                gestureEdges = insets.getSystemGestureInsets();
             }
-            boolean gestures = tappable.left == 0 && tappable.right == 0 && tappable.bottom == 0
-                    && (bars.left > 0 || bars.right > 0 || bars.bottom > 0);
-            Log.i(TAG, "Gesture navigation: " + gestures);
+            boolean backEdge = gestureEdges.left > bars.left || gestureEdges.right > bars.right;
+            boolean handle = tappable.left == 0 && tappable.right == 0 && tappable.bottom == 0
+                    && (bars.left > 0 || bars.right > 0 || bars.bottom > 0
+                            || gestureEdges.bottom > 0);
+            boolean gestures = backEdge || handle;
+            Log.i(TAG, "Gesture navigation: " + gestures + " (back edge " + backEdge
+                    + ", handle " + handle + "; tappable " + tappable + ", bars " + bars
+                    + ", gestures " + gestureEdges + ")");
             return gestures;
         } catch (RuntimeException e) {
             Log.w(TAG, "Couldn't check the navigation mode: " + e.getClass().getSimpleName());

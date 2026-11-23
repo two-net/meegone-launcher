@@ -43,7 +43,9 @@ jobs:
       # bridge, and a log that carries an exception (ADR 0042). And fails on Java that sets an
       # uncaught-exception handler, kills a process or exits outside Restart MeeGone, a Gradle
       # build that adds a library or another plugin, and bugs made to order turned on outside
-      # the debug build (ADR 0043).
+      # the debug build (ADR 0043). And fails on an oldest Android that differs between SRS.md,
+      # minSdk and the Rust library's build, a Gradle build that lets lint's NewApi through, and
+      # shipped Java that hides a call from it without a reason (ADR 0044).
       - name: Architecture rules
         run: cargo test -p arch-check
 

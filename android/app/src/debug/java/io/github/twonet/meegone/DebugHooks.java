@@ -51,6 +51,14 @@ final class DebugHooks {
      */
     static final String EXTRA_FAULT = "io.github.twonet.meegone.debug.FAULT";
 
+    /**
+     * Turns {@link CompatProbe} on for the rest of the process and logs its report under
+     * {@code MeeGoneCompat}, for {@code tools/compat-check.sh} (ADR 0044): {@code adb shell am
+     * start -n io.github.twonet.meegone/.HomeActivity --ez <this> true}. Without the Home
+     * category, it changes nothing on the home.
+     */
+    static final String EXTRA_COMPAT = "io.github.twonet.meegone.debug.COMPAT";
+
     /** The parts, in the Rust app's {@code Feature} order, as {@link #EXTRA_FAULT} names them. */
     private static final String[] PARTS = {"applications", "events", "recent", "image", "settings"};
 
@@ -138,9 +146,27 @@ final class DebugHooks {
         PerfProbe.created(views, started);
     }
 
-    /** The system's Home action reached the home (PERF-01). */
+    /**
+     * Turns the compatibility probe on and logs its report if {@code intent} asks for it (ADR
+     * 0044). The extra is taken off, so the activity made again after a configuration change
+     * doesn't report again.
+     */
+    static void readCompatExtras(HomeActivity activity, HomeViews views, Intent intent) {
+        if (intent != null && intent.getBooleanExtra(EXTRA_COMPAT, false)) {
+            intent.removeExtra(EXTRA_COMPAT);
+            CompatProbe.report(activity, views);
+        }
+    }
+
+    /** The system's Home action reached the home (PERF-01, COMP-02). */
     static void home(HomeViews views) {
         PerfProbe.home(views);
+        CompatProbe.home(views);
+    }
+
+    /** Back reached the home and the Rust app has answered it (COMP-02). */
+    static void back(HomeViews views) {
+        CompatProbe.back(views);
     }
 
     /** Search's text changed (PERF-05). */

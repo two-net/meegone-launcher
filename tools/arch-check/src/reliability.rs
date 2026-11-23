@@ -172,7 +172,7 @@ fn names(allowed: &[(&str, &str)]) -> String {
 }
 
 /// Kotlin `text` with its comments blanked, keeping every line where it was.
-fn kotlin_code_only(text: &str) -> String {
+pub(crate) fn kotlin_code_only(text: &str) -> String {
     let mut code = String::with_capacity(text.len());
     let mut in_block = false;
     for line in text.lines() {

@@ -2,11 +2,13 @@
 //! (MAINT-03). Each test carries its scenario's id; each feature adds its own here.
 //!
 //! AC-18 to AC-20 (animation scale, screen reader, timing) need a device to check in full; they
-//! belong to the device matrix (#43) and, for AC-20's 50 Homes and 30 s of swiping, to
-//! `tools/perf-bench.sh` (ADR 0041). Their core logic is tested without one: every flow with
-//! animations removed (AC-18, ANIM-05) and the actions a screen reader, a switch or a keyboard
-//! sends (AC-19, A11Y-05, A11Y-06) here, the carousel's in `meegone-shell-state`, and the Rust
-//! app's share of AC-20's time in `benches/budgets.rs`.
+//! are by-hand items of RELEASING.md, run on the device matrix (ADR 0044), and, for AC-20's 50
+//! Homes and 30 s of swiping, `tools/perf-bench.sh` (ADR 0041). Their core logic is tested
+//! without one: every flow with animations removed (AC-18, ANIM-05) and the actions a screen
+//! reader, a switch or a keyboard sends (AC-19, A11Y-05, A11Y-06) here, the carousel's in
+//! `meegone-shell-state`, and the Rust app's share of AC-20's time in `benches/budgets.rs`.
+//! COMP-02's Home and Back in each navigation mode are tested here with the fake's two answers,
+//! and on each device of the matrix by `tools/compat-check.sh`.
 
 mod backup;
 
