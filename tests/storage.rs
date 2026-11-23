@@ -108,11 +108,11 @@ fn damaged_files_load_as_defaults_without_a_crash() {
     let launcher = Launcher::start(fakes.platform());
 
     let shell = launcher.shell();
-    assert_eq!(*shell.theme().health(), Health::Ready);
-    assert_eq!(*shell.apps().health(), Health::Ready);
-    assert_eq!(*shell.recent().health(), Health::Ready);
-    assert_eq!(*shell.lockimage().health(), Health::Ready);
-    assert_eq!(*shell.settings().health(), Health::Ready);
+    assert_eq!(shell.theme().health(), Health::Ready);
+    assert_eq!(shell.apps().health(), Health::Ready);
+    assert_eq!(shell.recent().health(), Health::Ready);
+    assert_eq!(shell.lockimage().health(), Health::Ready);
+    assert_eq!(shell.settings().health(), Health::Ready);
     assert_eq!(shell.theme().state().theme, Theme::Light);
     assert_eq!(shell.lockimage().state().current, None);
     assert_eq!(grid(&launcher), ["Mail"]);

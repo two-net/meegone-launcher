@@ -455,6 +455,18 @@
     <string name="home_banner_text">MeeGone isn\'t your home screen yet.</string>
     <string name="home_banner_dismiss">Dismiss</string>
 
+    <!-- A card where a part of MeeGone stopped working after a bug, while the rest goes on
+         working (ARCH-09, ADR 0043). Each names the part as the home views and Settings do. The
+         card's one button is stopped_restart. -->
+    <string name="stopped_applications">Applications stopped working. Tapping an app still opens it.</string>
+    <string name="stopped_events">Events stopped working.</string>
+    <string name="stopped_recent">Recent stopped working.</string>
+    <string name="stopped_lock_screen_image">The lock-screen image stopped working.</string>
+    <string name="stopped_settings">Settings stopped working.</string>
+    <!-- The button on a stopped_ card: closes MeeGone and opens it again, with every part
+         working (ADR 0043). -->
+    <string name="stopped_restart">Restart MeeGone</string>
+
     <!-- Problems (L10N-01, ADR 0040). Each is named problem_ and the code the Rust app gives it,
          and Problems.java shows it: briefly at the bottom of the screen, below a setting, or in
          a status line, where a full stop and "Will try again later." may follow (WALL-16). So

@@ -12,6 +12,7 @@
 mod carousel;
 mod crossfade;
 mod events_change;
+mod failures;
 mod folder;
 mod grid_change;
 mod home_menu;
@@ -25,6 +26,7 @@ mod search;
 mod shared;
 mod timed;
 
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,13 +34,15 @@ use meegone_apps_data::PersistentLayoutStore;
 use meegone_apps_state::{
     AppsHolder, AppsIntent, AppsState, CellKey, FolderId, Surface, cells_moved,
 };
-use meegone_core_data::{HomeTarget, Platform, SettingsStore, SystemConfigAdapter};
+use meegone_core_data::{
+    AppsAdapter, HomeTarget, Platform, Problem, Rect, SettingsStore, SystemConfigAdapter,
+};
 use meegone_core_state::motion::{
     CARD_REMOVE, IMAGE_CROSSFADE, MODE_SCALE, RECENT_REFLOW, THEME_CROSSFADE,
     VIEW_FLING_VELOCITY_DP,
 };
 use meegone_core_state::{
-    Access, App, AppId, Health, RecentDensity, Store, Theme, ThemeHolder, ThemeIntent,
+    Access, App, AppId, RecentDensity, Store, Theme, ThemeHolder, ThemeIntent,
 };
 use meegone_events_state::{
     EventsHolder, EventsIntent, GroupId, NotificationGroup, RowKey, RowTarget, rows_came_or_went,
@@ -53,6 +57,7 @@ use crossfade::CrossFade;
 pub use crossfade::CrossFadeState;
 use events_change::EventsChange;
 pub use events_change::EventsChangeState;
+pub use failures::{Failures, Feature};
 use folder::FolderMotion;
 pub use folder::FolderState;
 use grid_change::GridChange;
@@ -215,6 +220,9 @@ pub struct ShellState {
     pub close_offered: bool,
     /// Cards removed from Recent shrinking and fading where they were, row by row (ANIM-18).
     pub recent_change: RecentChangeState,
+    /// Why the last app tapped in a failed Applications' last grid didn't open, or `None` if
+    /// it did (REL-01, ADR 0043). While Applications works, it says this itself.
+    pub launch_problem: Option<Problem>,
 }
 
 impl ShellState {
@@ -374,6 +382,9 @@ pub enum ShellIntent {
     /// may have set a new image or changed how the checks are going, and "Updating…" ends
     /// (ADR 0029, ADR 0030).
     ImageChecked,
+    /// The host found a bug in `Feature`'s own views and stopped drawing them, so the feature
+    /// stops as if its code had panicked (ARCH-09, ADR 0043).
+    Failed(Feature),
     Apps(AppsIntent),
     Events(EventsIntent),
     Recent(RecentIntent),
@@ -390,6 +401,12 @@ pub struct HomeShell {
     state: ShellState,
     settings_store: Arc<dyn SettingsStore>,
     system: Arc<dyn SystemConfigAdapter>,
+    /// The catalogue, to open an app tapped in a failed Applications' last grid (REL-01,
+    /// ADR 0043).
+    apps_adapter: Arc<dyn AppsAdapter>,
+    /// How far a failed Applications' last grid is scrolled, which it can't keep itself
+    /// (ADR 0043). `None` while it works.
+    grid_scroll_px: Option<f64>,
     carousel: Carousel,
     return_home: ReturnHome,
     press: Press,
@@ -461,6 +478,8 @@ impl HomeShell {
         let mut shell = Self {
             state: ShellState::default(),
             system: platform.system.clone(),
+            apps_adapter: platform.apps.clone(),
+            grid_scroll_px: None,
             carousel: Carousel::new(true, 1.0),
             return_home: ReturnHome::default(),
             press: Press::default(),
@@ -548,12 +567,15 @@ impl HomeShell {
         // card leaves.
         shell.seen_hidden = shell.apps.state().hidden_apps.clone();
         shell.seen_density = shell.recent.state().density;
-        shell.seen_recent = shell.recent_cards();
+        shell.seen_recent = shell.recent_cards().unwrap_or_default();
         // Events' list as it starts is shown as it is too (ANIM-20).
         let events = shell.events.state();
         shell.seen_groups = events.groups.clone();
         shell.seen_expanded = events.expanded.clone();
-        shell.seen_rows = events.row_keys();
+        shell.seen_rows = shell
+            .events
+            .contain(|| events.row_keys())
+            .unwrap_or_default();
         // A fresh install starts in setup, at Welcome (ONB-01).
         shell.seen_setup = shell.setup_step();
         shell.state.setup_open = shell.setup_shown();
@@ -568,8 +590,16 @@ impl HomeShell {
     pub fn saved(&self) -> SavedHome {
         SavedHome {
             view: self.state.current,
-            apps_scroll_px: self.apps.state().scroll_px,
+            apps_scroll_px: self
+                .grid_scroll_px
+                .unwrap_or_else(|| self.apps.state().scroll_px),
         }
+    }
+
+    /// How far a failed Applications' last grid is scrolled, as the user scrolled it, or
+    /// `None` while Applications works and keeps it itself (ADR 0043).
+    pub fn grid_scroll_px(&self) -> Option<f64> {
+        self.grid_scroll_px
     }
 
     pub fn theme(&self) -> &Store<ThemeHolder> {
@@ -583,28 +613,56 @@ impl HomeShell {
     /// Whether Applications works. Its content shown elsewhere, such as Hidden apps in
     /// Settings, is offered only then (ARCH-09).
     pub fn apps_ready(&self) -> bool {
-        *self.apps.health() == Health::Ready
+        self.apps.is_ready()
     }
 
     /// Whether Events works. Its header is drawn only then (ARCH-09).
     pub fn events_ready(&self) -> bool {
-        *self.events.health() == Health::Ready
+        self.events.is_ready()
     }
 
     /// Whether Recent works. Its cards are drawn only then (ARCH-09).
     pub fn recent_ready(&self) -> bool {
-        *self.recent.health() == Health::Ready
+        self.recent.is_ready()
     }
 
     /// Whether the lock-screen image works. Its card in Events, its section in Settings and
     /// its details screen are offered only then (ARCH-09).
     pub fn lockimage_ready(&self) -> bool {
-        *self.lockimage.health() == Health::Ready
+        self.lockimage.is_ready()
     }
 
     /// Whether Settings works. Its own items, such as Theme, are offered only then (ARCH-09).
     pub fn settings_ready(&self) -> bool {
-        *self.settings.health() == Health::Ready
+        self.settings.is_ready()
+    }
+
+    /// The features that have stopped working (ARCH-09, ADR 0043).
+    pub fn failures(&self) -> Failures {
+        [
+            (Feature::Applications, self.apps_ready()),
+            (Feature::Events, self.events_ready()),
+            (Feature::Recent, self.recent_ready()),
+            (Feature::LockScreenImage, self.lockimage_ready()),
+            (Feature::Settings, self.settings_ready()),
+        ]
+        .into_iter()
+        .filter(|(_, ready)| !ready)
+        .map(|(feature, _)| feature)
+        .collect()
+    }
+
+    /// Runs some of `feature`'s code outside its intents, such as what the host reads of it,
+    /// so a bug in it stops that feature alone (ARCH-09, ADR 0043). `None` without running it
+    /// once the feature has failed. `step` only computes; see [`Store::contain`].
+    pub fn contain<R>(&self, feature: Feature, step: impl FnOnce() -> R) -> Option<R> {
+        match feature {
+            Feature::Applications => self.apps.contain(step),
+            Feature::Events => self.events.contain(step),
+            Feature::Recent => self.recent.contain(step),
+            Feature::LockScreenImage => self.lockimage.contain(step),
+            Feature::Settings => self.settings.contain(step),
+        }
     }
 
     /// Whether first-run setup covers the home views (ONB-01). A failed Settings can't finish
@@ -626,11 +684,19 @@ impl HomeShell {
     pub fn banner_shown(&self) -> bool {
         self.settings_ready()
             && self.settings.state().home_banner
+            && !self.applications_card_shown()
             && !self.covered()
             && !self.folder_shown()
             && !self.search_shown()
             && !self.editing_shown()
             && !self.close_shown()
+    }
+
+    /// Whether the card that says Applications stopped working shows, in the home-app banner's
+    /// place: on Applications, with nothing covering it (ARCH-09, ADR 0043). It says a tap on
+    /// the last grid still opens an app, and offers Restart MeeGone.
+    pub fn applications_card_shown(&self) -> bool {
+        !self.apps_ready() && self.state.current == HomeView::Applications && !self.covered()
     }
 
     /// Whether Settings offers Reset launcher: only while every feature it resets works, so a
@@ -806,14 +872,31 @@ impl HomeShell {
                 self.image_change.start(self.carousel.animation_scale());
             }
             ShellIntent::ImageChecked => self.lockimage.dispatch(LockImageIntent::Checked),
+            // What the feature covered closes below, as after a panic in its code.
+            ShellIntent::Failed(feature) => match feature {
+                Feature::Applications => self.apps.fail(),
+                Feature::Events => self.events.fail(),
+                Feature::Recent => self.recent.fail(),
+                Feature::LockScreenImage => self.lockimage.fail(),
+                Feature::Settings => self.settings.fail(),
+            },
             ShellIntent::Apps(AppsIntent::OpenSearch) => self.open_search(),
             // A tap on a cell counts only where a finger could reach it: not under a menu or a
             // screen, nor on a surface something covers, such as the grid under an open folder.
             // A keyboard or switch can't reach those either (A11Y-06, ADR 0039).
             ShellIntent::Apps(AppsIntent::Launch { app, from }) => {
                 if self.reachable(&CellKey::App(app.clone())) {
-                    self.apps.dispatch(AppsIntent::Launch { app, from });
+                    if self.apps_ready() {
+                        self.apps.dispatch(AppsIntent::Launch { app, from });
+                    } else {
+                        self.launch_from_last_grid(&app, from);
+                    }
                 }
+            }
+            // A failed Applications' last grid still scrolls, under the user's finger, and
+            // the shell keeps where (ADR 0043).
+            ShellIntent::Apps(AppsIntent::Scrolled(px)) if !self.apps_ready() => {
+                self.grid_scroll_px = Some(px.max(0.0));
             }
             ShellIntent::Apps(AppsIntent::OpenFolder(folder)) => {
                 if self.reachable(&CellKey::Folder(folder)) {
@@ -870,7 +953,9 @@ impl HomeShell {
         self.state.events_menu_open = self.events_menu_shown();
         self.state.folder_open = self.folder_shown();
         self.state.folder = self.folder.state();
-        self.state.renaming = (*self.apps.health() == Health::Ready)
+        self.state.renaming = self
+            .apps
+            .is_ready()
             .then(|| self.apps.state().renaming)
             .flatten();
         self.state.search = self.search.state();
@@ -896,7 +981,7 @@ impl HomeShell {
     /// Whether a notification's menu is open. A failed Events can't close its menu, so it never
     /// counts: the home must never be left covered for good (ARCH-09).
     fn events_menu_shown(&self) -> bool {
-        *self.events.health() == Health::Ready && self.events.state().menu.is_some()
+        self.events.is_ready() && self.events.state().menu.is_some()
     }
 
     fn close_events_menu(&mut self) {
@@ -908,7 +993,7 @@ impl HomeShell {
     /// Whether an app's menu is open. A failed Applications can't close its menu, so it never
     /// counts: the home must never be left covered for good (ARCH-09).
     fn app_menu_shown(&self) -> bool {
-        *self.apps.health() == Health::Ready && self.apps.state().menu.is_some()
+        self.apps.is_ready() && self.apps.state().menu.is_some()
     }
 
     fn close_app_menu(&mut self) {
@@ -926,19 +1011,19 @@ impl HomeShell {
     /// Whether Applications shows edit mode. A failed Applications can't leave it, so it never
     /// counts: no badge, Done or drag is left on screen for good (ARCH-09).
     fn editing_shown(&self) -> bool {
-        *self.apps.health() == Health::Ready && self.apps.state().edit_mode
+        self.apps.is_ready() && self.apps.state().edit_mode
     }
 
     /// Whether a folder is open over Applications. A failed Applications can't close it, so it
     /// never counts (ARCH-09).
     fn folder_shown(&self) -> bool {
-        *self.apps.health() == Health::Ready && self.apps.state().open_folder.is_some()
+        self.apps.is_ready() && self.apps.state().open_folder.is_some()
     }
 
     /// Whether search is open on Applications. A failed Applications can't close it, so it
     /// never counts (ARCH-09).
     fn search_shown(&self) -> bool {
-        *self.apps.health() == Health::Ready && self.apps.state().search.is_some()
+        self.apps.is_ready() && self.apps.state().search.is_some()
     }
 
     fn close_search(&mut self) {
@@ -968,7 +1053,7 @@ impl HomeShell {
         let apps = self.apps.state();
         let carousel = self.carousel.state();
         let calm = self.state.current == HomeView::Applications
-            && *self.apps.health() == Health::Ready
+            && self.apps.is_ready()
             && !self.covered()
             && !self.folder_shown()
             && !self.editing_shown()
@@ -1097,10 +1182,17 @@ impl HomeShell {
         if Arc::ptr_eq(&events.groups, &self.seen_groups) && events.expanded == self.seen_expanded {
             return;
         }
-        let rows = events.row_keys();
+        // Events' own code, so a bug in it stops Events alone (ARCH-09).
+        let Some((rows, moved)) = self.events.contain(|| {
+            let rows = events.row_keys();
+            let moved = rows_came_or_went(&self.seen_rows, &rows);
+            (rows, moved)
+        }) else {
+            return;
+        };
         self.seen_groups = events.groups.clone();
         self.seen_expanded = events.expanded.clone();
-        if rows_came_or_went(&self.seen_rows, &rows) {
+        if moved {
             self.events_change.start(self.carousel.animation_scale());
         }
         self.seen_rows = rows;
@@ -1171,7 +1263,9 @@ impl HomeShell {
             return;
         }
         self.seen_recent_state = Some(recent);
-        let (cards, columns) = self.recent_cards();
+        let Some((cards, columns)) = self.recent_cards() else {
+            return;
+        };
         if cards == self.seen_recent.0 {
             self.seen_recent.1 = columns;
             return;
@@ -1201,15 +1295,17 @@ impl HomeShell {
         }
     }
 
-    /// The apps of Recent's cards, and how many each row holds.
-    fn recent_cards(&self) -> (Vec<AppId>, usize) {
+    /// The apps of Recent's cards, and how many each row holds. `None` once Recent has failed.
+    fn recent_cards(&self) -> Option<(Vec<AppId>, usize)> {
         let recent = self.recent.state();
-        let cards = recent
-            .cards
-            .iter()
-            .map(|card| card.app.id.clone())
-            .collect();
-        (cards, usize::from(recent.columns()))
+        self.recent.contain(|| {
+            let cards = recent
+                .cards
+                .iter()
+                .map(|card| card.app.id.clone())
+                .collect();
+            (cards, usize::from(recent.columns()))
+        })
     }
 
     /// Close mode's motion follows Recent (ANIM-12), and entering it ticks (ANIM-24), as edit
@@ -1234,7 +1330,11 @@ impl HomeShell {
     /// Close mode's motion for Recent's rows of cards: the badges stagger from the first.
     fn close_state(&self) -> ModeState {
         let recent = self.recent.state();
-        let columns = usize::from(recent.columns()).max(1);
+        let columns = self
+            .recent
+            .contain(|| usize::from(recent.columns()))
+            .unwrap_or(1)
+            .max(1);
         let rows = recent.cards.len().div_ceil(columns);
         self.close.state(0, rows.clamp(1, MAX_ROWS))
     }
@@ -1255,8 +1355,7 @@ impl HomeShell {
     /// Whether Recent shows its cards on screen with nothing covering them.
     fn recent_cards_offered(&self) -> bool {
         self.state.current == HomeView::Recent
-            && self.recent_ready()
-            && self.recent.state().shows_cards()
+            && self.recent.contain(|| self.recent.state().shows_cards()) == Some(true)
             && !self.covered()
     }
 
@@ -1269,8 +1368,10 @@ impl HomeShell {
             return None;
         }
         let recent = self.recent.state();
-        let other = recent.columns_of(other_density(recent.density));
-        Some(f64::from(recent.columns()) / f64::from(other.max(1)))
+        self.recent.contain(|| {
+            let other = recent.columns_of(other_density(recent.density));
+            f64::from(recent.columns()) / f64::from(other.max(1))
+        })
     }
 
     /// Follows two fingers on the home views (REC-05, ANIM-17). A pinch that starts takes the
@@ -1298,8 +1399,11 @@ impl HomeShell {
             self.carousel.lock(true);
             self.press.release(event.at, scale);
         }
-        if ended == Some(Ended::Switch) {
-            let density = other_density(self.recent.state().density);
+        if ended == Some(Ended::Switch)
+            && let Some(density) = self
+                .recent
+                .contain(|| other_density(self.recent.state().density))
+        {
             self.recent.dispatch(RecentIntent::SetDensity(density));
         }
     }
@@ -1503,6 +1607,20 @@ impl HomeShell {
             .press(surface, item, at, self.carousel.animation_scale());
     }
 
+    /// Opens `app`, tapped in a failed Applications' last grid, as Applications would have
+    /// (REL-01, ADR 0043): launching apps works whatever else fails. Only the launch happens;
+    /// nothing Applications keeps changes, such as a new app's dot. The catalogue may be what
+    /// failed, so a panic in it is contained too.
+    fn launch_from_last_grid(&mut self, app: &AppId, from: Option<Rect>) {
+        let launched =
+            panic::catch_unwind(AssertUnwindSafe(|| self.apps_adapter.launch(app, from)));
+        self.state.launch_problem = match launched {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error.problem()),
+            Err(_) => Some(Problem::AppUnavailable),
+        };
+    }
+
     /// Whether `surface` takes touches: the open folder's panel while it is open (FOLD-04);
     /// while search is open, its results, or the grid below an empty field; otherwise the grid.
     /// Whether `key`'s cell is on a surface a tap reaches now, with nothing covering the views.
@@ -1650,7 +1768,8 @@ impl HomeShell {
         if self.covered() || self.search_shown() {
             return;
         }
-        let editing = self.editing_shown();
+        // Like edit mode, a failed Applications offers no Edit applications (ARCH-09).
+        let editing = self.editing_shown() || !self.apps_ready();
         let Some(items) = HomeMenu::items_for(self.state.current, editing) else {
             return;
         };
@@ -1777,7 +1896,9 @@ impl HomeShell {
     /// Whether the image details screen can open: the lock-screen image works (ARCH-09), and
     /// its daily image is on with an image to show (WALL-15).
     pub fn image_details_offered(&self) -> bool {
-        self.lockimage_ready() && self.lockimage.state().has_details()
+        self.lockimage
+            .contain(|| self.lockimage.state().has_details())
+            == Some(true)
     }
 
     /// Opens the image details screen over the home views (EVT-12, WALL-15), while it has
@@ -1803,7 +1924,9 @@ impl HomeShell {
     /// Whether the past week's images can open: the lock-screen image works (ARCH-09), and its
     /// daily image is on (WALL-17).
     pub fn past_images_offered(&self) -> bool {
-        self.lockimage_ready() && self.lockimage.state().past_offered()
+        self.lockimage
+            .contain(|| self.lockimage.state().past_offered())
+            == Some(true)
     }
 
     /// Opens the past week's images over the image details screen or Settings, which offer
@@ -1846,8 +1969,12 @@ impl HomeShell {
             self.move_to(HomeView::Applications, 0.0, None);
         } else {
             // At rest on Applications, or settling onto it, so a second quick Home after
-            // leaving another view scrolls too.
-            self.apps.dispatch(AppsIntent::ScrollToTop);
+            // leaving another view scrolls too. A failed Applications' last grid does too.
+            if self.apps_ready() {
+                self.apps.dispatch(AppsIntent::ScrollToTop);
+            } else {
+                self.grid_scroll_px = Some(0.0);
+            }
         }
     }
 
@@ -1891,8 +2018,12 @@ impl HomeShell {
     /// kept, so any edit or close mode is cancelled.
     fn restore(&mut self, saved: SavedHome) {
         self.jump_to(saved.view);
-        self.apps
-            .dispatch(AppsIntent::Scrolled(saved.apps_scroll_px));
+        if self.apps_ready() {
+            self.apps
+                .dispatch(AppsIntent::Scrolled(saved.apps_scroll_px));
+        } else {
+            self.grid_scroll_px = Some(saved.apps_scroll_px.max(0.0));
+        }
     }
 
     /// Shows `view` at once, with nothing moving, while the home is out of sight.
@@ -2694,7 +2825,7 @@ mod tests {
         let mut platform = fakes.platform();
         platform.wallpaper = Arc::new(BrokenWallpaper);
         let mut shell = HomeShell::compose(platform);
-        assert!(matches!(shell.lockimage().health(), Health::Failed(_)));
+        assert_eq!(shell.lockimage().health(), Health::Failed);
         assert!(!shell.lockimage_ready());
 
         shell.dispatch(ShellIntent::LockImage(LockImageIntent::OpenDetails));
@@ -2851,10 +2982,7 @@ mod tests {
         platform.notifications = Arc::new(BrokenListener(broken));
         let mut shell = HomeShell::compose(platform);
 
-        assert_eq!(
-            *shell.events().health(),
-            Health::Failed("listener bug".into())
-        );
+        assert_eq!(shell.events().health(), Health::Failed);
         assert!(!shell.events_ready());
         shell.dispatch(ShellIntent::NotificationsChanged);
         shell.dispatch(ShellIntent::Swipe(Direction::Previous));
@@ -2925,12 +3053,9 @@ mod tests {
             from: None,
         }));
 
-        assert_eq!(
-            *shell.apps().health(),
-            Health::Failed("launcher bug".into())
-        );
+        assert_eq!(shell.apps().health(), Health::Failed);
         assert!(!shell.apps_ready());
-        assert_eq!(*shell.events().health(), Health::Ready);
+        assert_eq!(shell.events().health(), Health::Ready);
         shell.dispatch(ShellIntent::Swipe(Direction::Previous));
         assert_eq!(shell.state().current, HomeView::Events);
         shell.dispatch(ShellIntent::Events(EventsIntent::OpenAccessSettings));
@@ -2939,6 +3064,173 @@ mod tests {
         assert_eq!(shell.state().current, HomeView::Applications);
         shell.dispatch(ShellIntent::Back);
         assert_eq!(shell.state().current, HomeView::Applications);
+    }
+
+    /// A shell after setup, with Mail and Maps, whose Applications has stopped working.
+    fn without_applications() -> (Fakes, HomeShell) {
+        let fakes = Fakes::after_setup();
+        *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail"), app("maps", "Maps")];
+        let mut shell = HomeShell::compose(fakes.platform());
+        shell.dispatch(ShellIntent::Failed(Feature::Applications));
+        assert!(!shell.apps_ready());
+        (fakes, shell)
+    }
+
+    fn tap(shell: &mut HomeShell, id: &str) {
+        shell.dispatch(ShellIntent::Apps(AppsIntent::Launch {
+            app: app_id(id),
+            from: Some(ICON_BOUNDS),
+        }));
+    }
+
+    const ICON_BOUNDS: Rect = Rect {
+        left: 10,
+        top: 20,
+        right: 110,
+        bottom: 120,
+    };
+
+    #[test]
+    fn a_failed_applications_still_launches_an_app_tapped_in_its_last_grid() {
+        // REL-01, ADR 0043: launching apps works whatever else fails.
+        let (fakes, mut shell) = without_applications();
+
+        tap(&mut shell, "maps");
+
+        assert_eq!(*fakes.apps.launched.lock().unwrap(), [app_id("maps")]);
+        assert_eq!(
+            *fakes.apps.launched_from.lock().unwrap(),
+            [Some(ICON_BOUNDS)]
+        );
+        assert_eq!(shell.state().launch_problem, None);
+        // Nothing else of Applications' runs: its store stays as it was.
+        assert_eq!(shell.apps().health(), Health::Failed);
+    }
+
+    #[test]
+    fn a_failed_applications_launches_nothing_under_a_menu_or_screen() {
+        // A11Y-06: a tap counts only where a finger could reach it, as while it works.
+        let (fakes, mut shell) = without_applications();
+
+        shell.dispatch(ShellIntent::OpenMenu);
+        tap(&mut shell, "mail");
+        shell.dispatch(ShellIntent::CloseMenu);
+        shell.dispatch(ShellIntent::OpenSettings);
+        tap(&mut shell, "mail");
+        shell.dispatch(ShellIntent::Back);
+        shell.dispatch(ShellIntent::Swipe(Direction::Previous));
+        shell.dispatch(ShellIntent::OpenMenu);
+        tap(&mut shell, "mail");
+
+        assert!(fakes.apps.launched.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_failed_applications_grid_still_scrolls_and_home_takes_it_to_the_top() {
+        // HOME-07, REL-05, ADR 0043
+        let (_fakes, mut shell) = without_applications();
+        assert_eq!(shell.grid_scroll_px(), None);
+
+        shell.dispatch(ShellIntent::Apps(AppsIntent::Scrolled(480.0)));
+
+        assert_eq!(shell.grid_scroll_px(), Some(480.0));
+        assert_eq!(shell.saved().apps_scroll_px, 480.0);
+        shell.dispatch(ShellIntent::Home);
+        assert_eq!(shell.grid_scroll_px(), Some(0.0));
+        shell.dispatch(ShellIntent::Restore(SavedHome {
+            view: HomeView::Applications,
+            apps_scroll_px: 720.0,
+        }));
+        assert_eq!(shell.grid_scroll_px(), Some(720.0));
+    }
+
+    #[test]
+    fn a_failed_applications_offers_no_edit_applications_in_the_home_menu() {
+        // HOME-10, ARCH-09: it can't enter edit mode.
+        let (_fakes, mut shell) = without_applications();
+
+        shell.dispatch(ShellIntent::OpenMenu);
+
+        let menu = shell.state().menu.unwrap();
+        assert!(!menu.offers(MenuItem::EditApplications));
+        assert!(menu.offers(MenuItem::LauncherSettings));
+    }
+
+    #[test]
+    fn a_launch_that_fails_without_applications_says_why() {
+        // APPS-09, ADR 0043: the system's refusal, or a bug in asking it, is said, as
+        // Applications would say it.
+        let (fakes, mut shell) = without_applications();
+        *fakes.apps.error.lock().unwrap() = Some(DataError::Failed(Problem::AppUnavailable));
+
+        tap(&mut shell, "mail");
+
+        assert_eq!(shell.state().launch_problem, Some(Problem::AppUnavailable));
+
+        let broken = FakeApps::default();
+        broken.apps.lock().unwrap().push(app("mail", "Mail"));
+        let mut platform = Fakes::after_setup().platform();
+        platform.apps = Arc::new(BrokenLauncher(broken));
+        let mut shell = HomeShell::compose(platform);
+        shell.dispatch(ShellIntent::Failed(Feature::Applications));
+
+        tap(&mut shell, "mail");
+
+        assert_eq!(shell.state().launch_problem, Some(Problem::AppUnavailable));
+        assert_eq!(shell.events().health(), Health::Ready);
+    }
+
+    #[test]
+    fn the_applications_card_shows_on_applications_with_nothing_over_it_instead_of_the_banner() {
+        // ONB-04, ADR 0043
+        let fakes = Fakes::after_setup();
+        let mut shell = HomeShell::compose(fakes.platform());
+        assert!(shell.banner_shown());
+        assert!(!shell.applications_card_shown());
+
+        shell.dispatch(ShellIntent::Failed(Feature::Applications));
+
+        assert!(shell.applications_card_shown());
+        assert!(!shell.banner_shown());
+        shell.dispatch(ShellIntent::OpenSettings);
+        assert!(!shell.applications_card_shown());
+        shell.dispatch(ShellIntent::Back);
+        shell.dispatch(ShellIntent::Swipe(Direction::Previous));
+        assert!(!shell.applications_card_shown());
+        assert!(shell.banner_shown());
+    }
+
+    #[test]
+    fn a_feature_the_host_reports_failed_closes_what_it_covered() {
+        // ARCH-09, ADR 0043: a bug in a feature's own views stops it as a panic in its code
+        // does.
+        let mut shell = HomeShell::compose(Fakes::default().platform());
+        assert!(shell.setup_shown());
+
+        shell.dispatch(ShellIntent::Failed(Feature::Settings));
+
+        assert!(!shell.setup_shown());
+        assert!(!shell.state().setup_open);
+        assert_eq!(shell.settings().health(), Health::Failed);
+        assert_eq!(
+            shell.failures(),
+            [Feature::Settings].into_iter().collect::<Failures>()
+        );
+
+        let fakes = Fakes::after_setup();
+        *fakes.notifications.access.lock().unwrap() = Access::Granted;
+        *fakes.notifications.active.lock().unwrap() = vec![notification("m1", "mail")];
+        fakes.apps.apps.lock().unwrap().push(app("mail", "Mail"));
+        let mut shell = HomeShell::compose(fakes.platform());
+        shell.dispatch(ShellIntent::Swipe(Direction::Previous));
+        let row = shell.events().state().rows()[0].target();
+        shell.dispatch(ShellIntent::OpenNotificationMenu(row));
+        assert!(shell.state().events_menu_open);
+
+        shell.dispatch(ShellIntent::Failed(Feature::Events));
+
+        assert!(!shell.state().events_menu_open);
+        assert_eq!(shell.apps().health(), Health::Ready);
     }
 
     #[test]
@@ -3151,7 +3443,7 @@ mod tests {
         platform.usage = Arc::new(BrokenUsage);
         let mut shell = HomeShell::compose(platform);
 
-        assert_eq!(*shell.recent().health(), Health::Failed("usage bug".into()));
+        assert_eq!(shell.recent().health(), Health::Failed);
         assert!(!shell.recent_ready());
         shell.dispatch(ShellIntent::UsageAccessChanged);
         shell.dispatch(ShellIntent::Swipe(Direction::Next));
@@ -4727,7 +5019,7 @@ mod tests {
             AppMenuItem::Uninstall,
         )));
 
-        assert!(matches!(shell.apps().health(), Health::Failed(_)));
+        assert_eq!(shell.apps().health(), Health::Failed);
         assert!(!shell.state().app_menu_open);
         assert!(shell.state().menu_offered());
         shell.dispatch(ShellIntent::OpenMenu);
@@ -4973,7 +5265,7 @@ mod tests {
             NotificationMenuItem::Dismiss,
         )));
 
-        assert!(matches!(shell.events().health(), Health::Failed(_)));
+        assert_eq!(shell.events().health(), Health::Failed);
         assert!(!shell.state().events_menu_open);
         assert!(shell.state().menu_offered());
         shell.dispatch(ShellIntent::OpenMenu);
@@ -5352,7 +5644,7 @@ mod tests {
             "mail",
         ))));
 
-        assert!(matches!(shell.apps().health(), Health::Failed(_)));
+        assert_eq!(shell.apps().health(), Health::Failed);
         let state = shell.state();
         assert_eq!(state.lift, LiftState::default());
         assert!(!state.mode.on);
@@ -5542,7 +5834,7 @@ mod tests {
             from: None,
         }));
 
-        assert!(matches!(shell.apps().health(), Health::Failed(_)));
+        assert_eq!(shell.apps().health(), Health::Failed);
         assert!(!shell.state().folder_open);
         assert!(shell.state().menu_offered());
     }
@@ -5891,7 +6183,7 @@ mod tests {
 
         shell.dispatch(ShellIntent::Apps(AppsIntent::SubmitSearch { from: None }));
 
-        assert!(matches!(shell.apps().health(), Health::Failed(_)));
+        assert_eq!(shell.apps().health(), Health::Failed);
         assert!(!shell.state().search.open);
         assert!(shell.state().menu_offered());
     }

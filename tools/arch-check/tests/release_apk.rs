@@ -1,6 +1,7 @@
 //! Runs the manifest rules of ADR 0042 on the release APK as Gradle built it, and checks that it
-//! holds none of the debug build's own classes (SEC-03, SEC-04, SEC-06). It needs the APK, so it
-//! is ignored by default; CI's Android job runs it after the build:
+//! holds none of the debug build's own classes (SEC-03, SEC-04, SEC-06), nor any class that
+//! isn't MeeGone's own or the debug build's fault hook (REL-07, ADR 0043). It needs the APK, so
+//! it is ignored by default; CI's Android job runs it after the build:
 //!
 //! ```sh
 //! (cd android && ./gradlew assembleRelease)
@@ -16,7 +17,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use arch_check::a11y::java_files;
-use arch_check::security::{debug_only_classes, release_apk_violations};
+use arch_check::reliability::{foreign_classes, release_library_violations};
+use arch_check::security::{debug_only_classes, dex_classes, release_apk_violations};
 
 const APK: &str = "android/app/build/outputs/apk/release/app-release-unsigned.apk";
 
@@ -102,10 +104,14 @@ fn the_release_apk_asks_only_for_srs_8_1s_access_and_holds_no_debug_feature() {
         "the debug build's own classes weren't found: {debug_only:?}"
     );
 
-    let violations = release_apk_violations(&manifest, &dexdump, &debug_only);
+    let mut violations = release_apk_violations(&manifest, &dexdump, &debug_only);
+    // REL-07, SEC-06, ADR 0043: no SDK, such as a crash reporter, and no bugs made to order.
+    violations.extend(foreign_classes(&dex_classes(&dexdump)));
+    let bytes = fs::read(root().join(APK)).expect("the release APK can be read");
+    violations.extend(release_library_violations(&bytes));
     assert!(
         violations.is_empty(),
-        "the release APK breaks the security rules (see ADR 0042):\n{}",
+        "the release APK breaks the security or reliability rules (see ADR 0042, ADR 0043):\n{}",
         violations
             .iter()
             .map(|violation| format!("  - {violation}\n"))

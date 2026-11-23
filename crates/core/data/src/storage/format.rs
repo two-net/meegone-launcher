@@ -20,10 +20,14 @@
 //! version at a time, before it is parsed, so only the current version needs a parser. A file
 //! that is unreadable or comes from a newer version of MeeGone loads as the defaults (MAINT-04);
 //! after a downgrade, the newer data is replaced the next time the store saves.
+//!
+//! A file whose reading panics, through a bug in a migration or a parser, is unreadable too, so
+//! a bad file never stops MeeGone at every start (REL-02, ARCH-09, ADR 0043).
 
 use std::borrow::Cow;
 use std::fmt::Display;
 use std::iter::Peekable;
+use std::panic::{self, AssertUnwindSafe};
 use std::str::{FromStr, Split, SplitTerminator};
 
 use super::{StorageAdapter, StoredFile};
@@ -58,13 +62,23 @@ pub fn encode<F: Format>(value: &F) -> Vec<u8> {
 }
 
 /// The value saved in `bytes`, brought up to the current version. `None` if `bytes` are
-/// damaged, cut short, of another kind, from a newer version, or not a valid body.
+/// damaged, cut short, of another kind, from a newer version, or not a valid body, or if
+/// reading them panics.
 pub fn decode<F: Format>(bytes: &[u8]) -> Option<F> {
-    let (version, body) = open(F::KIND, bytes)?;
-    let body = migrate(version, F::VERSION, F::MIGRATIONS, body)?;
-    let mut input = Reader::new(&body);
-    let value = F::read(&mut input)?;
-    input.is_done().then_some(value)
+    unless_it_panics(|| {
+        let (version, body) = open(F::KIND, bytes)?;
+        let body = migrate(version, F::VERSION, F::MIGRATIONS, body)?;
+        let mut input = Reader::new(&body);
+        let value = F::read(&mut input)?;
+        input.is_done().then_some(value)
+    })
+}
+
+/// What `read` gives, or `None` if it panics: a file that a bug can't read is unreadable, and
+/// loads as the defaults instead of stopping MeeGone at every start (REL-02, MAINT-04, ADR 0043).
+/// Nothing is shared with `read`, so nothing is left half-changed.
+fn unless_it_panics<T>(read: impl FnOnce() -> Option<T>) -> Option<T> {
+    panic::catch_unwind(AssertUnwindSafe(read)).ok().flatten()
 }
 
 /// What a store's file holds.
@@ -126,11 +140,13 @@ pub fn salvage<F: Format>(bytes: &[u8]) -> Vec<F> {
         .split_terminator('\n')
         .filter(|record| record.split(' ').next() != Some(TRAILER_KEY))
         .filter_map(|record| {
-            let record = format!("{record}\n");
-            let record = migrate(version, F::VERSION, F::MIGRATIONS, &record)?;
-            let mut input = Reader::new(&record);
-            let value = F::read(&mut input)?;
-            input.is_done().then_some(value)
+            unless_it_panics(|| {
+                let record = format!("{record}\n");
+                let record = migrate(version, F::VERSION, F::MIGRATIONS, &record)?;
+                let mut input = Reader::new(&record);
+                let value = F::read(&mut input)?;
+                input.is_done().then_some(value)
+            })
         })
         .collect()
 }
@@ -778,6 +794,64 @@ mod tests {
         assert_eq!(decode::<Greeting>(&v1), None);
     }
 
+    /// A format whose parser has a bug: it panics on `who boom`.
+    #[derive(Debug, PartialEq, Default)]
+    struct Fragile {
+        who: String,
+    }
+
+    const FRAGILE_MIGRATIONS: [Migration; 1] = [|body| {
+        assert!(!body.contains("crash"), "migration bug");
+        Some(body.to_owned())
+    }];
+
+    impl Format for Fragile {
+        const KIND: &'static str = "fragile";
+        const VERSION: u32 = 2;
+        const MIGRATIONS: &'static [Migration] = &FRAGILE_MIGRATIONS;
+
+        fn write(&self, out: &mut Writer) {
+            out.line("who", &self.who);
+        }
+
+        fn read(input: &mut Reader<'_>) -> Option<Self> {
+            let who: String = input.line("who")?;
+            assert_ne!(who, "boom", "parser bug");
+            Some(Self { who })
+        }
+    }
+
+    #[test]
+    fn a_reader_that_panics_makes_the_file_unreadable_and_it_loads_as_the_defaults() {
+        // REL-02, MAINT-04, ADR 0043: a bug in reading a file never stops MeeGone at every start.
+        let storage = FakeStorage::default();
+        storage
+            .files
+            .lock()
+            .unwrap()
+            .insert(StoredFile::Settings, seal("fragile", 2, "who boom\n"));
+
+        assert_eq!(decode::<Fragile>(&seal("fragile", 2, "who boom\n")), None);
+        assert_eq!(
+            decode::<Fragile>(&seal("fragile", 2, "who Ann\n")),
+            Some(Fragile { who: "Ann".into() })
+        );
+        assert_eq!(
+            load::<Fragile>(&storage, StoredFile::Settings),
+            Fragile::default()
+        );
+    }
+
+    #[test]
+    fn a_migration_that_panics_makes_the_file_unreadable() {
+        // MAINT-04, ADR 0043
+        assert_eq!(decode::<Fragile>(&seal("fragile", 1, "who crash\n")), None);
+        assert_eq!(
+            decode::<Fragile>(&seal("fragile", 1, "who Ann\n")),
+            Some(Fragile { who: "Ann".into() })
+        );
+    }
+
     #[test]
     fn a_missing_migration_makes_the_file_unreadable() {
         #[derive(Default)]
@@ -960,6 +1034,21 @@ mod tests {
         ] {
             assert!(salvage::<Shelf>(&bytes).is_empty(), "{bytes:?}");
         }
+    }
+
+    #[test]
+    fn salvage_skips_a_record_whose_reader_panics_and_keeps_the_rest() {
+        // REL-02, ADR 0043: one record a bug can't read costs only that record.
+        let mut damaged = seal("fragile", 2, "who Ann\nwho boom\nwho Bo\n");
+        let last = damaged.len() - 2;
+        damaged[last] ^= 1;
+
+        let found: Vec<String> = salvage::<Fragile>(&damaged)
+            .into_iter()
+            .map(|fragile| fragile.who)
+            .collect();
+
+        assert_eq!(found, ["Ann", "Bo"]);
     }
 
     #[test]

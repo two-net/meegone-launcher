@@ -38,4 +38,8 @@ final class DebugHooks {
     static String realActivity(String activity) {
         return activity;
     }
+
+    static void readFaultExtras(Intent intent) {}
+
+    static void fault(int feature) {}
 }

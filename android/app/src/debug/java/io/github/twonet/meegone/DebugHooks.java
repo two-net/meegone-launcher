@@ -4,6 +4,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.icu.text.Collator;
 import android.icu.text.Transliterator;
+import android.util.Log;
 import android.view.MotionEvent;
 import java.util.List;
 
@@ -39,6 +40,23 @@ final class DebugHooks {
     /** With {@link #EXTRA_PERF}: how many apps the catalogue is padded to, such as 300. */
     static final String EXTRA_APPS = "io.github.twonet.meegone.debug.APPS";
 
+    /**
+     * Makes parts of MeeGone fail as a bug would, once each, for {@code tools/fault-check.sh}
+     * (ADR 0043): a comma-separated list such as {@code events-java,recent-rust}. Each names a
+     * part, {@code applications}, {@code events}, {@code recent}, {@code image} or {@code
+     * settings}, and where it fails: {@code -java} in its Java views at their next drawing,
+     * {@code -rust} in its Rust code at its next step, or {@code -reader} in what the host next
+     * reads of it. Only the debug build's Rust app has the Rust faults; the benchmark build's
+     * logs that it hasn't.
+     */
+    static final String EXTRA_FAULT = "io.github.twonet.meegone.debug.FAULT";
+
+    /** The parts, in the Rust app's {@code Feature} order, as {@link #EXTRA_FAULT} names them. */
+    private static final String[] PARTS = {"applications", "events", "recent", "image", "settings"};
+
+    /** Bits at each part's number: its Java views fail at their next drawing. Main thread. */
+    private static int javaFaults;
+
     /** Read on the icon threads. */
     private static volatile boolean legacyIcons;
 
@@ -61,6 +79,49 @@ final class DebugHooks {
             A11yTour.start(activity, views);
         }
     }
+
+    /**
+     * Arms the faults {@code intent} asks for (ADR 0043). The extra is taken off, so the activity
+     * made again after a configuration change doesn't arm them again. On the main thread, where
+     * MeeGone runs, after it has started.
+     */
+    static void readFaultExtras(Intent intent) {
+        String faults = intent == null ? null : intent.getStringExtra(EXTRA_FAULT);
+        if (faults == null) {
+            return;
+        }
+        intent.removeExtra(EXTRA_FAULT);
+        for (String named : faults.split(",")) {
+            String fault = named.trim();
+            int part = java.util.Arrays.asList(PARTS).indexOf(fault.split("-")[0]);
+            if (part >= 0 && fault.endsWith("-java")) {
+                javaFaults |= 1 << part;
+            } else {
+                try {
+                    nativeArmFault(fault);
+                } catch (UnsatisfiedLinkError e) {
+                    Log.w("MeeGone", "Only the debug build makes Rust faults: " + fault);
+                }
+            }
+        }
+    }
+
+    /**
+     * Throws, once, if a fault is armed for the Java views of part {@code feature}, which they
+     * are about to draw (ADR 0043).
+     */
+    static void fault(int feature) {
+        if ((javaFaults & 1 << feature) != 0) {
+            javaFaults &= ~(1 << feature);
+            throw new IllegalStateException("A fault made to order");
+        }
+    }
+
+    /**
+     * Makes the Rust app's {@code fault}, such as {@code events-rust} or {@code recent-reader},
+     * fail once. In the debug build's Rust app only (its {@code faults} feature).
+     */
+    private static native void nativeArmFault(String fault);
 
     /** Whether every icon is drawn as a legacy one. On any thread. */
     static boolean legacyIcons() {

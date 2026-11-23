@@ -18,9 +18,9 @@ use meegone_core_data::fakes::{
 };
 use meegone_core_data::storage::format::seal;
 use meegone_core_data::{
-    App, DataError, HomeTarget, JobNetwork, NetworkState, Notification, NotificationsAdapter,
-    PersistentSettingsStore, Problem, Profile, ProfileId, RecentDensity, Rect, Rgb, SettingsStore,
-    Shortcut, Size, StoredFile, ThemeChoice, accent,
+    App, DataError, HomeTarget, JobNetwork, NetworkAdapter, NetworkState, Notification,
+    NotificationsAdapter, PersistentSettingsStore, Problem, Profile, ProfileId, RecentDensity,
+    Rect, Rgb, SettingsStore, Shortcut, Size, StoredFile, ThemeChoice, accent,
 };
 use meegone_core_state::{Access, Health, Theme};
 use meegone_core_ui::tokens;
@@ -653,11 +653,13 @@ fn rel02_given_an_unreadable_layout_meegone_shows_an_alphabetical_grid_and_doesn
 
     let mut launcher = Launcher::start(fakes.platform());
 
-    assert_eq!(*launcher.shell().apps().health(), Health::Ready);
+    assert_eq!(launcher.shell().apps().health(), Health::Ready);
     assert_eq!(grid(&launcher), ["Atlas", "Mail", "Zoom"]);
     assert_eq!(dots(&mut launcher), [false, false, false]);
     let stored = fakes.storage.stored_text();
     assert!(stored.starts_with("meegone-layout 3\n"), "{stored}");
+    // SRS 7.6, issue #42: an app opens from the rebuilt grid (REL-01).
+    applications_launch(&fakes, &mut launcher, "mail");
     drop(launcher);
     assert_eq!(
         grid(&Launcher::start(fakes.platform())),
@@ -932,7 +934,7 @@ fn ac21_revoking_notification_access_shows_the_explainer_and_applications_still_
     let events = launcher.shell().events().state();
     assert_eq!(events.access, Access::Missing);
     assert!(events.groups.is_empty());
-    assert_eq!(*launcher.shell().events().health(), Health::Ready);
+    assert_eq!(launcher.shell().events().health(), Health::Ready);
     assert_eq!(
         events_list(&mut launcher),
         (EventsListMode::Explainer, Vec::new())
@@ -3419,7 +3421,10 @@ fn ac16_given_no_connection_the_daily_check_keeps_the_wallpaper_says_it_will_try
             .unwrap()
             .map(|job| job.not_before_ms),
         Some(NOV_19_MS + 24 * HOUR_MS)
-    );
+    ); // SRS 7.6, issue #42: Applications works offline all day (REL-01, REL-06).
+    fakes.apps.apps.lock().unwrap().push(app("mail", "Mail"));
+    launcher.dispatch(ShellIntent::AppsChanged);
+    applications_launch(&fakes, &mut launcher, "mail");
 }
 
 #[test]
@@ -3984,7 +3989,7 @@ fn rec02_given_usage_access_is_revoked_while_recent_shows_then_the_explainer_app
         (RecentMode::Explainer, Vec::new())
     );
     let recent = launcher.shell().recent();
-    assert_eq!(*recent.health(), Health::Ready);
+    assert_eq!(recent.health(), Health::Ready);
     assert_eq!(recent.state().problem, None);
     assert_eq!(launcher.shell().state().current, HomeView::Recent);
     // A tap on a card as it was drawn opens nothing.
@@ -5921,4 +5926,257 @@ fn ac18_with_animations_removed_folders_removals_coming_home_and_search_closing_
     assert!(!search.open);
     assert_eq!(search.reveal_px, 0);
     assert!(at_rest(&mut launcher));
+}
+
+// Failure handling (SRS 7.6, issue #42): each row of the table leaves Applications working
+// (REL-01, ARCH-09). Notification access is AC-21's, and a feed out of reach AC-16's.
+
+/// Goes home to Applications and taps `id`'s icon there: it opens (REL-01).
+fn applications_launch(fakes: &Fakes, launcher: &mut Launcher, id: &str) {
+    launcher.dispatch(ShellIntent::Home);
+    launcher.frame();
+    launcher.view().apps().icon_tapped(app_id(id), None);
+    launcher.frame();
+    assert_eq!(
+        fakes.apps.launched.lock().unwrap().last(),
+        Some(&app_id(id)),
+        "Applications didn't open {id}"
+    );
+}
+
+#[test]
+fn srs7_6_given_usage_access_is_revoked_then_recent_explains_and_applications_still_launches() {
+    // Issue #42: SRS 7.6, REC-02, REL-01.
+    let fakes = Fakes::after_setup();
+    let mut launcher = on_recent(&fakes);
+    assert_eq!(recent_cards(&mut launcher).0, RecentMode::Cards);
+
+    *fakes.usage.access.lock().unwrap() = Access::Missing;
+    launcher.dispatch(ShellIntent::UsageAccessChanged);
+
+    assert_eq!(
+        recent_cards(&mut launcher),
+        (RecentMode::Explainer, Vec::new())
+    );
+    assert_eq!(launcher.shell().recent().health(), Health::Ready);
+    applications_launch(&fakes, &mut launcher, "maps");
+}
+
+#[test]
+fn srs7_6_given_meegone_is_no_longer_the_default_home_app_then_the_banner_shows_and_applications_still_launches()
+ {
+    // Issue #42: SRS 7.6, ONB-04, REL-01. Another home app is chosen while MeeGone is away.
+    let fakes = Fakes::after_setup();
+    fakes.apps.apps.lock().unwrap().push(app("mail", "Mail"));
+    *fakes.system.default_home.lock().unwrap() = true;
+    let mut launcher = Launcher::start(fakes.platform());
+    assert!(!launcher.frame().home_banner);
+
+    *fakes.system.default_home.lock().unwrap() = false;
+    launcher.dispatch(ShellIntent::Resumed);
+
+    assert!(launcher.frame().home_banner);
+    applications_launch(&fakes, &mut launcher, "mail");
+}
+
+#[test]
+fn srs7_6_given_the_feeds_format_changed_then_the_wallpaper_stays_settings_says_so_and_applications_still_launches()
+ {
+    // Issue #42: SRS 7.6, WALL-08, WALL-16, REL-04, REL-01. The real feed client reads it.
+    let fakes = Fakes::after_setup();
+    fakes.apps.apps.lock().unwrap().push(app("mail", "Mail"));
+    image_cached(&fakes);
+    let cached = fakes.storage.files.lock().unwrap()[&StoredFile::ImageA].clone();
+    *fakes.network.state.lock().unwrap() = NetworkState::Unmetered;
+    fakes.network.responses.lock().unwrap().insert(
+        FEED_URL.into(),
+        b"{\"images\": \"not what it was\"}".to_vec(),
+    );
+    let (shared, mut launcher) = with_the_daily_check(&fakes);
+
+    run_the_daily_job(&fakes, &shared, &mut launcher, NOV_19_MS + HOUR_MS);
+
+    assert_eq!(
+        launcher.view().image_settings().checks(),
+        CheckStatus::Retrying(Problem::FeedFormatChanged)
+    );
+    assert_eq!(
+        fakes.storage.files.lock().unwrap()[&StoredFile::ImageA],
+        cached
+    );
+    assert_eq!(*fakes.wallpaper.lock_screen_images_set.lock().unwrap(), 0);
+    // Retried with back-off (REL-04): the next attempt waits.
+    assert!(fakes.scheduler.job.lock().unwrap().is_some());
+    applications_launch(&fakes, &mut launcher, "mail");
+}
+
+#[test]
+fn srs7_6_given_an_invalid_image_then_the_wallpaper_stays_settings_says_so_and_applications_still_launches()
+ {
+    // Issue #42: SRS 7.6, WALL-08, WALL-16, SEC-02, REL-01. The feed answers; its image doesn't
+    // decode.
+    let fakes = Fakes::after_setup();
+    fakes.apps.apps.lock().unwrap().push(app("mail", "Mail"));
+    serve_todays_image(&fakes);
+    fakes
+        .network
+        .responses
+        .lock()
+        .unwrap()
+        .insert(UHD_URL.into(), b"not a JPEG at all".to_vec());
+    let (shared, mut launcher) = with_the_daily_check(&fakes);
+
+    run_the_daily_job(&fakes, &shared, &mut launcher, NOV_19_MS + HOUR_MS);
+
+    assert!(matches!(
+        launcher.view().image_settings().checks(),
+        CheckStatus::Retrying(_)
+    ));
+    assert_eq!(lock_screen(&fakes), None);
+    assert_eq!(*fakes.wallpaper.lock_screen_images_set.lock().unwrap(), 0);
+    applications_launch(&fakes, &mut launcher, "mail");
+}
+
+#[test]
+fn srs7_6_given_the_device_stops_allowing_wallpapers_then_the_feature_is_unavailable_with_the_reason_and_applications_still_launches()
+ {
+    // Issue #42: SRS 7.6, WALL-13, REL-01. A policy arrives while the daily image is on.
+    let fakes = Fakes::after_setup();
+    fakes.apps.apps.lock().unwrap().push(app("mail", "Mail"));
+    serve_todays_image(&fakes);
+    let (shared, mut launcher) = with_the_daily_check(&fakes);
+
+    *fakes.wallpaper.unsupported.lock().unwrap() = Some(Problem::WallpaperNotAllowed);
+    launcher.dispatch(ShellIntent::Resumed);
+    // The job finds it can't set the lock screen, and asks nothing.
+    shared.check_image();
+
+    assert_eq!(launcher.frame().daily_image, Some(DailyImage::Unavailable));
+    assert_eq!(
+        launcher.view().image_settings().unavailable_reason(),
+        Some(Problem::WallpaperNotAllowed)
+    );
+    assert!(fakes.network.requests.lock().unwrap().is_empty());
+    assert_eq!(*fakes.wallpaper.lock_screen_images_set.lock().unwrap(), 0);
+    applications_launch(&fakes, &mut launcher, "mail");
+}
+
+#[test]
+fn srs7_6_given_low_storage_then_the_download_is_skipped_settings_says_so_and_applications_still_launches()
+ {
+    // Issue #42: SRS 7.6, WALL-16, REL-01. Less free than the largest image may take.
+    let fakes = Fakes::after_setup();
+    fakes.apps.apps.lock().unwrap().push(app("mail", "Mail"));
+    serve_todays_image(&fakes);
+    *fakes.system.free_storage_bytes.lock().unwrap() = Some(19_999_999);
+    let (shared, mut launcher) = with_the_daily_check(&fakes);
+
+    run_the_daily_job(&fakes, &shared, &mut launcher, NOV_19_MS + HOUR_MS);
+
+    // The feed is asked; the image is never downloaded.
+    let requests = fakes.network.requests.lock().unwrap().clone();
+    assert!(!requests.is_empty());
+    assert!(requests.iter().all(|url| url == FEED_URL), "{requests:?}");
+    assert_eq!(
+        launcher.view().image_settings().checks(),
+        CheckStatus::Retrying(Problem::StorageFull)
+    );
+    assert_eq!(lock_screen(&fakes), None);
+    applications_launch(&fakes, &mut launcher, "mail");
+}
+
+#[test]
+fn rel06_with_no_connection_every_view_and_setting_works_and_only_the_daily_image_asks_the_network()
+{
+    // Issue #42: REL-06. The network is off all along, as the fakes start.
+    let fakes = Fakes::after_setup();
+    *fakes.apps.apps.lock().unwrap() = vec![app("mail", "Mail"), app("maps", "Maps")];
+    *fakes.notifications.access.lock().unwrap() = Access::Granted;
+    *fakes.notifications.active.lock().unwrap() = vec![notification("m1", "mail")];
+    *fakes.usage.access.lock().unwrap() = Access::Granted;
+    *fakes.system.now_ms.lock().unwrap() = 10_000_000;
+    *fakes.usage.uses.lock().unwrap() = vec![used("maps", 9_000_000)];
+    // Events, with the image of the day cached and turned on.
+    let mut launcher = with_the_daily_image(&fakes);
+
+    // Events: its notification and the image's card, then the image's details.
+    assert_eq!(events_list(&mut launcher).0, EventsListMode::List);
+    assert!(image_card(&mut launcher).is_some());
+    tap_the_image_card(&mut launcher);
+    assert!(image_details(&mut launcher).is_some());
+    launcher.dispatch(ShellIntent::Back);
+    // Recent: its card.
+    launcher.dispatch(ShellIntent::Swipe(Direction::Next));
+    launcher.dispatch(ShellIntent::Swipe(Direction::Next));
+    assert_eq!(recent_cards(&mut launcher).0, RecentMode::Cards);
+    // Settings: the theme changes.
+    launcher.dispatch(ShellIntent::OpenSettings);
+    launcher.view().settings().theme_chosen(ThemeChoice::Dark);
+    assert_eq!(launcher.frame().theme_choice, Some(ThemeChoice::Dark));
+    launcher.dispatch(ShellIntent::Back);
+    // Applications: search finds an app, and an app opens.
+    launcher.dispatch(ShellIntent::Home);
+    launcher.frame();
+    launcher.view().apps().open_search();
+    launcher.frame();
+    launcher.view().apps().search_changed("map".into());
+    assert!(launcher.frame().search.results_shown);
+    launcher.dispatch(ShellIntent::Back);
+    applications_launch(&fakes, &mut launcher, "mail");
+
+    assert!(fakes.network.requests.lock().unwrap().is_empty());
+
+    // Only the daily image's check asks, and only the feed.
+    let shared = Shared::new(fakes.platform());
+    shared.check_image();
+    let requests = fakes.network.requests.lock().unwrap().clone();
+    assert!(!requests.is_empty());
+    assert!(requests.iter().all(|url| url == FEED_URL), "{requests:?}");
+}
+
+/// A network with a bug: every request panics, as a bug in the image's check would.
+struct PanickingNetwork(std::sync::Arc<fakes::FakeNetwork>);
+
+impl NetworkAdapter for PanickingNetwork {
+    fn state(&self) -> NetworkState {
+        self.0.state()
+    }
+
+    fn saves_data(&self) -> bool {
+        self.0.saves_data()
+    }
+
+    fn get(&self, _https_url: &str, _max_bytes: usize) -> Result<Vec<u8>, DataError> {
+        panic!("network bug")
+    }
+}
+
+#[test]
+fn srs7_6_given_the_daily_check_panics_for_3_days_then_settings_says_daily_image_unavailable_and_applications_still_launches()
+ {
+    // Issue #42: ARCH-09, REL-04, SRS 7.6. A bug in the check fails each attempt, with the
+    // back-off and the day's budget, and never the app or the lock-screen image's own views.
+    let fakes = Fakes::after_setup();
+    fakes.apps.apps.lock().unwrap().push(app("mail", "Mail"));
+    *fakes.network.state.lock().unwrap() = NetworkState::Unmetered;
+    *fakes.system.now_ms.lock().unwrap() = NOV_19_MS;
+    let mut platform = fakes.platform();
+    platform.network = std::sync::Arc::new(PanickingNetwork(fakes.network.clone()));
+    let shared = Shared::new(platform);
+    let mut launcher = Launcher::start_shared(&shared);
+    launcher.view().image_settings().daily_image_toggled(true);
+    launcher.frame();
+
+    let runs = run_the_daily_job(&fakes, &shared, &mut launcher, NOV_19_MS + 73 * HOUR_MS);
+
+    // Six attempts a day for three days, and three in the fourth day's first hour (REL-04).
+    assert_eq!(runs, 3 * 6 + 3);
+    assert!(launcher.frame().image_unavailable);
+    assert_eq!(
+        launcher.view().image_settings().checks(),
+        CheckStatus::Unavailable(Problem::DownloadFailed)
+    );
+    assert_eq!(launcher.shell().lockimage().health(), Health::Ready);
+    assert_eq!(*fakes.wallpaper.lock_screen_images_set.lock().unwrap(), 0);
+    applications_launch(&fakes, &mut launcher, "mail");
 }

@@ -21,16 +21,19 @@ use meegone_shell_ui::ShellView;
 pub use meegone_shell_ui::{
     AccessItem, AccessStatus, Age, AppMenuFrame, AppMenuItem, AppsFrame, BADGE_ROWS, Bounds,
     CardContent, Cell, CellKey, CheckStatus, CloseFrame, DailyImage, DetailsContent, EditFrame,
-    EventsListFrame, EventsListMode, EventsMenuFrame, EventsRow, FolderFrame, FolderId,
-    GridChangeFrame, GridLayout, HomeFrame, HoverFrame, LiftFrame, MenuFrame, MergeFrame,
+    EventsListFrame, EventsListMode, EventsMenuFrame, EventsRow, Failures, Feature, FolderFrame,
+    FolderId, GridChangeFrame, GridLayout, HomeFrame, HoverFrame, LiftFrame, MenuFrame, MergeFrame,
     NotificationMenuItem, PastAction, PastContent, PastImageContent, Preview, RECENT_ROWS,
     RecentFrame, RecentMode, RecentWindow, RenameFrame, RowTarget, SearchFrame, SetupFrame,
-    SetupImageContent, SetupStep, ShownCard, Surface, SurfaceCellsFrame, TodayEntry, UpdateStatus,
+    SetupImageContent, SetupStep, ShownCard, StoppedCards, Surface, SurfaceCellsFrame, TodayEntry,
+    UpdateStatus,
 };
 
 pub struct Launcher {
     shell: HomeShell,
     view: ShellView,
+    /// The features drawn as failed in the last frame (ARCH-09, ADR 0043).
+    drawn: Failures,
 }
 
 impl Launcher {
@@ -43,7 +46,11 @@ impl Launcher {
     pub fn start_shared(shared: &Shared) -> Self {
         let mut shell = HomeShell::compose_shared(shared);
         let view = ShellView::new(&mut shell);
-        Self { shell, view }
+        Self {
+            shell,
+            view,
+            drawn: Failures::default(),
+        }
     }
 
     /// An event from the system, such as Home, Back or a theme change.
@@ -53,12 +60,32 @@ impl Launcher {
 
     /// One UI turn: applies the intents the views sent, then draws. Returns what the host
     /// draws for the home views (ADR 0006).
+    ///
+    /// A feature that fails while it is drawn is drawn as failed in this same frame: what it
+    /// covered, such as the image details, closes first (ARCH-09, ADR 0043).
     pub fn frame(&mut self) -> HomeFrame {
         for intent in self.view.take_intents() {
             self.shell.dispatch(intent);
         }
-        self.view.render(&self.shell);
-        self.view.frame(&self.shell)
+        // At most once more for each feature, as each failure is for good.
+        loop {
+            let failed = self.shell.failures();
+            for feature in failed.since(self.drawn) {
+                self.shell.dispatch(ShellIntent::Failed(feature));
+            }
+            self.drawn = failed;
+            self.view.render(&self.shell);
+            let frame = self.view.frame(&self.shell);
+            if !self.needs_redraw() {
+                return frame;
+            }
+        }
+    }
+
+    /// Whether a feature failed since the last frame was drawn, such as in one of the host's
+    /// readers, so the host should draw again (ADR 0043).
+    pub fn needs_redraw(&self) -> bool {
+        self.shell.failures() != self.drawn
     }
 
     pub fn shell(&self) -> &HomeShell {

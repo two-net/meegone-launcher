@@ -18,6 +18,7 @@ import android.os.Looper;
 import android.os.MessageQueue;
 import android.text.InputFilter;
 import android.text.TextUtils;
+import android.util.Log;
 import android.util.TypedValue;
 import android.view.Choreographer;
 import android.view.DisplayCutout;
@@ -243,7 +244,24 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private static final int SETUP_IMAGE_SWITCH = 152; // SetupScreens.SWITCH_*; -1 Continue alone
     private static final int SETUP_IMAGE_REVISION = 153; // changes when it changes; -1 none
     private static final int HOME_BANNER = 154; // 1 while the banner shows
-    private static final int FRAME_SIZE = 155;
+    // Parts that stopped working (ARCH-09, ADR 0043):
+    private static final int FAILED = 155; // bits at each FEATURE_*: the parts drawn no more
+    private static final int STOPPED = 156; // STOPPED_* bits: where a stopped card shows
+    private static final int FRAME_SIZE = 157;
+    /** The parts of MeeGone that fail on their own, as the Rust app's {@code Feature} numbers them. */
+    private static final int FEATURE_APPLICATIONS = 0;
+    private static final int FEATURE_EVENTS = 1;
+    private static final int FEATURE_RECENT = 2;
+    private static final int FEATURE_IMAGE = 3;
+    private static final int FEATURE_SETTINGS = 4;
+    /** Where a card says a part stopped working, as the frame's slot 156 has them. */
+    private static final int STOPPED_APPLICATIONS = 1;
+    private static final int STOPPED_EVENTS = 2;
+    private static final int STOPPED_RECENT = 4;
+    private static final int STOPPED_IMAGE_IN_EVENTS = 8;
+    private static final int STOPPED_IMAGE_IN_SETTINGS = 16;
+    private static final int STOPPED_SETTINGS = 32;
+    private static final String TAG = "MeeGone";
     /** The licences of the third-party code MeeGone includes, in About (LEGAL-06). */
     private static final int[] LICENCES = {
         R.raw.licence_mit, R.raw.licence_apache_2_0, R.raw.licence_unicode_3_0,
@@ -517,6 +535,22 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private int setupShown = -1;
     private int setupImageRead = -1;
     private int bannerShown = -1;
+    /** The FEATURE_* bits of the parts this view no longer draws (ARCH-09, ADR 0043). */
+    private int failed;
+    /** The frame's STOPPED bits as last shown. */
+    private int stoppedShown = -1;
+    /**
+     * Cards that say a part stopped working, with Restart MeeGone (ADR 0043): Applications' at
+     * the bottom of the home views; Events' and Recent's on their pages; the lock-screen
+     * image's in Events, where its card was, and in Settings; and Settings' at its top.
+     */
+    private final StoppedCard applicationsStopped;
+    private final StoppedCard eventsStopped;
+    private final StoppedCard recentStopped;
+    private final StoppedCard imageInEventsStopped;
+    private final StoppedCard imageInSettingsStopped;
+    private final StoppedCard settingsStopped;
+    private final StoppedCard[] stoppedCards;
     /** The revisions of the image details, the status line and the past week last read, or -1. */
     private int imageDetailsRead = -1;
     private int imageStatusRead = -1;
@@ -656,6 +690,19 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         doneShape.setCornerRadius(dp(24));
         done.setOnClickListener(view -> apps.done());
         done.setVisibility(GONE);
+        // Restart MeeGone, on any card that says a part stopped working (ADR 0043).
+        Runnable restart = () -> Restart.now((Activity) getContext());
+        applicationsStopped = new StoppedCard(context, R.string.stopped_applications, restart);
+        eventsStopped = new StoppedCard(context, R.string.stopped_events, restart);
+        recentStopped = new StoppedCard(context, R.string.stopped_recent, restart);
+        imageInEventsStopped = new StoppedCard(context, R.string.stopped_lock_screen_image, restart);
+        imageInSettingsStopped =
+                new StoppedCard(context, R.string.stopped_lock_screen_image, restart);
+        settingsStopped = new StoppedCard(context, R.string.stopped_settings, restart);
+        stoppedCards = new StoppedCard[] {
+            applicationsStopped, eventsStopped, recentStopped, imageInEventsStopped,
+            imageInSettingsStopped, settingsStopped,
+        };
         for (int i = 0; i < VIEWS; i++) {
             FrameLayout page = new FrameLayout(context);
             // The view's own element, under its content and first in its order (ADR 0039).
@@ -680,12 +727,15 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
                 // together (ADR 0020, ADR 0022).
                 LinearLayout content = new LinearLayout(context);
                 content.setOrientation(LinearLayout.VERTICAL);
+                // In place of the header and the notifications while Events doesn't work.
+                content.addView(eventsStopped, cardParams());
                 content.addView(eventsHeader, new LinearLayout.LayoutParams(
                         LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
                 content.addView(eventsList, new LinearLayout.LayoutParams(
                         LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
                 content.addView(imageCard, new LinearLayout.LayoutParams(
                         LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
+                content.addView(imageInEventsStopped, cardParams());
                 ScrollView scroll = new Scroll(context);
                 scroll.setVerticalScrollBarEnabled(false);
                 scroll.setOverScrollMode(OVER_SCROLL_IF_CONTENT_SCROLLS);
@@ -704,6 +754,11 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
                 scrolls.add(scroll);
                 page.addView(scroll, new LayoutParams(
                         LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
+                // In place of Recent's title and cards while Recent doesn't work.
+                LayoutParams stoppedParams = new LayoutParams(
+                        LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT, Gravity.TOP);
+                stoppedParams.setMargins(dp(16), dp(24), dp(16), 0);
+                page.addView(recentStopped, stoppedParams);
             }
             page.setVisibility(INVISIBLE);
             pages[i] = page;
@@ -761,6 +816,9 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         });
         banner.setVisibility(GONE);
         addView(banner, new LayoutParams(
+                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT, Gravity.BOTTOM));
+        // In the banner's place, while Applications doesn't work (ADR 0043).
+        addView(applicationsStopped, new LayoutParams(
                 LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT, Gravity.BOTTOM));
 
         // Below Settings, which can open over it (ADR 0031).
@@ -955,12 +1013,18 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         groups.setOrientation(LinearLayout.VERTICAL);
         // The bottom padding keeps the last item clear of the screen's edge.
         groups.setPadding(0, 0, 0, dp(24));
+        // Settings' own groups give way to its stopped card at the top, and the lock-screen
+        // image's group to its own, while they don't work (ADR 0043).
+        groups.addView(settingsStopped, cardParams());
         for (View group : new View[] {
             themeSettings, homeSettings, hiddenApps, recentSettings, imageSettings,
             accessSettings, aboutSettings,
         }) {
             groups.addView(group, new LinearLayout.LayoutParams(
                     LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
+            if (group == imageSettings) {
+                groups.addView(imageInSettingsStopped, cardParams());
+            }
         }
         settingsScroll = new Scroll(context);
         settingsScroll.addView(groups, new ScrollView.LayoutParams(
@@ -1103,9 +1167,11 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     protected void onSizeChanged(int width, int height, int oldWidth, int oldHeight) {
         super.onSizeChanged(width, height, oldWidth, oldHeight);
         // Recent's cards take the window's proportions, and fit their rows on screen (REC-04,
-        // REC-05).
-        recentList.window(width, height);
-        recentList.viewport(height - safe.top - safe.bottom);
+        // REC-05). Not once Recent has stopped: none of its views' code runs (ADR 0043).
+        if (drawing(FEATURE_RECENT)) {
+            recentList.window(width, height);
+            recentList.viewport(height - safe.top - safe.bottom);
+        }
         sendLayout();
         apply();
     }
@@ -1156,7 +1222,13 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         bannerParams.setMargins(safe.left + bannerGap, 0, safe.right + bannerGap,
                 safe.bottom + bannerGap);
         banner.setLayoutParams(bannerParams);
-        recentList.viewport(getHeight() - safe.top - safe.bottom);
+        LayoutParams stoppedParams = (LayoutParams) applicationsStopped.getLayoutParams();
+        stoppedParams.setMargins(safe.left + bannerGap, 0, safe.right + bannerGap,
+                safe.bottom + bannerGap);
+        applicationsStopped.setLayoutParams(stoppedParams);
+        if (drawing(FEATURE_RECENT)) {
+            recentList.viewport(getHeight() - safe.top - safe.bottom);
+        }
         LayoutParams params = (LayoutParams) indicator.getLayoutParams();
         if (params.topMargin != safe.top + indicatorMargin) {
             params.topMargin = safe.top + indicatorMargin;
@@ -1466,9 +1538,12 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             return;
         }
         View target = touchTarget(this, pages[frame[CURRENT]], downX, downY);
-        int row = frame[CURRENT] == EVENTS ? eventsList.indexOfRow(target) : -1;
-        boolean onRecentCard =
-                frame[CURRENT] == RECENT_VIEW && recentList.indexOfCard(target) >= 0;
+        // A part that stopped runs none of its views' code (ADR 0043).
+        int row = frame[CURRENT] == EVENTS && drawing(FEATURE_EVENTS)
+                ? eventsList.indexOfRow(target)
+                : -1;
+        boolean onRecentCard = frame[CURRENT] == RECENT_VIEW && drawing(FEATURE_RECENT)
+                && recentList.indexOfCard(target) >= 0;
         if (target == null || onRecentCard) {
             claimed = nativeLongPress();
         } else if (target instanceof AppCell && frame[CURRENT] == APPLICATIONS) {
@@ -1622,8 +1697,14 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         folderApps.refreshIcons();
         results.refreshIcons();
         hiddenApps.refreshIcons();
-        eventsList.refreshIcons();
-        recentList.refreshIcons();
+        // A part that stopped part-way through drawing runs none of its views' code again: its
+        // half-built rows could throw where nothing catches it (ADR 0043).
+        if (drawing(FEATURE_EVENTS)) {
+            eventsList.refreshIcons();
+        }
+        if (drawing(FEATURE_RECENT)) {
+            recentList.refreshIcons();
+        }
         shadow.invalidate();
     }
 
@@ -1725,15 +1806,61 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             }
             closingShown = frame[RECENT_CLOSE];
         }
-        applyEventsHeader();
-        applyEventsList();
-        applyImageCard();
-        applyRecent();
-        applyImageDetails();
+        applyFailed();
+        // Each part's views are drawn on their own: a bug in one stops that part alone, which
+        // then shows its stopped card, and launching apps keeps working (REL-01, ARCH-09,
+        // ADR 0043). Applications' and the home's own are not: a bug there is a crash, so it
+        // is counted (REL-07).
+        if (drawing(FEATURE_EVENTS)) {
+            try {
+                DebugHooks.fault(FEATURE_EVENTS);
+                applyEventsHeader();
+                applyEventsList();
+            } catch (RuntimeException | OutOfMemoryError e) {
+                stop(FEATURE_EVENTS, e);
+            }
+        }
+        if (drawing(FEATURE_IMAGE)) {
+            try {
+                DebugHooks.fault(FEATURE_IMAGE);
+                applyImageCard();
+            } catch (RuntimeException | OutOfMemoryError e) {
+                stop(FEATURE_IMAGE, e);
+            }
+        }
+        if (drawing(FEATURE_RECENT)) {
+            try {
+                DebugHooks.fault(FEATURE_RECENT);
+                applyRecent();
+            } catch (RuntimeException | OutOfMemoryError e) {
+                stop(FEATURE_RECENT, e);
+            }
+        }
+        if (drawing(FEATURE_IMAGE)) {
+            try {
+                applyImageDetails();
+            } catch (RuntimeException | OutOfMemoryError e) {
+                stop(FEATURE_IMAGE, e);
+            }
+        }
         applySettings();
-        applyPastImages();
-        applySetup();
-        applyBanner();
+        if (drawing(FEATURE_IMAGE)) {
+            try {
+                applyPastImages();
+            } catch (RuntimeException | OutOfMemoryError e) {
+                stop(FEATURE_IMAGE, e);
+            }
+        }
+        if (drawing(FEATURE_SETTINGS)) {
+            try {
+                DebugHooks.fault(FEATURE_SETTINGS);
+                applySetup();
+                applyBanner();
+            } catch (RuntimeException | OutOfMemoryError e) {
+                stop(FEATURE_SETTINGS, e);
+            }
+        }
+        applyStopped();
         applyMenu();
         applyRename();
         int offered = (frame[SEARCH] & SEARCH_OFFERED) != 0 ? 1 : 0;
@@ -2169,16 +2296,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
                         : null);
                 break;
             case SetupScreens.LOCK_SCREEN_IMAGE:
-                int switchState = frame[SETUP_IMAGE_SWITCH];
-                String reason = switchState == SetupScreens.SWITCH_UNAVAILABLE
-                        ? Problems.text(getResources(), nativeImageUnavailableReason())
-                        : null;
-                setup.showImage(switchState, reason, regionName(frame[REGION]));
-                int revision = frame[SETUP_IMAGE_REVISION];
-                if (revision >= 0 && revision != setupImageRead) {
-                    setupImageRead = revision;
-                    setup.fillImage(revision, nativeSetupImage());
-                }
+                applySetupImage();
                 break;
             case SetupScreens.ACCESS:
                 setup.showAccess(frame[NOTIFICATION_ACCESS] > 0, frame[USAGE_ACCESS] > 0,
@@ -2187,6 +2305,139 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             default:
                 break;
         }
+    }
+
+    /**
+     * Setup's lock-screen image step: the lock-screen image's own part of setup. While it doesn't
+     * work, the step offers Continue alone, as the frame says (ARCH-09, ADR 0043).
+     */
+    private void applySetupImage() {
+        if (!drawing(FEATURE_IMAGE)) {
+            setup.showImage(frame[SETUP_IMAGE_SWITCH], null, "");
+            return;
+        }
+        try {
+            int switchState = frame[SETUP_IMAGE_SWITCH];
+            String reason = switchState == SetupScreens.SWITCH_UNAVAILABLE
+                    ? Problems.text(getResources(), nativeImageUnavailableReason())
+                    : null;
+            setup.showImage(switchState, reason, regionName(frame[REGION]));
+            int revision = frame[SETUP_IMAGE_REVISION];
+            if (revision >= 0 && revision != setupImageRead) {
+                setupImageRead = revision;
+                setup.fillImage(revision, nativeSetupImage());
+            }
+        } catch (RuntimeException | OutOfMemoryError e) {
+            stop(FEATURE_IMAGE, e);
+        }
+    }
+
+    /** Whether this view still draws {@code feature}'s views (ARCH-09). */
+    private boolean drawing(int feature) {
+        return (failed & 1 << feature) == 0;
+    }
+
+    /**
+     * Takes on the parts the Rust app says stopped working, as their code panicked or this view
+     * reported them: each is logged once and its views are hidden (ARCH-09, ADR 0043).
+     */
+    private void applyFailed() {
+        int stopped = frame[FAILED] & ~failed;
+        for (int feature = FEATURE_APPLICATIONS; feature <= FEATURE_SETTINGS; feature++) {
+            if ((stopped & 1 << feature) != 0) {
+                Log.w(TAG, "Feature " + feature + " stopped working");
+                failed |= 1 << feature;
+                hide(feature);
+            }
+        }
+    }
+
+    /**
+     * {@code feature}'s views threw {@code e}: they are drawn no more, and the Rust app stops the
+     * feature too, which closes what it covered and shows its stopped card. Only the
+     * exception's kind is logged: its message may quote what it was showing (PRIV-03,
+     * ADR 0042).
+     */
+    private void stop(int feature, Throwable e) {
+        Log.w(TAG, "Feature " + feature + " stopped working: " + e.getClass().getSimpleName());
+        failed |= 1 << feature;
+        hide(feature);
+        try {
+            nativeFeatureFailed(feature);
+        } catch (RuntimeException alreadyStopped) {
+            // This view draws the part no more either way; the next frame says what Rust did.
+        }
+        post(this::apply);
+    }
+
+    /**
+     * Hides {@code feature}'s own views, without running any of their code: only their
+     * visibility changes. Applications' grid stays, so a tap on it still opens an app.
+     */
+    private void hide(int feature) {
+        switch (feature) {
+            case FEATURE_EVENTS:
+                eventsHeader.setVisibility(GONE);
+                eventsList.setVisibility(GONE);
+                break;
+            case FEATURE_RECENT:
+                recentList.setVisibility(GONE);
+                recentSettings.setVisibility(GONE);
+                break;
+            case FEATURE_IMAGE:
+                // Region's chooser is the image's, in Settings or setup.
+                closeSettingsDialog();
+                imageCard.setVisibility(GONE);
+                imageSettings.setVisibility(GONE);
+                imageDetails.setVisibility(GONE);
+                imageDetailsShown = 0;
+                pastImages.setVisibility(GONE);
+                pastImagesShown = 0;
+                break;
+            case FEATURE_SETTINGS:
+                closeSettingsDialog();
+                themeSettings.setVisibility(GONE);
+                homeSettings.setVisibility(GONE);
+                accessSettings.setVisibility(GONE);
+                setup.setVisibility(GONE);
+                setupShown = -1;
+                banner.setVisibility(GONE);
+                bannerShown = 0;
+                break;
+            default:
+                break;
+        }
+        coverLayers();
+    }
+
+    /**
+     * The cards that say a part stopped working, where the frame says (ADR 0043). They are
+     * this view's own, so they show whatever failed.
+     */
+    private void applyStopped() {
+        int stopped = frame[STOPPED];
+        if (stopped != stoppedShown) {
+            stoppedShown = stopped;
+            applicationsStopped.show((stopped & STOPPED_APPLICATIONS) != 0);
+            eventsStopped.show((stopped & STOPPED_EVENTS) != 0);
+            recentStopped.show((stopped & STOPPED_RECENT) != 0);
+            imageInEventsStopped.show((stopped & STOPPED_IMAGE_IN_EVENTS) != 0);
+            imageInSettingsStopped.show((stopped & STOPPED_IMAGE_IN_SETTINGS) != 0);
+            settingsStopped.show((stopped & STOPPED_SETTINGS) != 0);
+        }
+        if (stopped != 0) {
+            for (StoppedCard card : stoppedCards) {
+                card.colour(foreground, dim, surface, frame[ACCENT]);
+            }
+        }
+    }
+
+    /** A stopped card's place in a column, such as Events' or Settings'. */
+    private LinearLayout.LayoutParams cardParams() {
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+                LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT);
+        params.setMargins(dp(16), dp(16), dp(16), dp(8));
+        return params;
     }
 
     /** The banner offering to make MeeGone the default home app, while it shows (ONB-04). */
@@ -2200,11 +2451,19 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         }
     }
 
-    /** Whether the banner shows at {@code (x, y)} in the home views. */
+    /**
+     * Whether the banner, or Applications' stopped card in its place, shows at {@code (x, y)} in
+     * the home views.
+     */
     private boolean onBanner(float x, float y) {
-        return banner.getVisibility() == VISIBLE
-                && x >= banner.getLeft() && x < banner.getRight()
-                && y >= banner.getTop() && y < banner.getBottom();
+        return on(banner, x, y) || on(applicationsStopped, x, y);
+    }
+
+    /** Whether {@code view}, a child of this one, shows at {@code (x, y)}. */
+    private static boolean on(View view, float x, float y) {
+        return view.getVisibility() == VISIBLE
+                && x >= view.getLeft() && x < view.getRight()
+                && y >= view.getTop() && y < view.getBottom();
     }
 
     /**
@@ -2386,26 +2645,47 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
                 // The device's language, and so Automatic's region, may have changed.
                 regions = nativeRegions();
                 regionShown = -2;
-                scrollSettingsTo(settingsShown == SETTINGS_AT_LOCK_SCREEN_IMAGE
-                        ? imageSettings.heading()
-                        : null);
+                // At the lock-screen image's group, or at its stopped card in its place.
+                View at = null;
+                if (settingsShown == SETTINGS_AT_LOCK_SCREEN_IMAGE) {
+                    at = drawing(FEATURE_IMAGE) ? imageSettings.heading() : imageInSettingsStopped;
+                }
+                scrollSettingsTo(at);
             }
         }
-        applyThemeSettings();
-        applyHomeSettings();
+        if (drawing(FEATURE_SETTINGS)) {
+            try {
+                applyThemeSettings();
+                applyHomeSettings();
+                applyAccessSettings();
+            } catch (RuntimeException | OutOfMemoryError e) {
+                stop(FEATURE_SETTINGS, e);
+            }
+        }
         applyHiddenApps();
-        applyRecentSettings();
-        applyImageSettings();
-        applyAccessSettings();
+        if (drawing(FEATURE_RECENT)) {
+            try {
+                applyRecentSettings();
+            } catch (RuntimeException | OutOfMemoryError e) {
+                stop(FEATURE_RECENT, e);
+            }
+        }
+        if (drawing(FEATURE_IMAGE)) {
+            try {
+                applyImageSettings();
+            } catch (RuntimeException | OutOfMemoryError e) {
+                stop(FEATURE_IMAGE, e);
+            }
+        }
         aboutSettings.colour(foreground, dim, frame[ACCENT]);
         aboutSettings.show(frame[RESET_OFFERED] != 0);
     }
 
     /**
-     * Scrolls Settings to the group headed {@code heading}, which screen readers move to, or to
-     * its top with null, once it is laid out.
+     * Scrolls Settings to the group headed {@code heading}, or to a stopped card in a group's
+     * place, which screen readers move to, or to its top with null, once it is laid out.
      */
-    private void scrollSettingsTo(TextView heading) {
+    private void scrollSettingsTo(View heading) {
         ViewTreeObserver observer = settingsScroll.getViewTreeObserver();
         observer.addOnPreDrawListener(new ViewTreeObserver.OnPreDrawListener() {
             @Override
@@ -2415,8 +2695,14 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
                     settingsScroll.scrollTo(0, 0);
                     return true;
                 }
-                View group = (View) heading.getParent();
-                settingsScroll.scrollTo(0, group.getTop() + heading.getTop());
+                // Its top within the groups, the scroll's one child.
+                int top = 0;
+                for (View view = heading; view.getParent() instanceof View
+                        && view.getParent() != settingsScroll;
+                        view = (View) view.getParent()) {
+                    top += view.getTop();
+                }
+                settingsScroll.scrollTo(0, top);
                 heading.performAccessibilityAction(
                         AccessibilityNodeInfo.ACTION_ACCESSIBILITY_FOCUS, null);
                 return true;
@@ -3682,6 +3968,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         } else {
             layers.add(pages[frame[CURRENT]]);
             layers.add(banner);
+            layers.add(applicationsStopped);
         }
         return layers;
     }
@@ -3737,6 +4024,12 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
      * (ADR 0041). Returns whether it was, so the frame is read again.
      */
     private native boolean nativeIdle();
+
+    /**
+     * This view caught a bug in {@code feature}'s views, a FEATURE_* number, and stopped
+     * drawing them: the Rust app stops the feature too (ARCH-09, ADR 0043).
+     */
+    private native void nativeFeatureFailed(int feature);
 
     /**
      * Shows the next or previous view without a gesture. Returns false if there is none: past

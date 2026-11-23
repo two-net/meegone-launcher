@@ -33,6 +33,12 @@ The store listing is in `fastlane/metadata/android/`, in the layout F-Droid read
   - the release APK isn't debuggable, test-only or profileable, and holds none of the debug build's classes (SEC-06);
   - the shipped Java has no web view, links in text or device identifiers, connects only from the bridge, and logs no exception (SEC-02, PRIV-01, PRIV-02, PRIV-03);
   - a redirect never leaves the image feed's origin, and a day's requests all go to `https://www.bing.com/` (PRIV-02).
+- [ ] `cargo test --workspace`, `cargo test -p arch-check` and the APK job also check the reliability rules (#42, ADR 0043):
+  - a bug in Events, Recent, the lock-screen image or Settings, wherever its code runs, stops that part alone, which shows its stopped card, and an app still opens from Applications; a failed Applications' last grid still opens apps (REL-01, ARCH-09);
+  - every row of SRS 7.6's failure table ends with an app opened, and everything but the image's download works offline (REL-06);
+  - a saved file that a bug can't read loads as the defaults, and a daily check that panics backs off and says so;
+  - nothing in the Java host hides a crash or ends the process but Restart MeeGone; the build adds no library, and the release APK holds only MeeGone's own classes and no fault hook (REL-07, SEC-06);
+  - `meegone-core-state` doesn't compile unless panics unwind.
 
 ## Open questions that block a release
 
@@ -91,8 +97,22 @@ The store listing is in `fastlane/metadata/android/`, in the layout F-Droid read
 
   Every connection goes to `www.bing.com` over HTTPS (PRIV-02, SEC-01).
 - [ ] With no default browser set, More info offers only browsers, never another app that opens the site's links (SEC-02, ADR 0042).
+- [ ] `tools/fault-check.sh` passes with the debug build of the release's commit (`(cd android && ./gradlew installDebug)`), on a test device in English with Android 11 or later (#42, ADR 0043). For a fault in each part's Java views and in its Rust code, and in what the host reads of Events and Recent, it checks:
+  - the part says it stopped working, and the process lives on with no crash in the system's crash log or drop box (ARCH-09);
+  - an app still opens from Applications, Applications' own fault included (REL-01);
+  - Restart MeeGone starts it again in a new process, which Android records as exiting itself (`EXIT_SELF`), not as a crash (REL-07).
+- [ ] With the debug build and `--es io.github.twonet.meegone.debug.FAULT applications-rust,events-java,recent-java,image-java,settings-java`, each stopped card reads in full with TalkBack, its Restart MeeGone button is reached by Tab and Switch Access, and nothing overlaps at font scale 2.0, in the Dark theme or right to left (A11Y-01 to A11Y-06, ADR 0043).
 - [ ] Dates, times and numbers (L10N-03, L10N-04):
   - With 24-hour time on, the Events alarm and "Last updated" show 24-hour times; with it off, 12-hour ones.
   - In Arabic, Events' counts use Arabic-Indic digits.
   - In Swedish, Settings → Applications → Hidden apps, and a first start's grid, put "Ö…" after "Z…".
   - Searching "lodz" finds an app called "Łódź…".
+
+## After a release
+
+- [ ] Google Play Console → Android vitals, over the 28 days after the release reaches its users (#42, ADR 0043):
+  - the user-perceived crash rate is 0.1 % or less, so at least 99.9 % of daily users have no crash (REL-07);
+  - no crash cluster has many more reports than users: one user's repeated crashes would make the sessions' rate far worse than the users' one;
+  - no cluster is at `Restart`, which exits rather than crashes.
+
+  A miss is a bug to fix in the next release. F-Droid reports no stability data, so this is Play's alone.

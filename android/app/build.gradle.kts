@@ -65,15 +65,24 @@ abstract class CargoNdk @Inject constructor(private val exec: ExecOperations) : 
     @get:OutputDirectory
     abstract val jniLibs: DirectoryProperty
 
+    /**
+     * The Rust app's features: `faults` in the debug build alone, for tools/fault-check.sh
+     * (ADR 0043). tools/arch-check checks it stays there, and that the release APK has none.
+     */
+    @get:Input
+    abstract val features: ListProperty<String>
+
     @TaskAction
     fun build() {
         exec.exec {
             workingDir = workspace.get().asFile
             environment("ANDROID_NDK_HOME", ndk.get().asFile.path)
             commandLine(
-                "cargo", "ndk", "-t", "arm64-v8a", "-P", "29",
-                "-o", jniLibs.get().asFile.path,
-                "build", "--release", "-p", "meegone-launcher",
+                listOf(
+                    "cargo", "ndk", "-t", "arm64-v8a", "-P", "29",
+                    "-o", jniLibs.get().asFile.path,
+                    "build", "--release", "-p", "meegone-launcher",
+                ) + features.get().flatMap { listOf("--features", it) }
             )
         }
     }
@@ -83,6 +92,7 @@ androidComponents.onVariants { variant ->
     val cargo = tasks.register<CargoNdk>("cargoNdk" + variant.name.replaceFirstChar { it.uppercase() }) {
         ndk = androidComponents.sdkComponents.ndkDirectory
         workspace = rootProject.layout.projectDirectory.dir("..")
+        features = if (variant.buildType == "debug") listOf("meegone-launcher/faults") else listOf()
         // Cargo knows best whether the library is up to date.
         outputs.upToDateWhen { false }
     }

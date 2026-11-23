@@ -21,6 +21,10 @@
 //!    downloading it again.
 //! 7. Records how it went, for the next run and for Settings, and schedules the next run.
 //!
+//! A bug that panics part-way through step 5 or 6 counts as a failed attempt, so it is retried
+//! with back-off, Settings says so, and after 3 days of them the image shows as unavailable
+//! (ARCH-09, REL-04, ADR 0043).
+//!
 //! Any failure leaves the cache, and the wallpaper set from it, as they were (WALL-08). Nothing
 //! is ever set while the daily image is off (WALL-02, WALL-12), and with no image there is
 //! nothing to set (WALL-10).
@@ -38,6 +42,7 @@
 //! lock-screen image step, while the daily image may still be off, and only ever shows it
 //! (ONB-01, WALL-02, ADR 0036).
 
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use meegone_core_data::{
@@ -257,7 +262,11 @@ impl ImageUpdater {
             &offset,
             options.use_mobile_data,
         ));
-        let answer = self.ask(&options, now);
+        // A bug is a failed attempt like any other: it is counted already, and recording it
+        // shows the status and leads to the back-off (ARCH-09, ADR 0043). What it left cached
+        // but not set is set at the next attempt, as after any failure.
+        let answer = panic::catch_unwind(AssertUnwindSafe(|| self.ask(&options, now)))
+            .unwrap_or(Err(DataError::Failed(Problem::DownloadFailed)));
         let recorded = self.cache.update_checks(&mut |saved| match &answer {
             Ok(answer) => checks::answered(saved, matches!(answer, Answer::New(_))),
             Err(error) => checks::failed(saved, error.problem()),
@@ -898,6 +907,39 @@ mod tests {
 
         assert!(matches!(updater.check(), Checked::Failed(_)));
 
+        assert_eq!(
+            job(&fakes).unwrap().not_before_ms,
+            NOV_19 + 8 * HOUR_MS + FIRST_BACK_OFF_MS
+        );
+    }
+
+    #[test]
+    fn a_check_that_panics_counts_as_a_failed_attempt_says_so_and_backs_off() {
+        // ARCH-09, REL-04, SRS 7.6, ADR 0043: a bug in the check fails it, never the job.
+        let Setup {
+            fakes,
+            cache,
+            updater,
+            ..
+        } = setup_with("puffins", |inner| {
+            Arc::new(During {
+                inner,
+                during: || panic!("feed bug"),
+            })
+        });
+
+        assert_eq!(
+            updater.check(),
+            Checked::Failed(DataError::Failed(Problem::DownloadFailed))
+        );
+
+        assert_eq!(cache.current(), None);
+        assert_eq!(*fakes.wallpaper.lock_screen_images_set.lock().unwrap(), 0);
+        assert_eq!(cache.checks().attempts, 1);
+        assert_eq!(
+            checks::status(&cache.checks(), NOV_19 + 8 * HOUR_MS),
+            CheckStatus::Retrying(Problem::DownloadFailed)
+        );
         assert_eq!(
             job(&fakes).unwrap().not_before_ms,
             NOV_19 + 8 * HOUR_MS + FIRST_BACK_OFF_MS

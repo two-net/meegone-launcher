@@ -6,9 +6,10 @@
 //! leaves nothing cached (WALL-12). They also share what the user asked of the job's thread,
 //! and the past week it read (ADR 0032).
 
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
 
-use meegone_core_data::{PersistentSettingsStore, Platform};
+use meegone_core_data::{PersistentSettingsStore, Platform, Problem};
 use meegone_lockimage_data::{BingFeed, ImageMemory, ImageTask, PersistentImageCache};
 use meegone_lockimage_state::ImageUpdater;
 
@@ -67,21 +68,31 @@ impl Shared {
     /// image and its first check (ONB-01, ONB-03, ADR 0036). It blocks, as
     /// [`check_image`](Self::check_image) does. The home then reads the image again whatever
     /// happened (`ShellIntent::ImageChecked`), and shows as on its way only what still waits.
+    ///
+    /// A task that panics ends there, and the tasks after it still run. A browse or a pin that
+    /// panics says it failed, so the past week offers Try again (ARCH-09, ADR 0043).
     pub fn run_image_tasks(&self) {
         let past = &self.image_memory.past;
-        self.image_memory.tasks.run_each(&mut |task| match task {
-            ImageTask::UpdateNow => {
-                self.updater.update_now();
-            }
-            ImageTask::Browse => self.updater.browse(past),
-            ImageTask::Pin(id) => {
-                self.updater.pin(id, past);
-            }
-            ImageTask::PreviewToday => self.updater.preview_today(&self.image_memory.today),
-            // Within the daily check's rules: the job's thread runs one check at a time, so
-            // the job finds today's check done (WALL-03, WALL-04).
-            ImageTask::Check => {
-                self.updater.check();
+        self.image_memory.tasks.run_each(&mut |task| {
+            let run = || match task {
+                ImageTask::UpdateNow => {
+                    self.updater.update_now();
+                }
+                ImageTask::Browse => self.updater.browse(past),
+                ImageTask::Pin(id) => {
+                    self.updater.pin(id, past);
+                }
+                ImageTask::PreviewToday => self.updater.preview_today(&self.image_memory.today),
+                // Within the daily check's rules: the job's thread runs one check at a time,
+                // so the job finds today's check done (WALL-03, WALL-04).
+                ImageTask::Check => {
+                    self.updater.check();
+                }
+            };
+            if panic::catch_unwind(AssertUnwindSafe(run)).is_err()
+                && matches!(task, ImageTask::Browse | ImageTask::Pin(_))
+            {
+                past.set_problem(Some(Problem::DownloadFailed));
             }
         });
     }
@@ -91,9 +102,58 @@ impl Shared {
 mod tests {
     use super::*;
 
+    use meegone_core_data::fakes::{FakeNetwork, Fakes};
+    use meegone_core_data::{DataError, NetworkAdapter, NetworkState, SettingsStore};
+    use meegone_lockimage_data::ImageCache;
+
     #[test]
     fn the_job_thread_can_hold_it() {
         fn send_and_sync<T: Send + Sync>() {}
         send_and_sync::<Shared>();
+    }
+
+    /// A network with a bug: every request panics.
+    struct PanickingNetwork(Arc<FakeNetwork>);
+
+    impl NetworkAdapter for PanickingNetwork {
+        fn state(&self) -> NetworkState {
+            self.0.state()
+        }
+
+        fn saves_data(&self) -> bool {
+            self.0.saves_data()
+        }
+
+        fn get(&self, _https_url: &str, _max_bytes: usize) -> Result<Vec<u8>, DataError> {
+            panic!("network bug")
+        }
+    }
+
+    #[test]
+    fn a_task_that_panics_ends_and_the_tasks_after_it_still_run() {
+        // ARCH-09, ADR 0043
+        let fakes = Fakes::default();
+        *fakes.network.state.lock().unwrap() = NetworkState::Unmetered;
+        let mut platform = fakes.platform();
+        platform.network = Arc::new(PanickingNetwork(fakes.network.clone()));
+        let shared = Shared::new(platform);
+        shared
+            .settings
+            .update(&mut |s| s.image.enabled = true)
+            .unwrap();
+        let tasks = &shared.image_memory.tasks;
+        tasks.push(ImageTask::Browse);
+        tasks.push(ImageTask::PreviewToday);
+        tasks.push(ImageTask::Check);
+
+        shared.run_image_tasks();
+
+        assert!(tasks.pending().is_empty());
+        assert_eq!(
+            shared.image_memory.past.problem(),
+            Some(Problem::DownloadFailed)
+        );
+        // The check after them ran, and counted its own failure.
+        assert_eq!(shared.image_cache.checks().attempts, 1);
     }
 }

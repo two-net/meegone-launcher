@@ -14,11 +14,18 @@ crate-type = ["rlib", "cdylib"]
 meegone-core-data.workspace = true
 meegone-shell-state.workspace = true
 meegone-shell-ui.workspace = true
+# Only for the `faults` feature below.
+meegone-core-state = { workspace = true, optional = true }
 
 [dev-dependencies]
 meegone-core-data = { workspace = true, features = ["fakes"] }
-meegone-core-state.workspace = true
+meegone-core-state = { workspace = true, features = ["faults"] }
 meegone-core-ui.workspace = true
+
+[features]
+# Bugs made to order, for the debug build's fault check, tools/fault-check.sh (ADR 0043). Only
+# the debug build turns it on; tools/arch-check checks that, and that the release APK has none.
+faults = ["dep:meegone-core-state", "meegone-core-state/faults"]
 
 # The Rust app's share of each performance budget, timed with fakes (ADR 0041). Its own
 # `main` prints the table and fails past a limit, so it needs no benchmark library.

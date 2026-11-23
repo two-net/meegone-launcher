@@ -1,4 +1,4 @@
-use std::any::Any;
+use std::cell::Cell;
 use std::fmt::Debug;
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Arc;
@@ -27,13 +27,14 @@ pub trait StateHolder {
 /// Whether a feature is working.
 ///
 /// Expected problems, such as missing access or no connection, are part of the feature's own
-/// state. `Failed` is for bugs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// state. `Failed` is for bugs. It keeps nothing of the panic: its message can quote the data
+/// being handled, and the panic hook has already logged where it happened (PRIV-03, ADR 0043).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Health {
     Ready,
-    /// The state holder panicked. The store stops calling it and the rest of the app carries on
-    /// (ARCH-09).
-    Failed(String),
+    /// The feature's code panicked. Its store stops calling it, and the rest of the app carries
+    /// on (ARCH-09).
+    Failed,
 }
 
 type Listener<S> = Box<dyn FnMut(&Arc<S>)>;
@@ -41,12 +42,13 @@ type Listener<S> = Box<dyn FnMut(&Arc<S>)>;
 /// Runs a [`StateHolder`].
 ///
 /// It publishes a new immutable snapshot after every change and contains failures, so a
-/// failing feature never takes down the shell (ARCH-09). Containing a panic needs
-/// `panic = "unwind"`, which the workspace keeps (see ARCHITECTURE.md).
+/// failing feature never takes down the shell (ARCH-09). It is the feature's fuse: a panic in
+/// its intents, its listeners or any of its code run through [`Store::contain`] stops the
+/// feature for good. Containing a panic needs `panic = "unwind"`, which this crate requires.
 pub struct Store<H: StateHolder> {
     holder: H,
     snapshot: Arc<H::State>,
-    health: Health,
+    health: Cell<Health>,
     listeners: Vec<Listener<H::State>>,
 }
 
@@ -56,18 +58,39 @@ impl<H: StateHolder> Store<H> {
         Self {
             holder,
             snapshot,
-            health: Health::Ready,
+            health: Cell::new(Health::Ready),
             listeners: Vec::new(),
         }
     }
 
-    /// The latest snapshot.
+    /// The latest snapshot. After a failure, the last one published before it.
     pub fn state(&self) -> Arc<H::State> {
         Arc::clone(&self.snapshot)
     }
 
-    pub fn health(&self) -> &Health {
-        &self.health
+    pub fn health(&self) -> Health {
+        self.health.get()
+    }
+
+    /// Whether the feature is working.
+    pub fn is_ready(&self) -> bool {
+        self.health.get() == Health::Ready
+    }
+
+    /// Stops the feature, as a panic in its code would: the host found a bug in its views
+    /// (ARCH-09, ADR 0043).
+    pub fn fail(&self) {
+        self.health.set(Health::Failed);
+    }
+
+    /// Runs some of this feature's code outside its intents, such as building what its views
+    /// show. Returns `None` without running it once the feature has failed, and a panic inside
+    /// it stops the feature (ARCH-09).
+    ///
+    /// `step` only computes: whoever calls it changes their own state with its result, after
+    /// it returns, so a panic never leaves them half-way through a change.
+    pub fn contain<R>(&self, step: impl FnOnce() -> R) -> Option<R> {
+        Self::guard(&self.health, step)
     }
 
     /// Calls `listener` with every new snapshot.
@@ -86,41 +109,89 @@ impl<H: StateHolder> Store<H> {
     }
 
     fn run<R>(&mut self, step: impl FnOnce(&mut H) -> R) -> Option<R> {
-        if self.health != Health::Ready {
+        // The holder may be half-way through a change when it panics, so it is never called
+        // again. Publishing is inside too: a listener is the feature's own view keeping up.
+        Self::guard(&self.health, || {
+            let result = step(&mut self.holder);
+            publish(&self.holder, &mut self.snapshot, &mut self.listeners);
+            result
+        })
+    }
+
+    /// Runs `step` while the feature works, and stops the feature if it panics.
+    fn guard<R>(health: &Cell<Health>, step: impl FnOnce() -> R) -> Option<R> {
+        if health.get() != Health::Ready {
             return None;
         }
-        let holder = &mut self.holder;
-        match panic::catch_unwind(AssertUnwindSafe(|| step(holder))) {
-            Ok(result) => {
-                self.publish();
-                Some(result)
-            }
-            Err(payload) => {
-                // The holder may be half-way through a change, so it is never called again.
-                self.health = Health::Failed(panic_message(payload.as_ref()));
+        let step = || {
+            #[cfg(any(test, feature = "faults"))]
+            faults::fire(std::any::type_name::<H>());
+            step()
+        };
+        match panic::catch_unwind(AssertUnwindSafe(step)) {
+            Ok(result) => Some(result),
+            Err(_) => {
+                health.set(Health::Failed);
                 None
             }
         }
     }
+}
 
-    fn publish(&mut self) {
-        if *self.holder.state() == *self.snapshot {
-            return;
-        }
-        self.snapshot = Arc::new(self.holder.state().clone());
-        for listener in &mut self.listeners {
-            listener(&self.snapshot);
-        }
+fn publish<H: StateHolder>(
+    holder: &H,
+    snapshot: &mut Arc<H::State>,
+    listeners: &mut [Listener<H::State>],
+) {
+    if *holder.state() == **snapshot {
+        return;
+    }
+    *snapshot = Arc::new(holder.state().clone());
+    for listener in listeners {
+        listener(snapshot);
     }
 }
 
-fn panic_message(payload: &(dyn Any + Send)) -> String {
-    if let Some(message) = payload.downcast_ref::<&str>() {
-        (*message).to_owned()
-    } else if let Some(message) = payload.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "unknown failure".to_owned()
+/// Bugs made to order, for tests and the debug build's fault check (ADR 0043). Never in a
+/// release build: only tests and the `faults` feature, which only the debug build turns on,
+/// compile it.
+#[cfg(any(test, feature = "faults"))]
+pub mod faults {
+    use std::cell::RefCell;
+
+    thread_local! {
+        /// The faults waiting on this thread.
+        static ARMED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Makes the next contained step named `key` on this thread panic, once.
+    ///
+    /// `key` is a state holder's type name, such as `EventsHolder`, which fails at the
+    /// feature's next intent or contained step, or a name the host's readers fire, such as
+    /// `EventsReader`.
+    pub fn arm(key: &str) {
+        ARMED.with_borrow_mut(|armed| armed.push(key.to_owned()));
+    }
+
+    /// Forgets every fault armed on this thread.
+    pub fn disarm() {
+        ARMED.with_borrow_mut(Vec::clear);
+    }
+
+    /// Panics if a fault is armed for `name`, a type's path or a plain name, and disarms it.
+    pub fn fire(name: &str) {
+        let armed = ARMED.with_borrow_mut(|armed| {
+            let at = armed.iter().position(|key| {
+                name == key
+                    || name
+                        .strip_suffix(key.as_str())
+                        .is_some_and(|path| path.ends_with("::"))
+            })?;
+            Some(armed.remove(at))
+        });
+        if let Some(key) = armed {
+            panic!("fault injected: {key}");
+        }
     }
 }
 
@@ -211,8 +282,86 @@ mod tests {
         store.dispatch(Op::Fail);
         store.dispatch(Op::Add(1));
 
-        assert_eq!(*store.health(), Health::Failed("counter broke".into()));
+        assert_eq!(store.health(), Health::Failed);
+        assert!(!store.is_ready());
         assert_eq!(*store.state(), (1, true));
         assert!(!store.back());
+    }
+
+    #[test]
+    fn contained_code_runs_while_the_feature_works_and_returns_its_result() {
+        let mut store = Store::new(Counter::default());
+        store.dispatch(Op::Add(3));
+
+        let read = store.contain(|| store.state().0 * 2);
+
+        assert_eq!(read, Some(6));
+        assert!(store.is_ready());
+    }
+
+    #[test]
+    fn a_panic_in_contained_code_stops_the_feature_and_it_never_runs_again() {
+        // ARCH-09: a bug in what a feature shows stops the feature, not the caller.
+        let mut store = Store::new(Counter::default());
+        store.dispatch(Op::Add(1));
+
+        let failed: Option<u32> = store.contain(|| panic!("view broke"));
+        let mut ran = false;
+        let after = store.contain(|| ran = true);
+        store.dispatch(Op::Add(1));
+
+        assert_eq!(failed, None);
+        assert_eq!(after, None);
+        assert!(!ran);
+        assert_eq!(store.health(), Health::Failed);
+        assert_eq!(*store.state(), (1, false));
+    }
+
+    #[test]
+    fn a_listener_that_panics_stops_its_feature_not_the_caller() {
+        let mut store = Store::new(Counter::default());
+        store.subscribe(|state| assert!(state.0 < 2, "listener broke"));
+
+        store.dispatch(Op::Add(1));
+        store.dispatch(Op::Add(1));
+        store.dispatch(Op::Add(1));
+
+        assert_eq!(store.health(), Health::Failed);
+        // The snapshot it was publishing stays: what the views last saw is what they keep.
+        assert_eq!(*store.state(), (2, false));
+    }
+
+    #[test]
+    fn a_feature_failed_from_outside_ignores_intents_and_keeps_its_last_snapshot() {
+        // ADR 0043: the host reports a bug in the feature's own views.
+        let mut store = Store::new(Counter::default());
+        store.dispatch(Op::Add(4));
+
+        store.fail();
+        store.dispatch(Op::Add(1));
+
+        assert_eq!(store.health(), Health::Failed);
+        assert_eq!(*store.state(), (4, false));
+        assert_eq!(store.contain(|| 1), None);
+    }
+
+    #[test]
+    fn an_armed_fault_fires_once_in_the_next_contained_step() {
+        let mut store = Store::new(Counter::default());
+        let other = Store::new(Counter::default());
+        faults::arm("Counter");
+
+        store.dispatch(Op::Add(1));
+        faults::arm("CounterReader");
+        faults::fire("Reader");
+        let read = other.contain(|| faults::fire("CounterReader"));
+
+        assert_eq!(store.health(), Health::Failed);
+        assert_eq!(*store.state(), (0, false));
+        assert_eq!(read, None);
+        assert_eq!(other.health(), Health::Failed);
+        // Each fired once and is gone.
+        faults::fire("CounterReader");
+        faults::fire(std::any::type_name::<Counter>());
     }
 }

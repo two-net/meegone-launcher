@@ -40,7 +40,10 @@ jobs:
       # the home entry, the settings entry and the notification listener, a network config that
       # allows cleartext or certificates other than the system's, an API MeeGone rules out (web
       # views, links in text, the lock screen, device identifiers), a connection outside the
-      # bridge, and a log that carries an exception (ADR 0042).
+      # bridge, and a log that carries an exception (ADR 0042). And fails on Java that sets an
+      # uncaught-exception handler, kills a process or exits outside Restart MeeGone, a Gradle
+      # build that adds a library or another plugin, and bugs made to order turned on outside
+      # the debug build (ADR 0043).
       - name: Architecture rules
         run: cargo test -p arch-check
 
@@ -114,7 +117,9 @@ jobs:
       # SEC-03, SEC-04, SEC-06: the release APK, as built, asks for exactly SRS 8.1's
       # permissions, lets other apps reach only the home entry, the settings entry and the
       # notification listener, isn't debuggable, and holds none of the debug build's own
-      # classes. The runner's aapt2 and dexdump read it (ADR 0042).
+      # classes. The runner's aapt2 and dexdump read it (ADR 0042). REL-07: it holds only
+      # MeeGone's own classes, so no crash-reporting SDK, and its native library has no fault
+      # hook (ADR 0043).
       - name: Release build's access
         run: cargo test -p arch-check --test release_apk -- --ignored
 

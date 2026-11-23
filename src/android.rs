@@ -42,7 +42,7 @@ use meegone_core_data::{
 
 use crate::{
     AccessItem, Age, AppMenuItem, BADGE_ROWS, Bounds, Cell, CellKey, CheckStatus, DailyImage,
-    Direction, EventsListMode, EventsRow, FOLDER_COLUMNS, FolderId, GridLayout, HomeFrame,
+    Direction, EventsListMode, EventsRow, FOLDER_COLUMNS, Feature, FolderId, GridLayout, HomeFrame,
     HomeView, Launcher, Layout, MenuItem, NotificationMenuItem, PREVIEW_APPS, PastAction,
     PinchEvent, PinchKind, PointerEvent, PointerKind, RECENT_ROWS, RecentMode, RowTarget,
     SavedHome, SettingsGroup, SetupStep, Shared, ShellIntent, ShownCard, Surface,
@@ -856,9 +856,15 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeUnhi
     message
 }
 
-/// Applications' problem as a Java string, or `null` if there is none.
+/// Applications' problem as a Java string, or `null` if there is none. Once Applications has
+/// failed, why the last app tapped in its last grid didn't open (ADR 0043).
 fn problem(env: Env, launcher: &Launcher) -> Result<JObject, String> {
-    message(env, launcher.shell().apps().state().problem)
+    let shell = launcher.shell();
+    if shell.apps_ready() {
+        message(env, shell.apps().state().problem)
+    } else {
+        message(env, shell.state().launch_problem)
+    }
 }
 
 /// A problem for the host to show, as its code in a Java string, or `null` for none. The host
@@ -895,18 +901,16 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeEven
     guarded(env, || {
         LAUNCHER.with_borrow(|launcher| {
             let launcher = launcher.as_ref().ok_or("MeeGone hasn't started")?;
-            let header = launcher.view().events().header();
-            let texts: Vec<&str> = if launcher.shell().events_ready() {
+            let texts: Vec<String> = contained(launcher, Feature::Events, || {
+                let header = launcher.view().events().header();
                 vec![
-                    header.weekday.as_str(),
-                    header.date.as_str(),
-                    header.alarm.as_deref().unwrap_or_default(),
+                    header.weekday.clone(),
+                    header.date.clone(),
+                    header.alarm.clone().unwrap_or_default(),
                 ]
-            } else {
-                Vec::new()
-            };
+            });
             let array = env
-                .new_string_array(texts.into_iter())
+                .new_string_array(texts.iter().map(String::as_str))
                 .map_err(|error| format!("Couldn't pass the Events header: {error}"))?;
             fields = array.into_raw();
             Ok(())
@@ -929,20 +933,10 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeOpen
 ) -> JObject {
     // SAFETY: the JVM passes this thread's environment.
     let env = unsafe { Env::from_raw(env) };
-    let mut shown = std::ptr::null_mut();
-    guarded(env, || {
-        LAUNCHER.with_borrow_mut(|launcher| {
-            let launcher = launcher.as_mut().ok_or("MeeGone hasn't started")?;
-            if !launcher.shell().events_ready() {
-                return Ok(());
-            }
-            launcher.view().events().alarm_tapped();
-            launcher.frame();
-            shown = message(env, launcher.shell().events().state().problem)?;
-            Ok(())
-        })
-    });
-    shown
+    with_events_message(env, |launcher| {
+        launcher.view().events().alarm_tapped();
+        true
+    })
 }
 
 /// `String[] nativeEventsList()`: the app groups below the Events header as of the last frame,
@@ -964,12 +958,10 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeEven
     guarded(env, || {
         LAUNCHER.with_borrow(|launcher| {
             let launcher = launcher.as_ref().ok_or("MeeGone hasn't started")?;
-            let fields: Vec<String> = if launcher.shell().events_ready() {
+            let fields: Vec<String> = contained(launcher, Feature::Events, || {
                 let rows = launcher.view().events().rows();
                 rows.iter().flat_map(events_row_fields).collect()
-            } else {
-                Vec::new()
-            };
+            });
             let array = env
                 .new_string_array(fields.iter().map(String::as_str))
                 .map_err(|error| format!("Couldn't pass the Events list: {error}"))?;
@@ -1015,30 +1007,58 @@ fn events_row_fields(row: &EventsRow) -> [String; 10] {
 /// host last read and Events works (ARCH-09).
 fn row_at(launcher: &Launcher, revision: i32, index: i32) -> Option<RowTarget> {
     let index = usize::try_from(index).ok()?;
-    if !launcher.shell().events_ready() {
-        return None;
-    }
     // The revision travels as Java's `int`.
-    launcher.view().events().row_target(revision as u32, index)
+    contained(launcher, Feature::Events, || {
+        launcher.view().events().row_target(revision as u32, index)
+    })
 }
 
 /// Asks something of Events with `step`, applies it, and returns Events' `problem` as a message
 /// for the host to show, or `null`. Does nothing while Events isn't working (ARCH-09). The
 /// message never carries what a notification says (EVT-13).
 fn with_events_message(env: Env, step: impl FnOnce(&Launcher) -> bool) -> JObject {
+    with_feature_message(env, Feature::Events, step, |launcher| {
+        launcher.shell().events().state().problem
+    })
+}
+
+/// Asks something of `feature` with `step`, applies it, and returns the `problem` it then has
+/// as a message for the host to show, or `null`. Does nothing while the feature isn't working,
+/// and a bug in `step` stops that feature alone (ARCH-09, ADR 0043).
+fn with_feature_message(
+    env: Env,
+    feature: Feature,
+    step: impl FnOnce(&Launcher) -> bool,
+    problem: impl FnOnce(&Launcher) -> Option<Problem>,
+) -> JObject {
     let mut shown = std::ptr::null_mut();
     guarded(env, || {
         LAUNCHER.with_borrow_mut(|launcher| {
             let launcher = launcher.as_mut().ok_or("MeeGone hasn't started")?;
-            if !launcher.shell().events_ready() || !step(launcher) {
+            if !contained(launcher, feature, || step(launcher)) {
                 return Ok(());
             }
             launcher.frame();
-            shown = message(env, launcher.shell().events().state().problem)?;
+            shown = message(env, problem(launcher))?;
             Ok(())
         })
     });
     shown
+}
+
+/// Runs `read`, some of `feature`'s code the host asked for, so a bug in it stops that feature
+/// alone, and the host gets nothing and draws it as failed (ARCH-09, ADR 0043). Nothing once
+/// the feature has failed. The debug build's fault check can make it panic, as
+/// `<Feature>Reader`.
+fn contained<R: Default>(launcher: &Launcher, feature: Feature, read: impl FnOnce() -> R) -> R {
+    launcher
+        .shell()
+        .contain(feature, || {
+            #[cfg(feature = "faults")]
+            meegone_core_state::faults::fire(&format!("{feature:?}Reader"));
+            read()
+        })
+        .unwrap_or_default()
 }
 
 /// `String nativeEventsRowTapped(int revision, int index, int left, int top, int right, int
@@ -1223,12 +1243,10 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRece
     guarded(env, || {
         LAUNCHER.with_borrow(|launcher| {
             let launcher = launcher.as_ref().ok_or("MeeGone hasn't started")?;
-            let fields: Vec<String> = if launcher.shell().recent_ready() {
+            let fields: Vec<String> = contained(launcher, Feature::Recent, || {
                 let cards = launcher.view().recent().cards();
                 cards.iter().flat_map(recent_card_fields).collect()
-            } else {
-                Vec::new()
-            };
+            });
             let array = env
                 .new_string_array(fields.iter().map(String::as_str))
                 .map_err(|error| format!("Couldn't pass Recent's cards: {error}"))?;
@@ -1273,38 +1291,18 @@ fn recent_card_fields(card: &ShownCard) -> [String; 9] {
 /// Asks something of Recent with `step`, applies it, and returns Recent's `problem` as a message
 /// for the host to show, or `null`. Does nothing while Recent isn't working (ARCH-09).
 fn with_recent_message(env: Env, step: impl FnOnce(&Launcher) -> bool) -> JObject {
-    let mut shown = std::ptr::null_mut();
-    guarded(env, || {
-        LAUNCHER.with_borrow_mut(|launcher| {
-            let launcher = launcher.as_mut().ok_or("MeeGone hasn't started")?;
-            if !launcher.shell().recent_ready() || !step(launcher) {
-                return Ok(());
-            }
-            launcher.frame();
-            shown = message(env, launcher.shell().recent().state().problem)?;
-            Ok(())
-        })
-    });
-    shown
+    with_feature_message(env, Feature::Recent, step, |launcher| {
+        launcher.shell().recent().state().problem
+    })
 }
 
 /// Asks something of Settings with `step`, applies it, and returns Settings' `problem` as a
 /// message for the host to show, or `null`. Does nothing while Settings isn't working
 /// (ARCH-09).
 fn with_settings_message(env: Env, step: impl FnOnce(&Launcher) -> bool) -> JObject {
-    let mut shown = std::ptr::null_mut();
-    guarded(env, || {
-        LAUNCHER.with_borrow_mut(|launcher| {
-            let launcher = launcher.as_mut().ok_or("MeeGone hasn't started")?;
-            if !launcher.shell().settings_ready() || !step(launcher) {
-                return Ok(());
-            }
-            launcher.frame();
-            shown = message(env, launcher.shell().settings().state().problem)?;
-            Ok(())
-        })
-    });
-    shown
+    with_feature_message(env, Feature::Settings, step, |launcher| {
+        launcher.shell().settings().state().problem
+    })
 }
 
 /// `String nativeRecentCardTapped(int revision, int index, int left, int top, int right, int
@@ -1610,7 +1608,9 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeSetu
             let Some(setup) = launcher.frame().setup else {
                 return Ok(());
             };
-            launcher.view().setup().continue_tapped();
+            contained(launcher, Feature::Settings, || {
+                launcher.view().setup().continue_tapped();
+            });
             launcher.frame();
             let shell = launcher.shell();
             let image_problem = (setup.step == SetupStep::LockScreenImage
@@ -1741,14 +1741,12 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRegi
     guarded(env, || {
         LAUNCHER.with_borrow(|launcher| {
             let launcher = launcher.as_ref().ok_or("MeeGone hasn't started")?;
-            let tags: Vec<String> = if launcher.shell().lockimage_ready() {
+            let tags: Vec<String> = contained(launcher, Feature::LockScreenImage, || {
                 let section = launcher.view().image_settings();
                 std::iter::once(section.automatic_region())
                     .chain(section.regions())
                     .collect()
-            } else {
-                Vec::new()
-            };
+            });
             let array = env
                 .new_string_array(tags.iter().map(String::as_str))
                 .map_err(|error| format!("Couldn't pass the regions: {error}"))?;
@@ -1813,7 +1811,9 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRese
             if !launcher.shell().reset_offered() {
                 return Ok(());
             }
-            launcher.view().settings().reset_launcher_confirmed();
+            contained(launcher, Feature::Settings, || {
+                launcher.view().settings().reset_launcher_confirmed();
+            });
             launcher.frame();
             let shell = launcher.shell();
             let problem = shell
@@ -1930,8 +1930,12 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRece
     // SAFETY: the JVM passes this thread's environment.
     let env = unsafe { Env::from_raw(env) };
     with_launcher(env, |launcher| {
-        if launcher.shell().recent_ready() && launcher.shell().state().close.on {
-            launcher.view().recent().empty_tapped();
+        if launcher.shell().state().close.on
+            && contained(launcher, Feature::Recent, || {
+                launcher.view().recent().empty_tapped();
+                true
+            })
+        {
             launcher.frame();
         }
     });
@@ -1952,8 +1956,12 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRece
     // SAFETY: the JVM passes this thread's environment.
     let env = unsafe { Env::from_raw(env) };
     with_launcher(env, |launcher| {
-        if launcher.shell().recent_ready() && launcher.shell().state().close_offered {
-            launcher.view().recent().close_mode_requested();
+        if launcher.shell().state().close_offered
+            && contained(launcher, Feature::Recent, || {
+                launcher.view().recent().close_mode_requested();
+                true
+            })
+        {
             launcher.frame();
         }
     });
@@ -2002,12 +2010,10 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeImag
     guarded(env, || {
         LAUNCHER.with_borrow(|launcher| {
             let launcher = launcher.as_ref().ok_or("MeeGone hasn't started")?;
-            let card = launcher.view().image_card();
-            let content = if launcher.shell().lockimage_ready() && card.is_visible() {
-                card.content()
-            } else {
-                None
-            };
+            let content = contained(launcher, Feature::LockScreenImage, || {
+                let card = launcher.view().image_card();
+                card.is_visible().then(|| card.content()).flatten()
+            });
             let texts: Vec<&str> = content.as_ref().map_or_else(Vec::new, |content| {
                 vec![
                     content.title.as_str(),
@@ -2251,10 +2257,10 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeImag
     let mut reason = std::ptr::null_mut();
     guarded(env, || {
         LAUNCHER.with_borrow(|launcher| {
-            let Some(launcher) = launcher.as_ref().filter(|l| l.shell().lockimage_ready()) else {
-                return Ok(());
-            };
-            let problem = launcher.view().image_settings().unavailable_reason();
+            let launcher = launcher.as_ref().ok_or("MeeGone hasn't started")?;
+            let problem = contained(launcher, Feature::LockScreenImage, || {
+                launcher.view().image_settings().unavailable_reason()
+            });
             reason = message(env, problem)?;
             Ok(())
         })
@@ -2289,11 +2295,13 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeImag
     guarded(env, || {
         LAUNCHER.with_borrow(|launcher| {
             let launcher = launcher.as_ref().ok_or("MeeGone hasn't started")?;
-            let content = launcher
-                .shell()
-                .image_details_offered()
-                .then(|| launcher.view().image_details().content())
-                .flatten();
+            let content = contained(launcher, Feature::LockScreenImage, || {
+                launcher
+                    .shell()
+                    .image_details_offered()
+                    .then(|| launcher.view().image_details().content())
+                    .flatten()
+            });
             let texts: Vec<&str> = content.as_ref().map_or_else(Vec::new, |content| {
                 vec![
                     content.title.as_str(),
@@ -2342,11 +2350,9 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeImag
     guarded(env, || {
         LAUNCHER.with_borrow(|launcher| {
             let launcher = launcher.as_ref().ok_or("MeeGone hasn't started")?;
-            let status = launcher
-                .shell()
-                .lockimage_ready()
-                .then(|| launcher.view().image_settings().update_status())
-                .flatten();
+            let status = contained(launcher, Feature::LockScreenImage, || {
+                launcher.view().image_settings().update_status()
+            });
             let texts: Vec<&str> = status.as_ref().map_or_else(Vec::new, |status| {
                 let (problem, kind) = match &status.checks {
                     CheckStatus::Fine => ("", ""),
@@ -2405,7 +2411,9 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeImag
     let env = unsafe { Env::from_raw(env) };
     with_launcher(env, |launcher| {
         if launcher.shell().image_details_offered()
-            && launcher.view().image_details().open_settings()
+            && contained(launcher, Feature::LockScreenImage, || {
+                launcher.view().image_details().open_settings()
+            })
         {
             launcher.frame();
         }
@@ -2444,11 +2452,13 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativePast
     guarded(env, || {
         LAUNCHER.with_borrow(|launcher| {
             let launcher = launcher.as_ref().ok_or("MeeGone hasn't started")?;
-            let content = launcher
-                .shell()
-                .past_images_offered()
-                .then(|| launcher.view().past_images().content())
-                .flatten();
+            let content = contained(launcher, Feature::LockScreenImage, || {
+                launcher
+                    .shell()
+                    .past_images_offered()
+                    .then(|| launcher.view().past_images().content())
+                    .flatten()
+            });
             let texts: Vec<&str> = content.as_ref().map_or_else(Vec::new, |content| {
                 let mut texts = vec![
                     flag(content.loading),
@@ -2508,16 +2518,18 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativePast
                 return Ok(());
             };
             // The revision travels as Java's `int`.
-            let preview = launcher
-                .shell()
-                .past_images_offered()
-                .then(|| {
-                    launcher
-                        .view()
-                        .past_images()
-                        .preview(revision as u32, index)
-                })
-                .flatten();
+            let preview = contained(launcher, Feature::LockScreenImage, || {
+                launcher
+                    .shell()
+                    .past_images_offered()
+                    .then(|| {
+                        launcher
+                            .view()
+                            .past_images()
+                            .preview(revision as u32, index)
+                    })
+                    .flatten()
+            });
             if let Some(preview) = preview {
                 bytes = env
                     .new_bytes(preview.bytes())
@@ -2574,11 +2586,9 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeSetu
     guarded(env, || {
         LAUNCHER.with_borrow(|launcher| {
             let launcher = launcher.as_ref().ok_or("MeeGone hasn't started")?;
-            let content = launcher
-                .shell()
-                .lockimage_ready()
-                .then(|| launcher.view().image_setup().content())
-                .flatten();
+            let content = contained(launcher, Feature::LockScreenImage, || {
+                launcher.view().image_setup().content()
+            });
             let texts: Vec<&str> = content.as_ref().map_or_else(Vec::new, |content| {
                 let today = content.today.as_ref();
                 vec![
@@ -2618,11 +2628,9 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeSetu
         LAUNCHER.with_borrow(|launcher| {
             let launcher = launcher.as_ref().ok_or("MeeGone hasn't started")?;
             // The revision travels as Java's `int`.
-            let preview = launcher
-                .shell()
-                .lockimage_ready()
-                .then(|| launcher.view().image_setup().preview(revision as u32))
-                .flatten();
+            let preview = contained(launcher, Feature::LockScreenImage, || {
+                launcher.view().image_setup().preview(revision as u32)
+            });
             if let Some(preview) = preview {
                 bytes = env
                     .new_bytes(preview.bytes())
@@ -2708,7 +2716,9 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeOpen
     // SAFETY: the JVM passes this thread's environment.
     let env = unsafe { Env::from_raw(env) };
     with_launcher(env, |launcher| {
-        if launcher.shell().lockimage_ready() && launcher.view().image_settings().past_images() {
+        if contained(launcher, Feature::LockScreenImage, || {
+            launcher.view().image_settings().past_images()
+        }) {
             launcher.frame();
         }
     });
@@ -2722,19 +2732,9 @@ fn flag(on: bool) -> &'static str {
 /// Asks something of the lock-screen image with `step`, applies it, and returns its `problem`
 /// as a message for the host to show, or `null`. Does nothing while it isn't working (ARCH-09).
 fn with_image_message(env: Env, step: impl FnOnce(&Launcher) -> bool) -> JObject {
-    let mut shown = std::ptr::null_mut();
-    guarded(env, || {
-        LAUNCHER.with_borrow_mut(|launcher| {
-            let launcher = launcher.as_mut().ok_or("MeeGone hasn't started")?;
-            if !launcher.shell().lockimage_ready() || !step(launcher) {
-                return Ok(());
-            }
-            launcher.frame();
-            shown = message(env, launcher.shell().lockimage().state().problem)?;
-            Ok(())
-        })
-    });
-    shown
+    with_feature_message(env, Feature::LockScreenImage, step, |launcher| {
+        launcher.shell().lockimage().state().problem
+    })
 }
 
 /// `void nativeFrame(long frameTimeNanos)`: the display is about to draw a frame (ANIM-04).
@@ -2759,7 +2759,9 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeFram
 
 /// `boolean nativeIdle()`: nothing moves on the home views and the main thread has nothing else
 /// to do. The view that came into sight is read again now, as reading it while the row moved
-/// would cost a frame its deadline (PERF-03, ADR 0041). Returns whether it was read.
+/// would cost a frame its deadline (PERF-03, ADR 0041). Returns whether it was read, or a
+/// feature failed in one of the host's readers since the last frame, so it is drawn as failed
+/// (ADR 0043).
 ///
 /// # Safety
 ///
@@ -2778,8 +2780,84 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeIdle
             read = !launcher.shell().rereads();
             launcher.frame();
         }
+        read |= launcher.needs_redraw();
     });
     JBoolean::from(read)
+}
+
+/// `void nativeFeatureFailed(int feature)`: the host caught a bug in the feature at
+/// `feature`'s index, 0 Applications, 1 Events, 2 Recent, 3 the lock-screen image, 4 Settings,
+/// and stopped drawing its views. The feature stops as if its own code had panicked, and what
+/// it covered closes (ARCH-09, ADR 0043). Other numbers do nothing.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeFeatureFailed(
+    env: RawEnv,
+    _views: JObject,
+    feature: i32,
+) {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    let Some(feature) = usize::try_from(feature).ok().and_then(Feature::from_index) else {
+        return;
+    };
+    with_launcher(env, |launcher| {
+        launcher.dispatch(ShellIntent::Failed(feature));
+        launcher.frame();
+    });
+}
+
+/// `void DebugHooks.nativeArmFault(String fault)`: makes a part of MeeGone fail once, as a bug
+/// would, for `tools/fault-check.sh` (ADR 0043). `applications-rust`, `events-rust`,
+/// `recent-rust`, `image-rust` and `settings-rust` fail the part's next step in Rust, and
+/// `events-reader` and the like the next thing the host reads of it. Other names do nothing.
+/// Only in the debug build, whose Rust app has the `faults` feature; the release build has no
+/// such method (SEC-06).
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[cfg(feature = "faults")]
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_DebugHooks_nativeArmFault(
+    env: RawEnv,
+    _class: JObject,
+    fault: JObject,
+) {
+    // SAFETY: the JVM passes this thread's environment and a live local reference to a
+    // `String`, used only during this call.
+    let (env, fault) = unsafe { (Env::from_raw(env), LocalRef::from_raw(fault)) };
+    guarded(env, || {
+        let fault = env
+            .string(&fault)
+            .map_err(|error| format!("Couldn't read the fault: {error}"))?;
+        let (part, place) = fault.split_once('-').unwrap_or_default();
+        let feature = match part {
+            "applications" => Feature::Applications,
+            "events" => Feature::Events,
+            "recent" => Feature::Recent,
+            "image" => Feature::LockScreenImage,
+            "settings" => Feature::Settings,
+            _ => return Ok(()),
+        };
+        // The holder's type, which `Store` fails, or the host's reader, which `contained` does.
+        let holder = match feature {
+            Feature::Applications => "AppsHolder",
+            Feature::Events => "EventsHolder",
+            Feature::Recent => "RecentHolder",
+            Feature::LockScreenImage => "LockImageHolder",
+            Feature::Settings => "SettingsHolder",
+        };
+        match place {
+            "rust" => meegone_core_state::faults::arm(holder),
+            "reader" => meegone_core_state::faults::arm(&format!("{feature:?}Reader")),
+            _ => {}
+        }
+        Ok(())
+    });
 }
 
 /// `boolean nativeShow(boolean next)`: shows the next or previous view without a gesture, for
@@ -3641,7 +3719,7 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeRead
 }
 
 /// How many slots the frame has.
-const FRAME_SLOTS: usize = 155;
+const FRAME_SLOTS: usize = 157;
 /// The first of Recent's close-mode slots.
 const CLOSE_SLOTS: usize = 104;
 
@@ -3768,6 +3846,8 @@ const CLOSE_SLOTS: usize = 104;
 /// | 152 | The switch of setup's lock-screen image step: 1 on, 0 off, 2 unavailable, with its reason from `nativeImageUnavailableReason`, or -1 while the step doesn't show or the lock-screen image isn't working, so the step offers Continue alone (WALL-02, WALL-13, ARCH-09) |
 /// | 153 | The revision of what setup's lock-screen image step shows: when it changes, it is read again with `nativeSetupImage`; -1 under slot 152's -1 (ONB-01) |
 /// | 154 | 1 while the banner that offers to make MeeGone the default home app shows over the home views (ONB-04); otherwise 0 |
+/// | 155 | The features that have stopped working, which the host draws no more, as bits at their `Feature` index: 1 Applications, 2 Events, 4 Recent, 8 the lock-screen image, 16 Settings (ARCH-09, ADR 0043) |
+/// | 156 | Where a card says a feature stopped working, with Restart MeeGone, as bits: 1 Applications, at the bottom of the home views; 2 Events' page; 4 Recent's page; 8 the lock-screen image in Events, where its card was; 16 the lock-screen image in Settings; 32 Settings' own groups (ARCH-09, ADR 0043) |
 fn frame_slots(frame: &HomeFrame) -> [i32; FRAME_SLOTS] {
     let [events, applications, recent] = frame.pages;
     let menu_items = frame.menu.map_or(0, |menu| {
@@ -4012,6 +4092,8 @@ fn frame_slots(frame: &HomeFrame) -> [i32; FRAME_SLOTS] {
     });
     slots[window + 26] = revision(frame.setup_image);
     slots[window + 27] = i32::from(frame.home_banner);
+    slots[window + 28] = i32::from(frame.failed.bits());
+    slots[window + 29] = i32::from(frame.stopped.bits());
     slots
 }
 
@@ -4045,6 +4127,28 @@ fn with_launcher(env: Env, step: impl FnOnce(&mut Launcher)) {
             None => Err("MeeGone hasn't started".into()),
         })
     });
+}
+
+/// Writes `text` to logcat at warn level, under MeeGone's tag. Only for where a panic
+/// happened, never what it was about (PRIV-03, ADR 0043).
+pub(crate) fn log_warning(text: &str) {
+    #[link(name = "log")]
+    unsafe extern "C" {
+        fn __android_log_write(
+            priority: std::ffi::c_int,
+            tag: *const std::ffi::c_char,
+            text: *const std::ffi::c_char,
+        ) -> std::ffi::c_int;
+    }
+    /// `ANDROID_LOG_WARN`.
+    const WARN: std::ffi::c_int = 5;
+    let Ok(text) = std::ffi::CString::new(text) else {
+        return;
+    };
+    // SAFETY: both are NUL-terminated strings that outlive the call, which only reads them.
+    unsafe {
+        __android_log_write(WARN, c"MeeGone".as_ptr(), text.as_ptr());
+    }
 }
 
 /// Runs `body`, turning an error or a panic into a Java exception. An error's message is a

@@ -781,7 +781,7 @@ pub fn java_violations(
 }
 
 /// Where `name` stands as a whole word in `code`.
-fn words<'a>(code: &'a str, name: &'a str) -> impl Iterator<Item = usize> + 'a {
+pub(crate) fn words<'a>(code: &'a str, name: &'a str) -> impl Iterator<Item = usize> + 'a {
     code.match_indices(name).filter_map(move |(at, _)| {
         let after = code[at + name.len()..].chars().next();
         (!word_before(code, at) && !after.is_some_and(is_word_char)).then_some(at)

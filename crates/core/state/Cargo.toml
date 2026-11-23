@@ -6,6 +6,11 @@ edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
+[features]
+# Bugs made to order, for tests and the debug build's fault check (ADR 0043). Never in a release
+# build; tools/arch-check keeps it to dev-dependencies and the debug build.
+faults = []
+
 [dependencies]
 meegone-core-data.workspace = true
 

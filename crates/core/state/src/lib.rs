@@ -9,10 +9,21 @@
 //! The data models a UI may render are re-exported here, so UI crates never depend on a data
 //! crate (ARCH-02).
 
+// A failing feature is contained by catching its panic, which needs them to unwind (ARCH-09,
+// ADR 0043). This holds however the strategy is set: a profile, `.cargo/config.toml`,
+// `RUSTFLAGS` or `CARGO_PROFILE_*_PANIC`.
+#[cfg(not(panic = "unwind"))]
+compile_error!(
+    "MeeGone contains a failing feature by catching its panic, so panics must unwind: never set \
+     `panic = \"abort\"` (ARCH-09, REL-07, ADR 0043)"
+);
+
 pub mod motion;
 mod store;
 mod theme;
 
+#[cfg(any(test, feature = "faults"))]
+pub use store::faults;
 pub use store::{Health, StateHolder, Store};
 pub use theme::{Theme, ThemeHolder, ThemeIntent, ThemeState, resolve_theme};
 

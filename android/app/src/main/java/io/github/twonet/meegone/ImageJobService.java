@@ -103,6 +103,10 @@ public final class ImageJobService extends JobService {
                 nativeRunImageTasks(Bridge.get(app), app.getFilesDir().getPath());
             } catch (RuntimeException e) {
                 Log.w(TAG, "The daily image's tasks failed: " + e.getMessage());
+            } catch (OutOfMemoryError e) {
+                // Never left to end the thread: the home must still hear the tasks ended
+                // (ARCH-09, ADR 0043).
+                Log.w(TAG, "The daily image's tasks failed: " + e.getClass().getSimpleName());
             }
             MAIN.post(Bridge::imageChecked);
         });
@@ -183,6 +187,10 @@ public final class ImageJobService extends JobService {
         } catch (RuntimeException e) {
             // A bug in the check; the next start or run tries again.
             Log.w(TAG, "The daily image's check failed: " + e.getMessage());
+            return false;
+        } catch (OutOfMemoryError e) {
+            // Caught so the job always finishes, and its next run isn't lost (ARCH-09, ADR 0043).
+            Log.w(TAG, "The daily image's check failed: " + e.getClass().getSimpleName());
             return false;
         }
     }

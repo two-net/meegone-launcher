@@ -7,6 +7,10 @@
 //! text. So [`hide_messages`] replaces the panic hook with one that keeps only the panic's file
 //! and line, and [`message`] reports that instead of the panic's payload. The default hook's
 //! printout is dropped too: it carries the same message.
+//!
+//! On Android the hook also writes where each panic happened to logcat, once, as it happens.
+//! Most panics never reach the host: a feature's are contained, and stop only that feature
+//! (ARCH-09), so this line is all that tells a developer one happened (ADR 0043).
 
 use std::cell::RefCell;
 use std::panic::{self, PanicHookInfo};
@@ -28,13 +32,20 @@ fn remember(info: &PanicHookInfo<'_>) {
     let place = info
         .location()
         .map(|at| format!("{}:{}", at.file(), at.line()));
+    #[cfg(target_os = "android")]
+    crate::android::log_warning(&described(place.as_deref()));
     PLACE.with(|latest| *latest.borrow_mut() = place);
 }
 
 /// What to say about the panic this thread just caught: its file and line, if the hook kept
 /// them, and never its message.
 pub(crate) fn message() -> String {
-    match PLACE.with(|latest| latest.borrow_mut().take()) {
+    described(PLACE.with(|latest| latest.borrow_mut().take()).as_deref())
+}
+
+/// A panic at `place`, a file and line, as developers read it.
+fn described(place: Option<&str>) -> String {
+    match place {
         Some(place) => format!("MeeGone panicked at {place}"),
         None => "MeeGone panicked".to_owned(),
     }

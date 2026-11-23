@@ -4,7 +4,8 @@
 //! - features depend only on core, and only the shell puts features together (ARCH-03);
 //! - only platform adapters reach the operating system (ARCH-04);
 //! - every third-party crate is listed with a reason in DEPENDENCIES.md (ARCH-08);
-//! - test fakes are enabled only in dev-dependencies (SEC-06);
+//! - test fakes, and the bugs made to order of the `faults` feature, are enabled only in
+//!   dev-dependencies (SEC-06);
 //! - in [`legal`], the legal and branding rules of ADR 0037: the product's name, no
 //!   third-party names, every bundled asset in ASSETS.md, every licence in About, and the store
 //!   listing (LEGAL-01 to LEGAL-06, PRIV-04);
@@ -19,17 +20,23 @@
 //!   for SRS 8.1's access and lets other apps reach only the home entry, the settings entry and
 //!   the notification listener, the network config allows only HTTPS with the system's
 //!   certificates, and the shipped Java stays off the APIs MeeGone rules out, connects only from
-//!   the bridge and logs no exception (SEC-01 to SEC-06, PRIV-01 to PRIV-03).
+//!   the bridge and logs no exception (SEC-01 to SEC-06, PRIV-01 to PRIV-03);
+//! - and, in [`reliability`], the reliability rules of ADR 0043: nothing keeps a crash from the
+//!   platform's stability reports or ends the process but Restart MeeGone, and the build adds
+//!   no library or SDK, such as a crash reporter, nor bugs made to order outside the debug
+//!   build (REL-07, ARCH-09).
 //!
 //! The rules are pure functions over a [`Graph`] and over source text; [`load`] reads the graph
 //! with `cargo metadata`, and [`os_access_violations`] reads the app's sources.
-//! `tests/workspace.rs`, `tests/legal.rs`, `tests/a11y.rs`, `tests/l10n.rs` and
-//! `tests/security.rs` run them on this repository, so CI fails on any violation.
-//! `tests/release_apk.rs` runs the manifest rules on the release APK once Gradle has built it.
+//! `tests/workspace.rs`, `tests/legal.rs`, `tests/a11y.rs`, `tests/l10n.rs`,
+//! `tests/security.rs` and `tests/reliability.rs` run them on this repository, so CI fails on any
+//! violation. `tests/release_apk.rs` runs the manifest rules on the release APK once Gradle has
+//! built it, and checks it holds nothing but MeeGone's own code.
 
 pub mod a11y;
 pub mod l10n;
 pub mod legal;
+pub mod reliability;
 pub mod security;
 
 use std::collections::BTreeSet;
@@ -55,6 +62,11 @@ pub const APP: &str = "meegone-launcher";
 
 /// The feature that turns on a crate's test fakes (SEC-06).
 pub const FAKES: &str = "fakes";
+
+/// The features only tests may turn on in a dependency: fakes, and bugs made to order
+/// (SEC-06, ADR 0043). The app's own `faults` feature, for the debug build's fault check, is
+/// turned on only by the debug build (`reliability::gradle_violations`).
+pub const TEST_ONLY: [&str; 2] = [FAKES, reliability::FAULTS];
 
 /// The modules of `std` that reach the operating system. Only platform adapters may use them
 /// (ARCH-04).
@@ -188,12 +200,14 @@ pub fn check(graph: &Graph, listed: &BTreeSet<String>) -> Vec<Violation> {
     }
 
     for dependency in &graph.internal {
-        if !dependency.dev && dependency.features.iter().any(|f| f == FAKES) {
-            violations.insert(Violation(format!(
-                "`{}` turns on the `{FAKES}` feature of `{}` outside [dev-dependencies]; fakes \
-                 are for tests only (SEC-06)",
-                dependency.from, dependency.to
-            )));
+        for feature in TEST_ONLY {
+            if !dependency.dev && dependency.features.iter().any(|f| f == feature) {
+                violations.insert(Violation(format!(
+                    "`{}` turns on the `{feature}` feature of `{}` outside [dev-dependencies]; \
+                     {feature} are for tests only (SEC-06)",
+                    dependency.from, dependency.to
+                )));
+            }
         }
     }
 
@@ -764,6 +778,22 @@ mod tests {
         assert_eq!(normal.len(), 1, "{normal:?}");
         assert!(normal[0].0.contains("fakes are for tests only"));
         assert!(with_fakes(true).is_empty());
+    }
+
+    #[test]
+    fn faults_may_be_turned_on_only_in_dev_dependencies() {
+        // SEC-06, ADR 0043
+        let with_faults = |dev| {
+            let mut graph = graph(&[("meegone-shell-state", "meegone-core-state")], &[]);
+            graph.internal[0].dev = dev;
+            graph.internal[0].features = vec![reliability::FAULTS.to_owned()];
+            check(&graph, &BTreeSet::new())
+        };
+
+        let normal = with_faults(false);
+        assert_eq!(normal.len(), 1, "{normal:?}");
+        assert!(normal[0].0.contains("faults are for tests only"));
+        assert!(with_faults(true).is_empty());
     }
 
     fn os(source: &str) -> Vec<String> {

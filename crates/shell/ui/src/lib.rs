@@ -40,7 +40,7 @@ pub use meegone_settings_ui::{
     AccessItem, AccessStatus, HomeTarget, SetupFrame, SetupStep, ThemeChoice,
 };
 use meegone_settings_ui::{HomeBanner, SettingsView, SetupView};
-pub use meegone_shell_state::{BADGE_ROWS, RECENT_ROWS};
+pub use meegone_shell_state::{BADGE_ROWS, Failures, Feature, RECENT_ROWS};
 use meegone_shell_state::{HomeShell, HomeView, MenuItem, SettingsGroup, ShellIntent};
 
 type Outbox = Rc<RefCell<VecDeque<ShellIntent>>>;
@@ -248,6 +248,64 @@ pub struct EditFrame {
     pub badges: [u16; BADGE_ROWS],
 }
 
+/// Where a card says a feature stopped working, with Restart MeeGone (ARCH-09, ADR 0043). The
+/// host owns the cards, so none of the failed feature's own code runs to show them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StoppedCards {
+    /// Applications: at the bottom of the home views, in the home-app banner's place, while
+    /// Applications shows with nothing over it. A tap on its last grid still opens an app.
+    pub applications: bool,
+    /// Events: at the top of its page, in place of its header and list.
+    pub events: bool,
+    /// Recent: at the top of its page, in place of its cards.
+    pub recent: bool,
+    /// The lock-screen image: in Events, where its card was, if it showed when the feature
+    /// stopped and Events works.
+    pub image_in_events: bool,
+    /// The lock-screen image: in Settings, in place of its group.
+    pub image_in_settings: bool,
+    /// Settings: at the top of its screen, in place of Appearance, Home and Access.
+    pub settings: bool,
+}
+
+impl StoppedCards {
+    /// One bit for each, in the order of the fields, for the host.
+    pub fn bits(self) -> u8 {
+        [
+            self.applications,
+            self.events,
+            self.recent,
+            self.image_in_events,
+            self.image_in_settings,
+            self.settings,
+        ]
+        .into_iter()
+        .enumerate()
+        .fold(0, |bits, (at, on)| bits | u8::from(on) << at)
+    }
+}
+
+/// What the lock-screen image puts in a frame, all of it its own code (ARCH-09).
+#[derive(Default)]
+struct ImageParts {
+    card_visible: bool,
+    image_card: Option<u32>,
+    image_details: Option<u32>,
+    past_images: Option<u32>,
+    image_status: Option<u32>,
+    show_image_card: Option<bool>,
+    use_mobile_data: Option<bool>,
+    image_unavailable: bool,
+    daily_image: Option<DailyImage>,
+    update_now: Option<bool>,
+    image_paused: bool,
+    image_may_not_show: bool,
+    image_off_actions: bool,
+    region: Option<usize>,
+    setup_image_switch: Option<DailyImage>,
+    setup_image: Option<u32>,
+}
+
 /// What the host draws for the home views in one frame (ADR 0006).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HomeFrame {
@@ -404,6 +462,11 @@ pub struct HomeFrame {
     /// The banner that offers to make MeeGone the default home app shows over the home views
     /// (ONB-04).
     pub home_banner: bool,
+    /// The features that have stopped working, which the host draws no more (ARCH-09,
+    /// ADR 0043).
+    pub failed: Failures,
+    /// Where a card says a feature stopped working, with Restart MeeGone (ARCH-09, ADR 0043).
+    pub stopped: StoppedCards,
     /// The home views' solid background (HOME-11, THEME-04).
     pub background: Rgb,
     /// Menus and Settings (THEME-03).
@@ -435,6 +498,9 @@ pub struct ShellView {
     setup: SetupView,
     image_setup: ImageSetupStep,
     home_banner: HomeBanner,
+    /// The image of the day's card showed in Events as of the last frame the lock-screen image
+    /// worked, so its stopped card takes its place only then (ADR 0043).
+    image_card_shown: bool,
 }
 
 impl ShellView {
@@ -516,6 +582,7 @@ impl ShellView {
             setup,
             image_setup,
             home_banner,
+            image_card_shown: false,
             outbox,
         }
     }
@@ -532,6 +599,11 @@ impl ShellView {
         let state = shell.state();
         let apps_state = shell.apps().state();
         let mut apps = self.apps.frame(&apps_state);
+        // A failed Applications' last grid follows the user's scrolling, which the shell keeps
+        // (ADR 0043).
+        if let Some(px) = shell.grid_scroll_px() {
+            apps.scroll_px = px.round().clamp(0.0, f64::from(i32::MAX)) as i32;
+        }
         // A failed Applications can't close its menu, so the home is never left covered by it
         // (ARCH-09).
         if !state.app_menu_open {
@@ -586,13 +658,124 @@ impl ShellView {
             offered: state.search_offered(),
         };
         // Setup's lock-screen image step, drawn while the lock-screen image works (ARCH-09).
-        let image_step = shell.lockimage_ready()
-            && shell
-                .settings()
-                .state()
-                .setup
-                .is_some_and(|setup| setup.step == SetupStep::LockScreenImage)
+        let image_step = shell
+            .settings()
+            .state()
+            .setup
+            .is_some_and(|setup| setup.step == SetupStep::LockScreenImage)
             && shell.setup_shown();
+        // Each feature's part of the frame is its own code, so a bug in it stops that feature
+        // alone, which then shows nothing but its card (ARCH-09, ADR 0043).
+        let events_store = shell.events();
+        let (events_header, events_list, events_menu) = events_store
+            .contain(|| {
+                let events = events_store.state();
+                let header = self.events.show_header(&events);
+                let revision = self.events.show_list(&events, tokens);
+                let list = EventsListFrame {
+                    mode: self.events.mode(),
+                    revision,
+                    clearable: self.events.clearable(),
+                };
+                // After the list, so the menu opens at its row among the rows just made.
+                let menu = state
+                    .events_menu_open
+                    .then(|| self.events.menu(&events))
+                    .flatten();
+                (Some(header), Some(list), menu)
+            })
+            .unwrap_or_default();
+        let image = shell.lockimage().contain(|| {
+            let card_visible = self.image_card.is_visible();
+            let settings = &self.image_settings;
+            ImageParts {
+                card_visible,
+                image_card: card_visible.then(|| self.image_card.revision()),
+                // The shell opens the screen only while the lock-screen image works and has an
+                // image, and closes it once it hasn't.
+                image_details: state
+                    .image_details_open
+                    .then(|| self.image_details.revision()),
+                // Open only while the lock-screen image works and its daily image is on.
+                past_images: state.past_images_open.then(|| self.past_images.revision()),
+                image_status: settings
+                    .update_status()
+                    .is_some()
+                    .then(|| settings.status_revision()),
+                show_image_card: Some(settings.show_card()),
+                use_mobile_data: Some(settings.use_mobile_data()),
+                image_unavailable: settings.daily_image_unavailable(),
+                daily_image: Some(settings.daily_image()),
+                update_now: settings.update_now_offered().then(|| settings.updating()),
+                image_paused: settings.paused(),
+                image_may_not_show: settings.may_not_show(),
+                image_off_actions: settings.off_actions_offered(),
+                region: Some(settings.region_choice()),
+                setup_image_switch: image_step.then(|| self.image_setup.switch()).flatten(),
+                setup_image: image_step.then(|| self.image_setup.revision()),
+            }
+        });
+        // Its card in Events gives way to the stopped card only where it showed.
+        if let Some(image) = &image {
+            self.image_card_shown = image.card_visible;
+        }
+        let image = image.unwrap_or_default();
+        let recent_store = shell.recent();
+        let (recent_window, recent) = recent_store
+            .contain(|| {
+                let revision = self.recent.show_cards(&recent_store.state(), tokens);
+                let pinch = &state.pinch;
+                let recent = RecentFrame {
+                    mode: self.recent.mode(),
+                    revision,
+                    columns: self.recent.columns(),
+                    rows_per_screen: self.recent.rows_per_screen(),
+                    density_offered: state.density_offered,
+                    scale: pinch_scale(pinch.scale),
+                    pivot: (pinch.pivot_x.round() as i32, pinch.pivot_y.round() as i32),
+                    reflow: pinch.reflow,
+                    reflow_progress: ten_thousandths(pinch.progress),
+                    close: CloseFrame {
+                        on: state.close.on,
+                        scale: scale(state.close.scale),
+                        progress: ten_thousandths(state.close.progress),
+                        badges: std::array::from_fn(|row| scale(state.close.badges[row])),
+                    },
+                    close_offered: state.close_offered,
+                    removals: recent_store.state().removals,
+                    leave: state.recent_change.leave.map(ten_thousandths),
+                    leave_scale: scale(state.recent_change.leave_scale),
+                };
+                (Some(self.recent_settings.window()), Some(recent))
+            })
+            .unwrap_or_default();
+        let settings_store = shell.settings();
+        let (theme_choice, home_target, wrap_around, access, setup) = settings_store
+            .contain(|| {
+                let settings = settings_store.state();
+                (
+                    Some(settings.theme),
+                    Some(settings.home_target),
+                    Some(settings.wrap_around),
+                    Some(AccessStatus::of(&settings)),
+                    shell
+                        .setup_shown()
+                        .then(|| SetupFrame::of(&settings))
+                        .flatten(),
+                )
+            })
+            .unwrap_or_default();
+        let failed = shell.failures();
+        let stopped = StoppedCards {
+            applications: shell.applications_card_shown(),
+            events: failed.contains(Feature::Events),
+            recent: failed.contains(Feature::Recent),
+            image_in_events: failed.contains(Feature::LockScreenImage)
+                && self.image_card_shown
+                && !failed.contains(Feature::Events),
+            image_in_settings: failed.contains(Feature::LockScreenImage),
+            settings: failed.contains(Feature::Settings),
+        };
         HomeFrame {
             pages: HomeView::ALL.map(|view| state.page_offset_px(view).round() as i32),
             indicator_alpha: (state.carousel.indicator.clamp(0.0, 1.0) * 255.0).round() as u8,
@@ -649,104 +832,40 @@ impl ShellView {
             settings_open: state.settings_open,
             settings_group: state.settings_group,
             hidden_apps: shell.apps_ready().then(|| self.hidden_apps.revision()),
-            events_header: shell
-                .events_ready()
-                .then(|| self.events.show_header(&shell.events().state())),
-            events_list: shell.events_ready().then(|| {
-                let revision = self.events.show_list(&shell.events().state(), tokens);
-                EventsListFrame {
-                    mode: self.events.mode(),
-                    revision,
-                    clearable: self.events.clearable(),
-                }
-            }),
+            events_header,
+            events_list,
             events_change: ten_thousandths(state.events_change.progress),
-            // After the list, so the menu opens at its row among the rows just made.
-            events_menu: state
-                .events_menu_open
-                .then(|| self.events.menu(&shell.events().state()))
-                .flatten(),
-            image_card: (shell.lockimage_ready() && self.image_card.is_visible())
-                .then(|| self.image_card.revision()),
+            events_menu,
+            image_card: image.image_card,
             image_change: ten_thousandths(state.image_change.progress),
             theme_change: ten_thousandths(state.theme_change.progress),
-            theme_choice: shell
-                .settings_ready()
-                .then(|| shell.settings().state().theme),
+            theme_choice,
             image_details_open: state.image_details_open,
-            // The shell opens the screen only while the lock-screen image works and has an
-            // image, and closes it once it hasn't.
-            image_details: state
-                .image_details_open
-                .then(|| self.image_details.revision()),
+            image_details: image.image_details,
             past_images_open: state.past_images_open,
-            // Open only while the lock-screen image works and its daily image is on.
-            past_images: state.past_images_open.then(|| self.past_images.revision()),
-            image_status: (shell.lockimage_ready()
-                && self.image_settings.update_status().is_some())
-            .then(|| self.image_settings.status_revision()),
-            show_image_card: shell
-                .lockimage_ready()
-                .then(|| self.image_settings.show_card()),
-            use_mobile_data: shell
-                .lockimage_ready()
-                .then(|| self.image_settings.use_mobile_data()),
-            image_unavailable: shell.lockimage_ready()
-                && self.image_settings.daily_image_unavailable(),
-            daily_image: shell
-                .lockimage_ready()
-                .then(|| self.image_settings.daily_image()),
-            update_now: (shell.lockimage_ready() && self.image_settings.update_now_offered())
-                .then(|| self.image_settings.updating()),
-            image_paused: shell.lockimage_ready() && self.image_settings.paused(),
-            image_may_not_show: shell.lockimage_ready() && self.image_settings.may_not_show(),
-            image_off_actions: shell.lockimage_ready() && self.image_settings.off_actions_offered(),
-            recent_window: shell.recent_ready().then(|| self.recent_settings.window()),
-            recent: shell.recent_ready().then(|| {
-                let revision = self.recent.show_cards(&shell.recent().state(), tokens);
-                let pinch = &state.pinch;
-                RecentFrame {
-                    mode: self.recent.mode(),
-                    revision,
-                    columns: self.recent.columns(),
-                    rows_per_screen: self.recent.rows_per_screen(),
-                    density_offered: state.density_offered,
-                    scale: pinch_scale(pinch.scale),
-                    pivot: (pinch.pivot_x.round() as i32, pinch.pivot_y.round() as i32),
-                    reflow: pinch.reflow,
-                    reflow_progress: ten_thousandths(pinch.progress),
-                    close: CloseFrame {
-                        on: state.close.on,
-                        scale: scale(state.close.scale),
-                        progress: ten_thousandths(state.close.progress),
-                        badges: std::array::from_fn(|row| scale(state.close.badges[row])),
-                    },
-                    close_offered: state.close_offered,
-                    removals: shell.recent().state().removals,
-                    leave: state.recent_change.leave.map(ten_thousandths),
-                    leave_scale: scale(state.recent_change.leave_scale),
-                }
-            }),
-            home_target: shell
-                .settings_ready()
-                .then(|| shell.settings().state().home_target),
-            wrap_around: shell
-                .settings_ready()
-                .then(|| shell.settings().state().wrap_around),
-            access: shell
-                .settings_ready()
-                .then(|| AccessStatus::of(&shell.settings().state())),
-            region: shell
-                .lockimage_ready()
-                .then(|| self.image_settings.region_choice()),
+            past_images: image.past_images,
+            image_status: image.image_status,
+            show_image_card: image.show_image_card,
+            use_mobile_data: image.use_mobile_data,
+            image_unavailable: image.image_unavailable,
+            daily_image: image.daily_image,
+            update_now: image.update_now,
+            image_paused: image.image_paused,
+            image_may_not_show: image.image_may_not_show,
+            image_off_actions: image.image_off_actions,
+            recent_window,
+            recent,
+            home_target,
+            wrap_around,
+            access,
+            region: image.region,
             reset_offered: shell.reset_offered(),
-            setup: shell
-                .setup_shown()
-                .then(|| SetupFrame::of(&shell.settings().state()))
-                .flatten(),
-            setup_image_switch: image_step.then(|| self.image_setup.switch()).flatten(),
-            setup_image: image_step.then(|| self.image_setup.revision()),
+            setup,
+            setup_image_switch: image.setup_image_switch,
+            setup_image: image.setup_image,
             home_banner: shell.banner_shown(),
+            failed,
+            stopped,
             background: tokens.background,
             surface: tokens.surface,
             foreground: tokens.text_primary,
@@ -757,7 +876,8 @@ impl ShellView {
         }
     }
 
-    /// Draws what is on screen in the current theme (THEME-03).
+    /// Draws what is on screen in the current theme (THEME-03). The views' own drawing is the
+    /// host's (ADR 0006), so nothing here runs a feature's code that could fail.
     pub fn render(&mut self, shell: &HomeShell) {
         let tokens = tokens(shell.theme().state().theme);
         if shell.setup_shown() {

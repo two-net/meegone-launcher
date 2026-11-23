@@ -104,6 +104,7 @@ public final class HomeActivity extends Activity {
             nativeOpenSettings();
         }
         DebugHooks.readAuditExtras(this, views, getIntent());
+        DebugHooks.readFaultExtras(getIntent());
         DebugHooks.created(views, started);
     }
 
@@ -128,6 +129,7 @@ public final class HomeActivity extends Activity {
             views.refresh();
         }
         DebugHooks.readAuditExtras(this, views, intent);
+        DebugHooks.readFaultExtras(intent);
     }
 
     @Override

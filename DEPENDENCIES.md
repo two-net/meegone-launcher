@@ -14,7 +14,7 @@ Crates that only a listed crate pulls in, such as `itoa`, `memchr`, `serde_core`
 
 ## Android build
 
-The Android app in `android/` (ADR 0005) adds no library to the app. Its Java code uses only the Android SDK, without AndroidX or Kotlin, and the Rust app reaches it through a hand-written JNI binding. Two build tools are needed, and neither is part of the app:
+The Android app in `android/` (ADR 0005) adds no library to the app. Its Java code uses only the Android SDK, without AndroidX or Kotlin, and the Rust app reaches it through a hand-written JNI binding. In particular it has no crash-reporting or analytics SDK: crashes are counted by the store's own stability reporting (REL-07, ADR 0043). `tools/arch-check` checks that the Gradle build declares no dependency and applies only the Android plugin, and that the release APK holds only MeeGone's own classes. Two build tools are needed, and neither is part of the app:
 
 - **Android Gradle Plugin**, pinned in `android/build.gradle.kts`, with Gradle pinned by the wrapper. It compiles and packages the APK.
 - **cargo-ndk**, pinned in CI, which builds the Rust app with the Android NDK.
@@ -25,3 +25,4 @@ Checking the release build (ADR 0042) uses tools that aren't part of the app eit
 
 - **`aapt2` and `dexdump`**, from the Android SDK's build tools, which CI's runner already has. `tools/arch-check/tests/release_apk.rs` reads the release APK's manifest and classes with them.
 - **PCAPdroid** on a test device and **Wireshark's tshark** on the computer, for `tools/net-audit.sh` before a release. PCAPdroid captures only MeeGone's traffic, into a file on the device that the script pulls; nothing is sent anywhere.
+- **`uiautomator`** and `dumpsys`, on the test device, for `tools/fault-check.sh` before a release (ADR 0043). They find the Restart button and read what Android recorded; nothing is sent anywhere.

@@ -96,22 +96,17 @@ pub const TEXT_ALLOWED: [(&str, &str, &str); 5] = [
 
 /// Rust literals that read as prose but are never shown, as `(file, where, reason)`, matched as
 /// in [`TEXT_ALLOWED`].
-pub const PROSE_ALLOWED: [(&str, &str, &str); 6] = [
+pub const PROSE_ALLOWED: [(&str, &str, &str); 5] = [
     (
         "crates/core/ui/src/tokens.rs",
         "what",
         "what a pairing of colours draws, for the contrast tests' messages (ADR 0038)",
     ),
     (
-        "crates/core/state/src/store.rs",
-        "panic_message",
-        "a panic's message, kept with a failed feature's health and never shown (ARCH-09)",
-    ),
-    (
         "src/panics.rs",
-        "message",
-        "where a panic happened, never its message, thrown as a Java exception for logcat \
-         only (ADR 0005, ADR 0042)",
+        "described",
+        "where a panic happened, never its message, written to logcat and thrown as a Java \
+         exception for logcat only (ADR 0005, ADR 0042, ADR 0043)",
     ),
     (
         "src/android.rs",
@@ -130,10 +125,12 @@ pub const PROSE_ALLOWED: [(&str, &str, &str); 6] = [
     ),
 ];
 
-/// Calls whose literal arguments are for developers: a panic's, an assertion's or a log's
-/// message, a thread's name, an exception's message. The last part of the name is matched.
-const FOR_DEVELOPERS: [&str; 12] = [
+/// Calls whose literal arguments are for developers: a panic's, an assertion's, a build
+/// error's or a log's message, a thread's name, an exception's message. The last part of the
+/// name is matched.
+const FOR_DEVELOPERS: [&str; 13] = [
     "expect",
+    "compile_error!",
     "panic!",
     "unreachable!",
     "todo!",
