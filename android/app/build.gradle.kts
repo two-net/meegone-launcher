@@ -32,6 +32,25 @@ android {
             // the accessibility audit can check every screen in them (L10N-02, ADR 0040).
             isPseudoLocalesEnabled = true
         }
+        // What tools/perf-bench.sh measures (ADR 0041): the release build, which a debuggable
+        // build is far slower than, with the debug build's hooks for the probe and the
+        // benchmark's 300 apps. It installs beside MeeGone, so a benchmark never touches its
+        // layout or settings, and it is never released (SEC-06).
+        create("benchmark") {
+            initWith(getByName("release"))
+            applicationIdSuffix = ".benchmark"
+            signingConfig = signingConfigs.getByName("debug")
+            isDebuggable = false
+            // So simpleperf and Perfetto can profile it from adb.
+            isProfileable = true
+            matchingFallbacks += "release"
+        }
+    }
+
+    sourceSets {
+        getByName("benchmark") {
+            java.directories += "src/debug/java"
+        }
     }
 }
 

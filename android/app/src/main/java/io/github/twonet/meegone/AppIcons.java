@@ -19,9 +19,11 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.UserHandle;
 import android.os.UserManager;
+import java.lang.ref.WeakReference;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
@@ -39,6 +41,12 @@ import java.util.concurrent.Executors;
  * a bitmap of the size the grid shows, so a few hundred icons stay small and quick to draw.
  * Until one arrives, the cell shows a placeholder of the same size and shape, so the layout
  * never shifts (PERF-04).
+ *
+ * <p>It holds the {@link #HELD} icons asked for last, enough for the grid's cells near sight,
+ * Events and Recent. An older one lives on only while a view still draws it, and comes back
+ * from there without loading again; so 300 apps never mean 300 bitmaps, nor 300 textures
+ * (PERF-07, ADR 0041). When memory runs short, {@link #trim} keeps only the icons a view still
+ * draws.
  *
  * <p>When a package changes, as on an update, its icons are loaded again. Everything else runs
  * on the main thread.
@@ -69,7 +77,32 @@ final class AppIcons {
     private final Handler main = new Handler(Looper.getMainLooper());
     /** Runs when icons arrive or change, so the grid asks again. */
     private final Runnable onChange;
-    private final Map<String, Drawable> loaded = new HashMap<>();
+    /**
+     * How many icons are held at most: the grid's cells near sight, about two screens at its
+     * densest, with Events' and Recent's.
+     */
+    static final int HELD = 96;
+
+    /** The icons held, the one asked for longest ago first. */
+    private final Map<String, Drawable> loaded = new LinkedHashMap<String, Drawable>(
+            HELD, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, Drawable> eldest) {
+            if (size() <= HELD) {
+                return false;
+            }
+            if (released.size() >= HELD) {
+                forgetCollected();
+            }
+            released.put(eldest.getKey(), new WeakReference<>(eldest.getValue()));
+            return true;
+        }
+    };
+    /**
+     * Icons let go, as more were asked for or by {@link #trim}: each lives on only while a view
+     * still draws it, and comes back from here without loading again.
+     */
+    private final Map<String, WeakReference<Drawable>> released = new HashMap<>();
     /** Icons on their way, or that couldn't be loaded until their package changes. */
     private final Set<String> asked = new HashSet<>();
     private final LauncherApps.Callback forgetChanged = new LauncherApps.Callback() {
@@ -119,6 +152,9 @@ final class AppIcons {
     Drawable get(long profile, String packageName, String activity) {
         String key = key(profile, packageName, activity);
         Drawable icon = loaded.get(key);
+        if (icon == null) {
+            icon = revive(key);
+        }
         if (icon != null || !asked.add(key)) {
             return icon;
         }
@@ -137,6 +173,39 @@ final class AppIcons {
             });
         });
         return null;
+    }
+
+    /** An icon {@link #trim} let go that a view still draws, held again; or null. */
+    private Drawable revive(String key) {
+        WeakReference<Drawable> held = released.remove(key);
+        Drawable icon = held == null ? null : held.get();
+        if (icon != null) {
+            loaded.put(key, icon);
+        }
+        return icon;
+    }
+
+    /**
+     * Memory is short (PERF-07, ADR 0041): every icon is held only as long as a view draws it.
+     * The grids let go of the icons of cells out of sight first; the rest, such as those in
+     * sight, in Events and in Recent, stay and are found again without loading.
+     */
+    void trim() {
+        for (Map.Entry<String, Drawable> icon : loaded.entrySet()) {
+            released.put(icon.getKey(), new WeakReference<>(icon.getValue()));
+        }
+        loaded.clear();
+        forgetCollected();
+    }
+
+    /** Forgets the released icons no view drew any more, which are gone. */
+    private void forgetCollected() {
+        released.values().removeIf(held -> held.get() == null);
+    }
+
+    /** How many icons are held, for the debug build's probe. */
+    int size() {
+        return loaded.size();
     }
 
     /** Follows package changes while the grid is on screen. */
@@ -172,6 +241,7 @@ final class AppIcons {
     private void clear() {
         generation++;
         loaded.clear();
+        released.clear();
         asked.clear();
     }
 
@@ -180,6 +250,7 @@ final class AppIcons {
         String prefix = key(users.getSerialNumberForUser(user), packageName, "");
         boolean changed = removeStartingWith(loaded.keySet(), prefix);
         changed |= removeStartingWith(asked, prefix);
+        removeStartingWith(released.keySet(), prefix);
         if (changed) {
             onChange.run();
         }
@@ -210,16 +281,18 @@ final class AppIcons {
             if (source == null) {
                 return null;
             }
-            Drawable icon = new BitmapDrawable(context.getResources(), shaped(source, sizePx));
+            Bitmap shaped = shaped(source, sizePx);
+            Drawable icon = new BitmapDrawable(context.getResources(), shaped);
             Drawable badged = context.getPackageManager().getUserBadgedIcon(icon, user);
             if (badged == icon) {
-                return icon;
+                return new BitmapDrawable(context.getResources(), finished(shaped));
             }
             // A work app: draw its badge in, so the grid still draws one bitmap per icon.
             Bitmap bitmap = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888);
             badged.setBounds(0, 0, sizePx, sizePx);
             badged.draw(new Canvas(bitmap));
-            return new BitmapDrawable(context.getResources(), bitmap);
+            shaped.recycle();
+            return new BitmapDrawable(context.getResources(), finished(bitmap));
         } catch (RuntimeException e) {
             return null;
         }
@@ -229,7 +302,7 @@ final class AppIcons {
     private Drawable activityIcon(String packageName, String activity, UserHandle user) {
         Intent intent = new Intent(Intent.ACTION_MAIN)
                 .addCategory(Intent.CATEGORY_LAUNCHER)
-                .setComponent(new ComponentName(packageName, activity));
+                .setComponent(new ComponentName(packageName, DebugHooks.realActivity(activity)));
         LauncherActivityInfo info =
                 context.getSystemService(LauncherApps.class).resolveActivity(intent, user);
         return info != null ? info.getIcon(densityDpi) : null;
@@ -287,6 +360,26 @@ final class AppIcons {
         new Canvas(shaped).drawRoundRect(0, 0, sizePx, sizePx, corner, corner, paint);
         content.recycle();
         return shaped;
+    }
+
+    /**
+     * {@code bitmap}, drawn, as the grid keeps it: a hardware bitmap, whose pixels live only in
+     * graphics memory, once. A software one would be kept twice, in the process and as the
+     * GPU's texture, and a mutable one uploaded for every frame whose views hold it, in sight or
+     * not (PERF-07, ADR 0041). Where the system has no room for it, an immutable software copy.
+     * So nothing may draw an icon on a software canvas: {@link ThemeFade} records a {@link
+     * android.graphics.Picture} instead. On the loader thread.
+     */
+    private static Bitmap finished(Bitmap bitmap) {
+        Bitmap kept = bitmap.copy(Bitmap.Config.HARDWARE, false);
+        if (kept == null) {
+            kept = bitmap.copy(Bitmap.Config.ARGB_8888, false);
+        }
+        if (kept == null) {
+            return bitmap;
+        }
+        bitmap.recycle();
+        return kept;
     }
 
     /** One of an adaptive icon's layers, which may be missing, drawn over a square. */

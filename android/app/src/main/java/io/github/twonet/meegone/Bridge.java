@@ -576,6 +576,7 @@ final class Bridge {
                 }
             }
             accents.deriveWaiting();
+            DebugHooks.padApps(fields, collator, latin);
             return fields.toArray(new String[0]);
         } catch (RuntimeException e) {
             Log.w(TAG, "Couldn't list the apps", e);
@@ -620,7 +621,7 @@ final class Bridge {
     }
 
     /** Lowercase hex, two digits a byte, as catalogue.rs reads it. */
-    private static String hex(byte[] bytes) {
+    static String hex(byte[] bytes) {
         char[] text = new char[bytes.length * 2];
         for (int i = 0; i < bytes.length; i++) {
             text[2 * i] = HEX[(bytes[i] >> 4) & 0xF];
@@ -710,7 +711,9 @@ final class Bridge {
             Bundle options = growFrom(icon);
             Log.i(TAG, "Launching from the icon: " + (options != null));
             launcher.startMainActivity(
-                    new ComponentName(packageName, activityName), user, icon, options);
+                    new ComponentName(packageName, DebugHooks.realActivity(activityName)), user,
+                    icon, options);
+            DebugHooks.launched();
             return null;
         } catch (RuntimeException e) {
             // ActivityNotFoundException, SecurityException or IllegalStateException: the app
@@ -735,7 +738,8 @@ final class Bridge {
             }
             LauncherApps.ShortcutQuery query = new LauncherApps.ShortcutQuery()
                     .setPackage(packageName)
-                    .setActivity(new ComponentName(packageName, activityName))
+                    .setActivity(new ComponentName(packageName,
+                            DebugHooks.realActivity(activityName)))
                     .setQueryFlags(LauncherApps.ShortcutQuery.FLAG_MATCH_MANIFEST
                             | LauncherApps.ShortcutQuery.FLAG_MATCH_DYNAMIC);
             List<ShortcutInfo> found = launcher.getShortcuts(query, user);
@@ -819,7 +823,8 @@ final class Bridge {
                 return Problems.APP_INFO_UNAVAILABLE;
             }
             context.getSystemService(LauncherApps.class).startAppDetailsActivity(
-                    new ComponentName(packageName, activityName), user, null, null);
+                    new ComponentName(packageName, DebugHooks.realActivity(activityName)), user,
+                    null, null);
             return null;
         } catch (RuntimeException e) {
             Log.w(TAG, "Couldn't open App info: " + e.getClass().getSimpleName());

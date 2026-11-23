@@ -20,6 +20,12 @@ meegone-core-data = { workspace = true, features = ["fakes"] }
 meegone-core-state.workspace = true
 meegone-core-ui.workspace = true
 
+# The Rust app's share of each performance budget, timed with fakes (ADR 0041). Its own
+# `main` prints the table and fails past a limit, so it needs no benchmark library.
+[[bench]]
+name = "budgets"
+harness = false
+
 [workspace]
 members = ["crates/*/*", "tools/*"]
 resolver = "3"

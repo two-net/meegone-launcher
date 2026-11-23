@@ -2,10 +2,11 @@
 //! (MAINT-03). Each test carries its scenario's id; each feature adds its own here.
 //!
 //! AC-18 to AC-20 (animation scale, screen reader, timing) need a device to check in full; they
-//! belong to the device matrix (#43) and the benchmarks (#40). Their core logic is tested
-//! without one: every flow with animations removed (AC-18, ANIM-05) and the actions a screen
-//! reader, a switch or a keyboard sends (AC-19, A11Y-05, A11Y-06) here, and the carousel's in
-//! `meegone-shell-state`.
+//! belong to the device matrix (#43) and, for AC-20's 50 Homes and 30 s of swiping, to
+//! `tools/perf-bench.sh` (ADR 0041). Their core logic is tested without one: every flow with
+//! animations removed (AC-18, ANIM-05) and the actions a screen reader, a switch or a keyboard
+//! sends (AC-19, A11Y-05, A11Y-06) here, the carousel's in `meegone-shell-state`, and the Rust
+//! app's share of AC-20's time in `benches/budgets.rs`.
 
 mod backup;
 
@@ -4000,6 +4001,7 @@ fn rec02_given_access_is_revoked_as_recent_reads_then_the_explainer_appears_with
     *fakes.usage.error.lock().unwrap() = Some(DataError::AccessDenied);
     launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
     launcher.dispatch(ShellIntent::Swipe(Direction::Next));
+    launcher.dispatch(ShellIntent::Idle);
 
     assert_eq!(
         recent_cards(&mut launcher),
@@ -4086,7 +4088,50 @@ fn rec09_recent_refreshes_when_it_becomes_visible() {
 
     launcher.dispatch(ShellIntent::Swipe(Direction::Previous));
     launcher.dispatch(ShellIntent::Swipe(Direction::Next));
+    // Once nothing moves (ADR 0041).
+    launcher.dispatch(ShellIntent::Idle);
     assert_eq!(labels(&recent_cards(&mut launcher).1), ["Maps", "Mail"]);
+}
+
+#[test]
+fn perf03_a_view_that_comes_into_sight_is_read_again_only_once_nothing_moves() {
+    // Issue #40: PERF-03, REC-09, ADR 0041. Reading Recent's uses, or Events' notifications,
+    // takes long enough to cost a moving frame its deadline, so it waits for the host's Idle,
+    // which comes once nothing moves, and never happens while a finger holds the row.
+    let fakes = Fakes::after_setup();
+    let mut launcher = on_recent(&fakes);
+    launcher.dispatch(ShellIntent::Layout(phone()));
+    let mut clock = 0;
+    come_to_rest(&mut launcher, &mut clock);
+    swipe(&mut launcher, &mut clock, 200.0, 900.0, 160, 0);
+    assert_eq!(launcher.shell().state().current, HomeView::Applications);
+    *fakes.system.now_ms.lock().unwrap() = 10_100_000;
+    fakes.usage.uses.lock().unwrap()[0].last_used_ms = 10_100_000;
+
+    // The swipe back to Recent lands, but its cards are as they were while the row moves.
+    swipe(&mut launcher, &mut clock, 900.0, 200.0, 160, 0);
+    assert_eq!(launcher.shell().state().current, HomeView::Recent);
+    assert!(launcher.shell().rereads());
+    assert_eq!(labels(&recent_cards(&mut launcher).1), ["Mail", "Maps"]);
+
+    // A finger holding the row still waits.
+    let touch = |launcher: &mut Launcher, kind, at| {
+        launcher.dispatch(ShellIntent::Pointer(PointerEvent {
+            kind,
+            x: 540.0,
+            y: 1200.0,
+            at: Duration::from_millis(at),
+        }));
+        launcher.frame();
+    };
+    touch(&mut launcher, PointerKind::Down, clock + 100);
+    launcher.dispatch(ShellIntent::Idle);
+    assert_eq!(labels(&recent_cards(&mut launcher).1), ["Mail", "Maps"]);
+
+    touch(&mut launcher, PointerKind::Up, clock + 150);
+    launcher.dispatch(ShellIntent::Idle);
+    assert_eq!(labels(&recent_cards(&mut launcher).1), ["Maps", "Mail"]);
+    assert!(!launcher.shell().rereads());
 }
 
 #[test]

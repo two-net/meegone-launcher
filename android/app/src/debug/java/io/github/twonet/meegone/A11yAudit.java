@@ -1,9 +1,9 @@
 package io.github.twonet.meegone;
 
 import android.graphics.Bitmap;
-import android.graphics.Canvas;
 import android.graphics.Color;
 import android.graphics.Matrix;
+import android.graphics.Picture;
 import android.graphics.Rect;
 import android.graphics.RectF;
 import android.graphics.Typeface;
@@ -113,16 +113,23 @@ final class A11yAudit {
             done.run();
             return;
         }
-        Bitmap pixels = Bitmap.createBitmap(root.getWidth(), root.getHeight(),
-                Bitmap.Config.ARGB_8888);
         if (drawn) {
-            root.draw(new Canvas(pixels));
+            // Recorded and drawn by the GPU, as the icons are hardware bitmaps (ADR 0041), then
+            // copied where its pixels can be read.
+            Picture recorded = new Picture();
+            root.draw(recorded.beginRecording(root.getWidth(), root.getHeight()));
+            recorded.endRecording();
+            Bitmap drawnByGpu = Bitmap.createBitmap(recorded);
+            Bitmap pixels = drawnByGpu.copy(Bitmap.Config.ARGB_8888, false);
+            drawnByGpu.recycle();
             checkDrawn(root, pixels, screen, theme, layers);
             checkFocus(root, layers, screen, theme);
             pixels.recycle();
             done.run();
             return;
         }
+        Bitmap pixels = Bitmap.createBitmap(root.getWidth(), root.getHeight(),
+                Bitmap.Config.ARGB_8888);
         Handler main = new Handler(Looper.getMainLooper());
         PixelCopy.request(window, pixels, result -> {
             if (result == PixelCopy.SUCCESS) {

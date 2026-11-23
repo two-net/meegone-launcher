@@ -54,6 +54,12 @@ import java.util.function.Consumer;
  * <p>In edit mode (APPS-12, ADR 0014) the cells shrink and the ✕ badges pop in row by row, as
  * the frame says (ANIM-12). A tap on a ✕ asks the system to uninstall the app (APPS-13), and
  * screen readers move icons, make folders and take apps out of them with actions (A11Y-05).
+ *
+ * <p>Only the cells in sight, or within half a screen of it, hold their icons and draw; the others
+ * draw nothing, and draw in full, asking for their icons again, as they come near. So a grid of
+ * 300 apps holds about two screens of icons, not 300 (PERF-07), and draws as quickly as two
+ * screens of cells (PERF-03, ADR 0041). Until its icon arrives, a cell near sight draws the
+ * placeholder, the same size. When memory runs short, the cells out of sight let theirs go too.
  */
 final class AppsGrid extends Scroll {
     /** The surfaces, as the Rust app numbers them. */
@@ -566,6 +572,7 @@ final class AppsGrid extends Scroll {
             agreedScroll = top;
             nativeAppsScrolled(surface, top);
         }
+        followSight();
     }
 
     @Override
@@ -578,6 +585,96 @@ final class AppsGrid extends Scroll {
         }
         // Where it is on screen is known only now.
         reportAgain();
+        followSight();
+    }
+
+    /**
+     * Memory is short (PERF-07, ADR 0041): cells out of sight let their icons go. With {@code
+     * keepInSight} false, as for a grid no one sees, every cell lets go. They ask again as they
+     * come into sight.
+     */
+    void trimIcons(boolean keepInSight) {
+        for (AppCell cell : shown) {
+            if (!keepInSight || !overlaps(cell, 0)) {
+                cell.releaseIcons();
+            }
+        }
+    }
+
+    /**
+     * Whether {@code cell} is in sight, or within half the grid's height of it: only then does it
+     * hold its icons and draw (PERF-03, PERF-07).
+     */
+    boolean isNear(View cell) {
+        return overlaps(cell, getHeight() / 2);
+    }
+
+    /**
+     * As the grid scrolls or lays out, the cells that came near draw in full and ask for their
+     * icons, and those that went far let them go (PERF-03, PERF-07).
+     */
+    private void followSight() {
+        for (AppCell cell : shown) {
+            if (isNear(cell)) {
+                cell.cameNear();
+                if (!cell.iconsShown()) {
+                    cell.refreshIcon();
+                }
+            } else {
+                cell.releaseIcons();
+            }
+        }
+    }
+
+    /**
+     * Whether {@code cell}, laid out, shows within {@code margin} px of the grid's view, where it
+     * is laid out or where it is moving from, as when cells come, go and move (ANIM-21).
+     */
+    private boolean overlaps(View cell, int margin) {
+        if (!cell.isLaidOut() || getHeight() <= 0) {
+            return false;
+        }
+        int laidOut = cells.getTop() + cell.getTop();
+        int moved = laidOut + Math.round(cell.getTranslationY());
+        return spans(laidOut, cell.getHeight(), margin) || spans(moved, cell.getHeight(), margin);
+    }
+
+    private boolean spans(int top, int height, int margin) {
+        return top + height > getScrollY() - margin && top < getScrollY() + getHeight() + margin;
+    }
+
+    /** The cells shown on screen now, in order; none before they are laid out. */
+    List<AppCell> cellsInSight() {
+        List<AppCell> inSight = new ArrayList<>();
+        for (AppCell cell : shown) {
+            if (overlaps(cell, 0)) {
+                inSight.add(cell);
+            }
+        }
+        return inSight;
+    }
+
+    /**
+     * Whether the grid shows its cells, each with every icon: none is a placeholder (PERF-02,
+     * PERF-04). An empty grid shows all it has once it has read its cells.
+     */
+    boolean iconsShownInSight() {
+        if (!loaded) {
+            return false;
+        }
+        if (shown.isEmpty()) {
+            return true;
+        }
+        List<AppCell> inSight = cellsInSight();
+        if (inSight.isEmpty()) {
+            return false;
+        }
+        for (AppCell cell : inSight) {
+            if (!cell.iconsShown()) {
+                return false;
+            }
+        }
+        return true;
     }
 
     /** A cell was tapped: its app launches from its icon (APPS-10, ANIM-08), or it opens. */

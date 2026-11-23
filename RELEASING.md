@@ -22,10 +22,14 @@ The store listing is in `fastlane/metadata/android/`, in the layout F-Droid read
   - every string resource has a comment for translators, numbers its arguments when it has several, and only the product's name is untranslatable;
   - no number reaches the screen in ASCII digits whatever the language (L10N-03);
   - right to left, the views' order, the swipes and edit mode's drags are mirrored (L10N-02).
+- [ ] `cargo bench --bench budgets` and the APK job also check the performance budgets as far as CI can (ADR 0041):
+  - with 300 apps, the Rust app's share of Home, a cold start, a frame, a keystroke and a launch each stays within a tenth of its budget (PERF-01 to PERF-06);
+  - the release APK is 15 MB or less (PERF-08).
 
 ## Open questions that block a release
 
 - [ ] #44 (Q1): "MeeGone" is cleared as a product name.
+- [ ] #48 (Q5): the reference device is chosen. Every performance budget applies to it (SRS 1.3, PERF-01 to PERF-08).
 - [ ] #45 (Q2, LEGAL-04): the image source's terms allow the automated daily download and the image's use as a device wallpaper in a distributed app, and the attribution MeeGone shows, the feed's credit line in full, is the form they require.
 
 ## The store listing
@@ -65,6 +69,13 @@ The store listing is in `fastlane/metadata/android/`, in the layout F-Droid read
   - With a hardware keyboard, → past a view's end goes to the next view, and ← past its start to the one before.
   - TalkBack's page actions go the same way.
   - Settings, a folder, edit mode and Recent's close mode lay out from the right, with each ✕ at the start corner.
+- [ ] `tools/perf-bench.sh --record` passes on the reference device, with the benchmark build of the release's commit (`(cd android && ./gradlew installBenchmark)`), and its results file in `docs/benchmarks/` is committed (#40, ADR 0041). The run covers:
+  - Home pressed 50 times from an app, 95th percentile within 300 ms (PERF-01, AC-20);
+  - 20 cold starts: Applications with its icons within 1.5 s, and the saved layout of 300 apps within 500 ms without a cell moving (PERF-02, PERF-04);
+  - 30 s each of view swiping, scrolling and motion by key, with at most 1 % of frames past their deadline and none over 700 ms (PERF-03, AC-20);
+  - search within 50 ms of a keystroke, and a launch leaving within 50 ms of the tap (PERF-05, PERF-06);
+  - at most 150 MB at rest with 300 apps, giving icons back when the system asks (PERF-07);
+  - stored data within 50 MB and the APK within 15 MB (PERF-08).
 - [ ] Dates, times and numbers (L10N-03, L10N-04):
   - With 24-hour time on, the Events alarm and "Last updated" show 24-hour times; with it off, 12-hour ones.
   - In Arabic, Events' counts use Arabic-Indic digits.

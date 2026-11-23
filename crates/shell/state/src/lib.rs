@@ -284,6 +284,10 @@ pub enum ShellIntent {
     Pinch(PinchEvent),
     /// The display is about to draw a frame at this time on the host's monotonic clock.
     Frame(Duration),
+    /// The host is idle: nothing moves, and its main thread has nothing else to do. The view
+    /// that came into sight is read again now, so reading it never delays a moving frame
+    /// (PERF-03, ADR 0041).
+    Idle,
     /// A finger went down on an item of the current view, such as an app icon, at this time on
     /// the host's monotonic clock. `item` is its place in the view's cells, or in the open
     /// folder's on that `surface`. Its icon shrinks (ANIM-10).
@@ -425,6 +429,8 @@ pub struct HomeShell {
     theme_change: CrossFade,
     /// The theme drawn as of the last intent, to tell when it changes (ANIM-19).
     seen_theme: Theme,
+    /// The view that came into sight, which is read again at the next `Idle` (ADR 0041).
+    reread: Option<HomeView>,
     /// Events' groups and expanded group as of the last intent, to tell cheaply whether its
     /// rows may have changed, and the keys of those rows, to tell which came or went (ANIM-20).
     seen_groups: Arc<[NotificationGroup]>,
@@ -480,6 +486,7 @@ impl HomeShell {
             image_change: CrossFade::new(IMAGE_CROSSFADE),
             theme_change: CrossFade::new(THEME_CROSSFADE),
             seen_theme: Theme::default(),
+            reread: None,
             seen_groups: Arc::new([]),
             seen_expanded: None,
             seen_rows: Vec::new(),
@@ -730,6 +737,7 @@ impl HomeShell {
                 }
             }
             ShellIntent::Pinch(event) => self.follow_pinch(event),
+            ShellIntent::Idle => self.reread_shown(),
             ShellIntent::Frame(at) => {
                 self.carousel.frame(at);
                 self.pinch.frame(at);
@@ -1424,7 +1432,7 @@ impl HomeShell {
     /// left.
     fn apps_changed(&mut self) {
         self.apps.dispatch(AppsIntent::Refresh);
-        self.recent.dispatch(RecentIntent::Refresh);
+        self.recent.dispatch(RecentIntent::AppsChanged);
         // Events' groups take on new labels, icons and accents (APPS-17).
         self.events.dispatch(EventsIntent::AppsChanged);
     }
@@ -1940,14 +1948,35 @@ impl HomeShell {
             self.recent.dispatch(RecentIntent::ExitCloseMode);
         }
         // Recent refreshes whenever it becomes visible (REC-09); Events does too, to stay live.
-        match view {
-            HomeView::Events => {
+        // Both wait until nothing moves (ADR 0041).
+        self.reread = (view != HomeView::Applications).then_some(view);
+    }
+
+    /// Whether a view that came into sight waits to be read again at the next `Idle`
+    /// (ADR 0041). The host sends `Idle` only while nothing moves.
+    pub fn rereads(&self) -> bool {
+        self.reread.is_some()
+    }
+
+    /// Reads again what the view that came into sight shows, once the host is idle and no
+    /// finger holds the row: Recent its uses (REC-09), and Events its header, notifications and
+    /// image card (EVT-01, EVT-12). A read takes long enough to cost a moving frame its deadline,
+    /// so it waits for the views to come to rest (PERF-03, ADR 0041).
+    fn reread_shown(&mut self) {
+        let row = self.carousel.state();
+        if row.dragging || row.held || self.carousel.pressed_at().is_some() {
+            return;
+        }
+        match self.reread.take() {
+            Some(HomeView::Events) if self.state.current == HomeView::Events => {
                 self.events.dispatch(EventsIntent::Refresh);
                 // The card below the notifications stays live too (EVT-12).
                 self.lockimage.dispatch(LockImageIntent::Refresh);
             }
-            HomeView::Recent => self.recent.dispatch(RecentIntent::Refresh),
-            HomeView::Applications => {}
+            Some(HomeView::Recent) if self.state.current == HomeView::Recent => {
+                self.recent.dispatch(RecentIntent::Refresh);
+            }
+            _ => {}
         }
     }
 }
@@ -2692,6 +2721,8 @@ mod tests {
 
         cache_image(&fakes, "20261117");
         go(&mut shell, Direction::Previous);
+        // Once nothing moves (ADR 0041).
+        shell.dispatch(ShellIntent::Idle);
         assert_eq!(date(&shell), "20261117");
     }
 

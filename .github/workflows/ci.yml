@@ -45,6 +45,20 @@ jobs:
       - name: Tests
         run: cargo test --workspace
 
+      # The Rust app's share of each performance budget, timed with fakes and 300 apps: fails if
+      # a median goes past a tenth of its device budget, which only a much slower algorithm
+      # would. The table is shown on the run's summary page. The budgets themselves are
+      # measured on a device with tools/perf-bench.sh (ADR 0041).
+      - name: Performance budgets (host)
+        shell: bash
+        run: |
+          {
+            echo "### The Rust app's share of the performance budgets (ADR 0041)"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+          # GitHub runs bash with pipefail, so a budget past its limit fails the step.
+          cargo bench --bench budgets | tee -a "$GITHUB_STEP_SUMMARY"
+
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@v2
         with:
@@ -86,6 +100,20 @@ jobs:
         with:
           tool: cargo-ndk@4.1.2
 
+      # The debug, release and benchmark builds; the benchmark build is what tools/perf-bench.sh
+      # measures (ADR 0041).
       - name: Build the APK
         working-directory: android
-        run: ./gradlew assembleDebug assembleRelease
+        run: ./gradlew assembleDebug assembleRelease assembleBenchmark
+
+      # PERF-08: the release APK, which is what installs, stays within 15 MB.
+      - name: Install size
+        shell: bash
+        run: |
+          apk=android/app/build/outputs/apk/release/app-release-unsigned.apk
+          bytes=$(stat -c %s "$apk")
+          echo "The release APK is $bytes bytes." | tee -a "$GITHUB_STEP_SUMMARY"
+          if ((bytes > 15 * 1024 * 1024)); then
+            echo "It is over PERF-08's 15 MB." >&2
+            exit 1
+          fi

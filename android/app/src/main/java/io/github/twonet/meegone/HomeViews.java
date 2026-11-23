@@ -1,7 +1,9 @@
 package io.github.twonet.meegone;
 
 import android.annotation.TargetApi;
+import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.ComponentCallbacks2;
 import android.content.Context;
 import android.content.res.Resources;
 import android.graphics.Color;
@@ -12,6 +14,8 @@ import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.RippleDrawable;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Looper;
+import android.os.MessageQueue;
 import android.text.InputFilter;
 import android.text.TextUtils;
 import android.util.TypedValue;
@@ -341,6 +345,25 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     private final DragShadow shadow;
     /** Every grid's icons. */
     private final AppIcons icons;
+    /**
+     * Whether the system was told this home is fully drawn: Applications with every icon in
+     * sight (PERF-02, ADR 0041).
+     */
+    private boolean fullyDrawn;
+    /** Whether {@link #idle} waits for the main thread to have nothing to do. */
+    private boolean idleAsked;
+    /**
+     * Once nothing moves and the main thread has nothing else to do, the Rust app reads again
+     * the view that came into sight. Reading it while the row moves would cost a frame its
+     * deadline (PERF-03, ADR 0041).
+     */
+    private final MessageQueue.IdleHandler idle = () -> {
+        idleAsked = false;
+        if (isAttachedToWindow() && nativeIdle()) {
+            apply();
+        }
+        return false;
+    };
     /** Ends edit mode (APPS-12): a flat pill at the bottom of Applications. */
     private final TextView done;
     private final GradientDrawable doneShape;
@@ -543,6 +566,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         results = new AppsGrid(context, AppsGrid.SEARCH, icons, this::apply, this::announce);
         results.setScreen(this);
         searchPanel = new SearchPanel(context, results, query -> {
+            DebugHooks.typed(this);
             nativeSearchChanged(query);
             apply();
         }, this::submitSearch, () -> {
@@ -1228,6 +1252,7 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
     // closes it and goes nowhere.
     @Override
     public boolean dispatchTouchEvent(MotionEvent event) {
+        DebugHooks.touched(event);
         if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
             childClaimed = false;
             swallowing = menuOpen() && !isOver(menu, event.getX(), event.getY());
@@ -1516,12 +1541,72 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         // Restarts the frame loop, and sets the system bars now that there is a window.
         background = 0;
         apply();
+        watchFullyDrawn();
+    }
+
+    /**
+     * Tells the system the home is fully drawn once a frame shows Applications with every icon
+     * in sight, or another view, which shows at once: Android logs the time from the launch,
+     * and it is PERF-02's measure (ADR 0041). Checked after each frame until then.
+     */
+    private void watchFullyDrawn() {
+        if (fullyDrawn) {
+            return;
+        }
+        getViewTreeObserver().registerFrameCommitCallback(() -> {
+            if (fullyDrawn || !isAttachedToWindow()) {
+                return;
+            }
+            if (frame[CURRENT] != APPLICATIONS || apps.iconsShownInSight()) {
+                fullyDrawn = true;
+                ((Activity) getContext()).reportFullyDrawn();
+            } else {
+                watchFullyDrawn();
+            }
+        });
+    }
+
+    /**
+     * The system asks for memory back (PERF-07, ADR 0041). While the home is hidden it keeps
+     * everything, so Home brings it back fully drawn at once (PERF-01). When memory is low while
+     * it shows (Android 10 to 13), or the process is in the background list, which Android
+     * empties first, every icon out of sight goes: the cells draw their placeholders, the same
+     * size, and ask again as they scroll into sight.
+     */
+    @SuppressWarnings("deprecation") // The RUNNING_ levels reach only Android 10 to 13.
+    void trimMemory(int level) {
+        boolean lowWhileShown = level >= ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW
+                && level < ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN;
+        if (!lowWhileShown && level < ComponentCallbacks2.TRIM_MEMORY_BACKGROUND) {
+            return;
+        }
+        apps.trimIcons(true);
+        folderApps.trimIcons(folderApps.isShown());
+        results.trimIcons(results.isShown());
+        icons.trim();
+    }
+
+    /** The Applications grid, for the debug build's probe. */
+    AppsGrid appsGrid() {
+        return apps;
+    }
+
+    /** The icons, for the debug build's probe. */
+    AppIcons icons() {
+        return icons;
+    }
+
+    /** Whether Applications is the view shown, for the debug build's probe. */
+    boolean showsApplications() {
+        return frame[CURRENT] == APPLICATIONS;
     }
 
     @Override
     protected void onDetachedFromWindow() {
         Choreographer.getInstance().removeFrameCallback(this);
         framePosted = false;
+        Looper.myQueue().removeIdleHandler(idle);
+        idleAsked = false;
         removeCallbacks(longPress);
         icons.stopWatching();
         // The activity is going: its dialog goes with it, and the Rust app keeps the rename
@@ -1667,6 +1752,9 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
         if (frame[ANIMATING] != 0 && !framePosted && isAttachedToWindow()) {
             framePosted = true;
             Choreographer.getInstance().postFrameCallback(this);
+        } else if (frame[ANIMATING] == 0 && !idleAsked && isAttachedToWindow()) {
+            idleAsked = true;
+            Looper.myQueue().addIdleHandler(idle);
         }
     }
 
@@ -2002,6 +2090,10 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
             imageDetails.setVisibility(imageDetailsShown != 0 ? VISIBLE : GONE);
             if (imageDetailsShown != 0) {
                 imageDetails.opened();
+            } else {
+                // Its image is decoded again when it opens (PERF-07).
+                imageDetails.closed();
+                imageDetailsRead = -1;
             }
             coverLayers();
         }
@@ -3639,6 +3731,12 @@ final class HomeViews extends FrameLayout implements Choreographer.FrameCallback
 
     /** The display is about to draw a frame at this {@code System.nanoTime()}. */
     private native void nativeFrame(long frameTimeNanos);
+
+    /**
+     * Nothing moves and the main thread is idle: the view that came into sight is read again
+     * (ADR 0041). Returns whether it was, so the frame is read again.
+     */
+    private native boolean nativeIdle();
 
     /**
      * Shows the next or previous view without a gesture. Returns false if there is none: past

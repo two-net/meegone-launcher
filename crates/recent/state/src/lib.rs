@@ -150,15 +150,16 @@ impl RecentState {
 
 #[derive(Debug)]
 pub enum RecentIntent {
+    /// Reads the uses again, as when Recent shows (REC-09). The catalogue is the one read
+    /// before, so showing Recent never reads every app again (PERF-01, PERF-03, ADR 0041).
     Refresh,
+    /// The system's apps changed: the catalogue is read again, then the uses (REC-03).
+    AppsChanged,
     /// The user tapped Allow on the explainer card (REC-02).
     OpenAccessSettings,
     /// The user tapped a card: the app comes to the front, resumed if the system kept it, and
     /// its window grows from `from`, the card (REC-06, ANIM-08). In close mode it does nothing.
-    Launch {
-        app: AppId,
-        from: Option<Rect>,
-    },
+    Launch { app: AppId, from: Option<Rect> },
     /// A long-press on the grid, or a screen reader, enters close mode while there are cards
     /// (REC-07, A11Y-05).
     EnterCloseMode,
@@ -169,9 +170,7 @@ pub enum RecentIntent {
     /// Removes every card from Recent, in one save; no app is stopped (REC-08, AC-14).
     ClearAll,
     /// The host laid the cards out `width_dp` wide, inside their margins (REC-05).
-    Layout {
-        width_dp: f64,
-    },
+    Layout { width_dp: f64 },
     /// More cards or bigger ones, chosen by a pinch or from a screen reader (REC-05, A11Y-05).
     /// The choice is saved, so it stays after a restart.
     SetDensity(RecentDensity),
@@ -255,6 +254,9 @@ pub struct RecentHolder {
     settings: Arc<dyn SettingsStore>,
     system: Arc<dyn SystemConfigAdapter>,
     state: RecentState,
+    /// The launchable apps, read once and again only when they change: reading every app is
+    /// too slow for each time Recent shows (PERF-03, ADR 0041).
+    catalogue: Option<Vec<App>>,
 }
 
 impl RecentHolder {
@@ -270,6 +272,7 @@ impl RecentHolder {
             settings,
             system,
             state: RecentState::default(),
+            catalogue: None,
         }
     }
 
@@ -306,10 +309,17 @@ impl RecentHolder {
                 return;
             }
         };
-        match self.apps.launchable_apps() {
-            Ok(apps) => self.state.cards = cards(&uses, &apps, &settings, now),
-            Err(error) => self.state.problem = Some(error.problem()),
+        if self.catalogue.is_none() {
+            match self.apps.launchable_apps() {
+                Ok(apps) => self.catalogue = Some(apps),
+                Err(error) => {
+                    self.state.problem = Some(error.problem());
+                    return;
+                }
+            }
         }
+        let apps = self.catalogue.as_deref().unwrap_or_default();
+        self.state.cards = cards(&uses, apps, &settings, now);
     }
 
     /// Saves `density`. A failed save keeps the cards as they were and says why (ARCH-09).
@@ -398,6 +408,10 @@ impl StateHolder for RecentHolder {
     fn handle(&mut self, intent: RecentIntent) {
         match intent {
             RecentIntent::Refresh => self.refresh(),
+            RecentIntent::AppsChanged => {
+                self.catalogue = None;
+                self.refresh();
+            }
             RecentIntent::OpenAccessSettings => {
                 self.state.problem = self
                     .usage
@@ -546,9 +560,30 @@ mod tests {
 
         *fakes.usage.error.lock().unwrap() = None;
         *fakes.apps.error.lock().unwrap() = Some(DataError::Failed(Problem::AppListUnavailable));
-        holder.handle(RecentIntent::Refresh);
+        holder.handle(RecentIntent::AppsChanged);
         assert_eq!(packages(&holder), ["mail"]);
         assert_eq!(holder.state().problem, Some(Problem::AppListUnavailable));
+
+        // A catalogue that couldn't be read is asked for again at the next read.
+        *fakes.apps.error.lock().unwrap() = None;
+        holder.handle(RecentIntent::Refresh);
+        assert_eq!(packages(&holder), ["mail"]);
+        assert_eq!(holder.state().problem, None);
+    }
+
+    #[test]
+    fn the_catalogue_is_read_again_only_when_the_apps_change() {
+        // REC-09, PERF-03, ADR 0041: showing Recent reads the uses, not every app again.
+        let (fakes, _, mut holder) = setup(vec![used("mail", 1), used("news", 2)]);
+        holder.handle(RecentIntent::Refresh);
+        assert_eq!(packages(&holder), ["mail"]);
+
+        fakes.apps.apps.lock().unwrap().push(app("news", "news"));
+        holder.handle(RecentIntent::Refresh);
+        assert_eq!(packages(&holder), ["mail"]);
+
+        holder.handle(RecentIntent::AppsChanged);
+        assert_eq!(packages(&holder), ["mail", "news"]);
     }
 
     #[test]

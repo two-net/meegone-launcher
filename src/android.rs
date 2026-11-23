@@ -2756,6 +2756,31 @@ pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeFram
     });
 }
 
+/// `boolean nativeIdle()`: nothing moves on the home views and the main thread has nothing else
+/// to do. The view that came into sight is read again now, as reading it while the row moved
+/// would cost a frame its deadline (PERF-03, ADR 0041). Returns whether it was read.
+///
+/// # Safety
+///
+/// Called only by the JVM, with the arguments of that native method.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn Java_io_github_twonet_meegone_HomeViews_nativeIdle(
+    env: RawEnv,
+    _views: JObject,
+) -> JBoolean {
+    // SAFETY: the JVM passes this thread's environment.
+    let env = unsafe { Env::from_raw(env) };
+    let mut read = false;
+    with_launcher(env, |launcher| {
+        if launcher.shell().rereads() {
+            launcher.dispatch(ShellIntent::Idle);
+            read = !launcher.shell().rereads();
+            launcher.frame();
+        }
+    });
+    JBoolean::from(read)
+}
+
 /// `boolean nativeShow(boolean next)`: shows the next or previous view without a gesture, for
 /// screen readers (A11Y-05). Returns false if there is none, past an end with wrap-around off.
 ///

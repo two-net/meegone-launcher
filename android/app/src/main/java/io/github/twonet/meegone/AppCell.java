@@ -152,6 +152,8 @@ final class AppCell extends View implements Audited {
     private float motionDy;
     private Drawable icon;
     private StaticLayout labelLayout;
+    /** It was drawn as nothing, far out of sight, and draws in full once it comes near. */
+    private boolean drawnFar;
     private float iconScale = 1f;
 
     AppCell(Context context, AppsGrid grid) {
@@ -263,6 +265,10 @@ final class AppCell extends View implements Audited {
      * replacement arrives, so an updated app doesn't flash its placeholder.
      */
     void refreshIcon() {
+        if (!grid.isNear(this)) {
+            // Far out of sight: it asks once it comes near (PERF-07).
+            return;
+        }
         Drawable found = packageName == null ? null : grid.icon(profile, packageName, activity);
         if (found != null && found != icon) {
             icon = found;
@@ -276,6 +282,39 @@ final class AppCell extends View implements Audited {
                 invalidate();
             }
         }
+    }
+
+    /**
+     * Lets its icons go, as it is far out of sight or memory is short (PERF-07, ADR 0041): it
+     * draws the placeholder, the same size, until it asks again.
+     */
+    void releaseIcons() {
+        if (icon == null && Arrays.stream(previewIcons).allMatch(Objects::isNull)) {
+            return;
+        }
+        icon = null;
+        Arrays.fill(previewIcons, null);
+        invalidate();
+    }
+
+    /** It came near after it was drawn far out of sight: it draws in full (PERF-03). */
+    void cameNear() {
+        if (drawnFar) {
+            invalidate();
+        }
+    }
+
+    /** Whether every icon it shows has arrived: none is drawn as its placeholder (PERF-02). */
+    boolean iconsShown() {
+        if (!isFolder()) {
+            return icon != null;
+        }
+        for (int i = 0; i < Math.min(PREVIEW_APPS, preview.length); i++) {
+            if (previewIcons[i] == null) {
+                return false;
+            }
+        }
+        return true;
     }
 
     int index() {
@@ -630,6 +669,14 @@ final class AppCell extends View implements Audited {
         if (hidden) {
             return;
         }
+        if (!grid.isNear(this)) {
+            // Far out of sight: its label is laid out and it is drawn only once it comes near,
+            // so a grid of hundreds draws as quickly as two screens of cells (PERF-03,
+            // ADR 0041).
+            drawnFar = true;
+            return;
+        }
+        drawnFar = false;
         float centreX = getWidth() / 2f;
         int iconTop = verticalPaddingPx;
         canvas.save();

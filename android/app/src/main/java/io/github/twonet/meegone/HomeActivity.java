@@ -71,8 +71,10 @@ public final class HomeActivity extends Activity {
             savedView = savedInstanceState.getInt(SAVED_VIEW, NONE);
             savedAppsScroll = savedInstanceState.getInt(SAVED_APPS_SCROLL, 0);
         }
-        // Before MeeGone starts, so no icon or accent is drawn without it.
+        // Before MeeGone starts, so no icon or accent is drawn without it, and the catalogue is
+        // read with the benchmark's apps (ADR 0041).
         DebugHooks.readIconExtras(getIntent());
+        DebugHooks.readPerfExtras(this, getIntent());
         boolean started = nativeStart(bridge, getFilesDir().getPath(), savedView, savedAppsScroll);
         if (started) {
             // Checks the daily image if a check is due, and schedules its job again, which a
@@ -102,13 +104,17 @@ public final class HomeActivity extends Activity {
             nativeOpenSettings();
         }
         DebugHooks.readAuditExtras(this, views, getIntent());
+        DebugHooks.created(views, started);
     }
 
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
+        // The benchmark's settings take full effect from the next start (ADR 0041).
+        DebugHooks.readPerfExtras(this, intent);
         if (isHome(intent)) {
+            DebugHooks.home(views);
             if (away) {
                 homeWhileAway = true; // Handled when the home is back on screen, in onResume.
             } else {
@@ -144,6 +150,17 @@ public final class HomeActivity extends Activity {
     protected void onStop() {
         away = true;
         super.onStop();
+    }
+
+    /**
+     * The system asks for memory back: the home views let go of what they can rebuild (PERF-07,
+     * ADR 0041).
+     */
+    @Override
+    public void onTrimMemory(int level) {
+        super.onTrimMemory(level);
+        views.trimMemory(level);
+        DebugHooks.trimmed(views, level);
     }
 
     @Override

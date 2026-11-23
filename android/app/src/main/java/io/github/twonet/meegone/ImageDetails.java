@@ -175,6 +175,16 @@ final class ImageDetails extends Scroll {
         scrollTo(0, 0);
     }
 
+    /**
+     * Lets the decoded image go once the screen hides (PERF-07, ADR 0041). The next {@link
+     * #fill} decodes it again.
+     */
+    void closed() {
+        path = "";
+        key = "";
+        image.setImageDrawable(null);
+    }
+
     /** Shows the image and its details, in {@link #FIELDS} fields. */
     void fill(String[] fields) {
         if (fields == null || fields.length < FIELDS) {

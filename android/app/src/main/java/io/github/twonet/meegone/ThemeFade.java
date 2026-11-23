@@ -1,7 +1,7 @@
 package io.github.twonet.meegone;
 
 import android.graphics.Bitmap;
-import android.graphics.Canvas;
+import android.graphics.Picture;
 import android.graphics.drawable.BitmapDrawable;
 import android.util.Log;
 import android.view.ViewGroup;
@@ -16,8 +16,9 @@ import android.view.ViewGroup;
  * then fades it out as far as the Rust app says, and it goes once the fade ends. Every view
  * keeps its place and state underneath: nothing is made again.
  *
- * <p>The system bars and a dialog are other windows: they switch at once. If there is no
- * memory for the picture, the change is just instant.
+ * <p>The picture is recorded and then drawn by the GPU, as the icons are hardware bitmaps, which
+ * a software canvas can't draw (ADR 0041). The system bars and a dialog are other windows: they
+ * switch at once. If there is no memory for the picture, the change is just instant.
  */
 final class ThemeFade {
     private static final String TAG = "MeeGone";
@@ -43,8 +44,10 @@ final class ThemeFade {
         }
         Bitmap bitmap;
         try {
-            bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
-            screen.draw(new Canvas(bitmap));
+            Picture recorded = new Picture();
+            screen.draw(recorded.beginRecording(width, height));
+            recorded.endRecording();
+            bitmap = Bitmap.createBitmap(recorded);
         } catch (OutOfMemoryError | RuntimeException e) {
             Log.w(TAG, "No theme fade: " + e.getClass().getSimpleName());
             return;
